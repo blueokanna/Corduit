@@ -23,6 +23,33 @@ const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Runtime proxy mode values.
+///
+/// Kept as `i32` because they cross the C ABI (see `corduit-lib`); the names
+/// below are the single source of truth so the engine never spells magic
+/// numbers.
+pub mod proxy_mode {
+    /// Follow the configured `general.mode`.
+    pub const CONFIG: i32 = 0;
+    /// Route everything through the proxy group.
+    pub const GLOBAL: i32 = 1;
+    /// Route everything directly.
+    pub const DIRECT: i32 = 2;
+    /// Use rule matching.
+    pub const RULE: i32 = 3;
+}
+
+pub fn set_runtime_proxy_mode(mode: i32) {
+    let normalized = match mode {
+        proxy_mode::CONFIG | proxy_mode::GLOBAL | proxy_mode::DIRECT | proxy_mode::RULE => mode,
+        // Unknown values fall back to the configured mode instead of
+        // poisoning the engine with an unhandled state.
+        _ => proxy_mode::CONFIG,
+    };
+    tracing::info!("Setting runtime proxy mode to {}", normalized);
+    RUNTIME_PROXY_MODE.store(normalized, Ordering::SeqCst);
+}
+
 #[derive(Clone)]
 struct CachedResolution {
     addresses: Vec<IpAddr>,
@@ -35,11 +62,6 @@ static DNS_CACHE: once_cell::sync::Lazy<Mutex<LruCache<String, CachedResolution>
             NonZeroUsize::new(DNS_CACHE_CAPACITY).expect("DNS cache capacity must be non-zero"),
         ))
     });
-
-pub fn set_runtime_proxy_mode(mode: i32) {
-    tracing::info!("Setting runtime proxy mode to {}", mode);
-    RUNTIME_PROXY_MODE.store(mode, Ordering::SeqCst);
-}
 
 pub fn get_runtime_proxy_mode() -> i32 {
     RUNTIME_PROXY_MODE.load(Ordering::SeqCst)
@@ -62,18 +84,34 @@ fn runtime_rule_providers() -> Vec<RuleProviderConfig> {
 pub struct Router {
     config: Arc<RwLock<Config>>,
     rules: RwLock<Vec<CompiledRule>>,
+    /// Pre-resolved default outbound tags — no per-request scan of `outbounds`.
+    defaults: RwLock<DefaultOutbounds>,
     geoip_manager: Arc<dyn CountryMatcher>,
     rule_provider_manager: RuleProviderManager,
+}
+
+/// Fallback outbound tags resolved once per configuration, not per request.
+#[derive(Debug, Clone)]
+struct DefaultOutbounds {
+    direct: String,
+    global: Option<String>,
+    default: String,
 }
 
 #[derive(Debug, Clone)]
 struct CompiledRule {
     rule_type: RuleType,
+    /// Canonical pattern. Domain/process patterns are lowercased once at
+    /// compile time so matching never allocates or re-parses.
     pattern: String,
     outbound: String,
     #[allow(dead_code)]
     process_name: Option<String>,
     regex: Option<Regex>,
+    /// Pre-parsed CIDR for `IpCidr` / `SrcIpCidr` rules.
+    ipnet: Option<IpNet>,
+    /// Pre-parsed inclusive port ranges for `SrcPort` / `DstPort` rules.
+    port_ranges: Vec<(u16, u16)>,
 }
 
 impl Router {
@@ -116,9 +154,15 @@ impl Router {
             result?;
         }
 
+        let defaults = {
+            let config_guard = config.read().await;
+            Self::resolve_default_outbounds(&config_guard)
+        };
+
         Ok(Self {
             config,
             rules: RwLock::new(rules),
+            defaults: RwLock::new(defaults),
             geoip_manager,
             rule_provider_manager,
         })
@@ -144,53 +188,21 @@ impl Router {
         process_name: Option<&str>,
     ) -> String {
         let runtime_mode = get_runtime_proxy_mode();
-        let (effective_mode, direct_outbound, global_outbound, default_outbound) = {
+        let effective_mode = {
             let config = self.config.read().await;
-            let effective_mode = match runtime_mode {
-                1 => Mode::Global,
-                2 => Mode::Direct,
-                3 => Mode::Rule,
+            match runtime_mode {
+                proxy_mode::GLOBAL => Mode::Global,
+                proxy_mode::DIRECT => Mode::Direct,
+                proxy_mode::RULE => Mode::Rule,
                 _ => config.general.mode,
-            };
-            let direct_outbound = config
-                .outbounds
-                .iter()
-                .find(|outbound| outbound.outbound_type == crate::config::OutboundType::Direct)
-                .map(|outbound| outbound.tag.clone())
-                .unwrap_or_else(|| "DIRECT".to_string());
-            let global_outbound = config
-                .outbounds
-                .iter()
-                .find(|outbound| {
-                    matches!(
-                        outbound.outbound_type,
-                        crate::config::OutboundType::Selector
-                            | crate::config::OutboundType::Urltest
-                            | crate::config::OutboundType::Fallback
-                            | crate::config::OutboundType::Loadbalance
-                    )
-                })
-                .or_else(|| {
-                    config.outbounds.iter().find(|outbound| {
-                        !matches!(
-                            outbound.outbound_type,
-                            crate::config::OutboundType::Direct
-                                | crate::config::OutboundType::Reject
-                        )
-                    })
-                })
-                .map(|outbound| outbound.tag.clone());
-            let default_outbound = config
-                .outbounds
-                .first()
-                .map(|outbound| outbound.tag.clone())
-                .unwrap_or_else(|| direct_outbound.clone());
-
+            }
+        };
+        let (direct_outbound, global_outbound, default_outbound) = {
+            let defaults = self.defaults.read().await;
             (
-                effective_mode,
-                direct_outbound,
-                global_outbound,
-                default_outbound,
+                defaults.direct.clone(),
+                defaults.global.clone(),
+                defaults.default.clone(),
             )
         };
 
@@ -372,15 +384,66 @@ impl Router {
     }
 
     pub async fn reload(&self) -> Result<()> {
-        let config = self.config.read().await;
-        let new_rules = Self::compile_rules(&config.rules)?;
-        let mut rules = self.rules.write().await;
-        *rules = new_rules;
+        let (new_rules, defaults) = {
+            let config = self.config.read().await;
+            let new_rules = Self::compile_rules(&config.rules)?;
+            let defaults = Self::resolve_default_outbounds(&config);
+            (new_rules, defaults)
+        };
+        {
+            let mut rules = self.rules.write().await;
+            *rules = new_rules;
+        }
+        {
+            let mut defaults_guard = self.defaults.write().await;
+            *defaults_guard = defaults;
+        }
         Ok(())
     }
 
+    /// Compute the fallback outbound tags for a given configuration.
+    fn resolve_default_outbounds(config: &Config) -> DefaultOutbounds {
+        let direct = config
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.outbound_type == crate::config::OutboundType::Direct)
+            .map(|outbound| outbound.tag.clone())
+            .unwrap_or_else(|| "DIRECT".to_string());
+        let global = config
+            .outbounds
+            .iter()
+            .find(|outbound| {
+                matches!(
+                    outbound.outbound_type,
+                    crate::config::OutboundType::Selector
+                        | crate::config::OutboundType::Urltest
+                        | crate::config::OutboundType::Fallback
+                        | crate::config::OutboundType::Loadbalance
+                )
+            })
+            .or_else(|| {
+                config.outbounds.iter().find(|outbound| {
+                    !matches!(
+                        outbound.outbound_type,
+                        crate::config::OutboundType::Direct | crate::config::OutboundType::Reject
+                    )
+                })
+            })
+            .map(|outbound| outbound.tag.clone());
+        let default = config
+            .outbounds
+            .first()
+            .map(|outbound| outbound.tag.clone())
+            .unwrap_or_else(|| direct.clone());
+        DefaultOutbounds {
+            direct,
+            global,
+            default,
+        }
+    }
+
     fn compile_rules(rules: &[RuleConfig]) -> Result<Vec<CompiledRule>> {
-        let mut compiled = Vec::new();
+        let mut compiled = Vec::with_capacity(rules.len());
 
         for rule in rules {
             let regex = if rule.rule_type == RuleType::DomainRegex {
@@ -392,16 +455,76 @@ impl Router {
                 None
             };
 
+            // Pre-parse CIDRs and port ranges so hot-path matching never
+            // re-parses strings. Invalid payloads fail loudly at compile time.
+            let ipnet = if matches!(rule.rule_type, RuleType::IpCidr | RuleType::SrcIpCidr) {
+                Some(rule.payload.parse::<IpNet>().map_err(|e| {
+                    Error::config(format!("Invalid CIDR '{}': {}", rule.payload, e))
+                })?)
+            } else {
+                None
+            };
+            let port_ranges = if matches!(rule.rule_type, RuleType::SrcPort | RuleType::DstPort)
+            {
+                Self::compile_port_ranges(&rule.payload)?
+            } else {
+                Vec::new()
+            };
+
+            // Lowercase domain/process patterns once; matching then uses
+            // case-insensitive comparisons with zero allocations.
+            let pattern = if matches!(
+                rule.rule_type,
+                RuleType::Domain | RuleType::DomainSuffix | RuleType::DomainKeyword
+            ) {
+                rule.payload.to_ascii_lowercase()
+            } else {
+                rule.payload.clone()
+            };
+
             compiled.push(CompiledRule {
                 rule_type: rule.rule_type,
-                pattern: rule.payload.clone(),
+                pattern,
                 outbound: rule.outbound.clone(),
                 process_name: rule.process_name.clone(),
                 regex,
+                ipnet,
+                port_ranges,
             });
         }
 
         Ok(compiled)
+    }
+
+    /// Parse a comma-separated port list / range list into inclusive ranges.
+    fn compile_port_ranges(pattern: &str) -> Result<Vec<(u16, u16)>> {
+        let mut ranges = Vec::new();
+        for part in pattern.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(Error::config("Empty port in port rule"));
+            }
+            if let Some((start, end)) = part.split_once('-') {
+                let start: u16 = start
+                    .trim()
+                    .parse()
+                    .map_err(|_| Error::config(format!("Invalid port '{start}'")))?;
+                let end: u16 = end
+                    .trim()
+                    .parse()
+                    .map_err(|_| Error::config(format!("Invalid port '{end}'")))?;
+                if start > end {
+                    return Err(Error::config(format!("Invalid port range '{part}'")));
+                }
+                ranges.push((start, end));
+            } else {
+                let port: u16 = part
+                    .parse()
+                    .map_err(|_| Error::config(format!("Invalid port '{part}'")))?;
+                ranges.push((port, port));
+            }
+        }
+        Ok(ranges)
     }
 
     async fn matches_rule(
@@ -413,30 +536,11 @@ impl Router {
         process_name: Option<&str>,
     ) -> bool {
         match rule.rule_type {
-            RuleType::Domain => {
-                if let Some(domain) = domain {
-                    domain.to_lowercase() == rule.pattern.to_lowercase()
-                } else {
-                    false
-                }
-            }
-            RuleType::DomainSuffix => {
-                if let Some(domain) = domain {
-                    let domain_lower = domain.to_lowercase();
-                    let pattern_lower = rule.pattern.to_lowercase();
-                    domain_lower == pattern_lower
-                        || domain_lower.ends_with(&format!(".{}", pattern_lower))
-                } else {
-                    false
-                }
-            }
-            RuleType::DomainKeyword => {
-                if let Some(domain) = domain {
-                    domain.to_lowercase().contains(&rule.pattern.to_lowercase())
-                } else {
-                    false
-                }
-            }
+            RuleType::Domain => domain.is_some_and(|d| d.eq_ignore_ascii_case(&rule.pattern)),
+            RuleType::DomainSuffix => domain
+                .is_some_and(|d| Self::matches_domain_suffix(d, &rule.pattern)),
+            RuleType::DomainKeyword => domain
+                .is_some_and(|d| contains_ignore_case(d, &rule.pattern)),
             RuleType::DomainRegex => {
                 if let Some(domain) = domain {
                     if let Some(regex) = &rule.regex {
@@ -448,16 +552,9 @@ impl Router {
                     false
                 }
             }
-            RuleType::IpCidr => {
+            RuleType::IpCidr | RuleType::SrcIpCidr => {
                 if let Some(ip) = ip {
-                    Self::matches_cidr(&rule.pattern, ip)
-                } else {
-                    false
-                }
-            }
-            RuleType::SrcIpCidr => {
-                if let Some(ip) = ip {
-                    Self::matches_cidr(&rule.pattern, ip)
+                    rule.ipnet.is_some_and(|network| network.contains(&ip))
                 } else {
                     false
                 }
@@ -471,14 +568,16 @@ impl Router {
             }
             RuleType::SrcPort | RuleType::DstPort => {
                 if let Some(port) = port {
-                    Self::matches_port_range(&rule.pattern, port)
+                    rule.port_ranges
+                        .iter()
+                        .any(|(start, end)| port >= *start && port <= *end)
                 } else {
                     false
                 }
             }
             RuleType::ProcessName => {
                 if let Some(process) = process_name {
-                    self.matches_process_name(&rule.pattern, process)
+                    Self::matches_process_name(&rule.pattern, process)
                 } else {
                     false
                 }
@@ -492,6 +591,58 @@ impl Router {
         }
     }
 
+    /// Match a domain against a lowercased suffix pattern (`example.com`),
+    /// honoring the dotted boundary so `notexample.com` does not match.
+    fn matches_domain_suffix(domain: &str, pattern: &str) -> bool {
+        let domain = domain.trim_end_matches('.');
+        if domain.eq_ignore_ascii_case(pattern) {
+            return true;
+        }
+        let suffix_len = pattern.len();
+        if domain.len() <= suffix_len {
+            return false;
+        }
+        let start = domain.len() - suffix_len;
+        domain.as_bytes()[start - 1] == b'.'
+            && domain[start..].eq_ignore_ascii_case(pattern)
+    }
+
+    /// Match a process name against a lowercased pattern, checking the full
+    /// path, the basename and the `.exe`-stripped variants.
+    fn matches_process_name(pattern: &str, process_name: &str) -> bool {
+        let process_lower = process_name.to_ascii_lowercase();
+
+        if process_lower == pattern {
+            return true;
+        }
+
+        if let Some(name) = process_name.rsplit(['/', '\\']).next() {
+            if name.eq_ignore_ascii_case(pattern) {
+                return true;
+            }
+        }
+
+        if let Some(name_without_ext) = pattern.strip_suffix(".exe") {
+            if process_lower == name_without_ext {
+                return true;
+            }
+            if let Some(proc_name) = process_name.rsplit(['/', '\\']).next() {
+                if proc_name.eq_ignore_ascii_case(name_without_ext) {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(proc_without_ext) = process_lower.strip_suffix(".exe") {
+            if proc_without_ext == pattern {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    #[cfg(test)]
     fn matches_cidr(cidr_str: &str, ip: IpAddr) -> bool {
         match cidr_str.parse::<IpNet>() {
             Ok(network) => network.contains(&ip),
@@ -499,6 +650,7 @@ impl Router {
         }
     }
 
+    #[cfg(test)]
     fn matches_port_range(pattern: &str, port: u16) -> bool {
         for part in pattern.split(',') {
             let part = part.trim();
@@ -520,40 +672,20 @@ impl Router {
         }
         false
     }
+}
 
-    fn matches_process_name(&self, pattern: &str, process_name: &str) -> bool {
-        let pattern_lower = pattern.to_lowercase();
-        let process_lower = process_name.to_lowercase();
-
-        if pattern_lower == process_lower {
-            return true;
-        }
-
-        if let Some(name) = process_name.rsplit(['/', '\\']).next() {
-            if name.to_lowercase() == pattern_lower {
-                return true;
-            }
-        }
-
-        if let Some(name_without_ext) = pattern_lower.strip_suffix(".exe") {
-            if process_lower == name_without_ext {
-                return true;
-            }
-            if let Some(proc_name) = process_name.rsplit(['/', '\\']).next() {
-                if proc_name.to_lowercase() == name_without_ext {
-                    return true;
-                }
-            }
-        }
-
-        if let Some(proc_without_ext) = process_lower.strip_suffix(".exe") {
-            if proc_without_ext == pattern_lower {
-                return true;
-            }
-        }
-
-        false
+/// Case-insensitive substring search without allocation.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
     }
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let limit = haystack.len() - needle.len();
+    (0..=limit).any(|i| haystack[i..i + needle.len()].eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
@@ -617,6 +749,11 @@ mod tests {
         Router {
             config: Arc::new(RwLock::new(config)),
             rules: RwLock::new(rules),
+            defaults: RwLock::new(DefaultOutbounds {
+                direct: "bypass".to_string(),
+                global: Some("proxy".to_string()),
+                default: "proxy".to_string(),
+            }),
             geoip_manager: Arc::new(StubCountryMatcher),
             rule_provider_manager: RuleProviderManager::new(),
         }
@@ -723,41 +860,20 @@ mod tests {
 
     #[test]
     fn test_matches_process_name_exact() {
-        let router = Router {
-            config: std::sync::Arc::new(RwLock::new(Config::default())),
-            rules: RwLock::new(Vec::new()),
-            geoip_manager: Arc::new(GeoIpManager::new()),
-            rule_provider_manager: RuleProviderManager::new(),
-        };
-
-        assert!(router.matches_process_name("chrome", "chrome"));
-        assert!(router.matches_process_name("Chrome", "chrome"));
+        assert!(Router::matches_process_name("chrome", "chrome"));
+        assert!(Router::matches_process_name("Chrome", "chrome"));
     }
 
     #[test]
     fn test_matches_process_name_with_path() {
-        let router = Router {
-            config: std::sync::Arc::new(RwLock::new(Config::default())),
-            rules: RwLock::new(Vec::new()),
-            geoip_manager: Arc::new(GeoIpManager::new()),
-            rule_provider_manager: RuleProviderManager::new(),
-        };
-
-        assert!(router.matches_process_name("chrome", "/usr/bin/chrome"));
-        assert!(router.matches_process_name("chrome", "C:\\Program Files\\chrome"));
+        assert!(Router::matches_process_name("chrome", "/usr/bin/chrome"));
+        assert!(Router::matches_process_name("chrome", "C:\\Program Files\\chrome"));
     }
 
     #[test]
     fn test_matches_process_name_with_exe() {
-        let router = Router {
-            config: std::sync::Arc::new(RwLock::new(Config::default())),
-            rules: RwLock::new(Vec::new()),
-            geoip_manager: Arc::new(GeoIpManager::new()),
-            rule_provider_manager: RuleProviderManager::new(),
-        };
-
-        assert!(router.matches_process_name("chrome.exe", "chrome"));
-        assert!(router.matches_process_name("chrome", "chrome.exe"));
+        assert!(Router::matches_process_name("chrome.exe", "chrome"));
+        assert!(Router::matches_process_name("chrome", "chrome.exe"));
     }
 }
 
@@ -811,11 +927,18 @@ mod property_tests {
                 outbound: "proxy".to_string(),
                 process_name: None,
                 regex: None,
+                ipnet: None,
+                port_ranges: Vec::new(),
             };
 
             let router = Router {
                 config: std::sync::Arc::new(RwLock::new(Config::default())),
                 rules: RwLock::new(vec![rule]),
+                defaults: RwLock::new(DefaultOutbounds {
+                    direct: "proxy".to_string(),
+                    global: None,
+                    default: "proxy".to_string(),
+                }),
                 geoip_manager: Arc::new(GeoIpManager::new()),
                 rule_provider_manager: RuleProviderManager::new(),
             };
@@ -857,11 +980,18 @@ mod property_tests {
                 outbound: "proxy".to_string(),
                 process_name: None,
                 regex: None,
+                ipnet: None,
+                port_ranges: Vec::new(),
             };
 
             let router = Router {
                 config: std::sync::Arc::new(RwLock::new(Config::default())),
                 rules: RwLock::new(vec![rule]),
+                defaults: RwLock::new(DefaultOutbounds {
+                    direct: "proxy".to_string(),
+                    global: None,
+                    default: "proxy".to_string(),
+                }),
                 geoip_manager: Arc::new(GeoIpManager::new()),
                 rule_provider_manager: RuleProviderManager::new(),
             };
@@ -894,11 +1024,18 @@ mod property_tests {
                 outbound: "proxy".to_string(),
                 process_name: None,
                 regex: None,
+                ipnet: None,
+                port_ranges: Vec::new(),
             };
 
             let router = Router {
                 config: std::sync::Arc::new(RwLock::new(Config::default())),
                 rules: RwLock::new(vec![rule]),
+                defaults: RwLock::new(DefaultOutbounds {
+                    direct: "proxy".to_string(),
+                    global: None,
+                    default: "proxy".to_string(),
+                }),
                 geoip_manager: Arc::new(GeoIpManager::new()),
                 rule_provider_manager: RuleProviderManager::new(),
             };
@@ -992,11 +1129,18 @@ mod property_tests {
                 outbound: "proxy".to_string(),
                 process_name: None,
                 regex: None,
+                ipnet: None,
+                port_ranges: Vec::new(),
             };
 
             let router = Router {
                 config: std::sync::Arc::new(RwLock::new(Config::default())),
                 rules: RwLock::new(vec![rule]),
+                defaults: RwLock::new(DefaultOutbounds {
+                    direct: "proxy".to_string(),
+                    global: None,
+                    default: "proxy".to_string(),
+                }),
                 geoip_manager: Arc::new(GeoIpManager::new()),
                 rule_provider_manager: RuleProviderManager::new(),
             };

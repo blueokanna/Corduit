@@ -106,7 +106,7 @@ impl Request {
 
         buf.put_u8(self.version);
         buf.put_u8(self.command as u8);
-        self.address.write_to(&mut buf);
+        self.address.write_to(&mut buf)?;
 
         if let Some(ref payload) = self.payload {
             buf.put_u16(payload.len() as u16);
@@ -185,7 +185,7 @@ impl Response {
         }
     }
 
-    pub fn to_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Result<Bytes> {
         let addr_len = self
             .address
             .as_ref()
@@ -198,10 +198,10 @@ impl Response {
         buf.put_u8(if self.address.is_some() { 1 } else { 0 });
 
         if let Some(ref addr) = self.address {
-            addr.write_to(&mut buf);
+            addr.write_to(&mut buf)?;
         }
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
@@ -244,15 +244,15 @@ impl UdpHeader {
         Self { frag: 0, address }
     }
 
-    pub fn to_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Result<Bytes> {
         let addr_len = self.address.serialized_len();
         let mut buf = BytesMut::with_capacity(3 + addr_len);
 
         buf.put_u16(0);
         buf.put_u8(self.frag);
-        self.address.write_to(&mut buf);
+        self.address.write_to(&mut buf)?;
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<(Self, usize)> {

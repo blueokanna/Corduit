@@ -119,7 +119,8 @@ pub type ProxyRegistry = Arc<RwLock<HashMap<String, Arc<dyn OutboundProxy>>>>;
 pub struct OutboundManager {
     config: Arc<RwLock<Config>>,
     proxies: ProxyRegistry,
-    proxy_list: Vec<Arc<dyn OutboundProxy>>,
+    /// Lifecycle list (start/stop/tags); replaced atomically on reload.
+    proxy_list: parking_lot::RwLock<Vec<Arc<dyn OutboundProxy>>>,
 }
 
 #[async_trait::async_trait]
@@ -171,94 +172,99 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 impl OutboundManager {
     pub async fn new(config: Arc<RwLock<Config>>) -> Result<Self> {
         let proxies: ProxyRegistry = Arc::new(RwLock::new(HashMap::new()));
-        let mut proxy_list: Vec<Arc<dyn OutboundProxy>> = Vec::new();
-        let mut proxy_group_configs: Vec<OutboundConfig> = Vec::new();
-
-        {
+        let proxy_list = {
             let config_read = config.read().await;
-            for outbound_config in &config_read.outbounds {
-                let proxy: Option<Arc<dyn OutboundProxy>> = match outbound_config.outbound_type {
-                    OutboundType::Direct => {
-                        Some(Arc::new(DirectOutbound::new(outbound_config.clone())))
-                    }
-                    OutboundType::Reject => {
-                        Some(Arc::new(RejectOutbound::new(outbound_config.clone())))
-                    }
-                    OutboundType::Socks5 => {
-                        Some(Arc::new(Socks5Outbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Http => {
-                        Some(Arc::new(HttpOutbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Shadowsocks => {
-                        Some(Arc::new(ShadowsocksOutbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Vmess => {
-                        Some(Arc::new(VmessOutbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Vless => {
-                        Some(Arc::new(VlessOutbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Trojan => {
-                        Some(Arc::new(TrojanOutbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Wireguard => {
-                        Some(Arc::new(WireguardOutbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Tuic => {
-                        Some(Arc::new(TuicOutbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Hysteria2 => {
-                        Some(Arc::new(Hysteria2Outbound::new(outbound_config.clone())?))
-                    }
-                    OutboundType::Quic => {
-                        return Err(Error::config(format!(
-                            "QUIC outbound '{}' is not implemented; refusing unsafe direct fallback",
-                            outbound_config.tag
-                        )));
-                    }
-                    OutboundType::Selector
-                    | OutboundType::Urltest
-                    | OutboundType::Fallback
-                    | OutboundType::Loadbalance
-                    | OutboundType::Relay => {
-                        proxy_group_configs.push(outbound_config.clone());
-                        None
-                    }
-                };
-
-                if let Some(p) = proxy {
-                    let tag = p.tag().to_string();
-                    proxy_list.push(p.clone());
-                    proxies.write().await.insert(tag, p);
-                }
-            }
-        }
-
-        // Second pass: create proxy groups with access to the registry
-        for group_config in proxy_group_configs {
-            let proxy: Arc<dyn OutboundProxy> = match group_config.outbound_type {
-                OutboundType::Selector
-                | OutboundType::Urltest
-                | OutboundType::Fallback
-                | OutboundType::Loadbalance
-                | OutboundType::Relay => Arc::new(SelectorOutbound::new(
-                    group_config.clone(),
-                    proxies.clone(),
-                )?),
-                _ => unreachable!(),
-            };
-
-            let tag = proxy.tag().to_string();
-            proxy_list.push(proxy.clone());
-            proxies.write().await.insert(tag, proxy);
-        }
+            Self::build_outbounds(&config_read, &proxies).await?
+        };
 
         Ok(Self {
             config,
             proxies,
-            proxy_list,
+            proxy_list: parking_lot::RwLock::new(proxy_list),
         })
+    }
+
+    /// Build the outbound registry and lifecycle list from a configuration.
+    ///
+    /// The group pass runs after the leaf proxies so selector/urltest/…
+    /// groups can reference them through the shared registry.
+    async fn build_outbounds(
+        config: &Config,
+        registry: &ProxyRegistry,
+    ) -> Result<Vec<Arc<dyn OutboundProxy>>> {
+        let mut proxy_list: Vec<Arc<dyn OutboundProxy>> = Vec::new();
+        let mut proxy_group_configs: Vec<OutboundConfig> = Vec::new();
+
+        for outbound_config in &config.outbounds {
+            let proxy: Option<Arc<dyn OutboundProxy>> = match outbound_config.outbound_type {
+                OutboundType::Direct => {
+                    Some(Arc::new(DirectOutbound::new(outbound_config.clone())))
+                }
+                OutboundType::Reject => {
+                    Some(Arc::new(RejectOutbound::new(outbound_config.clone())))
+                }
+                OutboundType::Socks5 => {
+                    Some(Arc::new(Socks5Outbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Http => {
+                    Some(Arc::new(HttpOutbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Shadowsocks => {
+                    Some(Arc::new(ShadowsocksOutbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Vmess => {
+                    Some(Arc::new(VmessOutbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Vless => {
+                    Some(Arc::new(VlessOutbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Trojan => {
+                    Some(Arc::new(TrojanOutbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Wireguard => {
+                    Some(Arc::new(WireguardOutbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Tuic => {
+                    Some(Arc::new(TuicOutbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Hysteria2 => {
+                    Some(Arc::new(Hysteria2Outbound::new(outbound_config.clone())?))
+                }
+                OutboundType::Quic => {
+                    return Err(Error::config(format!(
+                        "QUIC outbound '{}' is not implemented; refusing unsafe direct fallback",
+                        outbound_config.tag
+                    )));
+                }
+                OutboundType::Selector
+                | OutboundType::Urltest
+                | OutboundType::Fallback
+                | OutboundType::Loadbalance
+                | OutboundType::Relay => {
+                    proxy_group_configs.push(outbound_config.clone());
+                    None
+                }
+            };
+
+            if let Some(p) = proxy {
+                let tag = p.tag().to_string();
+                proxy_list.push(p.clone());
+                registry.write().await.insert(tag, p);
+            }
+        }
+
+        // Second pass: create proxy groups with access to the registry.
+        for group_config in proxy_group_configs {
+            let proxy: Arc<dyn OutboundProxy> = Arc::new(SelectorOutbound::new(
+                group_config.clone(),
+                registry.clone(),
+            )?);
+            let tag = proxy.tag().to_string();
+            proxy_list.push(proxy.clone());
+            registry.write().await.insert(tag, proxy);
+        }
+
+        Ok(proxy_list)
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -266,19 +272,36 @@ impl OutboundManager {
         // Connections will be established on-demand when traffic flows through
         tracing::info!(
             "OutboundManager started with {} proxies (lazy connection mode)",
-            self.proxy_list.len()
+            self.proxy_list.read().len()
         );
         Ok(())
     }
 
     pub async fn stop(&self) -> Result<()> {
-        for proxy in &self.proxy_list {
+        // Clone the (cheap) Arc handles, drop the lock, then await — never
+        // hold a parking_lot guard across an await point.
+        let proxies: Vec<_> = self.proxy_list.read().iter().cloned().collect();
+        for proxy in proxies {
             proxy.disconnect().await?;
         }
         Ok(())
     }
 
+    /// Rebuild the proxy pool from the current configuration. Removed
+    /// outbounds are dropped; the registry is replaced atomically.
     pub async fn reload(&self) -> Result<()> {
+        let new_list = {
+            let config = self.config.read().await;
+            // Reset the registry first so outbounds removed from the config
+            // do not linger and stay reachable by tag.
+            self.proxies.write().await.clear();
+            Self::build_outbounds(&config, &self.proxies).await?
+        };
+        *self.proxy_list.write() = new_list;
+        tracing::info!(
+            "OutboundManager reloaded {} proxies",
+            self.proxy_list.read().len()
+        );
         Ok(())
     }
 
@@ -301,6 +324,7 @@ impl OutboundManager {
     /// Get all proxy tags
     pub fn get_all_tags(&self) -> Vec<String> {
         self.proxy_list
+            .read()
             .iter()
             .map(|p| p.tag().to_string())
             .collect()

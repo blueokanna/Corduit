@@ -17,10 +17,10 @@ bolt together a config loader, a rule engine, a DNS resolver, a TUN driver and a
 handful of proxy protocols — each owned by a different upstream, each with its
 own release cadence, its own bugs, and its own breaking changes.
 
-**Corduit is a new product.** It is a single, purpose-built engine where every
+**Corduit is a new product, not a wrapper.** It is a single engine where every
 layer — configuration, routing, DNS, userspace networking, and wire protocols —
-is a first-class member of one workspace, designed together, tested together,
-and released together.
+lives in one workspace and ships as one unit: one design, one test run, one
+release.
 
 | | Clash (composite) | Corduit (unified) |
 |---|---|---|
@@ -451,7 +451,7 @@ examples, built with `all-features` on docs.rs.
    included** — every type in the workspace (config, DTOs, protocol metadata)
    derives `nextjson`'s `NsonSerialize` / `NsonDeserialize`. Unused
    dependencies are removed and every declared dependency is actually used.
-5. **Serialization is a first-class citizen.** The FFI boundary uses
+5. **Serialization is built in, not bolted on.** The FFI boundary uses
    `nextjson` + `rustbinary` (typed, schema-driven, `no_std`, `unsafe`-free),
    so cross-language clients get stable, self-describing payloads with zero
    serde anywhere in the graph.

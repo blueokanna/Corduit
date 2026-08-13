@@ -75,7 +75,9 @@ impl Address {
         }
     }
 
-    pub fn write_to(&self, buf: &mut impl BufMut) {
+    /// Encode into a `BufMut`. Returns an error if a domain name exceeds the
+    /// 255-byte wire limit instead of silently truncating the length byte.
+    pub fn write_to(&self, buf: &mut impl BufMut) -> Result<()> {
         match self {
             Self::Ipv4(ip, port) => {
                 buf.put_u8(AddressType::IPv4 as u8);
@@ -89,19 +91,24 @@ impl Address {
             }
             Self::Domain(domain, port) => {
                 let domain_bytes = domain.as_bytes();
-                debug_assert!(
-                    domain_bytes.len() <= u8::MAX as usize,
-                    "domain name exceeds the 255-byte wire limit"
-                );
+                if domain_bytes.len() > u8::MAX as usize {
+                    return Err(ProtocolError::Protocol(format!(
+                        "domain name is {} bytes, exceeding the 255-byte wire limit",
+                        domain_bytes.len()
+                    )));
+                }
                 buf.put_u8(AddressType::Domain as u8);
                 buf.put_u8(domain_bytes.len() as u8);
                 buf.put_slice(domain_bytes);
                 buf.put_u16(*port);
             }
         }
+        Ok(())
     }
 
-    pub fn write_to_vec(&self, buf: &mut Vec<u8>) {
+    /// Encode into a plain `Vec<u8>`, returning an error for over-long
+    /// domain names instead of truncating the wire length byte.
+    pub fn write_to_vec(&self, buf: &mut Vec<u8>) -> Result<()> {
         match self {
             Self::Ipv4(ip, port) => {
                 buf.push(AddressType::IPv4 as u8);
@@ -115,16 +122,19 @@ impl Address {
             }
             Self::Domain(domain, port) => {
                 let domain_bytes = domain.as_bytes();
-                debug_assert!(
-                    domain_bytes.len() <= u8::MAX as usize,
-                    "domain name exceeds the 255-byte wire limit"
-                );
+                if domain_bytes.len() > u8::MAX as usize {
+                    return Err(ProtocolError::Protocol(format!(
+                        "domain name is {} bytes, exceeding the 255-byte wire limit",
+                        domain_bytes.len()
+                    )));
+                }
                 buf.push(AddressType::Domain as u8);
                 buf.push(domain_bytes.len() as u8);
                 buf.extend_from_slice(domain_bytes);
                 buf.extend_from_slice(&port.to_be_bytes());
             }
         }
+        Ok(())
     }
 
     pub fn write_address_to(&self, buf: &mut Vec<u8>) -> Result<()> {
@@ -150,10 +160,12 @@ impl Address {
         Ok(())
     }
 
-    pub fn to_bytes(&self) -> Bytes {
+    /// Encode into a `Bytes` buffer, returning an error for over-long domain
+    /// names instead of truncating the wire length byte.
+    pub fn to_bytes(&self) -> Result<Bytes> {
         let mut buf = BytesMut::with_capacity(self.serialized_len());
-        self.write_to(&mut buf);
-        buf.freeze()
+        self.write_to(&mut buf)?;
+        Ok(buf.freeze())
     }
 
     #[inline]
@@ -333,7 +345,7 @@ mod tests {
     #[test]
     fn test_address_ipv4_roundtrip() {
         let addr = Address::Ipv4(Ipv4Addr::new(192, 168, 1, 1), 8080);
-        let bytes = addr.to_bytes();
+        let bytes = addr.to_bytes().unwrap();
         let (parsed, len) = Address::read_from(&bytes).unwrap();
         assert_eq!(addr, parsed);
         assert_eq!(len, 7);
@@ -342,7 +354,7 @@ mod tests {
     #[test]
     fn test_address_ipv6_roundtrip() {
         let addr = Address::Ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 443);
-        let bytes = addr.to_bytes();
+        let bytes = addr.to_bytes().unwrap();
         let (parsed, len) = Address::read_from(&bytes).unwrap();
         assert_eq!(addr, parsed);
         assert_eq!(len, 19);
@@ -351,7 +363,7 @@ mod tests {
     #[test]
     fn test_address_domain_roundtrip() {
         let addr = Address::Domain("example.com".to_string(), 443);
-        let bytes = addr.to_bytes();
+        let bytes = addr.to_bytes().unwrap();
         let (parsed, len) = Address::read_from(&bytes).unwrap();
         assert_eq!(addr, parsed);
         assert_eq!(len, 4 + "example.com".len());
@@ -398,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn test_address_async_read() {
         let addr = Address::Domain("async.test".to_string(), 12345);
-        let bytes = addr.to_bytes();
+        let bytes = addr.to_bytes().unwrap();
         let mut cursor = std::io::Cursor::new(bytes.to_vec());
         let parsed = Address::read_from_async(&mut cursor).await.unwrap();
         assert_eq!(addr, parsed);
@@ -451,7 +463,7 @@ mod property_tests {
 
         #[test]
         fn prop_address_serialization_roundtrip(addr in arb_address()) {
-            let bytes = addr.to_bytes();
+            let bytes = addr.to_bytes().unwrap();
             let (parsed, len) = Address::read_from(&bytes).unwrap();
             prop_assert_eq!(&addr, &parsed);
             prop_assert_eq!(len, addr.serialized_len());
@@ -460,7 +472,7 @@ mod property_tests {
         #[test]
         fn prop_address_ipv4_roundtrip(ip in arb_ipv4_addr(), port in arb_port()) {
             let addr = Address::Ipv4(ip, port);
-            let bytes = addr.to_bytes();
+            let bytes = addr.to_bytes().unwrap();
             let (parsed, _) = Address::read_from(&bytes).unwrap();
             prop_assert_eq!(addr, parsed);
         }
@@ -468,7 +480,7 @@ mod property_tests {
         #[test]
         fn prop_address_ipv6_roundtrip(ip in arb_ipv6_addr(), port in arb_port()) {
             let addr = Address::Ipv6(ip, port);
-            let bytes = addr.to_bytes();
+            let bytes = addr.to_bytes().unwrap();
             let (parsed, _) = Address::read_from(&bytes).unwrap();
             prop_assert_eq!(addr, parsed);
         }
@@ -476,35 +488,35 @@ mod property_tests {
         #[test]
         fn prop_address_domain_roundtrip(domain in arb_domain(), port in arb_port()) {
             let addr = Address::Domain(domain, port);
-            let bytes = addr.to_bytes();
+            let bytes = addr.to_bytes().unwrap();
             let (parsed, _) = Address::read_from(&bytes).unwrap();
             prop_assert_eq!(addr, parsed);
         }
 
         #[test]
         fn prop_address_port_preserved(addr in arb_address()) {
-            let bytes = addr.to_bytes();
+            let bytes = addr.to_bytes().unwrap();
             let (parsed, _) = Address::read_from(&bytes).unwrap();
             prop_assert_eq!(addr.port(), parsed.port());
         }
 
         #[test]
         fn prop_address_host_preserved(addr in arb_address()) {
-            let bytes = addr.to_bytes();
+            let bytes = addr.to_bytes().unwrap();
             let (parsed, _) = Address::read_from(&bytes).unwrap();
             prop_assert_eq!(addr.host(), parsed.host());
         }
 
         #[test]
         fn prop_address_type_preserved(addr in arb_address()) {
-            let bytes = addr.to_bytes();
+            let bytes = addr.to_bytes().unwrap();
             let (parsed, _) = Address::read_from(&bytes).unwrap();
             prop_assert_eq!(addr.address_type(), parsed.address_type());
         }
 
         #[test]
         fn prop_address_serialized_len_correct(addr in arb_address()) {
-            let bytes = addr.to_bytes();
+            let bytes = addr.to_bytes().unwrap();
             prop_assert_eq!(bytes.len(), addr.serialized_len());
         }
 

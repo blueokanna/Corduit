@@ -67,9 +67,10 @@ fn bind_tcp_listener(listen: &str, port: u16, name: &str) -> Result<(TcpListener
 
 /// Inbound connection manager
 pub struct InboundManager {
-    _config: Arc<RwLock<Config>>,
-    _router: Arc<Router>,
-    listeners: Vec<Box<dyn InboundListener>>,
+    config: Arc<RwLock<Config>>,
+    router: Arc<Router>,
+    outbound_manager: Arc<OutboundManager>,
+    listeners: RwLock<Vec<Box<dyn InboundListener>>>,
 }
 
 #[async_trait::async_trait]
@@ -122,27 +123,73 @@ impl InboundManager {
         } // config_read is dropped here
 
         Ok(Self {
-            _config: config,
-            _router: router,
-            listeners,
+            config,
+            router,
+            outbound_manager,
+            listeners: RwLock::new(listeners),
         })
     }
 
     pub async fn start(&self) -> Result<()> {
-        for listener in &self.listeners {
+        for listener in self.listeners.read().await.iter() {
             listener.start().await?;
         }
         Ok(())
     }
 
     pub async fn stop(&self) -> Result<()> {
-        for listener in &self.listeners {
+        for listener in self.listeners.read().await.iter() {
             listener.stop().await?;
         }
         Ok(())
     }
 
+    /// Rebuild listeners from the current configuration: stop the old set,
+    /// construct the new set, then start it.
     pub async fn reload(&self) -> Result<()> {
+        // Stop existing listeners before swapping so no stale sockets linger.
+        for listener in self.listeners.read().await.iter() {
+            let _ = listener.stop().await;
+        }
+
+        let new_listeners = {
+            let config_read = self.config.read().await;
+            let mut new_listeners: Vec<Box<dyn InboundListener>> = Vec::new();
+            for inbound_config in &config_read.inbounds {
+                let listener: Box<dyn InboundListener> = match inbound_config.inbound_type {
+                    InboundType::Http => Box::new(HttpInbound::new(
+                        inbound_config.clone(),
+                        Arc::clone(&self.router),
+                        Arc::clone(&self.outbound_manager),
+                    )),
+                    InboundType::Socks5 => Box::new(Socks5Inbound::new(
+                        inbound_config.clone(),
+                        Arc::clone(&self.router),
+                        Arc::clone(&self.outbound_manager),
+                    )),
+                    InboundType::Mixed => Box::new(MixedInbound::new(
+                        inbound_config.clone(),
+                        Arc::clone(&self.router),
+                        Arc::clone(&self.outbound_manager),
+                    )),
+                    _ => {
+                        tracing::warn!(
+                            "Unsupported inbound type: {:?}",
+                            inbound_config.inbound_type
+                        );
+                        continue;
+                    }
+                };
+                new_listeners.push(listener);
+            }
+            new_listeners
+        };
+
+        *self.listeners.write().await = new_listeners;
+
+        for listener in self.listeners.read().await.iter() {
+            listener.start().await?;
+        }
         Ok(())
     }
 }

@@ -23,6 +23,14 @@ macro_rules! impl_config_enum {
                 e.write_str(name)
             }
         }
+        impl $ty {
+            /// Canonical string name as used in configuration files.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $($ty::$variant => $canonical,)+
+                }
+            }
+        }
         impl<'de> ::nextjson::NsonDeserialize<'de> for $ty {
             fn nextdecode_into<D: ::nextjson::FormatDecoder<'de>>(
                 d: &mut D,

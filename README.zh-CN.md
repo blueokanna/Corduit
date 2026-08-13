@@ -61,9 +61,9 @@ DNS、用户态网络、线缆协议每一层都是同一个工作区的头等�
 - **移动端就绪** —— `corduit-lib` 提供 Android JNI（`VpnService`）、Windows
   VPN 集成，以及面向任意原生宿主的统一 `corduit_call` / `corduit_call_binary`
   分发入口。
-- **对生态友好的许可** —— PolyForm Perimeter 1.0.1：允许自由使用、修改与分发，
-  仅限制**与 Corduit 构成竞争**的产品（例如托管式替代品）；与 FSL 不同，
-  该许可**永不会**转为 MIT/Apache。
+- **许可简单直接** —— PolyForm Perimeter 1.0.1：可以自由使用、修改、分发，
+  唯一限制是**不能拿它做与 Corduit 直接竞争的产品**（比如托管式克隆）；与 FSL
+  不同，这个许可**永远**不会自动变成 MIT/Apache。
 
 ---
 
@@ -438,7 +438,8 @@ Future<dynamic> corduit(String method, Map<String, dynamic> args) async {
    已从**整个依赖图（含 `Cargo.lock`）**彻底移除——工作区中每个类型（配置、
    DTO、协议元数据）都派生 `nextjson` 的 `NsonSerialize` / `NsonDeserialize`；
    未使用的依赖一律删除，每个声明的依赖都真实被使用——由构建期检查保证。
-5. **序列化是一等公民。** FFI 边界使用 `nextjson` + `rustbinary`（类型化、
+5. **序列化是内建能力，不是事后补丁。** FFI 边界使用 `nextjson` + `rustbinary`
+  （类型化、
    schema 驱动、`no_std`、`unsafe` 零容忍），跨语言客户端获得稳定、自描述
    的负载，依赖图中没有任何 serde。
 

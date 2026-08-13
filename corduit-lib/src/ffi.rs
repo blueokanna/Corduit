@@ -15,8 +15,6 @@
 //! [`corduit_binary_free`]. Thread-safe: a shared multi-threaded Tokio runtime
 //! drives every async API internally.
 
-#![allow(clippy::missing_safety_doc)]
-
 use std::ffi::{CStr, CString, c_char};
 use std::future::Future;
 use std::ptr;

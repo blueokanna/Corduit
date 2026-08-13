@@ -340,7 +340,7 @@ impl UdpSession {
         use super::protocol::UdpHeader;
 
         let header = UdpHeader::new(target.clone());
-        let header_bytes = header.to_bytes();
+        let header_bytes = header.to_bytes()?;
 
         let mut packet = Vec::with_capacity(header_bytes.len() + data.len());
         packet.extend_from_slice(&header_bytes);

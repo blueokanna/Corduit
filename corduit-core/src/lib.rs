@@ -70,6 +70,7 @@ pub use connection_tracker::TrackedConnection;
 pub use error::*;
 pub use health_check::*;
 pub use proxy::*;
+pub use routing::proxy_mode;
 pub use routing::{get_runtime_proxy_mode, set_runtime_proxy_mode, set_runtime_rule_providers};
 pub use traffic_stats::TrafficStats;
 pub use traffic_stats::TrafficStatsManager;

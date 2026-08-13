@@ -15,6 +15,8 @@ pub struct ApiState {
     pub proxy_manager: Arc<ProxyManager>,
     pub health_monitor: Arc<HealthMonitor>,
     pub traffic_stats: Arc<TrafficStatsManager>,
+    /// Server start time, used for the `uptime` field.
+    pub start_time: std::time::Instant,
 }
 
 /// Uniform REST envelope: `{ "success": bool, "data": T?, "error": String? }`.
@@ -107,11 +109,15 @@ fn json_response<T: NsonSerialize>(status: StatusCode, value: &T) -> Response<St
     response
 }
 
-/// Read the entire request body as a UTF-8 string.
+/// Read the entire request body as a UTF-8 string, bounded to 16 MiB so a
+/// hostile client cannot force unbounded buffering.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 async fn read_body(body: Incoming) -> Result<String, String> {
-    let bytes = http_body_util::BodyExt::collect(body)
+    let limited = http_body_util::Limited::new(body, MAX_BODY_BYTES);
+    let bytes = http_body_util::BodyExt::collect(limited)
         .await
-        .map_err(|e| format!("failed to read request body: {e}"))?
+        .map_err(|_| "request body exceeds 16 MiB limit or is malformed".to_string())?
         .to_bytes();
     String::from_utf8(bytes.to_vec()).map_err(|_| "request body is not valid UTF-8".to_string())
 }
@@ -126,7 +132,7 @@ async fn get_server_info(state: &ApiState) -> Response<String> {
         StatusCode::OK,
         &ApiResponse::success(ServerInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime: 0,
+            uptime: state.start_time.elapsed().as_secs(),
             active_connections,
         }),
     )
@@ -196,7 +202,7 @@ async fn get_proxies(state: &ApiState) -> Response<String> {
 
             ProxyInfo {
                 tag: outbound.tag,
-                proxy_type: format!("{:?}", outbound.outbound_type),
+                proxy_type: outbound.outbound_type.as_str().to_string(),
                 server: outbound.server,
                 port: outbound.port,
                 healthy,
@@ -221,7 +227,7 @@ async fn get_proxy(state: &ApiState, tag: &str) -> Response<String> {
             StatusCode::OK,
             &ApiResponse::success(ProxyInfo {
                 tag: outbound.tag,
-                proxy_type: format!("{:?}", outbound.outbound_type),
+                proxy_type: outbound.outbound_type.as_str().to_string(),
                 server: outbound.server,
                 port: outbound.port,
                 healthy,
@@ -306,6 +312,7 @@ impl ApiServer {
                 proxy_manager,
                 health_monitor,
                 traffic_stats,
+                start_time: std::time::Instant::now(),
             },
         }
     }

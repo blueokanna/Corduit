@@ -60,7 +60,9 @@ impl Address {
         }
     }
 
-    pub fn write_to(&self, buf: &mut BytesMut) {
+    /// Encode into a `BytesMut`. Returns an error if a domain name exceeds
+    /// the 255-byte wire limit instead of truncating the length byte.
+    pub fn write_to(&self, buf: &mut BytesMut) -> Result<()> {
         match self {
             Self::SocketAddr(SocketAddr::V4(addr)) => {
                 buf.put_u8(AddressType::IPv4 as u8);
@@ -74,18 +76,25 @@ impl Address {
             }
             Self::DomainName(domain, port) => {
                 let domain_bytes = domain.as_bytes();
+                if domain_bytes.len() > u8::MAX as usize {
+                    return Err(QuicError::InvalidConfig(format!(
+                        "domain name is {} bytes, exceeding the 255-byte wire limit",
+                        domain_bytes.len()
+                    )));
+                }
                 buf.put_u8(AddressType::Domain as u8);
                 buf.put_u8(domain_bytes.len() as u8);
                 buf.put_slice(domain_bytes);
                 buf.put_u16(*port);
             }
         }
+        Ok(())
     }
 
-    pub fn to_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Result<Bytes> {
         let mut buf = BytesMut::with_capacity(self.serialized_len());
-        self.write_to(&mut buf);
-        buf.freeze()
+        self.write_to(&mut buf)?;
+        Ok(buf.freeze())
     }
 
     #[inline]

@@ -56,18 +56,20 @@ impl ProxyManager {
         Ok(())
     }
 
-    /// Reload configuration
+    /// Reload configuration.
+    ///
+    /// The config lock is released before the router/inbound/outbound reloads
+    /// run, because each of those takes a read lock on the *same* `RwLock`
+    /// (a tokio `RwLock` is not re-entrant — holding the write lock here would
+    /// deadlock).
     pub async fn reload(&self, new_config: Config) -> Result<()> {
-        let mut config = self.config.write().await;
-        *config = new_config;
+        {
+            let mut config = self.config.write().await;
+            *config = new_config;
+        }
 
-        // Reload router with new rules
         self.router.reload().await?;
-
-        // Restart inbound listeners
         self.inbound_manager.reload().await?;
-
-        // Restart outbound connections
         self.outbound_manager.reload().await?;
 
         Ok(())

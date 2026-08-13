@@ -182,8 +182,7 @@ impl VirtualDevice {
 #[cfg(target_os = "android")]
 pub mod android {
     use super::*;
-    use std::io::{Read, Write};
-    use std::os::unix::io::{FromRawFd, RawFd};
+    use std::os::unix::io::RawFd;
 
     /// Android TUN device
     pub struct AndroidTunDevice {
@@ -227,39 +226,28 @@ pub mod android {
 
     impl VirtualDeviceTrait for AndroidTunDevice {
         fn read_packet(&self, buf: &mut [u8]) -> Result<usize> {
-            // Note: This is a simplified implementation
-            // In practice, you'd use AsyncFd for non-blocking I/O
-            let mut file = unsafe { std::fs::File::from_raw_fd(self.fd) };
-            let result = file.read(buf);
-            std::mem::forget(file); // Don't close the fd
-
-            match result {
-                Ok(n) => {
-                    self.stats.record_read(n);
-                    Ok(n)
-                }
-                Err(e) => {
-                    self.stats.record_read_error();
-                    Err(SolidTcpError::Io(e))
-                }
+            // The TUN fd is owned once by this device; read through it
+            // directly instead of wrapping it in a fresh `File` per call
+            // (which would be both wasteful and an unsafe ownership dance).
+            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                self.stats.record_read_error();
+                return Err(SolidTcpError::Io(std::io::Error::last_os_error()));
             }
+            let n = n as usize;
+            self.stats.record_read(n);
+            Ok(n)
         }
 
         fn write_packet(&self, data: &[u8]) -> Result<usize> {
-            let mut file = unsafe { std::fs::File::from_raw_fd(self.fd) };
-            let result = file.write(data);
-            std::mem::forget(file);
-
-            match result {
-                Ok(n) => {
-                    self.stats.record_write(n);
-                    Ok(n)
-                }
-                Err(e) => {
-                    self.stats.record_write_error();
-                    Err(SolidTcpError::Io(e))
-                }
+            let n = unsafe { libc::write(self.fd, data.as_ptr().cast(), data.len()) };
+            if n < 0 {
+                self.stats.record_write_error();
+                return Err(SolidTcpError::Io(std::io::Error::last_os_error()));
             }
+            let n = n as usize;
+            self.stats.record_write(n);
+            Ok(n)
         }
 
         fn mtu(&self) -> usize {

@@ -124,13 +124,10 @@ impl WireguardOutbound {
     async fn ensure_tunnel(&self) -> Result<()> {
         let mut tunnel_guard = self.tunnel.lock().await;
 
-        if tunnel_guard
-            .as_ref()
-            .map(|t| t.has_session())
-            .unwrap_or(false)
-            && !tunnel_guard.as_ref().unwrap().is_session_expired()
-        {
-            return Ok(());
+        if let Some(tunnel) = tunnel_guard.as_ref() {
+            if tunnel.has_session() && !tunnel.is_session_expired() {
+                return Ok(());
+            }
         }
 
         let endpoint: SocketAddr = format!("{}:{}", self.server, self.port)

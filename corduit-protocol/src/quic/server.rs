@@ -287,13 +287,13 @@ impl ServerConnection {
                     Self::handle_udp_associate(stream, request).await
                 } else {
                     let response = Response::error(ResponseStatus::CommandNotSupported);
-                    stream.write_raw(&response.to_bytes()).await?;
+                    stream.write_raw(&response.to_bytes()?).await?;
                     Err(QuicError::UnsupportedCommand(Command::UdpAssociate as u8))
                 }
             }
             Command::Bind => {
                 let response = Response::error(ResponseStatus::CommandNotSupported);
-                stream.write_raw(&response.to_bytes()).await?;
+                stream.write_raw(&response.to_bytes()?).await?;
                 Err(QuicError::UnsupportedCommand(Command::Bind as u8))
             }
         }
@@ -312,7 +312,7 @@ impl ServerConnection {
                         Some(addr) => addr,
                         None => {
                             let response = Response::error(ResponseStatus::HostUnreachable);
-                            stream.write_raw(&response.to_bytes()).await?;
+                            stream.write_raw(&response.to_bytes()?).await?;
                             return Err(QuicError::AddressParse(
                                 "Failed to resolve domain".to_string(),
                             ));
@@ -320,7 +320,7 @@ impl ServerConnection {
                     },
                     Err(_) => {
                         let response = Response::error(ResponseStatus::HostUnreachable);
-                        stream.write_raw(&response.to_bytes()).await?;
+                        stream.write_raw(&response.to_bytes()?).await?;
                         return Err(QuicError::AddressParse(
                             "Failed to resolve domain".to_string(),
                         ));
@@ -338,13 +338,13 @@ impl ServerConnection {
                     _ => ResponseStatus::NetworkUnreachable,
                 };
                 let response = Response::error(status);
-                stream.write_raw(&response.to_bytes()).await?;
+                stream.write_raw(&response.to_bytes()?).await?;
                 return Err(e.into());
             }
         };
 
         let response = Response::success();
-        stream.write_raw(&response.to_bytes()).await?;
+        stream.write_raw(&response.to_bytes()?).await?;
 
         if let Some(ref payload) = request.payload {
             if !payload.is_empty() {
@@ -411,7 +411,7 @@ impl ServerConnection {
         let local_addr = udp_socket.local_addr()?;
 
         let response = Response::success_with_address(Address::from(local_addr));
-        stream.write_raw(&response.to_bytes()).await?;
+        stream.write_raw(&response.to_bytes()?).await?;
 
         debug!("UDP session bound to {}", local_addr);
 
@@ -464,7 +464,9 @@ impl ServerConnection {
                 match udp_socket.recv_from(&mut buf).await {
                     Ok((n, from)) => {
                         let header = UdpHeader::new(Address::from(from));
-                        let header_bytes = header.to_bytes();
+                        let Ok(header_bytes) = header.to_bytes() else {
+                            break;
+                        };
 
                         let mut packet = Vec::with_capacity(header_bytes.len() + n);
                         packet.extend_from_slice(&header_bytes);
