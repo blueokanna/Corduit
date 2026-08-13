@@ -48,12 +48,16 @@ DNS、用户态网络、线缆协议每一层都是同一个工作区的头等�
 - **手写 C ABI** —— `corduit-lib` 提供无依赖、手写的 `#[no_mangle] extern "C"`
   接口（不使用 `flutter_rust_bridge`，无代码生成），可被 Flutter/Dart、Kotlin、
   Swift、C/C++ 宿主直接绑定。
-- **nextjson + rustbinary 序列化** —— serde 已从整个项目彻底移除。FFI
-  边界使用 `nextjson`（schema 驱动 JSON）承载可读负载，`rustbinary`
-  （有界、类型标记二进制）承载紧凑高吞吐通道。
+- **nextjson + rustbinary 序列化** —— **任何地方都零 serde，包括
+  `Cargo.lock`**：整个依赖图无 serde（无 `serde`、`serde_json`、`serde_core`、
+  `serde_derive` 等）。FFI 边界使用 `nextjson`（schema 驱动 JSON）承载可读
+  负载，`rustbinary`（有界、类型标记二进制）承载紧凑高吞吐通道。
+- **自研核心组件** —— 替代第三方 crate：自研 hyper HTTP 客户端、自研 URL
+  解析器、自研 MaxMind MMDB v2 读取器、自研 DNS wire 编解码，全部带边界
+  检查且依赖极轻（`corduit-common`、`corduit-core::mmdb`、`corduit-dns::wire`）。
 - **热重载** —— `Corduit::reload()` 原子化替换配置。
-- **可观测性** —— 基于 `tracing` 的结构化日志，`jaeger` feature 下可导出
-  OpenTelemetry / Jaeger，并提供逐连接流量统计。
+- **可观测性** —— 基于 `tracing` 的结构化日志与 span 辅助，并提供逐连接
+  流量统计。
 - **移动端就绪** —— `corduit-lib` 提供 Android JNI（`VpnService`）、Windows
   VPN 集成，以及面向任意原生宿主的统一 `corduit_call` / `corduit_call_binary`
   分发入口。
@@ -68,6 +72,8 @@ DNS、用户态网络、线缆协议每一层都是同一个工作区的头等�
 ```
 Corduit（工作区）
 │
+├── corduit-common       # 共享最小工具：无依赖 URL 解析器 + 自研 hyper HTTP 客户端
+│
 ├── corduit-core        # 引擎：配置模型、规则流水线、出站编排、
 │   │                   #       流量统计、健康检查
 │   └── src/
@@ -76,13 +82,15 @@ Corduit（工作区）
 │       ├── outbound/   #   Direct/Reject/SS/VMess/VLESS/Trojan/TUIC/Hy2/...
 │       ├── routing.rs  #   规则 → 出站匹配（rule/global/direct）
 │       ├── geoip.rs    #   CountryMatcher trait（依赖倒置）
+│       ├── mmdb.rs     #   自研 MaxMind MMDB v2 读取器
 │       └── proxy.rs    #   ProxyManager：总协调者
 │
 ├── corduit-protocol    # 线缆协议：QUIC、TLS、WireGuard、TUIC、
 │                       #   传输层（h2/gRPC/WebSocket/TLS）
 │
 ├── corduit-dns         # DNS：DoH/DoT/UDP/TCP 服务端与客户端、缓存、
-│                       #   fake-IP、hosts、抗污染、分流解析
+│   │                   #   fake-IP、hosts、抗污染、分流解析
+│   └── src/wire.rs     #   自研 DNS wire 编解码（RFC 1035）
 │
 ├── corduit-netstack    # 用户态 TCP/IP（SolidTCP）、TUN 设备、NAT、
 │                       #   Windows/macOS/Linux/Android VPN 驱动
@@ -115,9 +123,9 @@ Corduit（工作区）
 
 ```toml
 [dependencies]
-corduit-core = { version = "0.1", features = ["jaeger"] }   # 引擎
-corduit-dns  = "0.1"                                         # DNS（可选）
-corduit-netstack = "0.1"                                     # TUN（可选）
+corduit-core = { version = "0.1" }   # 引擎
+corduit-dns  = "0.1"                  # DNS（可选）
+corduit-netstack = "0.1"              # TUN（可选）
 ```
 
 ```rust,no_run
@@ -426,10 +434,10 @@ Future<dynamic> corduit(String method, Map<String, dynamic> args) async {
    依赖 `ProxyManager` 的稳定接口而非各协议的内部细节。替换实现无需改动调用方。
 3. **在边界处大声失败。** 配置在入口处一次性校验；内部代码只处理已校验、
    类型化的数据。
-4. **不引入死重，零 serde。** serde / serde_json / serde_yaml 已彻底移除——
-   工作区中每个类型（配置、DTO、协议元数据）都派生 `nextjson` 的
-   `NsonSerialize` / `NsonDeserialize`；未使用的依赖一律删除，每个声明的
-   依赖都真实被使用——由构建期检查保证。
+4. **不引入死重，零 serde。** serde / serde_json / serde_core / serde_derive
+   已从**整个依赖图（含 `Cargo.lock`）**彻底移除——工作区中每个类型（配置、
+   DTO、协议元数据）都派生 `nextjson` 的 `NsonSerialize` / `NsonDeserialize`；
+   未使用的依赖一律删除，每个声明的依赖都真实被使用——由构建期检查保证。
 5. **序列化是一等公民。** FFI 边界使用 `nextjson` + `rustbinary`（类型化、
    schema 驱动、`no_std`、`unsafe` 零容忍），跨语言客户端获得稳定、自描述
    的负载，依赖图中没有任何 serde。
@@ -457,10 +465,11 @@ MSRV：**Rust 1.85+**（edition 2021）。
 发布：
 
 ```bash
+cargo publish -p corduit-common    # 第 0 个（无内部依赖）
 cargo publish -p corduit-protocol   # 第 1 个（无内部依赖）
-cargo publish -p corduit-dns        # 第 2 个（无内部依赖）
+cargo publish -p corduit-dns        # 第 2 个（依赖 corduit-common）
 cargo publish -p corduit-netstack   # 第 3 个（依赖 corduit-dns）
-cargo publish -p corduit-core       # 第 4 个（依赖 corduit-protocol）
+cargo publish -p corduit-core       # 第 4 个（依赖 corduit-protocol + common）
 cargo publish -p corduit-lib        # 第 5 个（依赖 core + netstack）
 ```
 
@@ -474,13 +483,12 @@ Corduit 同时进行**依赖图审计**与**源码级审查**：
 
 ### 依赖审计（`cargo audit`）
 
-### 依赖审计（`cargo audit`）
-
 - 所有直接依赖均为较新且维护中的版本。整个 serde 家族（`serde`、
-  `serde_json`、`serde_yaml`）已由自研 `nextjson`（schema 驱动、
-  `#![deny(unsafe_code)]`、有界）与 `rustbinary` 替代；PEM 解析改用
-  `rustls-pki-types` 的自有 `PemObject` trait。
-  `rustls-pemfile` 迁移到 `rustls-pki-types` 自带的一等公民 `PemObject` trait。
+  `serde_json`、`serde_core`、`serde_derive`）已从**源码与 `Cargo.lock`**
+  中彻底移除，由自研 `nextjson`（schema 驱动、`#![deny(unsafe_code)]`、
+  有界）与 `rustbinary` 替代；原先的 `reqwest`（HTTP）、`url`、
+  `hickory-proto`（DNS）、`maxminddb` 依赖替换为仓库内实现
+  （`corduit-common`、`corduit-dns::wire`、`corduit-core::mmdb`）。
 - 唯一剩余的公告为*提示性*：`paste`（Linux netlink 栈带入的传递性构建期
   宏辅助）不再维护——它不是安全漏洞，且在不替换整个 `tun-rs` 依赖链的
   前提下无法移除。

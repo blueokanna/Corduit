@@ -183,16 +183,13 @@ impl ProxyProvider {
             }
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::network(format!("Failed to create HTTP client: {}", e)))?;
+        let client = corduit_common::HttpClient::new().with_timeout(Duration::from_secs(30));
 
-        let response = client.get(url).send().await.map_err(|e| {
-            Error::network(format!("Failed to fetch proxies from '{}': {}", url, e))
+        let response = client.get(url).await.map_err(|e| {
+            Error::network(format!("Failed to fetch proxies from '{url}': {e}"))
         })?;
 
-        if !response.status().is_success() {
+        if !response.is_success() {
             return Err(Error::network(format!(
                 "HTTP request failed with status: {}",
                 response.status()
@@ -201,8 +198,7 @@ impl ProxyProvider {
 
         let content = response
             .text()
-            .await
-            .map_err(|e| Error::network(format!("Failed to read response body: {}", e)))?;
+            .map_err(|e| Error::network(format!("Failed to read response body: {e}")))?;
 
         if let Some(path) = &self.config.path {
             if let Some(parent) = Path::new(path).parent() {

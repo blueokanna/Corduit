@@ -220,7 +220,7 @@ impl UpstreamConfig {
     pub fn parse(s: &str) -> Option<Self> {
         if s.starts_with("https://") {
             // DoH
-            let url = url::Url::parse(s).ok()?;
+            let url = corduit_common::url::Url::parse(s).ok()?;
             Some(Self {
                 address: url.host_str()?.to_string(),
                 protocol: UpstreamProtocol::DoH,

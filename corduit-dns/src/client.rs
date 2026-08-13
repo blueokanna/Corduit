@@ -3,9 +3,7 @@
 use crate::config::{UpstreamConfig, UpstreamProtocol};
 use crate::error::{DnsError, Result};
 
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RecordType};
-use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use crate::wire::{BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RecordType};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

@@ -22,8 +22,8 @@ where
 }
 
 pub fn init_app() {
-    // `reqwest` is compiled with `rustls-no-provider`: a crypto provider must
-    // be installed before any HTTP client is built.
+    // Ensure a rustls crypto provider is active before any TLS consumer
+    // (quinn, tokio-rustls, protocol layer) builds its first configuration.
     corduit_core::tls::install_crypto_provider();
 
     if TRACING_INITIALIZED
@@ -1109,7 +1109,7 @@ fn configure_rule_providers(config_json: &str) -> Result<()> {
                         provider.name
                     ))
                 })?;
-                let parsed = reqwest::Url::parse(url).map_err(|error| {
+                let parsed = corduit_common::url::Url::parse(url).map_err(|error| {
                     CorduitError::Parse(format!(
                         "Invalid URL for rule provider '{}': {error}",
                         provider.name
@@ -1522,7 +1522,7 @@ pub async fn test_shadowsocks_latency(
     let proxy_name = format!("{}:{}", server, port);
     let timeout_duration = Duration::from_millis(timeout_ms as u64);
     let test_url = "http://www.gstatic.com/generate_204";
-    let url = match url::Url::parse(test_url) {
+    let url = match corduit_common::url::Url::parse(test_url) {
         Ok(u) => u,
         Err(e) => {
             return Ok(LatencyTestResult {
@@ -1913,24 +1913,18 @@ async fn test_via_http_proxy(
 ) -> std::result::Result<(), String> {
     use tokio::time::timeout as tokio_timeout;
 
-    let proxy_url = format!("http://{proxy_addr}");
-    let proxy =
-        reqwest::Proxy::http(&proxy_url).map_err(|e| format!("Failed to create proxy: {}", e))?;
+    let client = corduit_common::HttpClient::new()
+        .with_proxy(proxy_addr)
+        .with_timeout(timeout);
 
-    let client = reqwest::Client::builder()
-        .proxy(proxy)
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
-
-    let result = tokio_timeout(timeout, client.get(url).send()).await;
+    let result = tokio_timeout(timeout, client.get(url)).await;
 
     match result {
         Ok(Ok(response)) => {
-            if response.status().is_success() || response.status().as_u16() == 204 {
+            if response.is_success() || response.status() == 204 {
                 Ok(())
             } else {
-                Err(format!("HTTP {}", response.status().as_u16()))
+                Err(format!("HTTP {}", response.status()))
             }
         }
         Ok(Err(e)) => Err(format!("{}", e)),

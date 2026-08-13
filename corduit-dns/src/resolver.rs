@@ -8,8 +8,7 @@ use crate::error::{DnsError, Result};
 use crate::fake_ip::FakeIpPool;
 use crate::hosts::HostsFile;
 use crate::RecordType;
-use hickory_proto::op::Message;
-use hickory_proto::rr::RData;
+use crate::wire::{Message, RData};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -120,11 +119,11 @@ impl DnsResolver {
 
     /// Query upstream DNS servers
     async fn query_upstream(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
-        let hickory_type = hickory_proto::rr::RecordType::from(record_type);
+        let wire_type = crate::wire::RecordType::from(record_type);
 
         // Try primary servers first
         for client in &self.primary_clients {
-            match client.query(name, hickory_type).await {
+            match client.query(name, wire_type).await {
                 Ok(response) => {
                     let ips = self.extract_ips(&response, record_type);
 
@@ -146,7 +145,7 @@ impl DnsResolver {
 
         // Try fallback servers
         for client in &self.fallback_clients {
-            match client.query(name, hickory_type).await {
+            match client.query(name, wire_type).await {
                 Ok(response) => {
                     let ips = self.extract_ips(&response, record_type);
                     if !ips.is_empty() {

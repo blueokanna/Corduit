@@ -46,7 +46,7 @@ impl OutboundProxy for HttpOutbound {
         use std::time::Instant;
 
         // Parse the test URL to get host and port
-        let url = url::Url::parse(test_url)
+        let url = corduit_common::url::Url::parse(test_url)
             .map_err(|e| Error::config(format!("Invalid test URL: {}", e)))?;
 
         let host = url

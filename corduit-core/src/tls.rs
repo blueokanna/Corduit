@@ -15,11 +15,11 @@ pub fn yaml_value_to_string(value: &nextjson::Value) -> String {
 
 /// Install the default rustls crypto provider (ring).
 ///
-/// `reqwest` is compiled with `rustls-no-provider`, so a provider MUST be
-/// installed before any [`reqwest::Client`] is built, otherwise the client
-/// constructor panics. This function is idempotent: once a provider is active,
-/// subsequent calls are no-ops, so it is safe to invoke from every entry point
-/// (`Corduit::new`, FFI `init_app`, …).
+/// Several TLS consumers in the workspace (quinn, tokio-rustls and the
+/// protocol layer) build `rustls` configurations that expect a process-wide
+/// crypto provider to be active. This function is idempotent: once a provider
+/// is installed, subsequent calls are no-ops, so it is safe to invoke from
+/// every entry point (`Corduit::new`, FFI `init_app`, …).
 pub fn install_crypto_provider() {
     use rustls::crypto::CryptoProvider;
 

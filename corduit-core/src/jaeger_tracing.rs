@@ -1,25 +1,33 @@
-#[cfg(feature = "jaeger")]
-use crate::error::Error;
+//! Tracing span helpers.
+//!
+//! Lightweight `tracing`-based instrumentation helpers. The former
+//! OpenTelemetry / Jaeger OTLP export (the `jaeger` feature) was removed to
+//! eliminate the `opentelemetry-*` / `tonic` / `reqwest` / `url` dependency
+//! chain from the project — a necessary step toward a fully serde-free
+//! dependency graph. Spans are still emitted through `tracing` and remain
+//! consumable by the standard tracing subscribers in the logging layer.
+//!
+//! The public API surface (`TracingConfig`, `init_tracing`,
+//! `shutdown_tracing`, the span helper types and the `trace_*!` macros) is
+//! preserved for source compatibility.
+
 use crate::error::Result;
 use std::sync::Once;
 
 static INIT: Once = Once::new();
 
-#[cfg(feature = "jaeger")]
-use opentelemetry::trace::TracerProvider;
-#[cfg(feature = "jaeger")]
-use opentelemetry_otlp::WithExportConfig;
-#[cfg(feature = "jaeger")]
-use opentelemetry_sdk::trace::SdkTracerProvider;
-#[cfg(feature = "jaeger")]
-use tracing_subscriber::layer::SubscriberExt;
-#[cfg(feature = "jaeger")]
-use tracing_subscriber::util::SubscriberInitExt;
-
+/// Tracing configuration.
+///
+/// Retained for API compatibility. Without the OTLP exporter this only gates
+/// the span helpers; the structured logger is configured separately in the
+/// logging module.
 #[derive(Debug, Clone)]
 pub struct TracingConfig {
+    /// Whether tracing helpers are enabled.
     pub enabled: bool,
+    /// Legacy Jaeger endpoint (kept for API compatibility; no OTLP export).
     pub jaeger_endpoint: Option<String>,
+    /// Service name used in emitted spans.
     pub service_name: String,
 }
 
@@ -50,252 +58,139 @@ impl TracingConfig {
     }
 }
 
-#[cfg(feature = "jaeger")]
-static TRACER_PROVIDER: once_cell::sync::OnceCell<SdkTracerProvider> =
-    once_cell::sync::OnceCell::new();
-
-pub fn init_tracing(config: TracingConfig) -> Result<()> {
-    let mut result = Ok(());
-
-    INIT.call_once(|| {
-        result = init_tracing_inner(config);
-    });
-
-    result
-}
-
-#[cfg(feature = "jaeger")]
-fn init_tracing_inner(config: TracingConfig) -> Result<()> {
-    if !config.enabled {
-        return Ok(());
-    }
-
-    let endpoint = config
-        .jaeger_endpoint
-        .unwrap_or_else(|| "http://localhost:4317".to_string());
-
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(&endpoint)
-        .build()
-        .map_err(|e| Error::config(format!("Failed to create OTLP exporter: {}", e)))?;
-
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(
-            opentelemetry_sdk::Resource::builder()
-                .with_service_name(config.service_name.clone())
-                .build(),
-        )
-        .build();
-
-    let tracer = tracer_provider.tracer(config.service_name);
-
-    TRACER_PROVIDER
-        .set(tracer_provider)
-        .map_err(|_| Error::config("Tracer provider already initialized".to_string()))?;
-
-    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-    tracing_subscriber::registry()
-        .with(telemetry_layer)
-        .try_init()
-        .map_err(|e| Error::config(format!("Failed to initialize tracing subscriber: {}", e)))?;
-
-    tracing::info!("Jaeger tracing initialized with endpoint: {}", endpoint);
+/// Initialize tracing. Without the OTLP exporter this is a no-op kept for
+/// source compatibility; the structured logger is set up by the logging
+/// module instead.
+pub fn init_tracing(_config: TracingConfig) -> Result<()> {
+    INIT.call_once(|| {});
     Ok(())
 }
 
-#[cfg(not(feature = "jaeger"))]
-fn init_tracing_inner(_config: TracingConfig) -> Result<()> {
-    Ok(())
-}
+/// Shut tracing down. No-op without the OTLP exporter.
+pub fn shutdown_tracing() {}
 
-pub fn shutdown_tracing() {
-    #[cfg(feature = "jaeger")]
-    {
-        if let Some(provider) = TRACER_PROVIDER.get() {
-            if let Err(e) = provider.shutdown() {
-                tracing::error!("Failed to shutdown tracer provider: {:?}", e);
-            }
-        }
-    }
-}
-
-#[cfg(feature = "jaeger")]
+/// Instrument an async block with a `dns_resolution` span.
 #[macro_export]
 macro_rules! trace_dns_resolution {
     ($domain:expr, $body:expr) => {{
         use tracing::Instrument;
-        let span = tracing::info_span!(
-            "dns_resolution",
-            domain = %$domain,
-            otel.kind = "client"
-        );
+        let span = tracing::info_span!("dns_resolution", domain = %$domain);
         async move { $body }.instrument(span).await
     }};
 }
 
-#[cfg(not(feature = "jaeger"))]
-#[macro_export]
-macro_rules! trace_dns_resolution {
-    ($domain:expr, $body:expr) => {{
-        $body
-    }};
-}
-
-#[cfg(feature = "jaeger")]
+/// Instrument an async block with a `proxy_connection` span.
 #[macro_export]
 macro_rules! trace_proxy_connection {
     ($target:expr, $protocol:expr, $body:expr) => {{
         use tracing::Instrument;
-        let span = tracing::info_span!(
-            "proxy_connection",
-            target = %$target,
-            protocol = %$protocol,
-            otel.kind = "client"
-        );
+        let span = tracing::info_span!("proxy_connection", target = %$target, protocol = %$protocol);
         async move { $body }.instrument(span).await
     }};
 }
 
-#[cfg(not(feature = "jaeger"))]
-#[macro_export]
-macro_rules! trace_proxy_connection {
-    ($target:expr, $protocol:expr, $body:expr) => {{
-        $body
-    }};
-}
-
-#[cfg(feature = "jaeger")]
+/// Record a routing decision in a `routing_decision` span.
 #[macro_export]
 macro_rules! trace_routing_decision {
     ($domain:expr, $ip:expr, $rule:expr, $outbound:expr) => {{
-        tracing::info_span!(
-            "routing_decision",
-            domain = ?$domain,
-            ip = ?$ip,
-            matched_rule = %$rule,
-            outbound = %$outbound,
-            otel.kind = "internal"
-        )
-        .in_scope(|| {
-            tracing::info!(
-                "Routing decision: domain={:?}, ip={:?}, rule={}, outbound={}",
-                $domain, $ip, $rule, $outbound
-            );
-        });
+        tracing::info_span!("routing_decision", domain = ?$domain, ip = ?$ip)
+            .in_scope(|| {
+                tracing::info!(
+                    "Routing decision: domain={:?}, ip={:?}, rule={}, outbound={}",
+                    $domain,
+                    $ip,
+                    $rule,
+                    $outbound
+                );
+            });
     }};
 }
 
-#[cfg(not(feature = "jaeger"))]
+/// Instrument an async block with an `inbound_connection` span.
 #[macro_export]
-macro_rules! trace_routing_decision {
-    ($domain:expr, $ip:expr, $rule:expr, $outbound:expr) => {{}};
+macro_rules! trace_inbound_connection {
+    ($inbound_type:expr, $src_addr:expr, $body:expr) => {{
+        use tracing::Instrument;
+        let span = tracing::info_span!(
+            "inbound_connection",
+            inbound_type = %$inbound_type,
+            src_addr = %$src_addr
+        );
+        async move { $body }.instrument(span).await
+    }};
 }
 
+/// Instrument an async block with an `outbound_connection` span.
+#[macro_export]
+macro_rules! trace_outbound_connection {
+    ($outbound_type:expr, $target:expr, $body:expr) => {{
+        use tracing::Instrument;
+        let span = tracing::info_span!(
+            "outbound_connection",
+            outbound_type = %$outbound_type,
+            target = %$target
+        );
+        async move { $body }.instrument(span).await
+    }};
+}
+
+/// A `dns_resolution` span that stays entered until dropped.
 pub struct DnsResolutionSpan {
-    #[cfg(feature = "jaeger")]
     _span: tracing::span::EnteredSpan,
 }
 
 impl DnsResolutionSpan {
-    #[cfg(feature = "jaeger")]
     pub fn new(domain: &str) -> Self {
-        let span = tracing::info_span!(
-            "dns_resolution",
-            domain = %domain,
-            otel.kind = "client"
-        );
+        let span = tracing::info_span!("dns_resolution", domain = %domain);
         Self {
             _span: span.entered(),
         }
     }
 
-    #[cfg(not(feature = "jaeger"))]
-    pub fn new(_domain: &str) -> Self {
-        Self {}
-    }
-
-    #[cfg(feature = "jaeger")]
     pub fn record_result(&self, success: bool, ip_count: usize) {
         tracing::Span::current().record("success", success);
-        tracing::Span::current().record("ip_count", ip_count);
+        tracing::Span::current().record("ip_count", ip_count as u64);
     }
-
-    #[cfg(not(feature = "jaeger"))]
-    pub fn record_result(&self, _success: bool, _ip_count: usize) {}
 }
 
+/// A `proxy_connection` span that stays entered until dropped.
 pub struct ProxyConnectionSpan {
-    #[cfg(feature = "jaeger")]
     _span: tracing::span::EnteredSpan,
 }
 
 impl ProxyConnectionSpan {
-    #[cfg(feature = "jaeger")]
     pub fn new(target: &str, protocol: &str) -> Self {
-        let span = tracing::info_span!(
-            "proxy_connection",
-            target = %target,
-            protocol = %protocol,
-            otel.kind = "client"
-        );
+        let span = tracing::info_span!("proxy_connection", target = %target, protocol = %protocol);
         Self {
             _span: span.entered(),
         }
     }
 
-    #[cfg(not(feature = "jaeger"))]
-    pub fn new(_target: &str, _protocol: &str) -> Self {
-        Self {}
-    }
-
-    #[cfg(feature = "jaeger")]
     pub fn record_success(&self, bytes_sent: u64, bytes_received: u64) {
         tracing::Span::current().record("success", true);
         tracing::Span::current().record("bytes_sent", bytes_sent);
         tracing::Span::current().record("bytes_received", bytes_received);
     }
 
-    #[cfg(not(feature = "jaeger"))]
-    pub fn record_success(&self, _bytes_sent: u64, _bytes_received: u64) {}
-
-    #[cfg(feature = "jaeger")]
     pub fn record_error(&self, error: &str) {
         tracing::Span::current().record("success", false);
         tracing::Span::current().record("error", error);
     }
-
-    #[cfg(not(feature = "jaeger"))]
-    pub fn record_error(&self, _error: &str) {}
 }
 
+/// A `routing_decision` span that stays entered until dropped.
 pub struct RoutingDecisionSpan {
-    #[cfg(feature = "jaeger")]
     _span: tracing::span::EnteredSpan,
 }
 
 impl RoutingDecisionSpan {
-    #[cfg(feature = "jaeger")]
     pub fn new(domain: Option<&str>, ip: Option<&str>) -> Self {
-        let span = tracing::info_span!(
-            "routing_decision",
-            domain = ?domain,
-            ip = ?ip,
-            otel.kind = "internal"
-        );
+        let span = tracing::info_span!("routing_decision", domain = ?domain, ip = ?ip);
         Self {
             _span: span.entered(),
         }
     }
 
-    #[cfg(not(feature = "jaeger"))]
-    pub fn new(_domain: Option<&str>, _ip: Option<&str>) -> Self {
-        Self {}
-    }
-
-    #[cfg(feature = "jaeger")]
     pub fn record_match(&self, rule_type: &str, rule_payload: &str, outbound: &str) {
         tracing::info!(
             rule_type = %rule_type,
@@ -304,129 +199,54 @@ impl RoutingDecisionSpan {
             "Routing rule matched"
         );
     }
-
-    #[cfg(not(feature = "jaeger"))]
-    pub fn record_match(&self, _rule_type: &str, _rule_payload: &str, _outbound: &str) {}
 }
 
+/// An `inbound_connection` span that stays entered until dropped.
 pub struct InboundConnectionSpan {
-    #[cfg(feature = "jaeger")]
     _span: tracing::span::EnteredSpan,
 }
 
 impl InboundConnectionSpan {
-    #[cfg(feature = "jaeger")]
     pub fn new(inbound_type: &str, src_addr: &str) -> Self {
         let span = tracing::info_span!(
             "inbound_connection",
             inbound_type = %inbound_type,
-            src_addr = %src_addr,
-            otel.kind = "server"
+            src_addr = %src_addr
         );
         Self {
             _span: span.entered(),
         }
     }
 
-    #[cfg(not(feature = "jaeger"))]
-    pub fn new(_inbound_type: &str, _src_addr: &str) -> Self {
-        Self {}
-    }
-
-    #[cfg(feature = "jaeger")]
     pub fn record_target(&self, target: &str) {
         tracing::Span::current().record("target", target);
     }
-
-    #[cfg(not(feature = "jaeger"))]
-    pub fn record_target(&self, _target: &str) {}
 }
 
+/// An `outbound_connection` span that stays entered until dropped.
 pub struct OutboundConnectionSpan {
-    #[cfg(feature = "jaeger")]
     _span: tracing::span::EnteredSpan,
 }
 
 impl OutboundConnectionSpan {
-    #[cfg(feature = "jaeger")]
     pub fn new(outbound_type: &str, target: &str) -> Self {
         let span = tracing::info_span!(
             "outbound_connection",
             outbound_type = %outbound_type,
-            target = %target,
-            otel.kind = "client"
+            target = %target
         );
         Self {
             _span: span.entered(),
         }
     }
 
-    #[cfg(not(feature = "jaeger"))]
-    pub fn new(_outbound_type: &str, _target: &str) -> Self {
-        Self {}
-    }
-
-    #[cfg(feature = "jaeger")]
     pub fn record_latency(&self, latency_ms: u64) {
         tracing::Span::current().record("latency_ms", latency_ms);
     }
 
-    #[cfg(not(feature = "jaeger"))]
-    pub fn record_latency(&self, _latency_ms: u64) {}
-
-    #[cfg(feature = "jaeger")]
     pub fn record_error(&self, error: &str) {
         tracing::Span::current().record("error", error);
     }
-
-    #[cfg(not(feature = "jaeger"))]
-    pub fn record_error(&self, _error: &str) {}
-}
-
-#[cfg(feature = "jaeger")]
-#[macro_export]
-macro_rules! trace_inbound_connection {
-    ($inbound_type:expr, $src_addr:expr, $body:expr) => {{
-        use tracing::Instrument;
-        let span = tracing::info_span!(
-            "inbound_connection",
-            inbound_type = %$inbound_type,
-            src_addr = %$src_addr,
-            otel.kind = "server"
-        );
-        async move { $body }.instrument(span).await
-    }};
-}
-
-#[cfg(not(feature = "jaeger"))]
-#[macro_export]
-macro_rules! trace_inbound_connection {
-    ($inbound_type:expr, $src_addr:expr, $body:expr) => {{
-        $body
-    }};
-}
-
-#[cfg(feature = "jaeger")]
-#[macro_export]
-macro_rules! trace_outbound_connection {
-    ($outbound_type:expr, $target:expr, $body:expr) => {{
-        use tracing::Instrument;
-        let span = tracing::info_span!(
-            "outbound_connection",
-            outbound_type = %$outbound_type,
-            target = %$target,
-            otel.kind = "client"
-        );
-        async move { $body }.instrument(span).await
-    }};
-}
-
-#[cfg(not(feature = "jaeger"))]
-#[macro_export]
-macro_rules! trace_outbound_connection {
-    ($outbound_type:expr, $target:expr, $body:expr) => {{
-        $body
-    }};
 }
 
 #[cfg(test)]
@@ -456,9 +276,15 @@ mod tests {
     }
 
     #[test]
-    fn test_span_creation_without_jaeger() {
+    fn test_span_creation() {
         let _dns_span = DnsResolutionSpan::new("example.com");
         let _proxy_span = ProxyConnectionSpan::new("example.com:443", "https");
         let _routing_span = RoutingDecisionSpan::new(Some("example.com"), None);
+    }
+
+    #[test]
+    fn test_init_tracing_is_noop() {
+        assert!(init_tracing(TracingConfig::default()).is_ok());
+        shutdown_tracing();
     }
 }

@@ -8,9 +8,7 @@ use crate::RecordType;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use bytes::Bytes;
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RData};
-use hickory_proto::serialize::binary::BinDecodable;
+use crate::wire::{BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RData};
 use rustls::pki_types::ServerName;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -19,7 +17,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, trace, warn};
-use url::Url;
+use corduit_common::url::Url;
 
 /// DoH request method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -146,7 +144,7 @@ impl DohClient {
     fn build_query(
         &self,
         domain: &str,
-        record_type: hickory_proto::rr::RecordType,
+        record_type: crate::wire::RecordType,
     ) -> Result<Vec<u8>> {
         let name = Name::from_str(domain)
             .map_err(|e| DnsError::NameError(format!("Invalid domain name: {}", e)))?;

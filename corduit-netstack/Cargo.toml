@@ -50,6 +50,6 @@ libc = { workspace = true }
 tun-rs = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-reqwest = { workspace = true }
+corduit-common = { workspace = true }
 wintun-bindings = { workspace = true }
 zip = { workspace = true }

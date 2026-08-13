@@ -80,6 +80,7 @@ pub mod hosts;
 pub mod manager;
 pub mod resolver;
 pub mod server;
+pub mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -148,39 +149,39 @@ impl std::fmt::Display for RecordType {
     }
 }
 
-impl From<hickory_proto::rr::RecordType> for RecordType {
-    fn from(rt: hickory_proto::rr::RecordType) -> Self {
+impl From<crate::wire::RecordType> for RecordType {
+    fn from(rt: crate::wire::RecordType) -> Self {
         match rt {
-            hickory_proto::rr::RecordType::A => RecordType::A,
-            hickory_proto::rr::RecordType::AAAA => RecordType::AAAA,
-            hickory_proto::rr::RecordType::CNAME => RecordType::CNAME,
-            hickory_proto::rr::RecordType::TXT => RecordType::TXT,
-            hickory_proto::rr::RecordType::MX => RecordType::MX,
-            hickory_proto::rr::RecordType::NS => RecordType::NS,
-            hickory_proto::rr::RecordType::SOA => RecordType::SOA,
-            hickory_proto::rr::RecordType::PTR => RecordType::PTR,
-            hickory_proto::rr::RecordType::SRV => RecordType::SRV,
-            hickory_proto::rr::RecordType::HTTPS => RecordType::HTTPS,
-            hickory_proto::rr::RecordType::SVCB => RecordType::SVCB,
+            crate::wire::RecordType::A => RecordType::A,
+            crate::wire::RecordType::AAAA => RecordType::AAAA,
+            crate::wire::RecordType::CNAME => RecordType::CNAME,
+            crate::wire::RecordType::TXT => RecordType::TXT,
+            crate::wire::RecordType::MX => RecordType::MX,
+            crate::wire::RecordType::NS => RecordType::NS,
+            crate::wire::RecordType::SOA => RecordType::SOA,
+            crate::wire::RecordType::PTR => RecordType::PTR,
+            crate::wire::RecordType::SRV => RecordType::SRV,
+            crate::wire::RecordType::HTTPS => RecordType::HTTPS,
+            crate::wire::RecordType::SVCB => RecordType::SVCB,
             _ => RecordType::A, // Default fallback
         }
     }
 }
 
-impl From<RecordType> for hickory_proto::rr::RecordType {
+impl From<RecordType> for crate::wire::RecordType {
     fn from(rt: RecordType) -> Self {
         match rt {
-            RecordType::A => hickory_proto::rr::RecordType::A,
-            RecordType::AAAA => hickory_proto::rr::RecordType::AAAA,
-            RecordType::CNAME => hickory_proto::rr::RecordType::CNAME,
-            RecordType::TXT => hickory_proto::rr::RecordType::TXT,
-            RecordType::MX => hickory_proto::rr::RecordType::MX,
-            RecordType::NS => hickory_proto::rr::RecordType::NS,
-            RecordType::SOA => hickory_proto::rr::RecordType::SOA,
-            RecordType::PTR => hickory_proto::rr::RecordType::PTR,
-            RecordType::SRV => hickory_proto::rr::RecordType::SRV,
-            RecordType::HTTPS => hickory_proto::rr::RecordType::HTTPS,
-            RecordType::SVCB => hickory_proto::rr::RecordType::SVCB,
+            RecordType::A => crate::wire::RecordType::A,
+            RecordType::AAAA => crate::wire::RecordType::AAAA,
+            RecordType::CNAME => crate::wire::RecordType::CNAME,
+            RecordType::TXT => crate::wire::RecordType::TXT,
+            RecordType::MX => crate::wire::RecordType::MX,
+            RecordType::NS => crate::wire::RecordType::NS,
+            RecordType::SOA => crate::wire::RecordType::SOA,
+            RecordType::PTR => crate::wire::RecordType::PTR,
+            RecordType::SRV => crate::wire::RecordType::SRV,
+            RecordType::HTTPS => crate::wire::RecordType::HTTPS,
+            RecordType::SVCB => crate::wire::RecordType::SVCB,
         }
     }
 }

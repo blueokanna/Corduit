@@ -1,5 +1,5 @@
 [package]
-name = "corduit-dns"
+name = "corduit-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,33 +9,22 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "DNS resolver and server for Corduit with anti-spoofing, caching and fake-IP support"
+description = "Shared minimal utilities for Corduit: a dependency-free URL parser and a self-implemented HTTP client built directly on hyper"
 
 [package.metadata.docs.rs]
 all-features = true
 
 [dependencies]
-base64 = { workspace = true }
 bytes = { workspace = true }
-corduit-common = { workspace = true }
-dashmap = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-ipnet = { workspace = true }
-nextjson = { workspace = true }
-parking_lot = { workspace = true }
-rand = { workspace = true }
 rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-thiserror = { workspace = true }
+rustls-native-certs = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
-tracing = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
 tokio-test = { workspace = true }
-tracing-subscriber = { workspace = true }

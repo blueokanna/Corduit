@@ -70,8 +70,8 @@ pub enum DnsError {
     Upstream(String),
 }
 
-impl From<hickory_proto::ProtoError> for DnsError {
-    fn from(e: hickory_proto::ProtoError) -> Self {
+impl From<crate::wire::WireError> for DnsError {
+    fn from(e: crate::wire::WireError) -> Self {
         DnsError::Protocol(e.to_string())
     }
 }

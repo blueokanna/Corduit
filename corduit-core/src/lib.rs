@@ -17,8 +17,7 @@
 //!   Trojan, TUIC, Hysteria2, WireGuard, QUIC, HTTP(S), SOCKS5, Direct, Reject —
 //!   plus selector / url-test / fallback / load-balance / relay groups.
 //! * **Hot reload** ([`Corduit::reload`]) with atomic config swaps.
-//! * **Observability**: `tracing`-based structured logging and optional
-//!   OpenTelemetry / Jaeger export behind the `jaeger` feature.
+//! * **Observability**: `tracing`-based structured logging and span helpers.
 //!
 //! ## Quick start
 //!
@@ -48,6 +47,7 @@ pub mod health_check;
 pub mod inbound;
 pub mod jaeger_tracing;
 pub mod logging;
+pub mod mmdb;
 pub mod outbound;
 pub mod process;
 pub mod provider_updater;
@@ -91,8 +91,8 @@ impl Corduit {
         config.validate()?;
         logging::init_logging(config.general.log_level)?;
 
-        // Ensure a rustls crypto provider is active before any HTTP client is
-        // built (reqwest is compiled with `rustls-no-provider`).
+        // Ensure a rustls crypto provider is active before any TLS consumer
+        // (quinn, tokio-rustls, protocol layer) builds its first configuration.
         tls::install_crypto_provider();
 
         let proxy_manager = ProxyManager::new(config.clone()).await?;

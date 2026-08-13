@@ -5,9 +5,7 @@
 use crate::error::{DnsError, Result};
 use crate::resolver::DnsResolver;
 use crate::RecordType;
-use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::{RData, Record};
-use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use crate::wire::{BinDecodable, BinEncodable, Message, RData, Record, ResponseCode};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pki_types::pem::PemObject;
 use std::net::{IpAddr, SocketAddr};
@@ -258,8 +256,8 @@ impl DotServer {
                 Ok(ips) => {
                     for ip in ips {
                         let rdata = match ip {
-                            IpAddr::V4(v4) => RData::A(hickory_proto::rr::rdata::A(v4)),
-                            IpAddr::V6(v6) => RData::AAAA(hickory_proto::rr::rdata::AAAA(v6)),
+                            IpAddr::V4(v4) => RData::A(crate::wire::rdata::A(v4)),
+                            IpAddr::V6(v6) => RData::AAAA(crate::wire::rdata::AAAA(v6)),
                         };
 
                         let record = Record::from_rdata(query.name().clone(), 300, rdata);

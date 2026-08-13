@@ -2,25 +2,22 @@ use crate::config::Config;
 use crate::health_check::{HealthMonitor, HealthStatus};
 use crate::proxy::ProxyManager;
 use crate::traffic_stats::TrafficStatsManager;
-use axum::{
-    extract::{Path, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Router,
-};
+use hyper::body::Incoming;
+use hyper::http::{header, Method, Request, Response, StatusCode};
+use hyper::service::service_fn;
 use nextjson::{NsonDeserialize, NsonSerialize};
+use std::convert::Infallible;
 use std::sync::Arc;
 
-/// API server state
+/// API server state (plain `Arc`, no nested wrappers).
 #[derive(Clone)]
 pub struct ApiState {
     pub proxy_manager: Arc<ProxyManager>,
     pub health_monitor: Arc<HealthMonitor>,
-    pub traffic_stats: Arc<Arc<TrafficStatsManager>>,
+    pub traffic_stats: Arc<TrafficStatsManager>,
 }
 
-/// API response wrapper
+/// Uniform REST envelope: `{ "success": bool, "data": T?, "error": String? }`.
 #[derive(NsonSerialize)]
 struct ApiResponse<T> {
     success: bool,
@@ -43,25 +40,6 @@ impl<T> ApiResponse<T> {
             data: None,
             error: Some(message),
         }
-    }
-}
-
-/// Axum JSON response serialized with `nextjson`.
-///
-/// Every dashboard handler returns this wrapper; the wire format is plain
-/// JSON produced by `NsonSerialize`, so the REST surface stays fully
-pub struct NsonJson<T>(pub T);
-
-impl<T: NsonSerialize> IntoResponse for NsonJson<T> {
-    fn into_response(self) -> Response {
-        let (status, body) = match nextjson::to_string(&self.0) {
-            Ok(json) => (StatusCode::OK, json),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(r#"{{"success":false,"error":"response encode failed: {e}"}}"#),
-            ),
-        };
-        (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
 }
 
@@ -107,87 +85,77 @@ struct ConfigUpdateRequest {
     config: Config,
 }
 
-/// API server
-pub struct ApiServer {
-    state: ApiState,
-    router: Router,
+// ---------------------------------------------------------------------------
+// JSON plumbing (hand-written, nextjson only)
+// ---------------------------------------------------------------------------
+
+/// Serialize `value` to JSON and wrap it in a `hyper` response.
+fn json_response<T: NsonSerialize>(status: StatusCode, value: &T) -> Response<String> {
+    let (status, body) = match nextjson::to_string(value) {
+        Ok(json) => (status, json),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(r#"{{"success":false,"error":"response encode failed: {e}"}}"#),
+        ),
+    };
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
-impl ApiServer {
-    /// Create a new API server
-    pub fn new(
-        proxy_manager: Arc<ProxyManager>,
-        health_monitor: Arc<HealthMonitor>,
-        traffic_stats: Arc<TrafficStatsManager>,
-    ) -> Self {
-        let state = ApiState {
-            proxy_manager,
-            health_monitor,
-            traffic_stats: Arc::new(traffic_stats),
-        };
-
-        let router = Router::new()
-            .route("/api/v1/info", get(get_server_info))
-            .route("/api/v1/traffic", get(get_traffic_stats))
-            .route("/api/v1/traffic/reset", post(reset_traffic_stats))
-            .route("/api/v1/health", get(get_health_status))
-            .route("/api/v1/proxies", get(get_proxies))
-            .route("/api/v1/proxies/:tag", get(get_proxy))
-            .route("/api/v1/config", get(get_config))
-            .route("/api/v1/config", post(update_config))
-            .route("/api/v1/rules", get(get_rules))
-            .with_state(state.clone());
-
-        Self { state, router }
-    }
-
-    /// Get the router for embedding in a server
-    pub fn router(&self) -> Router {
-        self.router.clone()
-    }
-
-    /// Get the API state
-    pub fn state(&self) -> &ApiState {
-        &self.state
-    }
+/// Read the entire request body as a UTF-8 string.
+async fn read_body(body: Incoming) -> Result<String, String> {
+    let bytes = http_body_util::BodyExt::collect(body)
+        .await
+        .map_err(|e| format!("failed to read request body: {e}"))?
+        .to_bytes();
+    String::from_utf8(bytes.to_vec()).map_err(|_| "request body is not valid UTF-8".to_string())
 }
 
-/// Get server information
-async fn get_server_info(State(state): State<ApiState>) -> NsonJson<ApiResponse<ServerInfo>> {
+// ---------------------------------------------------------------------------
+// Handlers (plain `&ApiState`, no framework extractors)
+// ---------------------------------------------------------------------------
+
+async fn get_server_info(state: &ApiState) -> Response<String> {
     let active_connections = state.traffic_stats.active_connections();
-
-    NsonJson(ApiResponse::success(ServerInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        uptime: 0,
-        active_connections,
-    }))
+    json_response(
+        StatusCode::OK,
+        &ApiResponse::success(ServerInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime: 0,
+            active_connections,
+        }),
+    )
 }
 
-/// Get traffic statistics
-async fn get_traffic_stats(
-    State(state): State<ApiState>,
-) -> NsonJson<ApiResponse<TrafficResponse>> {
+async fn get_traffic_stats(state: &ApiState) -> Response<String> {
     let stats = state.traffic_stats.global_stats();
-    NsonJson(ApiResponse::success(TrafficResponse {
-        upload_bytes: stats.upload_bytes,
-        download_bytes: stats.download_bytes,
-        total_bytes: stats.total_bytes(),
-        connections: stats.connections,
-        connection_time_secs: stats.connection_time_secs,
-    }))
+    json_response(
+        StatusCode::OK,
+        &ApiResponse::success(TrafficResponse {
+            upload_bytes: stats.upload_bytes,
+            download_bytes: stats.download_bytes,
+            total_bytes: stats.total_bytes(),
+            connections: stats.connections,
+            connection_time_secs: stats.connection_time_secs,
+        }),
+    )
 }
 
-/// Reset traffic statistics
-async fn reset_traffic_stats(State(state): State<ApiState>) -> NsonJson<ApiResponse<String>> {
+async fn reset_traffic_stats(state: &ApiState) -> Response<String> {
     state.traffic_stats.reset().await;
-    NsonJson(ApiResponse::success("Traffic statistics reset".to_string()))
+    json_response(
+        StatusCode::OK,
+        &ApiResponse::success("Traffic statistics reset".to_string()),
+    )
 }
 
-/// Get health status of all proxies
-async fn get_health_status(
-    State(state): State<ApiState>,
-) -> NsonJson<ApiResponse<Vec<HealthResponse>>> {
-    let health_statuses = state
+async fn get_health_status(state: &ApiState) -> Response<String> {
+    let health_statuses: Vec<HealthResponse> = state
         .health_monitor
         .get_all_health()
         .into_iter()
@@ -203,7 +171,6 @@ async fn get_health_status(
                 }
                 HealthStatus::Unknown => ("unknown".to_string(), None),
             };
-
             HealthResponse {
                 tag,
                 status: status_str,
@@ -212,13 +179,12 @@ async fn get_health_status(
         })
         .collect();
 
-    NsonJson(ApiResponse::success(health_statuses))
+    json_response(StatusCode::OK, &ApiResponse::success(health_statuses))
 }
 
-/// Get all proxies
-async fn get_proxies(State(state): State<ApiState>) -> NsonJson<ApiResponse<Vec<ProxyInfo>>> {
+async fn get_proxies(state: &ApiState) -> Response<String> {
     let config = state.proxy_manager.get_config().await;
-    let proxies = config
+    let proxies: Vec<ProxyInfo> = config
         .outbounds
         .into_iter()
         .map(|outbound| {
@@ -238,14 +204,10 @@ async fn get_proxies(State(state): State<ApiState>) -> NsonJson<ApiResponse<Vec<
         })
         .collect();
 
-    NsonJson(ApiResponse::success(proxies))
+    json_response(StatusCode::OK, &ApiResponse::success(proxies))
 }
 
-/// Get specific proxy information
-async fn get_proxy(
-    State(state): State<ApiState>,
-    Path(tag): Path<String>,
-) -> NsonJson<ApiResponse<ProxyInfo>> {
+async fn get_proxy(state: &ApiState, tag: &str) -> Response<String> {
     let config = state.proxy_manager.get_config().await;
 
     if let Some(outbound) = config.outbounds.into_iter().find(|o| o.tag == tag) {
@@ -255,50 +217,54 @@ async fn get_proxy(
             .map(|status| matches!(status, HealthStatus::Healthy))
             .unwrap_or(false);
 
-        NsonJson(ApiResponse::success(ProxyInfo {
-            tag: outbound.tag,
-            proxy_type: format!("{:?}", outbound.outbound_type),
-            server: outbound.server,
-            port: outbound.port,
-            healthy,
-        }))
+        json_response(
+            StatusCode::OK,
+            &ApiResponse::success(ProxyInfo {
+                tag: outbound.tag,
+                proxy_type: format!("{:?}", outbound.outbound_type),
+                server: outbound.server,
+                port: outbound.port,
+                healthy,
+            }),
+        )
     } else {
-        NsonJson(ApiResponse::error(format!("Proxy '{}' not found", tag)))
+        json_response(
+            StatusCode::NOT_FOUND,
+            &ApiResponse::<ProxyInfo>::error(format!("Proxy '{tag}' not found")),
+        )
     }
 }
 
-/// Get current configuration
-async fn get_config(State(state): State<ApiState>) -> NsonJson<ApiResponse<Config>> {
+async fn get_config(state: &ApiState) -> Response<String> {
     let config = state.proxy_manager.get_config().await;
-    NsonJson(ApiResponse::success(config))
+    json_response(StatusCode::OK, &ApiResponse::success(config))
 }
 
-/// Update configuration
-async fn update_config(
-    State(state): State<ApiState>,
-    body: String,
-) -> NsonJson<ApiResponse<String>> {
+async fn update_config(state: &ApiState, body: String) -> Response<String> {
     let request: ConfigUpdateRequest = match nextjson::from_str(&body) {
         Ok(request) => request,
         Err(e) => {
-            return NsonJson(ApiResponse::error(format!("Invalid JSON body: {e}")));
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &ApiResponse::<String>::error(format!("Invalid JSON body: {e}")),
+            );
         }
     };
     match state.proxy_manager.reload(request.config).await {
-        Ok(()) => NsonJson(ApiResponse::success(
-            "Configuration updated successfully".to_string(),
-        )),
-        Err(e) => NsonJson(ApiResponse::error(format!(
-            "Failed to update configuration: {}",
-            e
-        ))),
+        Ok(()) => json_response(
+            StatusCode::OK,
+            &ApiResponse::success("Configuration updated successfully".to_string()),
+        ),
+        Err(e) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ApiResponse::<String>::error(format!("Failed to update configuration: {e}")),
+        ),
     }
 }
 
-/// Get routing rules
-async fn get_rules(State(state): State<ApiState>) -> NsonJson<ApiResponse<Vec<nextjson::Value>>> {
+async fn get_rules(state: &ApiState) -> Response<String> {
     let config = state.proxy_manager.get_config().await;
-    let rules = config
+    let rules: Vec<nextjson::Value> = config
         .rules
         .into_iter()
         .map(|rule| {
@@ -311,15 +277,119 @@ async fn get_rules(State(state): State<ApiState>) -> NsonJson<ApiResponse<Vec<ne
         })
         .collect();
 
-    NsonJson(ApiResponse::success(rules))
+    json_response(StatusCode::OK, &ApiResponse::success(rules))
 }
 
-/// Create API router for embedding
-pub fn create_router(
+// ---------------------------------------------------------------------------
+// Router (hand-written dispatch, no framework)
+// ---------------------------------------------------------------------------
+
+/// Split a path into non-empty segments.
+fn path_segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// API server built directly on `hyper` — no web framework, no serde.
+pub struct ApiServer {
+    state: ApiState,
+}
+
+impl ApiServer {
+    /// Create a new API server.
+    pub fn new(
+        proxy_manager: Arc<ProxyManager>,
+        health_monitor: Arc<HealthMonitor>,
+        traffic_stats: Arc<TrafficStatsManager>,
+    ) -> Self {
+        Self {
+            state: ApiState {
+                proxy_manager,
+                health_monitor,
+                traffic_stats,
+            },
+        }
+    }
+
+    /// Get the API state.
+    pub fn state(&self) -> &ApiState {
+        &self.state
+    }
+
+    /// Serve one HTTP request.
+    pub async fn serve(&self, req: Request<Incoming>) -> Response<String> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_owned();
+        let body = match read_body(req.into_body()).await {
+            Ok(b) => b,
+            Err(e) => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &ApiResponse::<String>::error(e),
+                );
+            }
+        };
+        self.dispatch(method, &path, &body).await
+    }
+
+    /// Match `(method, path)` to a handler and run it.
+    async fn dispatch(&self, method: Method, path: &str, body: &str) -> Response<String> {
+        // `/api/v1/proxies/:tag` (GET) — parameterized route handled first.
+        let segments = path_segments(path);
+        if segments.len() == 4
+            && segments[0] == "api"
+            && segments[1] == "v1"
+            && segments[2] == "proxies"
+            && method == Method::GET
+        {
+            return get_proxy(&self.state, segments[3]).await;
+        }
+
+        match (method.as_str(), path) {
+            ("GET", "/api/v1/info") => get_server_info(&self.state).await,
+            ("GET", "/api/v1/traffic") => get_traffic_stats(&self.state).await,
+            ("POST", "/api/v1/traffic/reset") => reset_traffic_stats(&self.state).await,
+            ("GET", "/api/v1/health") => get_health_status(&self.state).await,
+            ("GET", "/api/v1/proxies") => get_proxies(&self.state).await,
+            ("GET", "/api/v1/config") => get_config(&self.state).await,
+            ("POST", "/api/v1/config") => update_config(&self.state, body.to_owned()).await,
+            ("GET", "/api/v1/rules") => get_rules(&self.state).await,
+            _ => json_response(
+                StatusCode::NOT_FOUND,
+                &ApiResponse::<()>::error("route not found".to_string()),
+            ),
+        }
+    }
+
+    /// Build a `hyper` [`Service`] for `hyper::server::conn::http1::Builder`.
+    pub fn into_service(
+        self,
+    ) -> impl hyper::service::Service<
+        Request<Incoming>,
+        Response = Response<String>,
+        Error = Infallible,
+    > + Clone {
+        let state = Arc::new(self.state);
+        service_fn(move |req: Request<Incoming>| {
+            let state = state.clone();
+            async move {
+                let server = ApiServer {
+                    state: (*state).clone(),
+                };
+                Ok::<_, Infallible>(server.serve(req).await)
+            }
+        })
+    }
+}
+
+/// Convenience constructor for embedding the dashboard into a server task.
+pub fn create_service(
     proxy_manager: Arc<ProxyManager>,
     health_monitor: Arc<HealthMonitor>,
     traffic_stats: Arc<TrafficStatsManager>,
-) -> Router {
-    let api_server = ApiServer::new(proxy_manager, health_monitor, traffic_stats);
-    api_server.router()
+) -> impl hyper::service::Service<
+    Request<Incoming>,
+    Response = Response<String>,
+    Error = Infallible,
+> + Clone {
+    ApiServer::new(proxy_manager, health_monitor, traffic_stats).into_service()
 }

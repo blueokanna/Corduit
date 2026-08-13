@@ -147,15 +147,12 @@ impl RuleProvider {
 
         let cache_path = self.http_cache_path();
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::network(format!("Failed to create HTTP client: {}", e)))?;
+        let client = corduit_common::HttpClient::new().with_timeout(Duration::from_secs(30));
 
-        let response = client.get(url).send().await;
+        let result = client.get(url).await;
 
-        let response = match response {
-            Ok(response) if response.status().is_success() => response,
+        let response = match result {
+            Ok(response) if response.is_success() => response,
             Ok(response) => {
                 return self
                     .read_cached_or_error(
@@ -168,7 +165,7 @@ impl RuleProvider {
                 return self
                     .read_cached_or_error(
                         &cache_path,
-                        format!("Failed to fetch rules from '{}': {}", url, error),
+                        format!("Failed to fetch rules from '{url}': {error}"),
                     )
                     .await;
             }
@@ -176,8 +173,7 @@ impl RuleProvider {
 
         let content = response
             .text()
-            .await
-            .map_err(|e| Error::network(format!("Failed to read response body: {}", e)))?;
+            .map_err(|e| Error::network(format!("Failed to read response body: {e}")))?;
 
         if let Some(path) = &cache_path {
             if let Some(parent) = path.parent() {

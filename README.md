@@ -52,13 +52,18 @@ and released together.
 - **Hand-written C ABI** — `corduit-lib` exposes a dependency-free, hand-written
   `#[no_mangle] extern "C"` surface (no `flutter_rust_bridge`, no codegen) for
   Flutter/Dart, Kotlin, Swift and C/C++ hosts.
-- **nextjson + rustbinary serialization** — serde is entirely removed from
-  the workspace. The FFI boundary speaks `nextjson` (schema-driven JSON) for
-  human-readable payloads and `rustbinary` (bounded, type-tagged binary) for
-  compact high-throughput channels.
+- **nextjson + rustbinary serialization** — **zero serde anywhere**, including
+  `Cargo.lock`: the entire dependency graph is serde-free (no `serde`,
+  `serde_json`, `serde_core`, `serde_derive`, …). The FFI boundary speaks
+  `nextjson` (schema-driven JSON) for human-readable payloads and `rustbinary`
+  (bounded, type-tagged binary) for compact high-throughput channels.
+- **Self-implemented core components** — instead of third-party crates, Corduit
+  ships its own hyper-based HTTP client, its own URL parser, its own MaxMind
+  MMDB v2 reader and its own DNS wire codec, all bounds-checked and
+  dependency-light (`corduit-common`, `corduit-core::mmdb`, `corduit-dns::wire`).
 - **Hot reload** — `Corduit::reload()` swaps configuration atomically.
-- **Observability** — `tracing`-based structured logging, optional OpenTelemetry /
-  Jaeger export behind the `jaeger` feature, and per-connection traffic stats.
+- **Observability** — `tracing`-based structured logging and span helpers with
+  per-connection traffic stats.
 - **Mobile-ready** — `corduit-lib` ships Android JNI (`VpnService`), Windows VPN
   integrations, and a unified `corduit_call` / `corduit_call_binary` dispatcher
   for any native host.
@@ -73,6 +78,9 @@ and released together.
 ```
 Corduit (workspace)
 │
+├── corduit-common       # Shared minimal utilities: dependency-free URL parser
+│   │                    #   + self-implemented hyper HTTP client
+│
 ├── corduit-core        # Engine: config model, rule pipeline, outbound
 │   │                   #         orchestration, traffic stats, health checks
 │   └── src/
@@ -81,13 +89,15 @@ Corduit (workspace)
 │       ├── outbound/   #   Direct/Reject/SS/VMess/VLESS/Trojan/TUIC/Hy2/...
 │       ├── routing.rs  #   Rule → outbound matching (rule/global/direct)
 │       ├── geoip.rs    #   CountryMatcher trait (dependency inversion)
+│       ├── mmdb.rs     #   Self-implemented MaxMind MMDB v2 reader
 │       └── proxy.rs    #   ProxyManager: the coordinator
 │
 ├── corduit-protocol    # Wire protocols: QUIC, TLS, WireGuard, TUIC,
 │                       #   transports (h2/gRPC/WebSocket/TLS)
 │
 ├── corduit-dns         # DNS: DoH/DoT/UDP/TCP servers & clients, cache,
-│                       #   fake-IP, hosts, anti-spoofing, split resolution
+│   │                   #   fake-IP, hosts, anti-spoofing, split resolution
+│   └── src/wire.rs     #   Self-implemented DNS wire codec (RFC 1035)
 │
 ├── corduit-netstack    # Userspace TCP/IP (SolidTCP), TUN devices, NAT,
 │                       #   Windows/macOS/Linux/Android VPN drivers
@@ -120,9 +130,9 @@ Corduit (workspace)
 
 ```toml
 [dependencies]
-corduit-core = { version = "0.1", features = ["jaeger"] }   # engine
-corduit-dns  = "0.1"                                         # DNS (optional)
-corduit-netstack = "0.1"                                     # TUN (optional)
+corduit-core = { version = "0.1" }   # engine
+corduit-dns  = "0.1"                  # DNS (optional)
+corduit-netstack = "0.1"              # TUN (optional)
 ```
 
 ```rust,no_run
@@ -436,8 +446,9 @@ examples, built with `all-features` on docs.rs.
    innards of each protocol. Swap implementations without touching callers.
 3. **Fail loudly at the boundary.** Configuration is validated once at the
    edge; interior code works on already-validated, typed data.
-4. **No dead weight, no serde.** serde / serde_json / serde_yaml are gone
-   entirely — every type in the workspace (config, DTOs, protocol metadata)
+4. **No dead weight, no serde.** serde / serde_json / serde_core /
+   serde_derive are gone **from the entire dependency graph, `Cargo.lock`
+   included** — every type in the workspace (config, DTOs, protocol metadata)
    derives `nextjson`'s `NsonSerialize` / `NsonDeserialize`. Unused
    dependencies are removed and every declared dependency is actually used.
 5. **Serialization is a first-class citizen.** The FFI boundary uses
@@ -468,10 +479,11 @@ Member crates depend on each other via `path` + `version` in the workspace
 manifest, so publish them **in dependency order**:
 
 ```bash
+cargo publish -p corduit-common    # 0th (no internal deps)
 cargo publish -p corduit-protocol   # 1st (no internal deps)
-cargo publish -p corduit-dns        # 2nd (no internal deps)
+cargo publish -p corduit-dns        # 2nd (depends on corduit-common)
 cargo publish -p corduit-netstack   # 3rd (depends on corduit-dns)
-cargo publish -p corduit-core       # 4th (depends on corduit-protocol)
+cargo publish -p corduit-core       # 4th (depends on corduit-protocol + common)
 cargo publish -p corduit-lib        # 5th (depends on core + netstack)
 ```
 
@@ -486,10 +498,12 @@ Corduit is audited as a dependency graph **and** at the source level:
 ### Dependency audit (`cargo audit`)
 
 - All direct dependencies are recent and maintained. The entire serde family
-  (`serde`, `serde_json`, `serde_yaml`) has been replaced by first-party
-  `nextjson` (schema-driven, `#![deny(unsafe_code)]`, bounded) and
-  `rustbinary`; PEM parsing moved to the first-party `PemObject` trait in
-  `rustls-pki-types`.
+  (`serde`, `serde_json`, `serde_core`, `serde_derive`) has been removed from
+  **both the source and `Cargo.lock`** and replaced by first-party `nextjson`
+  (schema-driven, `#![deny(unsafe_code)]`, bounded) and `rustbinary`; the
+  former `reqwest` (HTTP), `url`, `hickory-proto` (DNS) and `maxminddb`
+  dependencies are replaced by in-repo implementations (`corduit-common`,
+  `corduit-dns::wire`, `corduit-core::mmdb`).
 - The only remaining advisory is *informational*: `paste` (a transitive
   build-time macro helper pulled in by the Linux netlink stack) is
   unmaintained — it is not a security vulnerability and cannot be removed

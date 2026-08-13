@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use maxminddb::{geoip2, Reader};
+use crate::mmdb::MmdbReader;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ pub trait CountryMatcher: Send + Sync {
 }
 
 pub struct GeoIpDatabase {
-    reader: Option<Reader<Vec<u8>>>,
+    reader: Option<MmdbReader>,
 }
 
 impl GeoIpDatabase {
@@ -31,16 +31,18 @@ impl GeoIpDatabase {
     }
 
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let reader = Reader::open_readfile(path.as_ref())
-            .map_err(|e| Error::config(format!("Failed to load GeoIP database: {}", e)))?;
+        let data = std::fs::read(path.as_ref())
+            .map_err(|e| Error::config(format!("Failed to read GeoIP database: {e}")))?;
+        let reader = MmdbReader::open(data)
+            .map_err(|e| Error::config(format!("Failed to parse GeoIP database: {e}")))?;
         Ok(Self {
             reader: Some(reader),
         })
     }
 
     pub fn load_from_bytes(data: Vec<u8>) -> Result<Self> {
-        let reader = Reader::from_source(data).map_err(|e| {
-            Error::config(format!("Failed to load GeoIP database from bytes: {}", e))
+        let reader = MmdbReader::open(data).map_err(|e| {
+            Error::config(format!("Failed to parse GeoIP database from bytes: {e}"))
         })?;
         Ok(Self {
             reader: Some(reader),
@@ -52,10 +54,7 @@ impl GeoIpDatabase {
     }
 
     pub fn lookup_country(&self, ip: IpAddr) -> Option<String> {
-        let reader = self.reader.as_ref()?;
-        let lookup_result = reader.lookup(ip).ok()?;
-        let country_data: geoip2::Country = lookup_result.decode().ok()??;
-        country_data.country.iso_code.map(|s| s.to_uppercase())
+        self.reader.as_ref()?.lookup_country(ip)
     }
 
     pub fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {

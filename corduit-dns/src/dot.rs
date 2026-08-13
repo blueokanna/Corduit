@@ -5,9 +5,7 @@
 use crate::error::{DnsError, Result};
 use crate::RecordType;
 use bytes::{BufMut, BytesMut};
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RData};
-use hickory_proto::serialize::binary::BinDecodable;
+use crate::wire::{BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RData};
 use rustls::pki_types::ServerName;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -130,7 +128,7 @@ impl DotClient {
     fn build_query(
         &self,
         domain: &str,
-        record_type: hickory_proto::rr::RecordType,
+        record_type: crate::wire::RecordType,
     ) -> Result<Vec<u8>> {
         let name = Name::from_str(domain)
             .map_err(|e| DnsError::NameError(format!("Invalid domain name: {}", e)))?;

@@ -89,21 +89,21 @@ pub async fn download_wintun_dll() -> Result<PathBuf> {
 
     info!("Downloading wintun.dll from {}...", WINTUN_DOWNLOAD_URL);
 
-    let response = reqwest::get(WINTUN_DOWNLOAD_URL)
-        .await
-        .map_err(|e| NetStackError::TunError(format!("Failed to download wintun: {}", e)))?;
+    let client = corduit_common::HttpClient::new().with_timeout(std::time::Duration::from_secs(60));
 
-    if !response.status().is_success() {
+    let response = client
+        .get(WINTUN_DOWNLOAD_URL)
+        .await
+        .map_err(|e| NetStackError::TunError(format!("Failed to download wintun: {e}")))?;
+
+    if !response.is_success() {
         return Err(NetStackError::TunError(format!(
             "Failed to download wintun: HTTP {}",
             response.status()
         )));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| NetStackError::TunError(format!("Failed to read download: {}", e)))?;
+    let bytes = response.bytes().to_vec();
 
     info!("Downloaded {} bytes, extracting...", bytes.len());
 
