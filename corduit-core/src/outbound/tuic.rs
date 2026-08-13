@@ -472,7 +472,7 @@ impl TuicOutbound {
         let alpn = config
             .options
             .get("alpn")
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(String::from))
@@ -1053,19 +1053,19 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
         options.insert(
             "password".to_string(),
-            serde_yaml::Value::String("test_pass".to_string()),
+            nextjson::Value::String("test_pass".to_string()),
         );
         options.insert(
             "skip-cert-verify".to_string(),
-            serde_yaml::Value::Bool(true),
+            nextjson::Value::Bool(true),
         );
         options.insert(
             "congestion-controller".to_string(),
-            serde_yaml::Value::String("bbr".to_string()),
+            nextjson::Value::String("bbr".to_string()),
         );
 
         let config = OutboundConfig {
@@ -1107,7 +1107,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
 
         let config = OutboundConfig {

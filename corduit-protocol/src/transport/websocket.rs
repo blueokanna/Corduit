@@ -7,7 +7,7 @@ use base64::Engine;
 use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{Sink, Stream, StreamExt};
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::Uri;
@@ -16,7 +16,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use super::{Result, TransportError};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct WebSocketConfig {
     #[serde(default = "default_path")]
     pub path: String,
@@ -478,8 +478,8 @@ mod tests {
             early_data_header: None,
         };
 
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: WebSocketConfig = serde_json::from_str(&json).unwrap();
+        let json = nextjson::to_string(&config).unwrap();
+        let deserialized: WebSocketConfig = nextjson::from_str(&json).unwrap();
 
         assert_eq!(deserialized.path, config.path);
         assert_eq!(deserialized.host, config.host);

@@ -518,7 +518,7 @@ impl ProxyGroupDto {
         let proxies: Vec<String> = config
             .options
             .get("proxies")
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))

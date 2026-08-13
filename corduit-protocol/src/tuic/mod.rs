@@ -2,7 +2,7 @@ use quinn::{
     ClientConfig as QuinnClientConfig, Connection, Endpoint, ServerConfig as QuinnServerConfig,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -34,7 +34,7 @@ pub enum TuicError {
 
 const TUIC_PROTOCOL_VERSION: u8 = 5;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Command {
     Connect = 0,
@@ -42,6 +42,13 @@ pub enum Command {
     Dns = 2,
     Associate = 3,
 }
+
+crate::impl_protocol_enum!(Command {
+    Connect => "connect",
+    Bind => "bind",
+    Dns => "dns",
+    Associate => "associate",
+});
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -166,7 +173,7 @@ impl AuthRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 #[allow(dead_code)]
 struct AuthResponse {
     success: bool,

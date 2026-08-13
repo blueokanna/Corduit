@@ -34,7 +34,7 @@ impl SelectorOutbound {
             );
 
             // Try to parse as array directly
-            if let Some(arr) = outbounds_value.as_sequence() {
+            if let Some(arr) = outbounds_value.as_array() {
                 let result: Vec<String> = arr
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
@@ -47,7 +47,7 @@ impl SelectorOutbound {
                 result
             } else if let Some(s) = outbounds_value.as_str() {
                 // Try to parse as JSON string
-                let result = serde_json::from_str::<Vec<String>>(s).unwrap_or_default();
+                let result = nextjson::from_str::<Vec<String>>(s).unwrap_or_default();
                 tracing::debug!(
                     "Selector '{}' parsed {} outbounds from JSON string",
                     config.tag,

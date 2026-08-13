@@ -1,3 +1,40 @@
+//! # Corduit Core
+//!
+//! The unified engine behind **Corduit** — a single, non-composite network proxy
+//! engine written in Rust. This crate owns configuration modelling & validation,
+//! the typed rule-routing pipeline, inbound/outbound orchestration, proxy
+//! groups, health checks, provider updates and per-connection traffic
+//! accounting.
+//!
+//! ## Highlights
+//!
+//! * **One validated [`Config`] model** mapped from YAML — no ad-hoc dialects.
+//! * **Typed rule pipeline** ([`routing`]) with rule / global / direct modes.
+//! * **Dependency-inverted GeoIP** via [`geoip::CountryMatcher`] — swap the
+//!   database without touching the engine.
+//! * **Inbound listeners** ([`inbound`]): HTTP, SOCKS5 and mixed.
+//! * **Outbound protocols & groups** ([`outbound`]): Shadowsocks, VMess, VLESS,
+//!   Trojan, TUIC, Hysteria2, WireGuard, QUIC, HTTP(S), SOCKS5, Direct, Reject —
+//!   plus selector / url-test / fallback / load-balance / relay groups.
+//! * **Hot reload** ([`Corduit::reload`]) with atomic config swaps.
+//! * **Observability**: `tracing`-based structured logging and optional
+//!   OpenTelemetry / Jaeger export behind the `jaeger` feature.
+//!
+//! ## Quick start
+//!
+//! ```rust,no_run
+//! use corduit_core::{Config, Corduit};
+//!
+//! #[tokio::main]
+//! async fn main() -> corduit_core::Result<()> {
+//!     let engine = Corduit::new(Config::default()).await?;
+//!     engine.start().await?;
+//!     // ... run the proxy ...
+//!     engine.stop().await
+//! }
+//! ```
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 #[macro_use]
 pub mod macros;
 pub mod api;
@@ -53,6 +90,10 @@ impl Corduit {
     pub async fn new(config: Config) -> Result<Self> {
         config.validate()?;
         logging::init_logging(config.general.log_level)?;
+
+        // Ensure a rustls crypto provider is active before any HTTP client is
+        // built (reqwest is compiled with `rustls-no-provider`).
+        tls::install_crypto_provider();
 
         let proxy_manager = ProxyManager::new(config.clone()).await?;
         let traffic_stats = TrafficStatsManager::new();

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rustls::pki_types::ServerName;
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsConnector;
 
@@ -13,8 +13,7 @@ use super::{Result, TransportError};
 #[cfg(feature = "tls")]
 use crate::tls::SkipServerVerification;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsFingerprint {
     #[default]
     None,
@@ -27,7 +26,18 @@ pub enum TlsFingerprint {
     Random,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+crate::impl_protocol_enum!(TlsFingerprint {
+    None => "none",
+    Chrome => "chrome",
+    Firefox => "firefox",
+    Safari => "safari",
+    Ios => "ios",
+    Android => "android",
+    Edge => "edge",
+    Random => "random",
+});
+
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct TlsConfig {
     #[serde(default)]
     pub sni: Option<String>,
@@ -315,8 +325,8 @@ mod tests {
             max_version: None,
         };
 
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: TlsConfig = serde_json::from_str(&json).unwrap();
+        let json = nextjson::to_string(&config).unwrap();
+        let deserialized: TlsConfig = nextjson::from_str(&json).unwrap();
 
         assert_eq!(deserialized.sni, config.sni);
         assert_eq!(deserialized.alpn, config.alpn);

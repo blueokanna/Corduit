@@ -6,20 +6,24 @@ use std::task::{Context, Poll};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h2::client::{self, SendRequest};
 use http::{Method, Request, Uri};
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{Result, TransportError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrpcMode {
     #[default]
     Gun,
     Multi,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+crate::impl_protocol_enum!(GrpcMode {
+    Gun => "gun",
+    Multi => "multi",
+});
+
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct GrpcConfig {
     #[serde(default = "default_service_name")]
     pub service_name: String,
@@ -368,8 +372,8 @@ mod tests {
             mode: GrpcMode::Gun,
         };
 
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: GrpcConfig = serde_json::from_str(&json).unwrap();
+        let json = nextjson::to_string(&config).unwrap();
+        let deserialized: GrpcConfig = nextjson::from_str(&json).unwrap();
 
         assert_eq!(deserialized.service_name, config.service_name);
         assert_eq!(deserialized.host, config.host);
@@ -426,14 +430,14 @@ mod tests {
         let gun = GrpcMode::Gun;
         let multi = GrpcMode::Multi;
 
-        let gun_json = serde_json::to_string(&gun).unwrap();
-        let multi_json = serde_json::to_string(&multi).unwrap();
+        let gun_json = nextjson::to_string(&gun).unwrap();
+        let multi_json = nextjson::to_string(&multi).unwrap();
 
         assert_eq!(gun_json, "\"gun\"");
         assert_eq!(multi_json, "\"multi\"");
 
-        let gun_de: GrpcMode = serde_json::from_str(&gun_json).unwrap();
-        let multi_de: GrpcMode = serde_json::from_str(&multi_json).unwrap();
+        let gun_de: GrpcMode = nextjson::from_str(&gun_json).unwrap();
+        let multi_de: GrpcMode = nextjson::from_str(&multi_json).unwrap();
 
         assert_eq!(gun_de, GrpcMode::Gun);
         assert_eq!(multi_de, GrpcMode::Multi);

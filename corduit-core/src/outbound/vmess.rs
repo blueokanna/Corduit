@@ -800,10 +800,10 @@ impl VmessOutbound {
 
             let mut headers = std::collections::HashMap::new();
             if let Some(headers_value) = ws_opts_value.and_then(|v| v.get("headers")) {
-                if let Some(map) = headers_value.as_mapping() {
-                    for (k, v) in map {
-                        if let (Some(key), Some(value)) = (k.as_str(), v.as_str()) {
-                            headers.insert(key.to_string(), value.to_string());
+                if let Some(map) = headers_value.as_object() {
+                    for (k, v) in map.iter() {
+                        if let Some(value) = v.as_str() {
+                            headers.insert(k.to_string(), value.to_string());
                         }
                     }
                 }
@@ -823,7 +823,7 @@ impl VmessOutbound {
             .options
             .get("quic-opts")
             .and_then(|v| v.get("alpn"))
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(String::from))
@@ -2067,17 +2067,17 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
         options.insert(
             "alterId".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(0)),
+            nextjson::Value::Number(nextjson::Number::from(0)),
         );
         options.insert(
             "cipher".to_string(),
-            serde_yaml::Value::String("aes-128-gcm".to_string()),
+            nextjson::Value::String("aes-128-gcm".to_string()),
         );
-        options.insert("udp".to_string(), serde_yaml::Value::Bool(true));
+        options.insert("udp".to_string(), nextjson::Value::Bool(true));
 
         let config = OutboundConfig {
             tag: "vmess-test".to_string(),
@@ -2115,7 +2115,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("invalid-uuid".to_string()),
+            nextjson::Value::String("invalid-uuid".to_string()),
         );
 
         let config = OutboundConfig {
@@ -2135,7 +2135,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
 
         let config = OutboundConfig {
@@ -2157,7 +2157,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
 
         let config = OutboundConfig {
@@ -2185,7 +2185,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
 
         let config = OutboundConfig {
@@ -2216,7 +2216,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
 
         let config = OutboundConfig {
@@ -2249,11 +2249,11 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
         options.insert(
             "cipher".to_string(),
-            serde_yaml::Value::String("aes-128-gcm".to_string()),
+            nextjson::Value::String("aes-128-gcm".to_string()),
         );
 
         let config = OutboundConfig {
@@ -2285,11 +2285,11 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
         options.insert(
             "cipher".to_string(),
-            serde_yaml::Value::String("chacha20-poly1305".to_string()),
+            nextjson::Value::String("chacha20-poly1305".to_string()),
         );
 
         let config = OutboundConfig {
@@ -2321,11 +2321,11 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
         options.insert(
             "cipher".to_string(),
-            serde_yaml::Value::String("none".to_string()),
+            nextjson::Value::String("none".to_string()),
         );
 
         let config = OutboundConfig {
@@ -2382,11 +2382,11 @@ mod property_tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
         options.insert(
             "cipher".to_string(),
-            serde_yaml::Value::String(cipher_str.to_string()),
+            nextjson::Value::String(cipher_str.to_string()),
         );
 
         let config = OutboundConfig {

@@ -7,6 +7,32 @@ use std::net::Ipv4Addr;
 use std::process::Command;
 use tracing::{error, info, warn};
 
+/// Validate a Windows network interface name before it is embedded into
+/// PowerShell / netsh command lines.
+///
+/// Interface names flow into interpolated PowerShell `-Command` strings such
+/// as `Set-NetIPInterface -InterfaceAlias '{}' -InterfaceMetric 1`. Although
+/// the name is wrapped in single quotes, a name containing `'`, `"`, `` ` ``,
+/// `$` or command separators could break out of the string and execute
+/// arbitrary commands (CWE-78). Such characters are rejected outright, while
+/// Unicode adapter names (e.g. Chinese "以太网") remain fully supported.
+fn sanitize_interface_name(name: &str) -> Result<&str, String> {
+    if name.is_empty() || name.len() > 128 {
+        return Err("invalid interface name: must be 1..=128 characters".to_string());
+    }
+    if name.chars().any(|c| {
+        matches!(
+            c,
+            '\'' | '"' | '`' | '$' | ';' | '&' | '|' | '<' | '>' | '\r' | '\n' | '\0'
+        )
+    }) {
+        return Err(format!(
+            "interface name contains characters unsafe for the shell: {name:?}"
+        ));
+    }
+    Ok(name)
+}
+
 /// Windows route manager for TUN mode
 pub struct WindowsRouteManager {
     /// TUN interface name
@@ -45,12 +71,13 @@ impl WindowsRouteManager {
 
     /// Get the interface index for the TUN adapter
     fn get_interface_index(&self) -> Option<u32> {
+        let name = sanitize_interface_name(&self.interface_name).ok()?;
         let output = Command::new("powershell")
             .args([
                 "-Command",
                 &format!(
                     "(Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue).ifIndex",
-                    self.interface_name
+                    name
                 ),
             ])
             .output()
@@ -310,6 +337,9 @@ impl Drop for WindowsRouteManager {
 
 /// Set Windows DNS servers for the TUN interface
 pub fn set_tun_dns(interface_name: &str, dns_servers: &[Ipv4Addr]) -> Result<(), String> {
+    // Reject shell-unsafe adapter names before interpolation (CWE-78).
+    let interface_name = sanitize_interface_name(interface_name)?;
+
     // First, set DNS for the TUN interface
     for (i, dns) in dns_servers.iter().enumerate() {
         let action = if i == 0 { "set" } else { "add" };

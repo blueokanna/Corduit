@@ -10,6 +10,7 @@
 //! - DNS resolution with DoH/DoT support (via corduit-dns)
 //! - Fake-IP mode for transparent proxying
 //! - SolidTCP: High-performance user-space TCP/IP stack (merged from corduit-solidtcp)
+#![cfg_attr(docsrs, feature(doc_cfg))]
 //!
 //! # Platform Requirements
 //!

@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct ClientConfig {
     pub server_name: Option<String>,
     pub alpn: Vec<String>,
@@ -19,7 +19,7 @@ impl Default for ClientConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct ServerConfig {
     pub certificate: String,
     pub private_key: String,

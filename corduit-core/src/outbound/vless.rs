@@ -152,7 +152,7 @@ impl VlessOutbound {
         let alpn = config
             .options
             .get("alpn")
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -789,21 +789,21 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
         options.insert(
             "flow".to_string(),
-            serde_yaml::Value::String("xtls-rprx-vision".to_string()),
+            nextjson::Value::String("xtls-rprx-vision".to_string()),
         );
         options.insert(
             "sni".to_string(),
-            serde_yaml::Value::String("custom.sni.com".to_string()),
+            nextjson::Value::String("custom.sni.com".to_string()),
         );
         options.insert(
             "skip-cert-verify".to_string(),
-            serde_yaml::Value::Bool(true),
+            nextjson::Value::Bool(true),
         );
-        options.insert("udp".to_string(), serde_yaml::Value::Bool(true));
+        options.insert("udp".to_string(), nextjson::Value::Bool(true));
 
         let config = OutboundConfig {
             tag: "vless-test".to_string(),
@@ -843,7 +843,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
 
         let config = OutboundConfig {
@@ -863,7 +863,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
 
         let config = OutboundConfig {
@@ -883,7 +883,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "uuid".to_string(),
-            serde_yaml::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
         );
 
         let config = OutboundConfig {

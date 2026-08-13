@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use ipnet::IpNet;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -9,23 +9,31 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleProviderType {
     Http,
     File,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+crate::impl_config_enum!(RuleProviderType {
+    Http => "http",
+    File => "file",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleProviderBehavior {
     Domain,
-    #[serde(alias = "ipcidr")]
     IpCidr,
     Classical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+crate::impl_config_enum!(RuleProviderBehavior {
+    Domain => "domain",
+    IpCidr => "ip-cidr" | "ipcidr" | "ip_cidr",
+    Classical => "classical",
+});
+
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct RuleProviderConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -231,8 +239,8 @@ impl RuleProvider {
     fn parse_domain_rules(&self, content: &str) -> Result<Vec<CompiledRuleEntry>> {
         let mut rules = Vec::new();
 
-        if let Ok(yaml_content) = serde_yaml::from_str::<serde_yaml::Value>(content) {
-            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_sequence()) {
+        if let Ok(yaml_content) = nextjson::from_str::<nextjson::Value>(content) {
+            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_array()) {
                 for item in payload {
                     if let Some(domain) = item.as_str() {
                         rules.push(self.parse_domain_entry(domain));
@@ -280,8 +288,8 @@ impl RuleProvider {
     fn parse_ipcidr_rules(&self, content: &str) -> Result<Vec<CompiledRuleEntry>> {
         let mut rules = Vec::new();
 
-        if let Ok(yaml_content) = serde_yaml::from_str::<serde_yaml::Value>(content) {
-            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_sequence()) {
+        if let Ok(yaml_content) = nextjson::from_str::<nextjson::Value>(content) {
+            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_array()) {
                 for item in payload {
                     if let Some(cidr) = item.as_str() {
                         if let Ok(network) = cidr.parse::<IpNet>() {
@@ -309,8 +317,8 @@ impl RuleProvider {
     fn parse_classical_rules(&self, content: &str) -> Result<Vec<CompiledRuleEntry>> {
         let mut rules = Vec::new();
 
-        if let Ok(yaml_content) = serde_yaml::from_str::<serde_yaml::Value>(content) {
-            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_sequence()) {
+        if let Ok(yaml_content) = nextjson::from_str::<nextjson::Value>(content) {
+            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_array()) {
                 for item in payload {
                     if let Some(rule_str) = item.as_str() {
                         if let Some(entry) = self.parse_classical_entry(rule_str) {

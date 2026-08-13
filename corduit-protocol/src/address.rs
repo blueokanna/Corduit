@@ -89,6 +89,10 @@ impl Address {
             }
             Self::Domain(domain, port) => {
                 let domain_bytes = domain.as_bytes();
+                debug_assert!(
+                    domain_bytes.len() <= u8::MAX as usize,
+                    "domain name exceeds the 255-byte wire limit"
+                );
                 buf.put_u8(AddressType::Domain as u8);
                 buf.put_u8(domain_bytes.len() as u8);
                 buf.put_slice(domain_bytes);
@@ -111,6 +115,10 @@ impl Address {
             }
             Self::Domain(domain, port) => {
                 let domain_bytes = domain.as_bytes();
+                debug_assert!(
+                    domain_bytes.len() <= u8::MAX as usize,
+                    "domain name exceeds the 255-byte wire limit"
+                );
                 buf.push(AddressType::Domain as u8);
                 buf.push(domain_bytes.len() as u8);
                 buf.extend_from_slice(domain_bytes);

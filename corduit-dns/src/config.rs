@@ -1,17 +1,18 @@
 //! DNS configuration
 
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 /// DNS server configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 #[serde(default)]
 pub struct DnsConfig {
     /// Enable DNS server
     pub enable: bool,
 
     /// Listen address for UDP DNS server
+    #[serde(default = "default_listen")]
     pub listen: SocketAddr,
 
     /// Enable TCP DNS server
@@ -63,6 +64,7 @@ pub struct DnsConfig {
     pub max_ttl: u64,
 
     /// Query timeout
+    #[serde(default = "default_timeout")]
     pub timeout: Duration,
 
     /// Hosts file entries
@@ -79,6 +81,14 @@ pub struct DnsConfig {
 
     /// Enable DNS over proxy (route DNS through proxy)
     pub proxy_dns: bool,
+}
+
+fn default_listen() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5353)
+}
+
+fn default_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 impl Default for DnsConfig {
@@ -127,7 +137,7 @@ impl Default for DnsConfig {
 }
 
 /// Fallback filter configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 #[serde(default)]
 pub struct FallbackFilter {
     /// Enable GeoIP-based fallback

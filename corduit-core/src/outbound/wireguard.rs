@@ -92,7 +92,7 @@ impl WireguardOutbound {
         let reserved = config
             .options
             .get("reserved")
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .and_then(|seq| {
                 if seq.len() >= 3 {
                     Some([
@@ -644,15 +644,15 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "private-key".to_string(),
-            serde_yaml::Value::String(priv_key_b64),
+            nextjson::Value::String(priv_key_b64),
         );
         options.insert(
             "public-key".to_string(),
-            serde_yaml::Value::String(peer_pub_b64),
+            nextjson::Value::String(peer_pub_b64),
         );
         options.insert(
             "local-address".to_string(),
-            serde_yaml::Value::String("10.0.0.2/32".to_string()),
+            nextjson::Value::String("10.0.0.2/32".to_string()),
         );
 
         let config = OutboundConfig {
@@ -674,7 +674,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "public-key".to_string(),
-            serde_yaml::Value::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+            nextjson::Value::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
         );
 
         let config = OutboundConfig {
@@ -699,11 +699,11 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "private-key".to_string(),
-            serde_yaml::Value::String(STANDARD.encode(priv_key)),
+            nextjson::Value::String(STANDARD.encode(priv_key)),
         );
         options.insert(
             "public-key".to_string(),
-            serde_yaml::Value::String(STANDARD.encode(peer_pub)),
+            nextjson::Value::String(STANDARD.encode(peer_pub)),
         );
 
         let config = OutboundConfig {

@@ -3,13 +3,13 @@ name = "corduit-lib"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.85"
 readme.workspace = true
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Hand-written C ABI bindings for the Corduit proxy engine (nextjson + rustbinary)"
+description = "Hand-written C ABI bindings for the Corduit proxy engine"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -18,37 +18,32 @@ all-features = true
 name = "rust_lib_corduit"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
+# HarmonyOS (OpenHarmony) targets expose `target_os = "ohos"`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_os, values("ohos"))',
+] }
+
 [dependencies]
 aes-gcm = { workspace = true }
-bytes = { workspace = true }
 chrono = { workspace = true }
+corduit-core = { workspace = true }
+corduit-netstack = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
 hkdf = { workspace = true }
-http-body-util = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 md-5 = { workspace = true }
 nextjson = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 rustbinary = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 sha1 = { workspace = true }
 sysinfo = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
-corduit-core = { workspace = true }
-corduit-netstack = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { workspace = true }

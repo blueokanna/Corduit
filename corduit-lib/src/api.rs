@@ -8,18 +8,24 @@ use corduit_core::Config;
 
 static TRACING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Bridge a `nextjson::Value` into a serde-based core type via JSON text.
-///
-/// The FFI boundary speaks `nextjson`; engine types keep their `serde`
-/// contract. Crossing the boundary through canonical JSON keeps the two
-/// frameworks decoupled (no shared derive on one type).
-fn nextjson_to_core<T: serde::de::DeserializeOwned>(value: &nextjson::Value) -> Result<T> {
+/// Bridge a `nextjson::Value` into a typed core/engine value through canonical
+/// JSON text. Both sides speak `nextjson`, so the crossing is a pure
+/// `Value` → `T` decode with no external serialization framework involved.
+fn nextjson_to_core<T>(value: &nextjson::Value) -> Result<T>
+where
+    T: for<'de> nextjson::NsonDeserialize<'de>,
+{
     let json = nextjson::to_string(value)
         .map_err(|e| CorduitError::Parse(format!("bridge encode failed: {e}")))?;
-    serde_json::from_str(&json).map_err(|e| CorduitError::Parse(format!("bridge decode failed: {e}")))
+    nextjson::from_str(&json)
+        .map_err(|e| CorduitError::Parse(format!("bridge decode failed: {e}")))
 }
 
 pub fn init_app() {
+    // `reqwest` is compiled with `rustls-no-provider`: a crypto provider must
+    // be installed before any HTTP client is built.
+    corduit_core::tls::install_crypto_provider();
+
     if TRACING_INITIALIZED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
@@ -86,10 +92,10 @@ fn init_tracing_safe() -> std::result::Result<(), ()> {
 
 // ============== Proxy Control API (Design Document Compliant) ==============
 pub async fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
-    tracing::info!("Starting proxy from YAML config...");
+    tracing::info!("Starting proxy from config JSON...");
 
     let config: Config =
-        serde_yaml::from_str(&yaml_config).map_err(|e| format!("Invalid YAML config: {}", e))?;
+        nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {}", e))?;
     {
         let mut instance = CORDUIT_INSTANCE.write().await;
         if let Some(ref corduit) = *instance {
@@ -114,7 +120,7 @@ pub async fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(
     let mut instance = CORDUIT_INSTANCE.write().await;
     *instance = Some(corduit);
 
-    tracing::info!("Proxy started successfully from YAML config");
+    tracing::info!("Proxy started successfully from config JSON");
     Ok(())
 }
 
@@ -175,9 +181,9 @@ pub async fn is_proxy_running() -> std::result::Result<bool, String> {
 }
 
 pub async fn reload_config_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
-    tracing::info!("Reloading config from YAML...");
+    tracing::info!("Reloading config from JSON...");
     let config: Config =
-        serde_yaml::from_str(&yaml_config).map_err(|e| format!("Invalid YAML config: {}", e))?;
+        nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {}", e))?;
 
     let instance = get_corduit_instance()
         .await
@@ -345,7 +351,7 @@ pub async fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, Strin
             let proxies: Vec<String> = outbound
                 .options
                 .get("proxies")
-                .and_then(|v| v.as_sequence())
+                .and_then(|v| v.as_array())
                 .map(|seq| {
                     seq.iter()
                         .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -1339,28 +1345,14 @@ fn parse_rule_type(value: &str) -> Result<corduit_core::RuleType> {
     }
 }
 
-fn decode_options(kind: &str, tag: &str, raw: &str) -> Result<HashMap<String, serde_yaml::Value>> {
+fn decode_options(kind: &str, tag: &str, raw: &str) -> Result<HashMap<String, nextjson::Value>> {
     if raw.trim().is_empty() {
         return Ok(HashMap::new());
     }
 
-    let json: HashMap<String, nextjson::Value> = nextjson::from_str(raw).map_err(|error| {
+    nextjson::from_str(raw).map_err(|error| {
         CorduitError::Config(format!("Invalid {kind} options for '{tag}': {error}"))
-    })?;
-
-    json.into_iter()
-        .map(|(key, value)| {
-            nextjson_to_core::<serde_json::Value>(&value)
-                .and_then(|serde_value| {
-                    serde_yaml::to_value(serde_value).map_err(|error| {
-                        CorduitError::Config(format!(
-                            "Invalid {kind} option '{key}' for '{tag}': {error}"
-                        ))
-                    })
-                })
-                .map(|value| (key, value))
-        })
-        .collect()
+    })
 }
 
 // ============== Latency Testing ==============
@@ -2407,7 +2399,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
 
             while let Some(packet) = tun_rx.recv().await {
                 packet_count += 1;
-                if packet_count <= 10 || packet_count.is_multiple_of(100) {
+                if packet_count <= 10 || packet_count % 100 == 0 {
                     tracing::debug!(
                         "Processing packet #{}: {} bytes",
                         packet_count,

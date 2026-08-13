@@ -4,12 +4,27 @@ pub use corduit_protocol::tls::{
     ClientConfig, ServerConfig, SkipServerVerification, TlsAcceptor, TlsConnector, TlsStream,
 };
 
-pub fn yaml_value_to_string(value: &serde_yaml::Value) -> String {
+pub fn yaml_value_to_string(value: &nextjson::Value) -> String {
     match value {
-        serde_yaml::Value::String(s) => s.clone(),
-        serde_yaml::Value::Number(n) => n.to_string(),
-        serde_yaml::Value::Bool(b) => b.to_string(),
+        nextjson::Value::String(s) => s.clone(),
+        nextjson::Value::Number(n) => n.to_string(),
+        nextjson::Value::Bool(b) => b.to_string(),
         _ => value.as_str().map(|s| s.to_string()).unwrap_or_default(),
+    }
+}
+
+/// Install the default rustls crypto provider (ring).
+///
+/// `reqwest` is compiled with `rustls-no-provider`, so a provider MUST be
+/// installed before any [`reqwest::Client`] is built, otherwise the client
+/// constructor panics. This function is idempotent: once a provider is active,
+/// subsequent calls are no-ops, so it is safe to invoke from every entry point
+/// (`Corduit::new`, FFI `init_app`, …).
+pub fn install_crypto_provider() {
+    use rustls::crypto::CryptoProvider;
+
+    if CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }
 

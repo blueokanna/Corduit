@@ -417,7 +417,7 @@ impl Hysteria2Outbound {
         let alpn = config
             .options
             .get("alpn")
-            .and_then(|v| v.as_sequence())
+            .and_then(|v| v.as_array())
             .map(|seq| {
                 seq.iter()
                     .filter_map(|v| v.as_str().map(String::from))
@@ -963,21 +963,21 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "password".to_string(),
-            serde_yaml::Value::String("test_pass".to_string()),
+            nextjson::Value::String("test_pass".to_string()),
         );
         options.insert(
             "skip-cert-verify".to_string(),
-            serde_yaml::Value::Bool(true),
+            nextjson::Value::Bool(true),
         );
-        options.insert("up".to_string(), serde_yaml::Value::Number(100.into()));
-        options.insert("down".to_string(), serde_yaml::Value::Number(200.into()));
+        options.insert("up".to_string(), nextjson::Value::Number(100.into()));
+        options.insert("down".to_string(), nextjson::Value::Number(200.into()));
         options.insert(
             "obfs".to_string(),
-            serde_yaml::Value::String("salamander".to_string()),
+            nextjson::Value::String("salamander".to_string()),
         );
         options.insert(
             "obfs-password".to_string(),
-            serde_yaml::Value::String("obfs_pass".to_string()),
+            nextjson::Value::String("obfs_pass".to_string()),
         );
 
         let config = OutboundConfig {
@@ -1018,7 +1018,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "password".to_string(),
-            serde_yaml::Value::String("test_pass".to_string()),
+            nextjson::Value::String("test_pass".to_string()),
         );
 
         let config = OutboundConfig {

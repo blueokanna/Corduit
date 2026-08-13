@@ -123,12 +123,16 @@ proptest! {
 
         let provider = RuleProvider::new(config);
 
-        let yaml_content = format!(
-            "payload:\n{}",
-            domains.iter().map(|d| format!("  - {}", d)).collect::<Vec<_>>().join("\n")
+        let json_content = format!(
+            r#"{{"payload": [{}]}}"#,
+            domains
+                .iter()
+                .map(|d| format!("\"{d}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
-        let rules = provider.parse_rules(&yaml_content);
+        let rules = provider.parse_rules(&json_content);
         prop_assert!(rules.is_ok(), "Parsing should succeed");
 
         let rules = rules.unwrap();
@@ -161,12 +165,16 @@ proptest! {
 
         let provider = RuleProvider::new(config);
 
-        let yaml_content = format!(
-            "payload:\n{}",
-            cidrs.iter().map(|c| format!("  - {}", c)).collect::<Vec<_>>().join("\n")
+        let json_content = format!(
+            r#"{{"payload": [{}]}}"#,
+            cidrs
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
-        let rules = provider.parse_rules(&yaml_content);
+        let rules = provider.parse_rules(&json_content);
         prop_assert!(rules.is_ok(), "Parsing should succeed");
 
         let rules = rules.unwrap();
@@ -282,15 +290,22 @@ proptest! {
 
         let mut rules_content = Vec::new();
         for domain in &domains {
-            rules_content.push(format!("  - DOMAIN-SUFFIX,{}", domain));
+            rules_content.push(format!("DOMAIN-SUFFIX,{}", domain));
         }
         for cidr in &cidrs {
-            rules_content.push(format!("  - IP-CIDR,{}", cidr));
+            rules_content.push(format!("IP-CIDR,{}", cidr));
         }
 
-        let yaml_content = format!("payload:\n{}", rules_content.join("\n"));
+        let json_content = format!(
+            r#"{{"payload": [{}]}}"#,
+            rules_content
+                .iter()
+                .map(|r| format!("\"{r}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
-        let rules = provider.parse_rules(&yaml_content);
+        let rules = provider.parse_rules(&json_content);
         prop_assert!(rules.is_ok(), "Parsing should succeed");
 
         let rules = rules.unwrap();
@@ -317,21 +332,21 @@ proptest! {
 
         let provider = ProxyProvider::new(config);
 
-        let proxies_yaml: Vec<String> = proxy_names
+        let proxies_json: Vec<String> = proxy_names
             .iter()
             .enumerate()
             .map(|(i, name)| {
                 format!(
-                    "  - type: socks5\n    tag: {}\n    server: 127.0.0.1\n    port: {}",
+                    r#"{{"type": "socks5", "tag": "{}", "server": "127.0.0.1", "port": {}}}"#,
                     name,
                     1080 + i
                 )
             })
             .collect();
 
-        let yaml_content = format!("proxies:\n{}", proxies_yaml.join("\n"));
+        let json_content = format!(r#"{{"proxies": [{}]}}"#, proxies_json.join(", "));
 
-        let result = provider.parse_proxies(&yaml_content);
+        let result = provider.parse_proxies(&json_content);
         prop_assert!(result.is_ok(), "Parsing should succeed: {:?}", result.err());
 
         let configs = result.unwrap();
@@ -416,26 +431,23 @@ mod unit_tests {
             name: "test".to_string(),
             provider_type: ProxyProviderType::File,
             url: None,
-            path: Some("/tmp/test.yaml".to_string()),
+            path: Some("/tmp/test.json".to_string()),
             interval: 86400,
             health_check: HealthCheckConfig::default(),
         };
 
         let provider = ProxyProvider::new(config);
 
-        let yaml_content = r#"
-proxies:
-  - type: socks5
-    tag: proxy1
-    server: 127.0.0.1
-    port: 1080
-  - type: http
-    tag: proxy2
-    server: 127.0.0.1
-    port: 8080
+        let json_content = r#"
+{
+  "proxies": [
+    {"type": "socks5", "tag": "proxy1", "server": "127.0.0.1", "port": 1080},
+    {"type": "http", "tag": "proxy2", "server": "127.0.0.1", "port": 8080}
+  ]
+}
 "#;
 
-        let result = provider.parse_proxies(yaml_content);
+        let result = provider.parse_proxies(json_content);
         assert!(result.is_ok());
 
         let configs = result.unwrap();

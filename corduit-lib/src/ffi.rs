@@ -482,10 +482,121 @@ async fn dispatch(method: &str, args: Args<'_>) -> HandlerResult {
 // Public entry points
 // ---------------------------------------------------------------------------
 
+/// Bridge ABI version. Bump on any breaking change to `corduit_call` /
+/// `corduit_call_binary` semantics or payload schemas.
+pub const CORDUIT_API_VERSION: &str = "0.1.0";
+
+/// Every method accepted by [`dispatch`]. Cross-language hosts use
+/// [`corduit_methods`] to validate their bindings against the running library
+/// instead of hard-coding method lists.
+pub const CORDUIT_METHODS: &[&str] = &[
+    // lifecycle
+    "init_app",
+    // proxy control (YAML)
+    "start_proxy_from_yaml",
+    "start_proxy_from_file",
+    "stop_proxy",
+    "is_proxy_running",
+    "reload_config_from_yaml",
+    "reload_config_from_file",
+    // dashboard / DTOs
+    "get_traffic_stats_dto",
+    "get_connections_dto",
+    "close_connection_by_id",
+    "close_all_connections_dto",
+    "get_proxies",
+    "get_proxy_groups",
+    "select_proxy",
+    "test_proxy_latency_dto",
+    "test_all_proxies_latency",
+    "get_rules",
+    "get_dns_config",
+    "set_proxy_mode",
+    "get_proxy_mode",
+    // TUN / VPN
+    "start_tun_mode",
+    "stop_tun_mode",
+    // modern engine API
+    "initialize_corduit",
+    "start_corduit",
+    "stop_corduit",
+    "reload_corduit",
+    "get_corduit_status",
+    "get_traffic_stats",
+    "test_config",
+    "get_connections",
+    "close_connection",
+    "get_logs",
+    "set_log_level",
+    "get_system_info",
+    "get_version",
+    "get_build_info",
+    // latency testing
+    "test_proxy_latency",
+    "test_outbound_latency",
+    "test_tcp_connectivity",
+    "test_shadowsocks_latency",
+    "test_proxies_latency",
+    // proxy group selection
+    "select_proxy_in_group",
+    "get_selected_proxy_in_group",
+    // connection tracking
+    "get_active_connections",
+    "close_active_connection",
+    "close_all_connections",
+    "get_connection_stats",
+    // wintun / TUN status
+    "is_wintun_available",
+    "get_wintun_dll_path",
+    "ensure_wintun_dll",
+    "enable_tun_mode",
+    "enable_tun_mode_with_mode",
+    "disable_tun_mode",
+    "get_tun_status",
+    "set_windows_proxy_mode",
+    "get_windows_proxy_mode_str",
+    "get_windows_tun_stats",
+    "enable_uwp_loopback",
+    "open_uwp_loopback_utility",
+    // android
+    "set_android_vpn_fd",
+    "get_android_vpn_fd",
+    "clear_android_vpn_fd",
+    "set_android_proxy_mode",
+    "get_android_proxy_mode",
+    "start_android_vpn",
+    "stop_android_vpn",
+    // vpn fd (legacy)
+    "set_vpn_fd",
+    "clear_vpn_fd",
+    "set_protect_socket_callback_enabled",
+];
+
 /// Initialize the bridge (logging, tracing, platform hooks).
 #[no_mangle]
 pub extern "C" fn corduit_init() {
     api::init_app();
+}
+
+/// Return the bridge ABI version as a C string (caller frees with
+/// [`corduit_string_free`]).
+#[no_mangle]
+pub extern "C" fn corduit_api_version() -> *mut c_char {
+    into_cstring(CORDUIT_API_VERSION.to_string())
+}
+
+/// Return the list of supported `corduit_call` methods as a JSON array string
+/// (caller frees with [`corduit_string_free`]).
+#[no_mangle]
+pub extern "C" fn corduit_methods() -> *mut c_char {
+    let json = nextjson::to_string(&nextjson::Value::Array(
+        CORDUIT_METHODS
+            .iter()
+            .map(|m| nextjson::Value::String((*m).to_string()))
+            .collect(),
+    ))
+    .unwrap_or_else(|_| "[]".to_string());
+    into_cstring(json)
 }
 
 /// Invoke a named API with a nextjson (JSON) payload.
@@ -495,8 +606,16 @@ pub extern "C" fn corduit_init() {
 ///
 /// Returns an [`FfiResponse`] whose `data` must be released with
 /// [`corduit_string_free`].
+///
+/// # Safety
+///
+/// Both pointers must be valid NUL-terminated C strings (or null) and stay
+/// valid for the duration of the call.
 #[no_mangle]
-pub extern "C" fn corduit_call(method: *const c_char, args_json: *const c_char) -> FfiResponse {
+pub unsafe extern "C" fn corduit_call(
+    method: *const c_char,
+    args_json: *const c_char,
+) -> FfiResponse {
     let method = unsafe { read_cstr(method) }.to_string();
     let raw = unsafe { read_cstr(args_json) };
     let value: nextjson::Value = if raw.is_empty() {
@@ -522,8 +641,14 @@ pub extern "C" fn corduit_call(method: *const c_char, args_json: *const c_char) 
 ///
 /// Returns an [`FfiBinaryResponse`] whose buffer must be released with
 /// [`corduit_binary_free`].
+///
+/// # Safety
+///
+/// `method` must be a valid NUL-terminated C string (or null); `payload` must
+/// point to `len` readable bytes (or be null when `len == 0`) and stay valid
+/// for the duration of the call.
 #[no_mangle]
-pub extern "C" fn corduit_call_binary(
+pub unsafe extern "C" fn corduit_call_binary(
     method: *const c_char,
     payload: *const u8,
     len: usize,
@@ -595,5 +720,44 @@ mod tests {
         let encoded = rustbinary::serialize(&value).expect("binary encode");
         let decoded: nextjson::Value = rustbinary::deserialize(&encoded).expect("binary decode");
         assert_eq!(decoded.get("mode").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn every_declared_method_is_dispatched() {
+        // Ensure platform hooks (incl. the rustls crypto provider) are ready
+        // before dispatching methods that build HTTP clients.
+        api::init_app();
+
+        let value = nextjson::Value::Null;
+        for method in CORDUIT_METHODS {
+            let result = runtime().block_on(dispatch(method, Args(&value)));
+            if let Err(e) = result {
+                assert!(
+                    !e.starts_with("unknown method"),
+                    "declared method '{method}' is missing from dispatch: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn methods_discovery_returns_valid_json_array() {
+        let ptr = corduit_methods();
+        assert!(!ptr.is_null());
+        let json = unsafe {
+            let s = CStr::from_ptr(ptr).to_str().unwrap().to_string();
+            drop(CString::from_raw(ptr));
+            s
+        };
+        let parsed: nextjson::Value = nextjson::from_str(&json).expect("valid JSON");
+        let methods = parsed.as_array().expect("array of method names");
+        assert_eq!(methods.len(), CORDUIT_METHODS.len());
+        assert!(methods.iter().all(|m| m.as_str().is_some()));
+    }
+
+    #[test]
+    fn api_version_is_semver_like() {
+        let version = CORDUIT_API_VERSION;
+        assert!(version.split('.').count() >= 2, "expected semver-ish string");
     }
 }

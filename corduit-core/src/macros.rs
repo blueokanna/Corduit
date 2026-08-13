@@ -1,3 +1,50 @@
+/// String-based codec for unit-variant enums in configuration files.
+///
+/// nextjson's derived enum codec uses externally-tagged objects
+/// (`{"socks5": null}`); Corduit configuration spells such values as plain
+/// strings (`"socks5"`). This macro implements a string codec: the first
+/// literal is the canonical serialized name, the remaining literals are
+/// accepted deserialization aliases. This keeps the config format stable and
+/// human-friendly while staying 100% on `nextjson` (no serde anywhere).
+#[macro_export]
+macro_rules! impl_config_enum {
+    ($ty:ident { $($variant:ident => $canonical:literal $(| $alias:literal)*),+ $(,)? }) => {
+        impl ::nextjson::NsonSchema for $ty {
+            const SCHEMA: ::nextjson::TypeSchema = ::nextjson::TypeSchema::Str;
+        }
+        impl ::nextjson::NsonSerialize for $ty {
+            fn nextencode<E: ::nextjson::FormatEncoder>(
+                &self,
+                e: &mut E,
+            ) -> ::core::result::Result<(), E::Error> {
+                let name = match self {
+                    $($ty::$variant => $canonical,)+
+                };
+                e.write_str(name)
+            }
+        }
+        impl<'de> ::nextjson::NsonDeserialize<'de> for $ty {
+            fn nextdecode_into<D: ::nextjson::FormatDecoder<'de>>(
+                d: &mut D,
+                out: &mut ::nextjson::DecodeSlot<Self>,
+            ) -> ::core::result::Result<(), D::Error> {
+                let s = d.string()?;
+                let value = match s.as_ref() {
+                    $($canonical $(| $alias)* => $ty::$variant,)+
+                    other => {
+                        return Err(::nextjson::Error::custom(
+                            format!("invalid {} value: {other}", stringify!($ty)),
+                        )
+                        .into());
+                    }
+                };
+                out.write(value);
+                Ok(())
+            }
+        }
+    };
+}
+
 #[macro_export]
 macro_rules! bail_config {
     ($($arg:tt)*) => {
@@ -127,60 +174,60 @@ macro_rules! try_config {
 macro_rules! get_option {
     ($options:expr, $key:expr, String) => {
         $options.get($key).and_then(|v| match v {
-            serde_yaml::Value::String(s) => Some(s.clone()),
-            serde_yaml::Value::Number(n) => Some(n.to_string()),
-            serde_yaml::Value::Bool(b) => Some(b.to_string()),
+            nextjson::Value::String(s) => Some(s.clone()),
+            nextjson::Value::Number(n) => Some(n.to_string()),
+            nextjson::Value::Bool(b) => Some(b.to_string()),
             _ => None,
         })
     };
     ($options:expr, $key:expr, u16) => {
         $options.get($key).and_then(|v| match v {
-            serde_yaml::Value::Number(n) => n.as_u64().map(|n| n as u16),
-            serde_yaml::Value::String(s) => s.parse::<u16>().ok(),
+            nextjson::Value::Number(n) => n.as_u64().map(|n| n as u16),
+            nextjson::Value::String(s) => s.parse::<u16>().ok(),
             _ => None,
         })
     };
     ($options:expr, $key:expr, u32) => {
         $options.get($key).and_then(|v| match v {
-            serde_yaml::Value::Number(n) => n.as_u64().map(|n| n as u32),
-            serde_yaml::Value::String(s) => s.parse::<u32>().ok(),
+            nextjson::Value::Number(n) => n.as_u64().map(|n| n as u32),
+            nextjson::Value::String(s) => s.parse::<u32>().ok(),
             _ => None,
         })
     };
     ($options:expr, $key:expr, u64) => {
         $options.get($key).and_then(|v| match v {
-            serde_yaml::Value::Number(n) => n.as_u64(),
-            serde_yaml::Value::String(s) => s.parse::<u64>().ok(),
+            nextjson::Value::Number(n) => n.as_u64(),
+            nextjson::Value::String(s) => s.parse::<u64>().ok(),
             _ => None,
         })
     };
     ($options:expr, $key:expr, i64) => {
         $options.get($key).and_then(|v| match v {
-            serde_yaml::Value::Number(n) => n.as_i64(),
-            serde_yaml::Value::String(s) => s.parse::<i64>().ok(),
+            nextjson::Value::Number(n) => n.as_i64(),
+            nextjson::Value::String(s) => s.parse::<i64>().ok(),
             _ => None,
         })
     };
     ($options:expr, $key:expr, bool) => {
         $options.get($key).and_then(|v| match v {
-            serde_yaml::Value::Bool(b) => Some(*b),
-            serde_yaml::Value::String(s) => match s.to_lowercase().as_str() {
+            nextjson::Value::Bool(b) => Some(*b),
+            nextjson::Value::String(s) => match s.to_lowercase().as_str() {
                 "true" | "yes" | "1" | "on" => Some(true),
                 "false" | "no" | "0" | "off" => Some(false),
                 _ => None,
             },
-            serde_yaml::Value::Number(n) => n.as_i64().map(|n| n != 0),
+            nextjson::Value::Number(n) => n.as_i64().map(|n| n != 0),
             _ => None,
         })
     };
     ($options:expr, $key:expr, Vec<String>) => {
         $options.get($key).and_then(|v| match v {
-            serde_yaml::Value::Sequence(seq) => {
+            nextjson::Value::Array(seq) => {
                 let strings: Vec<String> = seq
                     .iter()
                     .filter_map(|item| match item {
-                        serde_yaml::Value::String(s) => Some(s.clone()),
-                        serde_yaml::Value::Number(n) => Some(n.to_string()),
+                        nextjson::Value::String(s) => Some(s.clone()),
+                        nextjson::Value::Number(n) => Some(n.to_string()),
                         _ => None,
                     })
                     .collect();
@@ -190,7 +237,7 @@ macro_rules! get_option {
                     Some(strings)
                 }
             }
-            serde_yaml::Value::String(s) => Some(vec![s.clone()]),
+            nextjson::Value::String(s) => Some(vec![s.clone()]),
             _ => None,
         })
     };
@@ -449,7 +496,7 @@ macro_rules! relay_streams {
 
 #[cfg(test)]
 mod tests {
-    use serde_yaml::Value;
+    use nextjson::Value;
     use std::collections::HashMap;
 
     fn create_test_map() -> HashMap<String, Value> {
@@ -457,13 +504,13 @@ mod tests {
         map.insert("string_val".to_string(), Value::String("hello".to_string()));
         map.insert(
             "number_val".to_string(),
-            Value::Number(serde_yaml::Number::from(42)),
+            Value::Number(nextjson::Number::from(42)),
         );
         map.insert("bool_val".to_string(), Value::Bool(true));
         map.insert("string_bool".to_string(), Value::String("yes".to_string()));
         map.insert(
             "array_val".to_string(),
-            Value::Sequence(vec![
+            Value::Array(vec![
                 Value::String("a".to_string()),
                 Value::String("b".to_string()),
             ]),

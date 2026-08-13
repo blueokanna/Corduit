@@ -5,21 +5,25 @@ use crate::outbound::{
     ShadowsocksOutbound, Socks5Outbound, TrojanOutbound, TuicOutbound, VlessOutbound,
     VmessOutbound, WireguardOutbound,
 };
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyProviderType {
     Http,
     File,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+crate::impl_config_enum!(ProxyProviderType {
+    Http => "http",
+    File => "file",
+});
+
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct ProxyProviderConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -32,7 +36,7 @@ pub struct ProxyProviderConfig {
     pub health_check: HealthCheckConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct HealthCheckConfig {
     #[serde(default = "default_health_check_enabled")]
     pub enable: bool,
@@ -211,23 +215,19 @@ impl ProxyProvider {
     }
 
     pub fn parse_proxies(&self, content: &str) -> Result<Vec<OutboundConfig>> {
-        #[derive(Deserialize)]
+        #[derive(NsonDeserialize)]
         struct ProxyFile {
             proxies: Option<Vec<OutboundConfig>>,
         }
 
-        if let Ok(yaml_content) = serde_yaml::from_str::<ProxyFile>(content) {
+        if let Ok(yaml_content) = nextjson::from_str::<ProxyFile>(content) {
             if let Some(proxies) = yaml_content.proxies {
                 return Ok(proxies);
             }
         }
 
-        if let Ok(proxies) = serde_yaml::from_str::<Vec<OutboundConfig>>(content) {
+        if let Ok(proxies) = nextjson::from_str::<Vec<OutboundConfig>>(content) {
             return Ok(proxies);
-        }
-
-        if let Ok(json_proxies) = serde_json::from_str::<Vec<OutboundConfig>>(content) {
-            return Ok(json_proxies);
         }
 
         Err(Error::parse("Failed to parse proxy provider content"))
@@ -633,26 +633,23 @@ mod tests {
             name: "test".to_string(),
             provider_type: ProxyProviderType::File,
             url: None,
-            path: Some("test.yaml".to_string()),
+            path: Some("test.json".to_string()),
             interval: 3600,
             health_check: HealthCheckConfig::default(),
         };
 
         let provider = ProxyProvider::new(config);
 
-        let yaml_content = r#"
-proxies:
-  - type: socks5
-    tag: proxy1
-    server: 127.0.0.1
-    port: 1080
-  - type: http
-    tag: proxy2
-    server: 127.0.0.1
-    port: 8080
+        let json_content = r#"
+{
+  "proxies": [
+    {"type": "socks5", "tag": "proxy1", "server": "127.0.0.1", "port": 1080},
+    {"type": "http", "tag": "proxy2", "server": "127.0.0.1", "port": 8080}
+  ]
+}
 "#;
 
-        let result = provider.parse_proxies(yaml_content);
+        let result = provider.parse_proxies(json_content);
         assert!(result.is_ok());
         let proxies = result.unwrap();
         assert_eq!(proxies.len(), 2);

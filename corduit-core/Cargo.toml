@@ -3,7 +3,7 @@ name = "corduit-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.85"
 readme.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -33,6 +33,7 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
+corduit-protocol = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
@@ -47,6 +48,7 @@ libc = { workspace = true }
 lru = { workspace = true }
 maxminddb = { workspace = true }
 md-5 = { workspace = true }
+nextjson = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 quinn = { workspace = true }
@@ -54,38 +56,27 @@ rand = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+rustls-native-certs = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 socket2 = { workspace = true }
-rustls-native-certs = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-corduit-protocol = { workspace = true }
 
+# feature-gated (jaeger)
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
-    "Win32_NetworkManagement_Rras",
-    "Win32_Networking_WinSock",
-    "Win32_System_ProcessStatus",
-    "Win32_System_Threading",
-] }
+windows = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

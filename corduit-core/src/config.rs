@@ -1,10 +1,10 @@
 pub mod validator;
 
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use std::collections::HashMap;
 
 /// Main configuration structure
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize, Default)]
 pub struct Config {
     /// General settings
     #[serde(default)]
@@ -54,7 +54,7 @@ impl Config {
 }
 
 /// General configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct GeneralConfig {
     /// Listening port for HTTP proxy
     #[serde(default = "default_port")]
@@ -132,7 +132,7 @@ impl Default for GeneralConfig {
 }
 
 /// DNS configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct DnsConfig {
     /// Enable DNS server
     #[serde(default)]
@@ -168,7 +168,7 @@ impl Default for DnsConfig {
 }
 
 /// Inbound configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct InboundConfig {
     /// Inbound type
     #[serde(rename = "type")]
@@ -186,11 +186,11 @@ pub struct InboundConfig {
 
     /// Protocol-specific options
     #[serde(flatten)]
-    pub options: HashMap<String, serde_yaml::Value>,
+    pub options: HashMap<String, nextjson::Value>,
 }
 
 /// Outbound configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct OutboundConfig {
     /// Outbound type
     #[serde(rename = "type")]
@@ -207,11 +207,11 @@ pub struct OutboundConfig {
 
     /// Protocol-specific options
     #[serde(flatten)]
-    pub options: HashMap<String, serde_yaml::Value>,
+    pub options: HashMap<String, nextjson::Value>,
 }
 
 /// Routing rule configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct RuleConfig {
     /// Rule type
     #[serde(rename = "type")]
@@ -228,15 +228,14 @@ pub struct RuleConfig {
 }
 
 /// Authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct AuthenticationConfig {
     pub username: String,
     pub password: String,
 }
 
 /// Proxy mode
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     #[default]
     Rule,
@@ -244,9 +243,14 @@ pub enum Mode {
     Direct,
 }
 
+impl_config_enum!(Mode {
+    Rule => "rule",
+    Global => "global",
+    Direct => "direct",
+});
+
 /// Log level
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogLevel {
     #[default]
     Info,
@@ -256,18 +260,29 @@ pub enum LogLevel {
     Silent,
 }
 
+impl_config_enum!(LogLevel {
+    Info => "info",
+    Warning => "warning" | "warn",
+    Error => "error",
+    Debug => "debug",
+    Silent => "silent",
+});
+
 /// DNS mode
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DnsMode {
     #[default]
     Normal,
     FakeIp,
 }
 
+impl_config_enum!(DnsMode {
+    Normal => "normal",
+    FakeIp => "fake-ip" | "fakeip" | "fake_ip",
+});
+
 /// Inbound protocol types
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundType {
     Http,
     Socks5,
@@ -277,9 +292,17 @@ pub enum InboundType {
     Tun,
 }
 
+impl_config_enum!(InboundType {
+    Http => "http",
+    Socks5 => "socks5" | "socks",
+    Mixed => "mixed",
+    Redir => "redir",
+    Tproxy => "tproxy",
+    Tun => "tun",
+});
+
 /// Outbound protocol types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundType {
     Direct,
     Reject,
@@ -290,26 +313,39 @@ pub enum OutboundType {
     Wireguard,
     Socks5,
     Http,
-    #[serde(alias = "tuic")]
     Tuic,
-    #[serde(alias = "hysteria2", alias = "hy2")]
     Hysteria2,
-    #[serde(alias = "quic", alias = "shadowquic")]
     Quic,
     // Proxy group types
-    #[serde(alias = "select")]
     Selector,
-    #[serde(alias = "url-test")]
     Urltest,
     Fallback,
-    #[serde(alias = "load-balance")]
     Loadbalance,
     Relay,
 }
 
+impl_config_enum!(OutboundType {
+    Direct => "direct",
+    Reject => "reject",
+    Shadowsocks => "shadowsocks" | "ss",
+    Vmess => "vmess",
+    Vless => "vless",
+    Trojan => "trojan",
+    Wireguard => "wireguard",
+    Socks5 => "socks5" | "socks",
+    Http => "http",
+    Tuic => "tuic",
+    Hysteria2 => "hysteria2" | "hy2",
+    Quic => "quic" | "shadowquic",
+    Selector => "selector" | "select",
+    Urltest => "url-test" | "urltest",
+    Fallback => "fallback",
+    Loadbalance => "load-balance" | "loadbalance",
+    Relay => "relay",
+});
+
 /// Rule types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleType {
     Domain,
     DomainSuffix,
@@ -324,6 +360,21 @@ pub enum RuleType {
     RuleSet,
     Match,
 }
+
+impl_config_enum!(RuleType {
+    Domain => "domain",
+    DomainSuffix => "domain-suffix" | "domain_suffix",
+    DomainKeyword => "domain-keyword" | "domain_keyword",
+    DomainRegex => "domain-regex" | "domain_regex",
+    Geoip => "geoip",
+    IpCidr => "ip-cidr" | "ip_cidr",
+    SrcIpCidr => "src-ip-cidr" | "src_ip_cidr",
+    SrcPort => "src-port" | "src_port",
+    DstPort => "dst-port" | "dst_port",
+    ProcessName => "process-name" | "process_name",
+    RuleSet => "rule-set" | "rule_set",
+    Match => "match",
+});
 
 fn default_port() -> u16 {
     7890

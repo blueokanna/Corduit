@@ -6,12 +6,12 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use h2::client::{self, SendRequest};
 use http::{Method, Request, Uri};
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{Result, TransportError};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct H2Config {
     #[serde(default = "default_path")]
     pub path: String,
@@ -302,8 +302,8 @@ mod tests {
             method: "POST".to_string(),
         };
 
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: H2Config = serde_json::from_str(&json).unwrap();
+        let json = nextjson::to_string(&config).unwrap();
+        let deserialized: H2Config = nextjson::from_str(&json).unwrap();
 
         assert_eq!(deserialized.path, config.path);
         assert_eq!(deserialized.host, config.host);

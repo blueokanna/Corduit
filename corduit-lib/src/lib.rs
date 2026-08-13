@@ -1,4 +1,3 @@
-#![allow(unexpected_cfgs)]
 mod logging;
 
 use std::sync::Arc;

@@ -8,6 +8,7 @@
 //! - Anti-spoofing protection
 //! - Domain-based routing (domestic/foreign DNS)
 //! - Hosts file support
+#![cfg_attr(docsrs, feature(doc_cfg))]
 //!
 //! # Architecture
 //!

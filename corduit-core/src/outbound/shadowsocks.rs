@@ -1110,11 +1110,11 @@ mod tests {
                 let mut opts = std::collections::HashMap::new();
                 opts.insert(
                     "password".to_string(),
-                    serde_yaml::Value::String("test".to_string()),
+                    nextjson::Value::String("test".to_string()),
                 );
                 opts.insert(
                     "cipher".to_string(),
-                    serde_yaml::Value::String("aes-256-gcm".to_string()),
+                    nextjson::Value::String("aes-256-gcm".to_string()),
                 );
                 opts
             },
@@ -1143,11 +1143,11 @@ mod tests {
                 let mut opts = std::collections::HashMap::new();
                 opts.insert(
                     "password".to_string(),
-                    serde_yaml::Value::String("test".to_string()),
+                    nextjson::Value::String("test".to_string()),
                 );
                 opts.insert(
                     "cipher".to_string(),
-                    serde_yaml::Value::String("aes-256-gcm".to_string()),
+                    nextjson::Value::String("aes-256-gcm".to_string()),
                 );
                 opts
             },

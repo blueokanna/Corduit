@@ -17,8 +17,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::fs::File;
-use std::io::BufReader;
+use rustls_pki_types::pem::PemObject;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -102,13 +101,10 @@ impl DohServer {
 
     /// Load certificates from PEM file
     fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-        let file = File::open(path)
-            .map_err(|e| DnsError::Config(format!("Failed to open cert file: {}", e)))?;
-        let mut reader = BufReader::new(file);
-
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-            .filter_map(|r| r.ok())
-            .collect();
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+            .map_err(|e| DnsError::Config(format!("Failed to open cert file: {}", e)))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| DnsError::Config(format!("Failed to parse certificate: {}", e)))?;
 
         if certs.is_empty() {
             return Err(DnsError::Config(
@@ -121,30 +117,8 @@ impl DohServer {
 
     /// Load private key from PEM file
     fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-        let file = File::open(path)
-            .map_err(|e| DnsError::Config(format!("Failed to open key file: {}", e)))?;
-        let mut reader = BufReader::new(file);
-
-        loop {
-            match rustls_pemfile::read_one(&mut reader) {
-                Ok(Some(rustls_pemfile::Item::Pkcs1Key(key))) => {
-                    return Ok(PrivateKeyDer::Pkcs1(key));
-                }
-                Ok(Some(rustls_pemfile::Item::Pkcs8Key(key))) => {
-                    return Ok(PrivateKeyDer::Pkcs8(key));
-                }
-                Ok(Some(rustls_pemfile::Item::Sec1Key(key))) => {
-                    return Ok(PrivateKeyDer::Sec1(key));
-                }
-                Ok(None) => break,
-                Ok(Some(_)) => continue,
-                Err(e) => {
-                    return Err(DnsError::Config(format!("Failed to parse key: {}", e)));
-                }
-            }
-        }
-
-        Err(DnsError::Config("No private key found in file".to_string()))
+        PrivateKeyDer::from_pem_file(path)
+            .map_err(|e| DnsError::Config(format!("No private key found in file: {}", e)))
     }
 
     /// Start the DoH server

@@ -5,8 +5,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/corduit-core)](https://crates.io/crates/corduit-core)
 [![docs.rs](https://img.shields.io/docsrs/corduit-core)](https://docs.rs/corduit-core)
-[![License](https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.77-blue)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-PolyForm--Perimeter--1.0.1-blue)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](Cargo.toml)
 
 ---
 
@@ -20,14 +20,14 @@
 DNS、用户态网络、线缆协议每一层都是同一个工作区的头等公民，一起设计、一起
 测试、一起发布。
 
-| | Clash（组合式） | Corduit（统一式） |
-|---|---|---|
-| 协议实现 | Fork/嵌入第三方 | 仓库内原生实现，单一版本 |
-| 规则引擎 | 多个 crate 胶水拼接 | 单一强类型 `RuleConfig` 流水线 |
-| DNS | 多个可选 crate | 自带抗污染 `corduit-dns` |
-| TUN 栈 | 外部库 | 仓库内用户态 TCP/IP（SolidTCP） |
-| 配置 | 多种格式、多套加载器 | 单一校验过的 `Config` 模型 |
-| 发布节奏 | 各组件各自为政 | 全工作区原子发布 |
+|          | Clash（组合式）      | Corduit（统一式）               |
+| -------- | -------------------- | ------------------------------- |
+| 协议实现 | Fork/嵌入第三方      | 仓库内原生实现，单一版本        |
+| 规则引擎 | 多个 crate 胶水拼接  | 单一强类型 `RuleConfig` 流水线  |
+| DNS      | 多个可选 crate       | 自带抗污染 `corduit-dns`        |
+| TUN 栈   | 外部库               | 仓库内用户态 TCP/IP（SolidTCP） |
+| 配置     | 多种格式、多套加载器 | 单一校验过的 `Config` 模型      |
+| 发布节奏 | 各组件各自为政       | 全工作区原子发布                |
 
 ---
 
@@ -48,17 +48,18 @@ DNS、用户态网络、线缆协议每一层都是同一个工作区的头等�
 - **手写 C ABI** —— `corduit-lib` 提供无依赖、手写的 `#[no_mangle] extern "C"`
   接口（不使用 `flutter_rust_bridge`，无代码生成），可被 Flutter/Dart、Kotlin、
   Swift、C/C++ 宿主直接绑定。
-- **nextjson + rustbinary 序列化** —— FFI 边界使用 `nextjson`（schema 驱动
-  JSON）承载可读负载，`rustbinary`（有界、类型标记二进制）承载紧凑高吞吐
-  通道——API 层不再使用 `serde`/`serde_json`。
+- **nextjson + rustbinary 序列化** —— serde 已从整个项目彻底移除。FFI
+  边界使用 `nextjson`（schema 驱动 JSON）承载可读负载，`rustbinary`
+  （有界、类型标记二进制）承载紧凑高吞吐通道。
 - **热重载** —— `Corduit::reload()` 原子化替换配置。
 - **可观测性** —— 基于 `tracing` 的结构化日志，`jaeger` feature 下可导出
   OpenTelemetry / Jaeger，并提供逐连接流量统计。
 - **移动端就绪** —— `corduit-lib` 提供 Android JNI（`VpnService`）、Windows
   VPN 集成，以及面向任意原生宿主的统一 `corduit_call` / `corduit_call_binary`
   分发入口。
-- **对生态友好的许可** —— FSL-1.1-Apache-2.0：允许商业修改、集成与商业化，
-  仅限制竞争性托管服务；发布 **2 年后自动转为 Apache 2.0**。
+- **对生态友好的许可** —— PolyForm Perimeter 1.0.1：允许自由使用、修改与分发，
+  仅限制**与 Corduit 构成竞争**的产品（例如托管式替代品）；与 FSL 不同，
+  该许可**永不会**转为 MIT/Apache。
 
 ---
 
@@ -70,7 +71,7 @@ Corduit（工作区）
 ├── corduit-core        # 引擎：配置模型、规则流水线、出站编排、
 │   │                   #       流量统计、健康检查
 │   └── src/
-│       ├── config/     #   强类型校验配置 + YAML 映射
+│       ├── config/     #   强类型校验配置 + JSON 映射
 │       ├── inbound/    #   HTTP / SOCKS5 / mixed 监听
 │       ├── outbound/   #   Direct/Reject/SS/VMess/VLESS/Trojan/TUIC/Hy2/...
 │       ├── routing.rs  #   规则 → 出站匹配（rule/global/direct）
@@ -184,69 +185,69 @@ async fn main() -> anyhow::Result<()> {
 
 ## 配置
 
-Corduit 使用单一、经校验、可映射到 YAML 的 `Config` 模型——没有临时方言，
-没有多种格式。最小 `config.yaml`：
+Corduit 使用单一、经校验、**nextjson 原生 JSON** 的 `Config` 模型——没有临时
+dialect、没有 YAML、没有多种格式。`nextjson` 的 schema 驱动 derive 处理整个
+模型（默认值、别名、重命名规则），全程零 serde。最小 `config.json`：
 
-```yaml
-general:
-  mode: rule                # rule | global | direct
-  mixed_port: 7890          # HTTP + SOCKS5 同端口
-  allow_lan: false
-  log_level: info
-
-dns:
-  enable: true
-  listen: 0.0.0.0:53
-  nameservers:
-    - https://dns.google/dns-query
-  fallback:
-    - 8.8.8.8
-  enhanced_mode: fake-ip
-
-inbounds:
-  - type: mixed
-    tag: mixed-in
-    listen: 127.0.0.1
-    port: 7890
-
-outbounds:
-  - type: direct
-    tag: DIRECT
-  - type: selector
-    tag: PROXY
-    options:
-      proxies: [proxy-1, proxy-2]
-  - type: vmess
-    tag: proxy-1
-    server: vmess.example.com
-    port: 443
-    options:
-      uuid: 00000000-0000-0000-0000-000000000000
-      security: auto
-  - type: tuic
-    tag: proxy-2
-    server: tuic.example.com
-    port: 443
-    options:
-      uuid: 00000000-0000-0000-0000-000000000000
-      password: secret
-  - type: hysteria2
-    tag: hy2
-    server: hy2.example.com
-    port: 443
-    options:
-      password: secret
-
-rules:
-  - type: domain_suffix
-    payload: example.com
-    outbound: DIRECT
-  - type: geoip
-    payload: cn
-    outbound: DIRECT
-  - type: match
-    payload: ""
-    outbound: PROXY
+```json
+{
+  "general": {
+    "mode": "rule",
+    "mixed_port": 7890,
+    "allow_lan": false,
+    "log_level": "info"
+  },
+  "dns": {
+    "enable": true,
+    "listen": "0.0.0.0:53",
+    "nameservers": ["https://dns.google/dns-query"],
+    "fallback": ["8.8.8.8"],
+    "enhanced_mode": "fake-ip"
+  },
+  "inbounds": [
+    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "port": 7890 }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "DIRECT" },
+    {
+      "type": "selector",
+      "tag": "PROXY",
+      "options": { "proxies": ["proxy-1", "proxy-2"] }
+    },
+    {
+      "type": "vmess",
+      "tag": "proxy-1",
+      "server": "vmess.example.com",
+      "port": 443,
+      "options": {
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "security": "auto"
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "proxy-2",
+      "server": "tuic.example.com",
+      "port": 443,
+      "options": {
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "password": "secret"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "server": "hy2.example.com",
+      "port": 443,
+      "options": { "password": "secret" }
+    }
+  ],
+  "rules": [
+    { "type": "domain_suffix", "payload": "example.com", "outbound": "DIRECT" },
+    { "type": "geoip", "payload": "cn", "outbound": "DIRECT" },
+    { "type": "match", "payload": "", "outbound": "PROXY" }
+  ]
+}
 ```
 
 所有枚举均为强类型：`OutboundType` 覆盖 `direct`、`reject`、`shadowsocks`、
@@ -260,26 +261,146 @@ rules:
 
 ## 支持的协议
 
-| 层次 | 协议 |
-|---|---|
+| 层次     | 协议                                                                                                 |
+| -------- | ---------------------------------------------------------------------------------------------------- |
 | 代理出站 | Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、SOCKS5、HTTP(S)、QUIC、WireGuard、Direct、Reject |
-| 代理组 | Selector、URL-test、Fallback、Load-balance、Relay |
-| 入站 | HTTP、SOCKS5、Mixed（Linux 下 redir / TProxy） |
-| 传输层 | WebSocket、h2、gRPC、TLS、QUIC |
-| DNS | UDP、TCP、DoH、DoT —— 服务端与客户端 |
-| TUN | 用户态 TCP/IP（SolidTCP）带 NAT |
+| 代理组   | Selector、URL-test、Fallback、Load-balance、Relay                                                    |
+| 入站     | HTTP、SOCKS5、Mixed（Linux 下 redir / TProxy）                                                       |
+| 传输层   | WebSocket、h2、gRPC、TLS、QUIC                                                                       |
+| DNS      | UDP、TCP、DoH、DoT —— 服务端与客户端                                                                 |
+| TUN      | 用户态 TCP/IP（SolidTCP）带 NAT                                                                      |
 
 ---
 
 ## 平台支持
 
-| 平台 | 入站 | TUN | 说明 |
-|---|---|---|---|
-| Windows | ✓ | ✓ | wintun（自动下载或 `embed-wintun` feature） |
-| Linux | ✓ | ✓ | TUN 需要 `CAP_NET_ADMIN` |
-| macOS | ✓ | ✓ | TUN 需要 root |
-| Android | ✓ | ✓ | 经 JNI 使用 VpnService（`corduit-lib`） |
-| Flutter | — | — | 经 `corduit-lib` 手写 C ABI（`corduit_call`） |
+| 平台    | 入站 | TUN | 说明                                          |
+| ------- | ---- | --- | --------------------------------------------- |
+| Windows | ✓    | ✓   | wintun（自动下载或 `embed-wintun` feature）   |
+| Linux   | ✓    | ✓   | TUN 需要 `CAP_NET_ADMIN`                      |
+| macOS   | ✓    | ✓   | TUN 需要 root                                 |
+| Android | ✓    | ✓   | 经 JNI 使用 VpnService（`corduit-lib`）       |
+| Flutter | —    | —   | 经 `corduit-lib` 手写 C ABI（`corduit_call`） |
+
+---
+
+## 跨语言 API（FFI）
+
+`corduit-lib` 提供**手写 C ABI**——无 `flutter_rust_bridge`、无代码生成、无
+运行时。任何能调用 C 的语言都可以通过**两个**入口驱动整个引擎：
+
+| 入口                                        | 负载格式               | 适用场景     |
+| ------------------------------------------- | ---------------------- | ------------ |
+| `corduit_call(method, args_json)`           | `nextjson`（JSON）     | 可读的控制面 |
+| `corduit_call_binary(method, payload, len)` | `rustbinary`（二进制） | 紧凑高吞吐   |
+
+内存规则（两者一致）：
+
+1. 每次调用返回 `FfiResponse { code: i32, data: *mut c_char }`（或
+   `FfiBinaryResponse { code, data, len }`）。
+2. `code == 0` 表示成功；非零表示错误（消息在 `data` 中）。
+3. 用 `corduit_string_free(ptr)` / `corduit_binary_free(resp)` 释放返回缓冲区。
+
+自描述辅助函数（让绑定不再硬编码方法列表）：
+
+```c
+const char *corduit_api_version(void);  /* ABI 版本，例如 "0.1.0" */
+char       *corduit_methods(void);      /* 支持的方法列表（JSON 数组） */
+void        corduit_string_free(char *);/* 释放以上两者 */
+```
+
+### 示例：Python（`ctypes`）
+
+```python
+import ctypes, json
+
+lib = ctypes.CDLL("rust_lib_corduit.dll")   # .so / .dylib / .a
+lib.corduit_call.restype = ctypes.POINTER(None)
+# ... 绑定 FfiResponse 布局 ...
+
+def call(method: str, args: dict) -> dict:
+    payload = json.dumps(args).encode()
+    resp = lib.corduit_call(method.encode(), payload or None)
+    code, data = resp.code, ctypes.string_at(resp.data)
+    lib.corduit_string_free(resp.data)
+    if code != 0:
+        raise RuntimeError(data.decode())
+    return json.loads(data) if data else None
+```
+
+### 示例：JavaScript / TypeScript（`koffi` 或 `ffi-napi`）
+
+```ts
+const koffi = require("koffi");
+const lib = koffi.load("rust_lib_corduit");
+
+const FfiResponse = koffi.struct("FfiResponse", {
+  code: "int32",
+  data: "str",
+});
+lib.func("FfiResponse corduit_call(const char* method, const char* args_json)");
+lib.func("void corduit_string_free(char* ptr)");
+
+export async function corduit(method: string, args: object = {}) {
+  const resp = lib.corduit_call(method, JSON.stringify(args));
+  if (resp.code !== 0) throw new Error(resp.data);
+  return resp.data ? JSON.parse(resp.data) : null;
+}
+```
+
+### 示例：Dart / Flutter（`dart:ffi`）
+
+```dart
+import 'dart:ffi';
+import 'dart:convert';
+
+typedef CorduitCallNative = Pointer<FfiResponse> Function(
+    Pointer<Utf8> method, Pointer<Utf8> args);
+typedef CorduitCall = Pointer<FfiResponse> Function(
+    Pointer<Utf8> method, Pointer<Utf8> args);
+
+final call = lib.lookupFunction<CorduitCallNative, CorduitCall>('corduit_call');
+
+Future<dynamic> corduit(String method, Map<String, dynamic> args) async {
+  final m = method.toNativeUtf8();
+  final a = jsonEncode(args).toNativeUtf8();
+  final resp = call(m, a);
+  final code = resp.ref.code;
+  final data = resp.ref.data.cast<Utf8>().toDartString();
+  calloc.free(m); calloc.free(a);
+  if (code != 0) throw Exception(data);
+  return data.isEmpty ? null : jsonDecode(data);
+}
+```
+
+### 完整方法参考
+
+以运行时 `corduit_methods()` 返回的列表为准。当前分发表（由单元测试强制
+同步）覆盖：
+
+- **生命周期** —— `init_app`、`start_proxy_from_yaml`、`start_proxy_from_file`、
+  `stop_proxy`、`is_proxy_running`、`reload_config_from_yaml`、
+  `reload_config_from_file`
+- **现代引擎** —— `initialize_corduit`、`start_corduit`、`stop_corduit`、
+  `reload_corduit`、`get_corduit_status`、`test_config`
+- **仪表盘** —— `get_traffic_stats`、`get_connections`、`close_connection`、
+  `close_all_connections`、`get_logs`、`set_log_level`、`get_system_info`、
+  `get_version`、`get_build_info`
+- **代理与代理组** —— `get_proxies`、`get_proxy_groups`、`select_proxy`、
+  `select_proxy_in_group`、`get_selected_proxy_in_group`、`get_rules`、
+  `get_dns_config`、`set_proxy_mode`、`get_proxy_mode`
+- **延迟测试** —— `test_proxy_latency`、`test_outbound_latency`、
+  `test_tcp_connectivity`、`test_shadowsocks_latency`、`test_proxies_latency`、
+  `test_proxy_latency_dto`、`test_all_proxies_latency`
+- **TUN / VPN** —— `start_tun_mode`、`stop_tun_mode`、`enable_tun_mode`、
+  `enable_tun_mode_with_mode`、`disable_tun_mode`、`get_tun_status`、
+  `is_wintun_available`、`get_wintun_dll_path`、`ensure_wintun_dll`、
+  `set_windows_proxy_mode`、`get_windows_proxy_mode_str`、
+  `get_windows_tun_stats`、`enable_uwp_loopback`、`open_uwp_loopback_utility`
+- **Android** —— `set_android_vpn_fd`、`get_android_vpn_fd`、
+  `clear_android_vpn_fd`、`set_android_proxy_mode`、`get_android_proxy_mode`、
+  `start_android_vpn`、`stop_android_vpn`、`set_vpn_fd`、`clear_vpn_fd`、
+  `set_protect_socket_callback_enabled`
 
 ---
 
@@ -305,8 +426,13 @@ rules:
    依赖 `ProxyManager` 的稳定接口而非各协议的内部细节。替换实现无需改动调用方。
 3. **在边界处大声失败。** 配置在入口处一次性校验；内部代码只处理已校验、
    类型化的数据。
-4. **不引入虚构依赖。** 锁文件中的每个依赖都是真实且被使用的；线缆格式为
-   手写实现并由属性测试覆盖。
+4. **不引入死重，零 serde。** serde / serde_json / serde_yaml 已彻底移除——
+   工作区中每个类型（配置、DTO、协议元数据）都派生 `nextjson` 的
+   `NsonSerialize` / `NsonDeserialize`；未使用的依赖一律删除，每个声明的
+   依赖都真实被使用——由构建期检查保证。
+5. **序列化是一等公民。** FFI 边界使用 `nextjson` + `rustbinary`（类型化、
+   schema 驱动、`no_std`、`unsafe` 零容忍），跨语言客户端获得稳定、自描述
+   的负载，依赖图中没有任何 serde。
 
 ---
 
@@ -323,7 +449,7 @@ cargo doc --workspace --all-features --no-deps
 cargo build --release --workspace
 ```
 
-MSRV：**Rust 1.77+**（edition 2021）。
+MSRV：**Rust 1.85+**（edition 2021）。
 
 ### 发布到 crates.io
 
@@ -342,18 +468,65 @@ cargo publish -p corduit-lib        # 第 5 个（依赖 core + netstack）
 
 ---
 
+## 安全
+
+Corduit 同时进行**依赖图审计**与**源码级审查**：
+
+### 依赖审计（`cargo audit`）
+
+### 依赖审计（`cargo audit`）
+
+- 所有直接依赖均为较新且维护中的版本。整个 serde 家族（`serde`、
+  `serde_json`、`serde_yaml`）已由自研 `nextjson`（schema 驱动、
+  `#![deny(unsafe_code)]`、有界）与 `rustbinary` 替代；PEM 解析改用
+  `rustls-pki-types` 的自有 `PemObject` trait。
+  `rustls-pemfile` 迁移到 `rustls-pki-types` 自带的一等公民 `PemObject` trait。
+- 唯一剩余的公告为*提示性*：`paste`（Linux netlink 栈带入的传递性构建期
+  宏辅助）不再维护——它不是安全漏洞，且在不替换整个 `tun-rs` 依赖链的
+  前提下无法移除。
+
+### 源码级加固（CWE 审查）
+
+| 检查项                            | 结论                                               |
+| --------------------------------- | -------------------------------------------------- |
+| CWE-78 操作系统命令注入           | 已修复——接口名在进入 PowerShell/netsh 插值前       |
+| 经 `sanitize_interface_name` 校验 |
+| CWE-190 整数截断                  | 已修复——QUIC 请求负载 > 64 KiB 时拒绝而非截断；    |
+| SOCKS5 凭据按 RFC 1929 做长度校验 |
+| CWE-295 TLS 证书校验              | 已验证——`skip_cert_verify` 默认关闭；使用系统根    |
+| 证书，仅显式配置时才绕过校验      |
+| CWE-22 路径穿越                   | 已验证——wintun 解压使用固定条目名；无用户可控路径  |
+| 到达文件系统                      |
+| CWE-502 反序列化                  | 已验证——`nextjson`/`rustbinary` 为内存安全、有界、 |
+| schema 驱动的格式                 |
+| CWE-798 硬编码凭据                | 已验证——生产代码无凭据（仅测试夹具）               |
+| CWE-120 / CWE-416 内存安全        | 已验证——`unsafe` 仅限手写并核对的                  |
+| FFI/平台边界                      |
+
+### 运行时态势
+
+- **默认 TLS 1.3**（rustls/ring），仅 AEAD 密码套件（AES-GCM /
+  ChaCha20-Poly1305），X25519/Curve25519 密钥交换。
+- **构造即内存安全** —— Rust 的 panic 不会变成内存破坏；所有缓冲区大小
+  在使用前均做边界检查。
+- **失败即关闭** —— 未知协议与畸形选项在边界处被拒绝，而非静默忽略。
+
+---
+
 ## 许可证
 
-[FSL-1.1-Apache-2.0](LICENSE) —— **Functional Source License, Version 1.1,
-ALv2 Future License**（Sentry 推出的新一代许可证）。
+[PolyForm Perimeter 1.0.1](LICENSE) —— 来自
+[PolyForm Project](https://polyformproject.org/licenses/perimeter/1.0.1) 的
+源码可用（source-available）许可。
 
-- ✅ 允许自由使用、修改、集成与商业化
+- ✅ 允许自由使用、修改与创作衍生作品
 - ✅ 允许再分发，包括衍生作品
-- ✅ 为许可目的授予专利
-- 🚫 仅禁止**竞争性托管服务**
-- 🔁 每个版本发布 **2 年后自动转为 Apache License 2.0**
+- ✅ 授予专利许可；保留合理使用（fair use）权利
+- 🚫 **不竞争条款** —— 不得提供替代 Corduit 功能或价值的产品
+- 🔒 **无自动重新授权** —— 许可永久保持 PolyForm Perimeter，绝不转为
+  MIT 或 Apache-2.0
 
-SPDX 标识符：`FSL-1.1-Apache-2.0`
+SPDX 标识符：`PolyForm-Perimeter-1.0.1`
 
 ---
 

@@ -3,7 +3,8 @@ use quinn::{
     Connection, Endpoint, ServerConfig as QuinnServerConfig,
     TransportConfig as QuinnTransportConfig,
 };
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::pem::PemObject;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -107,9 +108,9 @@ impl QuicServer {
 
     fn build_server_config(&self) -> Result<QuinnServerConfig> {
         let cert_pem = self.config.certificate.as_bytes();
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &*cert_pem)
-            .filter_map(|r| r.ok())
-            .collect();
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| QuicError::InvalidConfig(format!("Invalid certificate: {}", e)))?;
 
         if certs.is_empty() {
             return Err(QuicError::InvalidConfig(
@@ -118,9 +119,8 @@ impl QuicServer {
         }
 
         let key_pem = self.config.private_key.as_bytes();
-        let key = rustls_pemfile::private_key(&mut &*key_pem)
-            .map_err(|e| QuicError::InvalidConfig(format!("Invalid private key: {}", e)))?
-            .ok_or_else(|| QuicError::InvalidConfig("No private key found".to_string()))?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem)
+            .map_err(|e| QuicError::InvalidConfig(format!("Invalid private key: {}", e)))?;
 
         let mut tls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()

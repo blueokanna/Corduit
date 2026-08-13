@@ -1,21 +1,26 @@
-use serde::{Deserialize, Serialize};
+use nextjson::{NsonDeserialize, NsonSerialize};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CipherKind {
     #[default]
     Aes256Gcm,
     Aes128Gcm,
     Chacha20Poly1305,
-    #[serde(alias = "2022-blake3-aes-256-gcm")]
     Aead2022Aes256Gcm,
-    #[serde(alias = "2022-blake3-aes-128-gcm")]
     Aead2022Aes128Gcm,
-    #[serde(alias = "2022-blake3-chacha20-poly1305")]
     Aead2022Chacha20Poly1305,
 }
+
+crate::impl_protocol_enum!(CipherKind {
+    Aes256Gcm => "aes-256-gcm",
+    Aes128Gcm => "aes-128-gcm",
+    Chacha20Poly1305 => "chacha20-poly1305" | "chacha20-ietf-poly1305",
+    Aead2022Aes256Gcm => "2022-blake3-aes-256-gcm",
+    Aead2022Aes128Gcm => "2022-blake3-aes-128-gcm",
+    Aead2022Chacha20Poly1305 => "2022-blake3-chacha20-poly1305" | "2022-blake3-chacha20-ietf-poly1305",
+});
 
 impl CipherKind {
     #[allow(clippy::should_implement_trait)]
@@ -60,8 +65,7 @@ impl CipherKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CongestionControl {
     #[default]
     Cubic,
@@ -69,7 +73,13 @@ pub enum CongestionControl {
     Bbr,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+crate::impl_protocol_enum!(CongestionControl {
+    Cubic => "cubic",
+    NewReno => "new-reno" | "newreno",
+    Bbr => "bbr",
+});
+
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct TransportConfig {
     #[serde(default = "defaults::idle_timeout", with = "humantime_serde")]
     pub idle_timeout: Duration,
@@ -107,7 +117,7 @@ impl Default for TransportConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct ClientConfig {
     pub server_addr: SocketAddr,
     pub password: String,
@@ -132,7 +142,7 @@ pub struct ClientConfig {
     pub udp_relay: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     pub password: String,
@@ -192,44 +202,50 @@ mod defaults {
 }
 
 mod humantime_serde {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use nextjson::{FormatDecoder, FormatEncoder};
     use std::time::Duration;
 
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u64(duration.as_secs())
+    pub fn serialize<E: FormatEncoder>(
+        duration: &Duration,
+        encoder: &mut E,
+    ) -> Result<(), E::Error> {
+        encoder.write_u64(duration.as_secs())
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let secs = u64::deserialize(deserializer)?;
+    pub fn deserialize<'de, D: FormatDecoder<'de>>(
+        decoder: &mut D,
+    ) -> Result<Duration, D::Error> {
+        let secs = decoder.u64()?;
         Ok(Duration::from_secs(secs))
     }
 }
 
 mod option_duration {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use nextjson::{FormatDecoder, FormatEncoder, OptionTag};
     use std::time::Duration;
 
-    pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    pub fn serialize<E: FormatEncoder>(
+        duration: &Option<Duration>,
+        encoder: &mut E,
+    ) -> Result<(), E::Error> {
         match duration {
-            Some(d) => serializer.serialize_some(&d.as_secs()),
-            None => serializer.serialize_none(),
+            Some(d) => {
+                encoder.write_some()?;
+                encoder.write_u64(d.as_secs())
+            }
+            None => encoder.write_none(),
         }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt = Option::<u64>::deserialize(deserializer)?;
-        Ok(opt.map(Duration::from_secs))
+    pub fn deserialize<'de, D: FormatDecoder<'de>>(
+        decoder: &mut D,
+    ) -> Result<Option<Duration>, D::Error> {
+        match decoder.option_tag()? {
+            OptionTag::None => Ok(None),
+            OptionTag::Some => {
+                let secs = decoder.u64()?;
+                Ok(Some(Duration::from_secs(secs)))
+            }
+        }
     }
 }

@@ -5,8 +5,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/corduit-core)](https://crates.io/crates/corduit-core)
 [![docs.rs](https://img.shields.io/docsrs/corduit-core)](https://docs.rs/corduit-core)
-[![License](https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.77-blue)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-PolyForm--Perimeter--1.0.1-blue)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](Cargo.toml)
 
 ---
 
@@ -52,19 +52,19 @@ and released together.
 - **Hand-written C ABI** — `corduit-lib` exposes a dependency-free, hand-written
   `#[no_mangle] extern "C"` surface (no `flutter_rust_bridge`, no codegen) for
   Flutter/Dart, Kotlin, Swift and C/C++ hosts.
-- **nextjson + rustbinary serialization** — the FFI boundary speaks
-  `nextjson` (schema-driven JSON) for human-readable payloads and `rustbinary`
-  (bounded, type-tagged binary) for compact high-throughput channels — no
-  `serde`/`serde_json` in the API layer.
+- **nextjson + rustbinary serialization** — serde is entirely removed from
+  the workspace. The FFI boundary speaks `nextjson` (schema-driven JSON) for
+  human-readable payloads and `rustbinary` (bounded, type-tagged binary) for
+  compact high-throughput channels.
 - **Hot reload** — `Corduit::reload()` swaps configuration atomically.
 - **Observability** — `tracing`-based structured logging, optional OpenTelemetry /
   Jaeger export behind the `jaeger` feature, and per-connection traffic stats.
 - **Mobile-ready** — `corduit-lib` ships Android JNI (`VpnService`), Windows VPN
   integrations, and a unified `corduit_call` / `corduit_call_binary` dispatcher
   for any native host.
-- **Licensed for the ecosystem** — FSL-1.1-Apache-2.0: commercial use and
-  modification are allowed; only competing hosted service is restricted, and the
-  code automatically becomes **Apache 2.0 after 2 years**.
+- **Licensed for the ecosystem** — PolyForm Perimeter 1.0.1: use, modify and
+  distribute freely; only a product that competes with Corduit (e.g. a hosted
+  clone) is restricted — and unlike FSL, it **never** converts to MIT/Apache.
 
 ---
 
@@ -76,7 +76,7 @@ Corduit (workspace)
 ├── corduit-core        # Engine: config model, rule pipeline, outbound
 │   │                   #         orchestration, traffic stats, health checks
 │   └── src/
-│       ├── config/     #   Typed, validated configuration + YAML mapping
+│       ├── config/     #   Typed, validated configuration + JSON mapping
 │       ├── inbound/    #   HTTP / SOCKS5 / mixed listeners
 │       ├── outbound/   #   Direct/Reject/SS/VMess/VLESS/Trojan/TUIC/Hy2/...
 │       ├── routing.rs  #   Rule → outbound matching (rule/global/direct)
@@ -190,69 +190,70 @@ async fn main() -> anyhow::Result<()> {
 
 ## Configuration
 
-Corduit uses a single validated, YAML-mapped `Config` model — no ad-hoc toml,
-no multiple dialects. A minimal `config.yaml`:
+Corduit uses a single validated, **nextjson-native JSON** `Config` model — no
+ad-hoc toml, no YAML, no multiple dialects. `nextjson`'s schema-driven derive
+handles the whole model (defaults, aliases, rename rules) with zero serde. A
+minimal `config.json`:
 
-```yaml
-general:
-  mode: rule                # rule | global | direct
-  mixed_port: 7890          # HTTP + SOCKS5 on one port
-  allow_lan: false
-  log_level: info
-
-dns:
-  enable: true
-  listen: 0.0.0.0:53
-  nameservers:
-    - https://dns.google/dns-query
-  fallback:
-    - 8.8.8.8
-  enhanced_mode: fake-ip
-
-inbounds:
-  - type: mixed
-    tag: mixed-in
-    listen: 127.0.0.1
-    port: 7890
-
-outbounds:
-  - type: direct
-    tag: DIRECT
-  - type: selector
-    tag: PROXY
-    options:
-      proxies: [proxy-1, proxy-2]
-  - type: vmess
-    tag: proxy-1
-    server: vmess.example.com
-    port: 443
-    options:
-      uuid: 00000000-0000-0000-0000-000000000000
-      security: auto
-  - type: tuic
-    tag: proxy-2
-    server: tuic.example.com
-    port: 443
-    options:
-      uuid: 00000000-0000-0000-0000-000000000000
-      password: secret
-  - type: hysteria2
-    tag: hy2
-    server: hy2.example.com
-    port: 443
-    options:
-      password: secret
-
-rules:
-  - type: domain_suffix
-    payload: example.com
-    outbound: DIRECT
-  - type: geoip
-    payload: cn
-    outbound: DIRECT
-  - type: match
-    payload: ""
-    outbound: PROXY
+```json
+{
+  "general": {
+    "mode": "rule",
+    "mixed_port": 7890,
+    "allow_lan": false,
+    "log_level": "info"
+  },
+  "dns": {
+    "enable": true,
+    "listen": "0.0.0.0:53",
+    "nameservers": ["https://dns.google/dns-query"],
+    "fallback": ["8.8.8.8"],
+    "enhanced_mode": "fake-ip"
+  },
+  "inbounds": [
+    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "port": 7890 }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "DIRECT" },
+    {
+      "type": "selector",
+      "tag": "PROXY",
+      "options": { "proxies": ["proxy-1", "proxy-2"] }
+    },
+    {
+      "type": "vmess",
+      "tag": "proxy-1",
+      "server": "vmess.example.com",
+      "port": 443,
+      "options": {
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "security": "auto"
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "proxy-2",
+      "server": "tuic.example.com",
+      "port": 443,
+      "options": {
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "password": "secret"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "server": "hy2.example.com",
+      "port": 443,
+      "options": { "password": "secret" }
+    }
+  ],
+  "rules": [
+    { "type": "domain_suffix", "payload": "example.com", "outbound": "DIRECT" },
+    { "type": "geoip", "payload": "cn", "outbound": "DIRECT" },
+    { "type": "match", "payload": "", "outbound": "PROXY" }
+  ]
+}
 ```
 
 All enums are strongly typed: `OutboundType` covers `direct`, `reject`,
@@ -289,6 +290,128 @@ All enums are strongly typed: `OutboundType` covers `direct`, `reject`,
 
 ---
 
+## Cross-Language API (FFI)
+
+`corduit-lib` ships a **hand-written C ABI** — no `flutter_rust_bridge`, no
+codegen, no runtime. Any language that can call C can drive the whole engine
+through **two** entry points:
+
+| Entry point | Payload format | Use case |
+|---|---|---|
+| `corduit_call(method, args_json)` | `nextjson` (JSON) | Human-readable control plane |
+| `corduit_call_binary(method, payload, len)` | `rustbinary` (binary) | Compact, high-throughput |
+
+Memory rules (identical for both):
+
+1. Every call returns an `FfiResponse { code: i32, data: *mut c_char }` (or
+   `FfiBinaryResponse { code, data, len }`).
+2. `code == 0` means success; non-zero means error (message in `data`).
+3. Free returned buffers with `corduit_string_free(ptr)` /
+   `corduit_binary_free(resp)`.
+
+Introspection helpers (so bindings never hard-code method lists):
+
+```c
+const char *corduit_api_version(void);  /* ABI version, e.g. "0.1.0" */
+char       *corduit_methods(void);      /* JSON array of supported methods */
+void        corduit_string_free(char *);/* free both of the above */
+```
+
+### Example: Python (`ctypes`)
+
+```python
+import ctypes, json
+
+lib = ctypes.CDLL("rust_lib_corduit.dll")   # .so / .dylib / .a
+lib.corduit_call.restype = ctypes.POINTER(None)
+# ... bind FfiResponse layout ...
+
+def call(method: str, args: dict) -> dict:
+    payload = json.dumps(args).encode()
+    resp = lib.corduit_call(method.encode(), payload or None)
+    code, data = resp.code, ctypes.string_at(resp.data)
+    lib.corduit_string_free(resp.data)
+    if code != 0:
+        raise RuntimeError(data.decode())
+    return json.loads(data) if data else None
+```
+
+### Example: JavaScript / TypeScript (via `koffi` or `ffi-napi`)
+
+```ts
+const koffi = require("koffi");
+const lib = koffi.load("rust_lib_corduit");
+
+const FfiResponse = koffi.struct("FfiResponse", {
+  code: "int32",
+  data: "str",
+});
+lib.func("FfiResponse corduit_call(const char* method, const char* args_json)");
+lib.func("void corduit_string_free(char* ptr)");
+
+export async function corduit(method: string, args: object = {}) {
+  const resp = lib.corduit_call(method, JSON.stringify(args));
+  if (resp.code !== 0) throw new Error(resp.data);
+  return resp.data ? JSON.parse(resp.data) : null;
+}
+```
+
+### Example: Dart / Flutter (via `dart:ffi`)
+
+```dart
+import 'dart:ffi';
+import 'dart:convert';
+
+typedef CorduitCallNative = Pointer<FfiResponse> Function(
+    Pointer<Utf8> method, Pointer<Utf8> args);
+typedef CorduitCall = Pointer<FfiResponse> Function(
+    Pointer<Utf8> method, Pointer<Utf8> args);
+
+final call = lib.lookupFunction<CorduitCallNative, CorduitCall>('corduit_call');
+
+Future<dynamic> corduit(String method, Map<String, dynamic> args) async {
+  final m = method.toNativeUtf8();
+  final a = jsonEncode(args).toNativeUtf8();
+  final resp = call(m, a);
+  final code = resp.ref.code;
+  final data = resp.ref.data.cast<Utf8>().toDartString();
+  calloc.free(m); calloc.free(a);
+  if (code != 0) throw Exception(data);
+  return data.isEmpty ? null : jsonDecode(data);
+}
+```
+
+### Full method reference
+
+Use `corduit_methods()` at runtime for the authoritative list. The current
+dispatch table (also enforced by a unit test) covers:
+
+- **Lifecycle** — `init_app`, `start_proxy_from_yaml`, `start_proxy_from_file`,
+  `stop_proxy`, `is_proxy_running`, `reload_config_from_yaml`,
+  `reload_config_from_file`
+- **Modern engine** — `initialize_corduit`, `start_corduit`, `stop_corduit`,
+  `reload_corduit`, `get_corduit_status`, `test_config`
+- **Dashboard** — `get_traffic_stats`, `get_connections`, `close_connection`,
+  `close_all_connections`, `get_logs`, `set_log_level`, `get_system_info`,
+  `get_version`, `get_build_info`
+- **Proxies & groups** — `get_proxies`, `get_proxy_groups`, `select_proxy`,
+  `select_proxy_in_group`, `get_selected_proxy_in_group`, `get_rules`,
+  `get_dns_config`, `set_proxy_mode`, `get_proxy_mode`
+- **Latency testing** — `test_proxy_latency`, `test_outbound_latency`,
+  `test_tcp_connectivity`, `test_shadowsocks_latency`, `test_proxies_latency`,
+  `test_proxy_latency_dto`, `test_all_proxies_latency`
+- **TUN / VPN** — `start_tun_mode`, `stop_tun_mode`, `enable_tun_mode`,
+  `enable_tun_mode_with_mode`, `disable_tun_mode`, `get_tun_status`,
+  `is_wintun_available`, `get_wintun_dll_path`, `ensure_wintun_dll`,
+  `set_windows_proxy_mode`, `get_windows_proxy_mode_str`,
+  `get_windows_tun_stats`, `enable_uwp_loopback`, `open_uwp_loopback_utility`
+- **Android** — `set_android_vpn_fd`, `get_android_vpn_fd`,
+  `clear_android_vpn_fd`, `set_android_proxy_mode`, `get_android_proxy_mode`,
+  `start_android_vpn`, `stop_android_vpn`, `set_vpn_fd`, `clear_vpn_fd`,
+  `set_protect_socket_callback_enabled`
+
+---
+
 ## Documentation
 
 - `corduit-core` — [docs.rs/corduit-core](https://docs.rs/corduit-core)
@@ -313,8 +436,14 @@ examples, built with `all-features` on docs.rs.
    innards of each protocol. Swap implementations without touching callers.
 3. **Fail loudly at the boundary.** Configuration is validated once at the
    edge; interior code works on already-validated, typed data.
-4. **No fabricated dependencies.** Every dependency in the lockfile is real and
-   used; the wire formats are hand-implemented and covered by property tests.
+4. **No dead weight, no serde.** serde / serde_json / serde_yaml are gone
+   entirely — every type in the workspace (config, DTOs, protocol metadata)
+   derives `nextjson`'s `NsonSerialize` / `NsonDeserialize`. Unused
+   dependencies are removed and every declared dependency is actually used.
+5. **Serialization is a first-class citizen.** The FFI boundary uses
+   `nextjson` + `rustbinary` (typed, schema-driven, `no_std`, `unsafe`-free),
+   so cross-language clients get stable, self-describing payloads with zero
+   serde anywhere in the graph.
 
 ---
 
@@ -331,7 +460,7 @@ cargo doc --workspace --all-features --no-deps
 cargo build --release --workspace
 ```
 
-MSRV: **Rust 1.77+** (edition 2021).
+MSRV: **Rust 1.85+** (edition 2021).
 
 ### Publishing to crates.io
 
@@ -350,19 +479,68 @@ Each crate is built with `all-features` on docs.rs.
 
 ---
 
+## Security
+
+Corduit is audited as a dependency graph **and** at the source level:
+
+### Dependency audit (`cargo audit`)
+
+- All direct dependencies are recent and maintained. The entire serde family
+  (`serde`, `serde_json`, `serde_yaml`) has been replaced by first-party
+  `nextjson` (schema-driven, `#![deny(unsafe_code)]`, bounded) and
+  `rustbinary`; PEM parsing moved to the first-party `PemObject` trait in
+  `rustls-pki-types`.
+- The only remaining advisory is *informational*: `paste` (a transitive
+  build-time macro helper pulled in by the Linux netlink stack) is
+  unmaintained — it is not a security vulnerability and cannot be removed
+  without replacing the whole `tun-rs` dependency chain.
+
+### Source-level hardening (CWE review)
+
+| Check | Verdict |
+|---|---|
+| CWE-78 OS command injection | Fixed — interface names are validated before
+  PowerShell/netsh interpolation (`sanitize_interface_name`) |
+| CWE-190 integer truncation | Fixed — QUIC request payloads > 64 KiB are
+  rejected instead of truncated; SOCKS5 credentials are length-checked
+  (RFC 1929) |
+| CWE-295 TLS certificate verification | Verified — `skip_cert_verify` is
+  off by default; native roots are used and verification is only bypassed
+  when explicitly configured |
+| CWE-22 path traversal | Verified — wintun extraction uses fixed entry names;
+  no user-controlled paths reach the filesystem |
+| CWE-502 deserialization | Verified — `nextjson`/`rustbinary` are
+  memory-safe, bounded, schema-driven formats |
+| CWE-798 hard-coded credentials | Verified — no credentials in production
+  code (test-only fixtures) |
+| CWE-120 / CWE-416 memory safety | Verified — `unsafe` is confined to the
+  hand-verified FFI/platform boundary |
+
+### Runtime posture
+
+- **TLS 1.3 by default** via rustls (ring), AEAD ciphers only
+  (AES-GCM / ChaCha20-Poly1305), X25519/Curve25519 key exchange.
+- **Memory safety by construction** — a Rust panic cannot become memory
+  corruption; all buffer sizes are bounds-checked before use.
+- **Fail-closed configuration** — unknown protocols and malformed options are
+  rejected at the boundary, not silently ignored.
+
+---
+
 ## License
 
-[FSL-1.1-Apache-2.0](LICENSE) — **Functional Source License, Version 1.1, ALv2
-Future License** (Sentry's next-generation license).
+[PolyForm Perimeter 1.0.1](LICENSE) — a source-available license from
+[PolyForm Project](https://polyformproject.org/licenses/perimeter/1.0.1).
 
-- ✅ Use, modify, integrate and commercialize freely
-- ✅ Redistribute, including derivatives
-- ✅ Patents granted for permitted purposes
-- 🚫 **Competing hosted service** only
-- 🔁 Automatically becomes **Apache License 2.0** on the second anniversary of
-  each release
+- ✅ Use, modify and create new works freely
+- ✅ Distribute copies, including derivatives
+- ✅ Patents granted; fair use preserved
+- 🚫 **Noncompete** — you may not offer a product that substitutes for
+  Corduit's functionality or value
+- 🔒 **No automatic relicensing** — the license stays PolyForm Perimeter
+  forever; it never converts to MIT or Apache-2.0
 
-SPDX identifier: `FSL-1.1-Apache-2.0`
+SPDX identifier: `PolyForm-Perimeter-1.0.1`
 
 ---
 

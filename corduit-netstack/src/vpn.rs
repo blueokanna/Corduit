@@ -74,7 +74,10 @@ impl TunPacketProcessor {
         }
 
         let packet_number = self.packet_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if packet_number <= 10 || packet_number.is_multiple_of(500) {
+        // `u64::is_multiple_of` is stable only since Rust 1.87; the declared
+        // MSRV is 1.85, so keep the remainder check.
+        #[allow(clippy::manual_is_multiple_of)]
+        if packet_number <= 10 || packet_number % 500 == 0 {
             debug!(packet_number, bytes = packet.len(), "processing TUN packet");
         }
 

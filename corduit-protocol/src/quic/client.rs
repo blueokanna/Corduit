@@ -239,7 +239,7 @@ impl ClientConnection {
         let mut stream = QuicStream::new(send, recv, StreamType::Tcp);
 
         let request = Request::connect(target);
-        stream.write_raw(&request.to_bytes()).await?;
+        stream.write_raw(&request.to_bytes()?).await?;
 
         let mut resp_buf = [0u8; 64];
         let n = stream
@@ -268,7 +268,7 @@ impl ClientConnection {
         let mut stream = QuicStream::new(send, recv, StreamType::Tcp);
 
         let request = Request::connect(target).with_payload(early_data);
-        stream.write_raw(&request.to_bytes()).await?;
+        stream.write_raw(&request.to_bytes()?).await?;
 
         let mut resp_buf = [0u8; 64];
         let n = stream
@@ -293,7 +293,7 @@ impl ClientConnection {
         let mut stream = QuicStream::new(send, recv, StreamType::Udp);
 
         let request = Request::udp_associate(bind_addr);
-        stream.write_raw(&request.to_bytes()).await?;
+        stream.write_raw(&request.to_bytes()?).await?;
 
         let mut resp_buf = [0u8; 128];
         let n = stream

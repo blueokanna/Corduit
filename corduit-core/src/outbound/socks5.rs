@@ -248,7 +248,15 @@ impl Socks5Outbound {
         username: &str,
         password: &str,
     ) -> Result<()> {
-        // Username/password auth (RFC 1929)
+        // Username/password auth (RFC 1929). Each credential is a single byte
+        // length-prefixed field (max 255 bytes), so oversized credentials are
+        // rejected instead of silently truncated.
+        if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
+            return Err(Error::config(
+                "SOCKS5 username/password must be at most 255 bytes (RFC 1929)",
+            ));
+        }
+
         let mut auth = vec![0x01]; // Version
         auth.push(username.len() as u8);
         auth.extend_from_slice(username.as_bytes());

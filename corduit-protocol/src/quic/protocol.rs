@@ -88,9 +88,20 @@ impl Request {
         self
     }
 
-    pub fn to_bytes(&self) -> Bytes {
+    /// Serialize the request into its wire form.
+    ///
+    /// The wire format stores the payload length as a `u16`, so a payload
+    /// larger than [`u16::MAX`] is rejected instead of being silently
+    /// truncated (which would corrupt the frame).
+    pub fn to_bytes(&self) -> Result<Bytes> {
         let addr_len = self.address.serialized_len();
         let payload_len = self.payload.as_ref().map(|p| p.len()).unwrap_or(0);
+        if payload_len > u16::MAX as usize {
+            return Err(QuicError::InvalidConfig(format!(
+                "request payload too large: {payload_len} bytes (max {})",
+                u16::MAX
+            )));
+        }
         let mut buf = BytesMut::with_capacity(2 + addr_len + 2 + payload_len);
 
         buf.put_u8(self.version);
@@ -104,7 +115,7 @@ impl Request {
             buf.put_u16(0);
         }
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
