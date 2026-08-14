@@ -24,7 +24,6 @@ keywords = ["proxy", "protocol", "network", "tun", "rust"]
 categories = [
     "network-programming",
     "web-programming",
-    "protocol-implementation",
     "asynchronous",
 ]
 
