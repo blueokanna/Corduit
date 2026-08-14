@@ -12,7 +12,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-license = "PolyForm-Perimeter-1.0.1"
+license-file = "LICENSE"
 version = "0.1.0"
 authors = ["blueokanna"]
 rust-version = "1.95"

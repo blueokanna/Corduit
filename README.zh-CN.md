@@ -535,7 +535,8 @@ Corduit 同时进行**依赖图审计**与**源码级审查**：
 - 🔒 **无自动重新授权** —— 许可永久保持 PolyForm Perimeter，绝不转为
   MIT 或 Apache-2.0
 
-SPDX 标识符：`PolyForm-Perimeter-1.0.1`
+许可证：[PolyForm Perimeter 1.0.1](LICENSE) —— 通过 manifest 中的
+`license-file` 字段声明（PolyForm Perimeter 没有 SPDX 标识符）。
 
 ---
 

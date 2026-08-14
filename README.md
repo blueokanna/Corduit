@@ -573,7 +573,8 @@ Corduit is audited as a dependency graph **and** at the source level:
 - 🔒 **No automatic relicensing** — the license stays PolyForm Perimeter
   forever; it never converts to MIT or Apache-2.0
 
-SPDX identifier: `PolyForm-Perimeter-1.0.1`
+License: [PolyForm Perimeter 1.0.1](LICENSE) — declared via `license-file` in
+the manifests (PolyForm Perimeter has no SPDX identifier).
 
 ---
 
