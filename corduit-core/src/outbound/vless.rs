@@ -3,12 +3,12 @@ use crate::connection_tracker::{global_tracker, TrackedConnection};
 use crate::error::{Error, Result};
 use crate::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
 use crate::tls::SkipServerVerification;
+use corduit_crypto::uuid::Uuid;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
-use uuid::Uuid;
 
 const VLESS_VERSION: u8 = 0x00;
 

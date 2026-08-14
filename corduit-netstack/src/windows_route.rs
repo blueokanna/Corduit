@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 /// `$` or command separators could break out of the string and execute
 /// arbitrary commands (CWE-78). Such characters are rejected outright, while
 /// Unicode adapter names (e.g. Chinese "以太网") remain fully supported.
-fn sanitize_interface_name(name: &str) -> Result<&str, String> {
+pub(crate) fn sanitize_interface_name(name: &str) -> Result<&str, String> {
     if name.is_empty() || name.len() > 128 {
         return Err("invalid interface name: must be 1..=128 characters".to_string());
     }

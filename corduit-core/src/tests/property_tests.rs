@@ -227,7 +227,7 @@ proptest! {
             base_domain
         );
 
-        let unrelated = format!("unrelated{}.xyz", rand::random::<u32>());
+        let unrelated = format!("unrelated{}.xyz", crate::random::u32());
         prop_assert!(
             !provider.matches_entry(&entry, Some(&unrelated), None),
             "Unrelated domain {} should not match suffix {}",

@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
+use corduit_crypto::uuid::Uuid;
 
 const TUIC_VERSION: u8 = 0x05;
 const TUIC_CMD_AUTHENTICATE: u8 = 0x00;
@@ -313,7 +313,8 @@ impl TuicConnection {
 }
 
 fn compute_auth_token(uuid: &Uuid, password: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
+    use corduit_crypto::digest::Digest;
+    use corduit_crypto::hash::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(uuid.as_bytes());
     hasher.update(password.as_bytes());
@@ -690,7 +691,7 @@ impl TuicOutbound {
 
     pub async fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         let conn = self.get_or_create_connection().await?;
-        let assoc_id: u16 = rand::random();
+        let assoc_id: u16 = crate::random::u16();
 
         conn.send_udp_packet(assoc_id, target, data, 0, 1).await?;
 

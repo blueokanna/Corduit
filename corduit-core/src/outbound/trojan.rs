@@ -3,7 +3,9 @@ use crate::connection_tracker::{global_tracker, TrackedConnection};
 use crate::error::{Error, Result};
 use crate::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
 use crate::tls::SkipServerVerification;
-use sha2::{Digest, Sha224};
+use corduit_crypto::digest::Digest;
+use corduit_crypto::encoding::hex_encode;
+use corduit_crypto::hash::Sha224;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -466,7 +468,7 @@ fn compute_password_hash(password: &str) -> [u8; 56] {
     let mut hasher = Sha224::new();
     hasher.update(password.as_bytes());
     let result = hasher.finalize();
-    let hex_str = hex::encode(result);
+    let hex_str = hex_encode(&result);
     let mut hash = [0u8; 56];
     hash.copy_from_slice(hex_str.as_bytes());
     hash
@@ -615,7 +617,7 @@ mod tests {
 
         let mut hasher = Sha224::new();
         hasher.update(password.as_bytes());
-        let expected = hex::encode(hasher.finalize());
+        let expected = hex_encode(&hasher.finalize());
 
         assert_eq!(hash_str, expected);
     }

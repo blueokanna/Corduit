@@ -958,7 +958,8 @@ pub async fn get_system_info() -> Result<SystemInfo> {
         .map(|process| process.memory())
         .unwrap_or_default();
     let cpu_threads = sys.cpus().len() as u32;
-    let cpu_cores = System::physical_core_count()
+    let cpu_cores = sys
+        .physical_core_count()
         .map(|c| c as u32)
         .unwrap_or(cpu_threads);
 
@@ -1773,9 +1774,9 @@ fn ss_derive_subkey(
     salt: &[u8],
     key_len: usize,
 ) -> std::result::Result<Vec<u8>, String> {
-    use hkdf::Hkdf;
-    use md5::{Digest, Md5};
-    use sha1::Sha1;
+    use corduit_crypto::digest::Digest;
+    use corduit_crypto::hash::{Md5, Sha1};
+    use corduit_crypto::kdf::Hkdf;
 
     let mut key = Vec::new();
     let mut prev: Vec<u8> = Vec::new();
@@ -1791,7 +1792,7 @@ fn ss_derive_subkey(
     let hk = Hkdf::<Sha1>::new(Some(salt), &key);
     let mut subkey = vec![0u8; key_len];
     hk.expand(b"ss-subkey", &mut subkey)
-        .map_err(|e| format!("HKDF expand failed: {}", e))?;
+        .map_err(|e| format!("HKDF expand failed: {e:?}"))?;
 
     Ok(subkey)
 }
@@ -1808,8 +1809,8 @@ fn ss_build_address_header(host: &str, port: u16) -> Vec<u8> {
 
 #[allow(clippy::large_enum_variant)]
 enum SsAeadCipherInner {
-    Aes256Gcm(aes_gcm::Aes256Gcm),
-    Aes128Gcm(aes_gcm::Aes128Gcm),
+    Aes256Gcm(corduit_crypto::aead::Aes256Gcm),
+    Aes128Gcm(corduit_crypto::aead::Aes128Gcm),
 }
 
 struct SsAeadCipher {
@@ -1819,15 +1820,15 @@ struct SsAeadCipher {
 
 impl SsAeadCipher {
     fn new(key: &[u8]) -> std::result::Result<Self, String> {
-        use aes_gcm::KeyInit;
-
         let inner = if key.len() == 32 {
             SsAeadCipherInner::Aes256Gcm(
-                aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|_| "Invalid AES-256 key")?,
+                corduit_crypto::aead::Aes256Gcm::new_from_slice(key)
+                    .map_err(|_| "Invalid AES-256 key")?,
             )
         } else if key.len() == 16 {
             SsAeadCipherInner::Aes128Gcm(
-                aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|_| "Invalid AES-128 key")?,
+                corduit_crypto::aead::Aes128Gcm::new_from_slice(key)
+                    .map_err(|_| "Invalid AES-128 key")?,
             )
         } else {
             return Err(format!("Invalid key length: {}", key.len()));
@@ -1844,36 +1845,32 @@ impl SsAeadCipher {
     }
 
     fn encrypt(&mut self, plaintext: &[u8]) -> std::result::Result<Vec<u8>, String> {
-        use aes_gcm::aead::Aead;
+        use corduit_crypto::aead::Aead;
 
         let nonce = self.next_nonce();
-        let nonce =
-            aes_gcm::Nonce::try_from(nonce.as_slice()).map_err(|_| "Invalid nonce length")?;
 
         match &self.inner {
             SsAeadCipherInner::Aes256Gcm(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| format!("Encryption failed: {}", e)),
+                .encrypt(&nonce, plaintext, &[])
+                .map_err(|e| format!("Encryption failed: {e:?}")),
             SsAeadCipherInner::Aes128Gcm(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| format!("Encryption failed: {}", e)),
+                .encrypt(&nonce, plaintext, &[])
+                .map_err(|e| format!("Encryption failed: {e:?}")),
         }
     }
 
     fn decrypt(&mut self, ciphertext: &[u8]) -> std::result::Result<Vec<u8>, String> {
-        use aes_gcm::aead::Aead;
+        use corduit_crypto::aead::Aead;
 
         let nonce = self.next_nonce();
-        let nonce =
-            aes_gcm::Nonce::try_from(nonce.as_slice()).map_err(|_| "Invalid nonce length")?;
 
         match &self.inner {
             SsAeadCipherInner::Aes256Gcm(cipher) => cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| format!("Decryption failed: {}", e)),
+                .decrypt(&nonce, ciphertext, &[])
+                .map_err(|e| format!("Decryption failed: {e:?}")),
             SsAeadCipherInner::Aes128Gcm(cipher) => cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| format!("Decryption failed: {}", e)),
+                .decrypt(&nonce, ciphertext, &[])
+                .map_err(|e| format!("Decryption failed: {e:?}")),
         }
     }
 }

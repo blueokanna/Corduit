@@ -6,7 +6,7 @@
 [![Crates.io](https://img.shields.io/crates/v/corduit-core)](https://crates.io/crates/corduit-core)
 [![docs.rs](https://img.shields.io/docsrs/corduit-core)](https://docs.rs/corduit-core)
 [![License](https://img.shields.io/badge/license-PolyForm--Perimeter--1.0.1-blue)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.78-blue)](Cargo.toml)
 
 ---
 
@@ -61,6 +61,14 @@ release.
   ships its own hyper-based HTTP client, its own URL parser, its own MaxMind
   MMDB v2 reader and its own DNS wire codec, all bounds-checked and
   dependency-light (`corduit-common`, `corduit-core::mmdb`, `corduit-dns::wire`).
+- **Every cryptographic primitive is in-repo** — `corduit-crypto` implements the
+  full stack from scratch with **zero external dependencies** and a `no_std`
+  core: AES-GCM, ChaCha20-Poly1305, Poly1305, HMAC, HKDF, MD5, SHA-1, SHA-2,
+  SHA-3, BLAKE2, BLAKE3, X25519, base64/hex, UUIDv4 and a ChaCha-based CSPRNG.
+  Only the OS entropy source (`getrandom`) is external. The proxy protocols
+  (Shadowsocks, VMess, WireGuard, QUIC, …) all call into it directly; the old
+  `aes-gcm`, `chacha20poly1305`, `blake2/3`, `sha1/2`, `hkdf`, `md-5`, `uuid`,
+  `rand`, `x25519-dalek` dependencies are gone from the workspace.
 - **Hot reload** — `Corduit::reload()` swaps configuration atomically.
 - **Observability** — `tracing`-based structured logging and span helpers with
   per-connection traffic stats.
@@ -91,6 +99,10 @@ Corduit (workspace)
 │       ├── geoip.rs    #   CountryMatcher trait (dependency inversion)
 │       ├── mmdb.rs     #   Self-implemented MaxMind MMDB v2 reader
 │       └── proxy.rs    #   ProxyManager: the coordinator
+│
+├── corduit-crypto      # Dependency-free, no_std crypto primitives: AES-GCM,
+│                       #   ChaCha20-Poly1305, SHA-1/2/3, BLAKE2/3, MD5, HMAC,
+│                       #   Poly1305, HKDF, X25519, base64/hex, UUIDv4, CSPRNG
 │
 ├── corduit-protocol    # Wire protocols: QUIC, TLS, WireGuard, TUIC,
 │                       #   transports (h2/gRPC/WebSocket/TLS)
@@ -471,7 +483,10 @@ cargo doc --workspace --all-features --no-deps
 cargo build --release --workspace
 ```
 
-MSRV: **Rust 1.85+** (edition 2021).
+MSRV: **Rust 1.78** (verified with `cargo +1.78.0 check/test`; `resolver = "2"`
+with an MSRV-aware fallback in `.cargo/config.toml` keeps the lock
+compatible, and `rustbinary` is vendored under `vendor/` with a one-line
+`std`-gate patch because its upstream releases require Rust 1.81+).
 
 ### Publishing to crates.io
 
@@ -534,6 +549,11 @@ Corduit is audited as a dependency graph **and** at the source level:
 
 - **TLS 1.3 by default** via rustls (ring), AEAD ciphers only
   (AES-GCM / ChaCha20-Poly1305), X25519/Curve25519 key exchange.
+- **All symmetric/key-agreement crypto is self-implemented and audited** in
+  `corduit-crypto` against RFC/NIST/IRTF vectors: the AEAD, hash and X25519
+  suites are verified against RFC 8439, NIST SP 800-38D, RFC 7748, RFC 7693,
+  the official BLAKE3 test vectors and RFC 5869, and the MAC comparisons and
+  field arithmetic are constant-time.
 - **Memory safety by construction** — a Rust panic cannot become memory
   corruption; all buffer sizes are bounds-checked before use.
 - **Fail-closed configuration** — unknown protocols and malformed options are

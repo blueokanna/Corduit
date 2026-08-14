@@ -84,7 +84,7 @@ impl DnsClient {
         let name = Name::from_ascii(name)
             .map_err(|e| DnsError::NameError(format!("Invalid domain name: {}", e)))?;
 
-        let mut message = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+        let mut message = Message::new(crate::util::random_id(), MessageType::Query, OpCode::Query);
         message.metadata.recursion_desired = true;
 
         let query = Query::query(name, record_type);
@@ -216,8 +216,10 @@ impl DnsClient {
         let port = self.config.port.unwrap_or(443);
 
         // Use base64url encoding for GET request
-        let _encoded =
-            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &data);
+        let _encoded = corduit_crypto::encoding::encode(
+            &data,
+            corduit_crypto::encoding::Config::URL_SAFE_NO_PAD,
+        );
 
         let url = format!("https://{}:{}{}", host, port, path);
 

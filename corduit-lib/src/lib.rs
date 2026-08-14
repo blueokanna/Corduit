@@ -1,3 +1,6 @@
+// HarmonyOS uses a non-standard `target_os = "ohos"` value.
+#![allow(unexpected_cfgs)]
+
 mod logging;
 
 use std::sync::Arc;

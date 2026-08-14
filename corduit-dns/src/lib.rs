@@ -80,6 +80,7 @@ pub mod hosts;
 pub mod manager;
 pub mod resolver;
 pub mod server;
+pub mod util;
 pub mod wire;
 
 #[cfg(test)]

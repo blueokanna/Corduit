@@ -2,8 +2,8 @@
 name = "corduit-dns"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-rust-version = "1.85"
 readme.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -15,10 +15,11 @@ description = "DNS resolver and server for Corduit with anti-spoofing, caching a
 all-features = true
 
 [dependencies]
-base64 = { workspace = true }
 bytes = { workspace = true }
 corduit-common = { workspace = true }
+corduit-crypto = { workspace = true }
 dashmap = { workspace = true }
+getrandom = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
@@ -26,7 +27,6 @@ hyper-util = { workspace = true }
 ipnet = { workspace = true }
 nextjson = { workspace = true }
 parking_lot = { workspace = true }
-rand = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 thiserror = { workspace = true }

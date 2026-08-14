@@ -52,37 +52,45 @@ impl Socks5Server {
 }
 
 async fn handle_socks5_connection(mut stream: TcpStream, client: Arc<QuicClient>) -> Result<()> {
-    let mut buf = [0u8; 2];
-    stream.read_exact(&mut buf).await?;
+    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    if buf[0] != SOCKS5_VERSION {
-        return Err(QuicError::Protocol("Invalid SOCKS version".to_string()));
-    }
+    let (cmd, target) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let mut buf = [0u8; 2];
+        stream.read_exact(&mut buf).await?;
 
-    let nmethods = buf[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    stream.read_exact(&mut methods).await?;
+        if buf[0] != SOCKS5_VERSION {
+            return Err(QuicError::Protocol("Invalid SOCKS version".to_string()));
+        }
 
-    if !methods.contains(&SOCKS5_AUTH_NONE) {
-        stream.write_all(&[SOCKS5_VERSION, 0xFF]).await?;
-        return Err(QuicError::Protocol("No supported auth method".to_string()));
-    }
+        let nmethods = buf[1] as usize;
+        let mut methods = vec![0u8; nmethods];
+        stream.read_exact(&mut methods).await?;
 
-    stream
-        .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
-        .await?;
+        if !methods.contains(&SOCKS5_AUTH_NONE) {
+            stream.write_all(&[SOCKS5_VERSION, 0xFF]).await?;
+            return Err(QuicError::Protocol("No supported auth method".to_string()));
+        }
 
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header).await?;
+        stream
+            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
+            .await?;
 
-    if header[0] != SOCKS5_VERSION {
-        return Err(QuicError::Protocol("Invalid SOCKS version".to_string()));
-    }
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).await?;
 
-    let cmd = header[1];
-    let atyp = header[3];
+        if header[0] != SOCKS5_VERSION {
+            return Err(QuicError::Protocol("Invalid SOCKS version".to_string()));
+        }
 
-    let target = parse_address(&mut stream, atyp).await?;
+        let cmd = header[1];
+        let atyp = header[3];
+
+        let target = parse_address(&mut stream, atyp).await?;
+
+        Ok::<_, QuicError>((cmd, target))
+    })
+    .await
+    .map_err(|_| QuicError::Protocol("SOCKS5 handshake timeout".to_string()))??;
 
     match cmd {
         SOCKS5_CMD_CONNECT => handle_tcp_connect(&mut stream, client, target).await,

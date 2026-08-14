@@ -334,7 +334,8 @@ pub struct SalamanderObfs {
 
 impl SalamanderObfs {
     pub fn new(password: &str) -> Self {
-        use sha2::{Digest, Sha256};
+        use corduit_crypto::digest::Digest;
+        use corduit_crypto::hash::Sha256;
         let mut hasher = Sha256::new();
         hasher.update(b"hysteria2-salamander-");
         hasher.update(password.as_bytes());
@@ -619,7 +620,7 @@ impl Hysteria2Outbound {
 
     pub async fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         let conn = self.get_or_create_connection().await?;
-        let session_id: u32 = rand::random();
+        let session_id: u32 = crate::random::u32();
 
         conn.send_udp_packet(session_id, target, data).await?;
 

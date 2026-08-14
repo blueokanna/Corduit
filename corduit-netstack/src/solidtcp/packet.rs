@@ -182,8 +182,8 @@ fn parse_ipv4(data: &[u8]) -> Result<ParsedPacket> {
 
     Ok(ParsedPacket {
         version: IpVersion::Ipv4,
-        src_addr: IpAddr::V4(src),
-        dst_addr: IpAddr::V4(dst),
+        src_addr: IpAddr::V4(src.into()),
+        dst_addr: IpAddr::V4(dst.into()),
         protocol,
         payload_offset: ihl,
         payload_len: payload.len(),
@@ -205,8 +205,8 @@ fn parse_ipv6(data: &[u8]) -> Result<ParsedPacket> {
 
     Ok(ParsedPacket {
         version: IpVersion::Ipv6,
-        src_addr: IpAddr::V6(src),
-        dst_addr: IpAddr::V6(dst),
+        src_addr: IpAddr::V6(src.into()),
+        dst_addr: IpAddr::V6(dst.into()),
         protocol,
         payload_offset: 40,
         payload_len: payload.len(),

@@ -5,8 +5,7 @@
 use crate::error::{DnsError, Result};
 use crate::resolver::DnsResolver;
 use crate::RecordType;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use corduit_crypto::encoding::{decode as b64_decode, Config as B64Config};
 use bytes::Bytes;
 use crate::wire::{BinDecodable, BinEncodable, Message, RData, Record, ResponseCode};
 use http::{Method, Request, Response, StatusCode};
@@ -276,9 +275,8 @@ impl DohServer {
             })
             .ok_or_else(|| DnsError::Protocol("Missing 'dns' query parameter".to_string()))?;
 
-        let query_bytes = URL_SAFE_NO_PAD
-            .decode(dns_param)
-            .map_err(|e| DnsError::Protocol(format!("Invalid base64: {}", e)))?;
+        let query_bytes = b64_decode(dns_param.as_bytes(), B64Config::URL_SAFE_NO_PAD)
+            .map_err(|e| DnsError::Protocol(format!("Invalid base64: {:?}", e)))?;
 
         Self::process_dns_query(&query_bytes, resolver).await
     }
@@ -301,7 +299,11 @@ impl DohServer {
             )));
         }
 
-        let body = req
+        // Cap the body: a DNS message over TCP/DoH is at most 65535 bytes, so
+        // buffering more than that is either garbage or an attack. Without a
+        // limit a hostile client could stream an unbounded body into memory.
+        let limited = http_body_util::Limited::new(req.into_body(), 65_536);
+        let body = limited
             .collect()
             .await
             .map_err(|e| DnsError::Http(format!("Failed to read body: {}", e)))?

@@ -3,6 +3,7 @@ use crate::connection_tracker::global_tracker;
 use crate::error::{Error, Result};
 use crate::outbound::direct::relay_bidirectional_with_connection;
 use crate::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use corduit_crypto::encoding::{encode as b64_encode, Config as B64Config};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -13,6 +14,63 @@ pub struct HttpOutbound {
     port: u16,
     username: Option<String>,
     password: Option<String>,
+}
+
+/// Read one line from `reader`, capped at `MAX_LINE` bytes.
+///
+/// `read_line` has no length limit: a misbehaving proxy that never sends a
+/// newline could grow memory without bound (until the caller's timeout). This
+/// helper stops as soon as the line is delimited, hits the cap, or hits EOF.
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<String> {
+    const MAX_LINE: usize = 4096;
+    let mut line: Vec<u8> = Vec::with_capacity(128);
+    loop {
+        let buf = reader
+            .fill_buf()
+            .await
+            .map_err(|e| Error::network(format!("Failed to read response line: {e}")))?;
+        if buf.is_empty() {
+            break; // EOF
+        }
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                line.extend_from_slice(&buf[..=i]);
+                reader.consume(i + 1);
+                break;
+            }
+            None => {
+                let take = MAX_LINE.saturating_sub(line.len()).min(buf.len());
+                line.extend_from_slice(&buf[..take]);
+                reader.consume(take);
+                if line.len() >= MAX_LINE {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// Skip HTTP header lines up to a total byte cap, stopping at the blank line.
+///
+/// Both the number of lines and their sizes are attacker-controlled; without
+/// a cap a misbehaving proxy could stream headers without end.
+async fn skip_headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<()> {
+    const MAX_HEADER_BYTES: usize = 16 * 1024;
+    let mut total = 0usize;
+    loop {
+        let line = read_bounded_line(reader).await?;
+        total += line.len();
+        if total > MAX_HEADER_BYTES {
+            return Err(Error::network("HTTP proxy response headers too large"));
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -80,9 +138,8 @@ impl OutboundProxy for HttpOutbound {
 
         // Add proxy auth if configured
         if let (Some(user), Some(pass)) = (&self.username, &self.password) {
-            use base64::Engine;
             let credentials = format!("{}:{}", user, pass);
-            let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+            let encoded = b64_encode(credentials.as_bytes(), B64Config::STANDARD);
             connect_request.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
         }
         connect_request.push_str("\r\n");
@@ -94,11 +151,7 @@ impl OutboundProxy for HttpOutbound {
 
         // Read CONNECT response
         let mut reader = BufReader::new(&mut stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .await
-            .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
+        let response_line = read_bounded_line(&mut reader).await?;
 
         if !response_line.contains("200") {
             return Err(Error::network(format!(
@@ -108,16 +161,7 @@ impl OutboundProxy for HttpOutbound {
         }
 
         // Skip headers
-        loop {
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read headers: {}", e)))?;
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-        }
+        skip_headers(&mut reader).await?;
 
         // Now send HTTP request through the tunnel
         let http_request = format!(
@@ -135,11 +179,7 @@ impl OutboundProxy for HttpOutbound {
         // Read HTTP response
         let result = tokio::time::timeout(timeout, async {
             let mut reader = BufReader::new(stream);
-            let mut response_line = String::new();
-            reader
-                .read_line(&mut response_line)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
+            let response_line = read_bounded_line(&mut reader).await?;
 
             if response_line.starts_with("HTTP/") {
                 Ok(())
@@ -190,9 +230,8 @@ impl OutboundProxy for HttpOutbound {
 
         // Add proxy auth if configured
         if let (Some(user), Some(pass)) = (&self.username, &self.password) {
-            use base64::Engine;
             let credentials = format!("{}:{}", user, pass);
-            let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+            let encoded = b64_encode(credentials.as_bytes(), B64Config::STANDARD);
             request.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
         }
 
@@ -206,11 +245,7 @@ impl OutboundProxy for HttpOutbound {
 
         // Read response
         let mut reader = BufReader::new(&mut outbound);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .await
-            .map_err(|e| Error::network(format!("Failed to read proxy response: {}", e)))?;
+        let response_line = read_bounded_line(&mut reader).await?;
 
         // Parse response status
         let parts: Vec<&str> = response_line.split_whitespace().collect();
@@ -230,14 +265,8 @@ impl OutboundProxy for HttpOutbound {
             )));
         }
 
-        // Skip remaining headers (read until empty line)
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
-            if line.trim().is_empty() {
-                break;
-            }
-        }
+        // Skip remaining headers (read until empty line, bounded)
+        skip_headers(&mut reader).await?;
 
         // Get the stream back from the reader
         let outbound = reader.into_inner();

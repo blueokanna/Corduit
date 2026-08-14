@@ -133,7 +133,7 @@ impl DotClient {
         let name = Name::from_str(domain)
             .map_err(|e| DnsError::NameError(format!("Invalid domain name: {}", e)))?;
 
-        let mut message = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+        let mut message = Message::new(crate::util::random_id(), MessageType::Query, OpCode::Query);
         message.metadata.recursion_desired = true;
 
         let query = Query::query(name, record_type);

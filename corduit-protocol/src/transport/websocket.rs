@@ -3,8 +3,8 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use base64::Engine;
 use bytes::Bytes;
+use corduit_crypto::encoding::{encode as b64_encode, Config as B64Config};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{Sink, Stream, StreamExt};
 use nextjson::{NsonDeserialize, NsonSerialize};
@@ -114,10 +114,9 @@ impl WebSocketTransport {
         let host = self.config.host.as_deref().unwrap_or(&self.server);
 
         let early_data_encoded = if early_data.len() <= self.config.max_early_data {
-            base64::engine::general_purpose::STANDARD.encode(early_data)
+            b64_encode(early_data, B64Config::STANDARD)
         } else {
-            base64::engine::general_purpose::STANDARD
-                .encode(&early_data[..self.config.max_early_data])
+            b64_encode(&early_data[..self.config.max_early_data], B64Config::STANDARD)
         };
 
         let path_with_early_data = if let Some(ref header_name) = self.config.early_data_header {
@@ -168,7 +167,7 @@ impl WebSocketTransport {
 fn generate_ws_key() -> String {
     let mut key = [0u8; 16];
     getrandom::fill(&mut key).ok();
-    base64::engine::general_purpose::STANDARD.encode(key)
+    b64_encode(&key, B64Config::STANDARD)
 }
 
 pub struct WsStream<S> {
@@ -494,9 +493,8 @@ mod tests {
         assert_ne!(key1, key2);
         assert!(!key1.is_empty());
 
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&key1)
-            .unwrap();
+        let decoded = corduit_crypto::encoding::decode(key1.as_bytes(), B64Config::STANDARD)
+            .expect("valid base64");
         assert_eq!(decoded.len(), 16);
     }
 }

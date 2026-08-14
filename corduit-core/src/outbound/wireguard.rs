@@ -303,7 +303,7 @@ impl WireguardOutbound {
             IpAddr::V4(ip) => ip,
             IpAddr::V6(_) => return Err(Error::protocol("IPv6 local address not supported")),
         };
-        let src_port = 40000 + (rand::random::<u16>() % 20000);
+        let src_port = 40000 + (crate::random::u16() % 20000);
 
         let udp_len = UDP_HEADER_SIZE + data.len();
         let total_len = IP_HEADER_SIZE + udp_len;
@@ -312,7 +312,7 @@ impl WireguardOutbound {
         packet[0] = 0x45;
         packet[1] = 0x00;
         packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-        packet[4..6].copy_from_slice(&rand::random::<u16>().to_be_bytes());
+        packet[4..6].copy_from_slice(&crate::random::u16().to_be_bytes());
         packet[6] = 0x40;
         packet[7] = 0x00;
         packet[8] = 64;
@@ -436,7 +436,7 @@ impl OutboundProxy for WireguardOutbound {
 
         let tracker = global_tracker();
         let mut buf = vec![0u8; self.mtu as usize - IP_HEADER_SIZE - TCP_HEADER_SIZE - 50];
-        let mut seq: u32 = rand::random();
+        let mut seq: u32 = crate::random::u32();
 
         loop {
             tokio::select! {
@@ -553,11 +553,8 @@ impl OutboundProxy for WireguardOutbound {
 }
 
 fn decode_base64_key(s: &str) -> std::result::Result<[u8; 32], String> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-
-    let bytes = STANDARD
-        .decode(s)
-        .map_err(|e| format!("Base64 decode error: {}", e))?;
+    let bytes = corduit_crypto::encoding::decode(s.as_bytes(), corduit_crypto::encoding::Config::STANDARD)
+        .map_err(|e| format!("Base64 decode error: {:?}", e))?;
 
     if bytes.len() != 32 {
         return Err(format!("Key must be 32 bytes, got {}", bytes.len()));
@@ -630,13 +627,11 @@ mod tests {
 
     #[test]
     fn test_wireguard_outbound_new() {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-
         let (priv_key, _) = generate_keypair();
         let (_, peer_pub) = generate_keypair();
 
-        let priv_key_b64 = STANDARD.encode(priv_key);
-        let peer_pub_b64 = STANDARD.encode(peer_pub);
+        let priv_key_b64 = corduit_crypto::encoding::encode(&priv_key, corduit_crypto::encoding::Config::STANDARD);
+        let peer_pub_b64 = corduit_crypto::encoding::encode(&peer_pub, corduit_crypto::encoding::Config::STANDARD);
 
         let mut options = std::collections::HashMap::new();
         options.insert(
@@ -688,19 +683,17 @@ mod tests {
 
     #[test]
     fn test_wireguard_outbound_server_addr() {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-
         let (priv_key, _) = generate_keypair();
         let (_, peer_pub) = generate_keypair();
 
         let mut options = std::collections::HashMap::new();
         options.insert(
             "private-key".to_string(),
-            nextjson::Value::String(STANDARD.encode(priv_key)),
+            nextjson::Value::String(corduit_crypto::encoding::encode(&priv_key, corduit_crypto::encoding::Config::STANDARD)),
         );
         options.insert(
             "public-key".to_string(),
-            nextjson::Value::String(STANDARD.encode(peer_pub)),
+            nextjson::Value::String(corduit_crypto::encoding::encode(&peer_pub, corduit_crypto::encoding::Config::STANDARD)),
         );
 
         let config = OutboundConfig {

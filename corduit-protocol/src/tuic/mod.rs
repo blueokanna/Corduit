@@ -3,10 +3,10 @@ use quinn::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use nextjson::{NsonDeserialize, NsonSerialize};
+use corduit_crypto::uuid::Uuid;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
-use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum TuicError {

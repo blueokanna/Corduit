@@ -84,7 +84,7 @@ impl ConnectionPool {
         // Check if we can create a new connection
         if pool.len() < self.config.max_connections {
             let conn = PooledConnection {
-                id: format!("{}-{}", target, uuid::Uuid::new_v4()),
+                id: format!("{}-{}", target, crate::random::uuid_v4()),
                 target: target.to_string(),
                 last_used: Instant::now(),
                 state: ConnectionState::InUse,

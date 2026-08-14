@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ---- Native matrix: build + full test on the three desktop OSes ----------
+  native:
+    name: ${{ matrix.os }} (stable)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+
+  # ---- MSRV job: the declared rust-version must really compile --------------
+  msrv:
+    name: MSRV 1.78 (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.78
+        uses: dtolnay/rust-toolchain@1.78.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check (MSRV)
+        run: cargo check --workspace --all-targets
+
+      - name: Test (MSRV)
+        run: cargo test --workspace
+
+  # ---- Android: cross-check via `cross` (handles the NDK in Docker) --------
+  android:
+    name: Android (aarch64 + x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cross check (Android)
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: check
+          target: aarch64-linux-android
+          args: --workspace
+
+      - name: Cross check x86_64 (Android)
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: check
+          target: x86_64-linux-android
+          args: --workspace
+
+  # ---- iOS: cross-check on macOS (needs the Xcode toolchain) ---------------
+  ios:
+    name: iOS (aarch64-apple-ios)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check (iOS)
+        run: cargo check --workspace --target aarch64-apple-ios
+
+  # ---- HarmonyOS: best-effort cross-check --------------------------------
+  # OpenHarmony ships its own rust toolchain; the standard rustup target
+  # (`aarch64-unknown-linux-ohos`) is not on crates.io so this job installs
+  # the OHOS toolchain from the official mirror. Best effort: a toolchain
+  # outage must not fail the whole pipeline.
+  harmonyos:
+    name: HarmonyOS (aarch64-unknown-linux-ohos)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OHOS rust toolchain
+        run: |
+          set -e
+          mkdir -p "$HOME/ohos-rust"
+          curl -fsSL "https://repo.huaweicloud.com/openharmony/compiler/rust/1.68.0/rust-1.68.0-x86_64-unknown-linux-gnu.tar.gz" -o rust.tgz
+          tar -xzf rust.tgz -C "$HOME/ohos-rust" --strip-components=1
+          "$HOME/ohos-rust/bin/rustc" --version
+
+      - name: Install OHOS targets
+        run: |
+          "$HOME/ohos-rust/bin/rustup" target add \
+            aarch64-unknown-linux-ohos \
+            x86_64-unknown-linux-ohos \
+            --toolchain 1.68.0-x86_64-unknown-linux-gnu
+
+      - name: Check no_std crypto (HarmonyOS)
+        run: |
+          export PATH="$HOME/ohos-rust/bin:$PATH"
+          cargo check -p corduit-crypto --target aarch64-unknown-linux-ohos
+
+  # ---- Lints: keep the tree warning-free -----------------------------------
+  lint:
+    name: clippy (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check

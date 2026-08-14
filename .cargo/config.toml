@@ -1,0 +1,14 @@
+# Corduit cargo configuration
+#
+# - `incompatible-rust-versions = "fallback"`: when a locked version demands a
+#   newer rustc than this workspace's MSRV (1.78), the resolver falls back to
+#   the newest compatible version instead of failing. This is what keeps
+#   `rust-version = "1.78"` truthful.
+# - The `check-cfg` entry for HarmonyOS (`target_os = "ohos"`) lives here
+#   because the manifest-level `[lints.rust]` table needs cargo 1.80+.
+
+[resolver]
+incompatible-rust-versions = "fallback"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ohos"))'] }

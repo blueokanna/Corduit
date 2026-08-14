@@ -53,6 +53,9 @@ pub enum NetStackError {
 
     #[error("Unsupported protocol: {0}")]
     UnsupportedProtocol(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
 }
 
 impl From<smoltcp::socket::tcp::RecvError> for NetStackError {

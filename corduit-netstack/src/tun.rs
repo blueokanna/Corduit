@@ -303,8 +303,14 @@ impl TunDevice {
     fn configure_windows_adapter(&self, prefix_len: u8) -> Result<()> {
         use std::process::Command;
 
+        // The interface name is interpolated into a PowerShell `-Command`
+        // string below; reject shell metacharacters before anything is
+        // executed (CWE-78).
+        let name = crate::windows_route::sanitize_interface_name(&self.config.name)
+            .map_err(NetStackError::InvalidConfig)?;
+
         let ip_str = self.config.address.to_string();
-        info!("Configuring adapter with IP: {}/{}", ip_str, prefix_len);
+        info!("Configuring adapter with IP: {}/{} and name {:?}", ip_str, prefix_len, name);
 
         // Set IP address using netsh
         let _ = Command::new("netsh")
@@ -313,7 +319,7 @@ impl TunDevice {
                 "ip",
                 "set",
                 "address",
-                &format!("name=\"{}\"", self.config.name),
+                &format!("name=\"{}\"", name),
                 "source=static",
                 &format!("addr={}", ip_str),
                 &format!("mask={}", self.config.netmask),
@@ -327,7 +333,7 @@ impl TunDevice {
                 "ipv4",
                 "set",
                 "subinterface",
-                &format!("\"{}\"", self.config.name),
+                &format!("\"{}\"", name),
                 &format!("mtu={}", self.config.mtu),
                 "store=active",
             ])
@@ -341,7 +347,7 @@ impl TunDevice {
                     "ip",
                     if i == 0 { "set" } else { "add" },
                     "dns",
-                    &format!("name=\"{}\"", self.config.name),
+                    &format!("name=\"{}\"", name),
                     &format!("addr={}", dns),
                 ])
                 .output();
@@ -353,7 +359,7 @@ impl TunDevice {
                 "-Command",
                 &format!(
                     "Set-NetIPInterface -InterfaceAlias '{}' -InterfaceMetric 1 -ErrorAction SilentlyContinue",
-                    self.config.name
+                    name
                 ),
             ])
             .output();
@@ -365,7 +371,7 @@ impl TunDevice {
                 "ipv4",
                 "set",
                 "interface",
-                &format!("\"{}\"", self.config.name),
+                &format!("\"{}\"", name),
                 "metric=1",
             ])
             .output();

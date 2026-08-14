@@ -15,6 +15,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+//SETTING HTTP PACKAGE BYTES LIMIT
+const MAX_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// HTTP proxy inbound listener
 pub struct HttpInbound {
     config: InboundConfig,
@@ -335,40 +337,40 @@ impl HttpInbound {
         }
         request_bytes.extend_from_slice(b"\r\n");
 
-        let body = req.into_body();
-        let body_bytes = body
-            .collect()
-            .await
-            .map_err(|e| Error::network(format!("Failed to read request body: {}", e)))?
-            .to_bytes();
-
-        if !body_bytes.is_empty() {
-            request_bytes.extend_from_slice(&body_bytes);
-        }
-
-        // For plain HTTP proxy, we use a duplex stream but handle it differently
-        // The key is to shutdown the write side AFTER writing the request
-        // This signals EOF to relay_tcp's client_to_remote, allowing it to send the request
         let target = TargetAddr::new_domain(host.clone(), port);
-
-        // Create duplex stream for bidirectional communication
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-
-        // Spawn the outbound relay task
         let relay_handle =
             tokio::spawn(async move { outbound.relay_tcp(Box::new(server_side), target).await });
 
-        // Use the client side to send request and receive response
         let (mut read_half, mut write_half) = tokio::io::split(client_side);
 
-        // Write the HTTP request and then shutdown write side to signal end of request
+        // Write the request head, then stream the body chunk-by-chunk. Buffering
+        // the whole body (an unbounded `collect()`) lets a client exhaust memory
+        // with a single oversized POST.
         write_half
             .write_all(&request_bytes)
             .await
-            .map_err(|e| Error::network(format!("Failed to write request: {}", e)))?;
+            .map_err(|e| Error::network(format!("Failed to write request head: {}", e)))?;
 
-        // Shutdown write side to signal EOF to relay_tcp
-        // This allows client_to_remote to complete and send the request to remote server
+        let mut body = req.into_body();
+        loop {
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                body.frame(),
+            )
+            .await
+            .map_err(|_| Error::network("Request body read timed out"))?
+            .transpose()
+            .map_err(|e| Error::network(format!("Failed to read request body: {}", e)))?;
+            let Some(frame) = frame else { break };
+            if let Some(data) = frame.data_ref() {
+                write_half
+                    .write_all(data)
+                    .await
+                    .map_err(|e| Error::network(format!("Failed to write request body: {}", e)))?;
+            }
+        }
+
         write_half
             .shutdown()
             .await
@@ -399,6 +401,12 @@ impl HttpInbound {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(n)) => {
                     response_buf.extend_from_slice(&temp_buf[..n]);
+                    if response_buf.len() > MAX_HTTP_RESPONSE_BYTES {
+                        return Err(Error::network(format!(
+                            "HTTP proxy response exceeded {} bytes",
+                            MAX_HTTP_RESPONSE_BYTES
+                        )));
+                    }
 
                     // Check if we've received complete headers
                     if !headers_complete {

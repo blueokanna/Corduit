@@ -4,9 +4,9 @@
 //! RFC 8484 compliant implementation.
 
 use crate::error::{DnsError, Result};
+use crate::util::random_id;
 use crate::RecordType;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use corduit_crypto::encoding::{encode as b64_encode, Config as B64Config};
 use bytes::Bytes;
 use crate::wire::{BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RData};
 use rustls::pki_types::ServerName;
@@ -149,7 +149,7 @@ impl DohClient {
         let name = Name::from_str(domain)
             .map_err(|e| DnsError::NameError(format!("Invalid domain name: {}", e)))?;
 
-        let mut message = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+        let mut message = Message::new(random_id(), MessageType::Query, OpCode::Query);
         message.metadata.recursion_desired = true;
 
         let query = Query::query(name, record_type);
@@ -172,7 +172,7 @@ impl DohClient {
         // Build request based on method
         let (_uri, _body, content_type) = match self.method {
             DohMethod::Get => {
-                let encoded = URL_SAFE_NO_PAD.encode(query);
+                let encoded = b64_encode(&query, B64Config::URL_SAFE_NO_PAD);
                 let uri = format!("{}?dns={}", self.url, encoded);
                 (uri, Bytes::new(), None)
             }
@@ -237,12 +237,28 @@ impl DohClient {
             tls_stream.write_all(query).await?;
         }
 
-        // Read response
-        let mut response_buf = Vec::new();
-        tokio::time::timeout(self.timeout, tls_stream.read_to_end(&mut response_buf))
-            .await
-            .map_err(|_| DnsError::Timeout)?
-            .map_err(DnsError::Io)?;
+        // Read response with a hard size cap: a DNS message is at most 65535
+        // bytes and the HTTP head is tiny, so anything beyond 128 KiB is a
+        // misbehaving or hostile server. `read_to_end` would buffer forever.
+        const MAX_DOH_RESPONSE: usize = 128 * 1024;
+        let mut response_buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 2048];
+        loop {
+            let n = tokio::time::timeout(self.timeout, tls_stream.read(&mut chunk))
+                .await
+                .map_err(|_| DnsError::Timeout)?
+                .map_err(DnsError::Io)?;
+            if n == 0 {
+                break;
+            }
+            response_buf.extend_from_slice(&chunk[..n]);
+            if response_buf.len() > MAX_DOH_RESPONSE {
+                return Err(DnsError::Http(format!(
+                    "DoH response exceeds {} bytes",
+                    MAX_DOH_RESPONSE
+                )));
+            }
+        }
 
         // Parse HTTP response
         let response_str = String::from_utf8_lossy(&response_buf);

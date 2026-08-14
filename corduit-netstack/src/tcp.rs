@@ -127,7 +127,11 @@ impl TcpConnection {
 
     /// Push data received from the network into the connection
     pub(crate) fn push_recv_data(&self, data: &[u8]) {
+        const MAX_RECV_BUFFER: usize = 4 * 1024 * 1024;
         let mut inner = self.inner.lock();
+        if inner.recv_buffer.len() + data.len() > MAX_RECV_BUFFER {
+            return;
+        }
         inner.recv_buffer.extend_from_slice(data);
         inner.download_bytes += data.len() as u64;
         if let Some(waker) = inner.read_waker.take() {

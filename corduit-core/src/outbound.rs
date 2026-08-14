@@ -169,6 +169,44 @@ pub trait OutboundProxy: Send + Sync {
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
+/// Single source of truth for constructing an outbound proxy from a config.
+///
+/// Every outbound construction in the engine funnels through this factory so
+/// adding a protocol touches exactly one place. Returns `Ok(None)` for group
+/// types (Selector/Urltest/Fallback/Loadbalance/Relay), which need the shared
+/// proxy registry and are resolved by the caller in a second pass. Errors on
+/// unimplemented types so no caller can silently fall back to a direct
+/// connection.
+pub(crate) fn build_outbound_proxy(
+    config: &OutboundConfig,
+) -> Result<Option<Arc<dyn OutboundProxy>>> {
+    let proxy: Option<Arc<dyn OutboundProxy>> = match config.outbound_type {
+        OutboundType::Direct => Some(Arc::new(DirectOutbound::new(config.clone()))),
+        OutboundType::Reject => Some(Arc::new(RejectOutbound::new(config.clone()))),
+        OutboundType::Socks5 => Some(Arc::new(Socks5Outbound::new(config.clone())?)),
+        OutboundType::Http => Some(Arc::new(HttpOutbound::new(config.clone())?)),
+        OutboundType::Shadowsocks => Some(Arc::new(ShadowsocksOutbound::new(config.clone())?)),
+        OutboundType::Vmess => Some(Arc::new(VmessOutbound::new(config.clone())?)),
+        OutboundType::Vless => Some(Arc::new(VlessOutbound::new(config.clone())?)),
+        OutboundType::Trojan => Some(Arc::new(TrojanOutbound::new(config.clone())?)),
+        OutboundType::Wireguard => Some(Arc::new(WireguardOutbound::new(config.clone())?)),
+        OutboundType::Tuic => Some(Arc::new(TuicOutbound::new(config.clone())?)),
+        OutboundType::Hysteria2 => Some(Arc::new(Hysteria2Outbound::new(config.clone())?)),
+        OutboundType::Quic => {
+            return Err(Error::config(format!(
+                "QUIC outbound '{}' is not implemented; refusing unsafe direct fallback",
+                config.tag
+            )));
+        }
+        OutboundType::Selector
+        | OutboundType::Urltest
+        | OutboundType::Fallback
+        | OutboundType::Loadbalance
+        | OutboundType::Relay => None,
+    };
+    Ok(proxy)
+}
+
 impl OutboundManager {
     pub async fn new(config: Arc<RwLock<Config>>) -> Result<Self> {
         let proxies: ProxyRegistry = Arc::new(RwLock::new(HashMap::new()));
@@ -196,60 +234,20 @@ impl OutboundManager {
         let mut proxy_group_configs: Vec<OutboundConfig> = Vec::new();
 
         for outbound_config in &config.outbounds {
-            let proxy: Option<Arc<dyn OutboundProxy>> = match outbound_config.outbound_type {
-                OutboundType::Direct => {
-                    Some(Arc::new(DirectOutbound::new(outbound_config.clone())))
-                }
-                OutboundType::Reject => {
-                    Some(Arc::new(RejectOutbound::new(outbound_config.clone())))
-                }
-                OutboundType::Socks5 => {
-                    Some(Arc::new(Socks5Outbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Http => {
-                    Some(Arc::new(HttpOutbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Shadowsocks => {
-                    Some(Arc::new(ShadowsocksOutbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Vmess => {
-                    Some(Arc::new(VmessOutbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Vless => {
-                    Some(Arc::new(VlessOutbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Trojan => {
-                    Some(Arc::new(TrojanOutbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Wireguard => {
-                    Some(Arc::new(WireguardOutbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Tuic => {
-                    Some(Arc::new(TuicOutbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Hysteria2 => {
-                    Some(Arc::new(Hysteria2Outbound::new(outbound_config.clone())?))
-                }
-                OutboundType::Quic => {
-                    return Err(Error::config(format!(
-                        "QUIC outbound '{}' is not implemented; refusing unsafe direct fallback",
-                        outbound_config.tag
-                    )));
-                }
-                OutboundType::Selector
-                | OutboundType::Urltest
-                | OutboundType::Fallback
-                | OutboundType::Loadbalance
-                | OutboundType::Relay => {
-                    proxy_group_configs.push(outbound_config.clone());
-                    None
-                }
-            };
+            let proxy: Option<Arc<dyn OutboundProxy>> =
+                match build_outbound_proxy(outbound_config) {
+                    Ok(proxy) => proxy,
+                    Err(e) => return Err(e),
+                };
 
             if let Some(p) = proxy {
                 let tag = p.tag().to_string();
                 proxy_list.push(p.clone());
                 registry.write().await.insert(tag, p);
+            } else {
+                // Group types (Selector/Urltest/…) are resolved in a second
+                // pass once every leaf proxy is in the registry.
+                proxy_group_configs.push(outbound_config.clone());
             }
         }
 

@@ -1,8 +1,7 @@
-use blake2::digest::{KeyInit, Mac};
-use blake2::{Blake2s256, Blake2sMac, Digest};
-use chacha20poly1305::aead::KeyInit as AeadKeyInit;
-use chacha20poly1305::{aead::Aead, ChaCha20Poly1305};
-use x25519_dalek::{PublicKey, StaticSecret};
+use corduit_crypto::aead::{Aead, ChaCha20Poly1305};
+use corduit_crypto::dh::{public_key, x25519};
+use corduit_crypto::digest::Digest;
+use corduit_crypto::hash::Blake2s;
 
 pub const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 pub const IDENTIFIER: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
@@ -18,27 +17,23 @@ pub const REKEY_TIMEOUT: u64 = 5;
 pub const KEEPALIVE_TIMEOUT: u64 = 10;
 
 pub fn hash(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Blake2s256::new();
+    let mut hasher = Blake2s::new();
     hasher.update(data);
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 pub fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
-    type HmacBlake2s = Blake2sMac<blake2::digest::consts::U32>;
-
-    let mut mac =
-        <HmacBlake2s as KeyInit>::new_from_slice(key).expect("HMAC can take key of any size");
+    // WireGuard's "hmac" is keyed BLAKE2s-256 (not RFC 2104 HMAC).
+    let mut mac = Blake2s::new_keyed(key).expect("BLAKE2s accepts any key size");
     mac.update(data);
-    mac.finalize().into_bytes().into()
+    mac.finalize()
 }
 
 pub fn mac(key: &[u8], data: &[u8]) -> [u8; 16] {
-    type MacBlake2s = Blake2sMac<blake2::digest::consts::U16>;
-
-    let mut mac =
-        <MacBlake2s as KeyInit>::new_from_slice(key).expect("MAC can take key of any size");
+    let mut mac = Blake2s::with_params(16, key).expect("BLAKE2s accepts any key size");
     mac.update(data);
-    mac.finalize().into_bytes().into()
+    let d = mac.finalize();
+    d[..16].try_into().expect("16 bytes")
 }
 
 pub fn kdf1(key: &[u8], input: &[u8]) -> [u8; 32] {
@@ -68,32 +63,19 @@ pub fn kdf3(key: &[u8], input: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
 }
 
 pub fn dh(private_key: &[u8; 32], public_key: &[u8; 32]) -> [u8; 32] {
-    let secret = StaticSecret::from(*private_key);
-    let public = PublicKey::from(*public_key);
-    *secret.diffie_hellman(&public).as_bytes()
+    x25519(private_key, public_key)
 }
 
 pub fn public_key_from_private(private_key: &[u8; 32]) -> [u8; 32] {
-    let secret = StaticSecret::from(*private_key);
-    let public = PublicKey::from(&secret);
-    *public.as_bytes()
+    public_key(private_key)
 }
 
 pub fn aead_encrypt(key: &[u8; 32], counter: u64, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
-    let cipher =
-        <ChaCha20Poly1305 as AeadKeyInit>::new_from_slice(key).expect("Invalid key length");
+    let cipher = ChaCha20Poly1305::new(key);
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
-
-    let nonce = chacha20poly1305::Nonce::try_from(nonce.as_slice()).expect("fixed nonce length");
     cipher
-        .encrypt(
-            &nonce,
-            chacha20poly1305::aead::Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
+        .encrypt(&nonce, plaintext, aad)
         .expect("Encryption failed")
 }
 
@@ -103,29 +85,17 @@ pub fn aead_decrypt(
     ciphertext: &[u8],
     aad: &[u8],
 ) -> Option<Vec<u8>> {
-    let cipher =
-        <ChaCha20Poly1305 as AeadKeyInit>::new_from_slice(key).expect("Invalid key length");
+    let cipher = ChaCha20Poly1305::new(key);
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
-
-    let nonce = chacha20poly1305::Nonce::try_from(nonce.as_slice()).expect("fixed nonce length");
-    cipher
-        .decrypt(
-            &nonce,
-            chacha20poly1305::aead::Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
-        .ok()
+    cipher.decrypt(&nonce, ciphertext, aad).ok()
 }
 
 pub fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     let mut secret_bytes = [0u8; 32];
     getrandom::fill(&mut secret_bytes).expect("Failed to generate random bytes");
-    let secret = StaticSecret::from(secret_bytes);
-    let public = PublicKey::from(&secret);
-    (secret.to_bytes(), *public.as_bytes())
+    let pub_bytes = public_key(&secret_bytes);
+    (secret_bytes, pub_bytes)
 }
 
 pub fn timestamp() -> [u8; 12] {

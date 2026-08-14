@@ -141,16 +141,20 @@ impl Socks5Inbound {
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
     ) -> Result<()> {
-        // SOCKS5 handshake
-        if !Self::perform_handshake(&mut stream).await? {
-            return Err(Error::protocol_with_info(
-                "SOCKS5 handshake failed",
-                "SOCKS5",
-            ));
-        }
+        const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-        // Read request
-        let (target_addr, target_port, command) = Self::read_request(&mut stream).await?;
+        let (target_addr, target_port, command) =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+                if !Self::perform_handshake(&mut stream).await? {
+                    return Err(Error::protocol_with_info(
+                        "SOCKS5 handshake failed",
+                        "SOCKS5",
+                    ));
+                }
+                Self::read_request(&mut stream).await
+            })
+            .await
+            .map_err(|_| Error::protocol_with_info("SOCKS5 handshake timeout", "SOCKS5"))??;
 
         // Handle different SOCKS5 commands
         match command {

@@ -593,8 +593,9 @@ impl BinEncodable for Message {
         buf.extend_from_slice(&(self.name_servers.len() as u16).to_be_bytes());
         buf.extend_from_slice(&(self.additionals.len() as u16).to_be_bytes());
 
+        let mut compressor = NameCompressor::new();
         for query in &self.queries {
-            encode_name(&mut buf, &query.name)?;
+            compressor.write_name(&mut buf, &query.name)?;
             buf.extend_from_slice(&query.query_type.to_u16().to_be_bytes());
             buf.extend_from_slice(&query.query_class.to_u16().to_be_bytes());
         }
@@ -604,7 +605,7 @@ impl BinEncodable for Message {
             .chain(&self.name_servers)
             .chain(&self.additionals)
         {
-            encode_record(&mut buf, record)?;
+            encode_record(&mut compressor, &mut buf, record)?;
         }
         Ok(buf)
     }
@@ -668,20 +669,79 @@ impl BinDecodable for Message {
 // Low-level encode helpers
 // ---------------------------------------------------------------------------
 
-fn encode_name(buf: &mut Vec<u8>, name: &Name) -> Result<(), WireError> {
-    for label in &name.labels {
+/// RFC 1035 name compressor: remembers the message offset of every label
+/// suffix already written so a repeated name (or a shared suffix such as
+/// `.example.com`) is emitted as a 2-byte pointer instead of duplicated bytes.
+/// This keeps large multi-record responses inside the 512-byte UDP budget.
+///
+/// Pointers are only emitted for offsets that fit the 14-bit pointer field;
+/// anything beyond 0x3FFF falls back to the literal form.
+struct NameCompressor {
+    offsets: std::collections::HashMap<Vec<u8>, usize>,
+}
+
+impl NameCompressor {
+    fn new() -> Self {
+        Self {
+            offsets: std::collections::HashMap::new(),
+        }
+    }
+
+    fn write_name(&mut self, buf: &mut Vec<u8>, name: &Name) -> Result<(), WireError> {
+        if name.labels.is_empty() {
+            buf.push(0);
+            return Ok(());
+        }
+        // Longest-suffix first: the best compression wins.
+        for start in 0..name.labels.len() {
+            let key = Self::suffix_key(&name.labels[start..]);
+            if let Some(&off) = self.offsets.get(&key) {
+                if off <= 0x3FFF {
+                    for label in &name.labels[..start] {
+                        Self::push_label(buf, label)?;
+                    }
+                    let ptr = 0xC000u16 | off as u16;
+                    buf.extend_from_slice(&ptr.to_be_bytes());
+                    return Ok(());
+                }
+            }
+        }
+        // Nothing reusable: write the full name and index every suffix.
+        for i in 0..name.labels.len() {
+            let key = Self::suffix_key(&name.labels[i..]);
+            self.offsets.entry(key).or_insert(buf.len());
+            Self::push_label(buf, &name.labels[i])?;
+        }
+        buf.push(0);
+        Ok(())
+    }
+
+    /// Wire encoding of a label sequence, used as the compression key.
+    fn suffix_key(labels: &[Vec<u8>]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(labels.iter().map(|l| l.len() + 1).sum());
+        for label in labels {
+            key.push(label.len() as u8);
+            key.extend_from_slice(label);
+        }
+        key
+    }
+
+    fn push_label(buf: &mut Vec<u8>, label: &[u8]) -> Result<(), WireError> {
         if label.is_empty() || label.len() > 63 {
             return Err(WireError::new("invalid label length while encoding name"));
         }
         buf.push(label.len() as u8);
         buf.extend_from_slice(label);
+        Ok(())
     }
-    buf.push(0);
-    Ok(())
 }
 
-fn encode_record(buf: &mut Vec<u8>, record: &Record) -> Result<(), WireError> {
-    encode_name(buf, &record.name)?;
+fn encode_record(
+    compressor: &mut NameCompressor,
+    buf: &mut Vec<u8>,
+    record: &Record,
+) -> Result<(), WireError> {
+    compressor.write_name(buf, &record.name)?;
     let record_type = if record.record_type == RecordType::Unknown(0) {
         rdata_record_type(&record.data)
     } else {
@@ -693,7 +753,7 @@ fn encode_record(buf: &mut Vec<u8>, record: &Record) -> Result<(), WireError> {
 
     let rdata_start = buf.len();
     buf.extend_from_slice(&[0, 0]); // rdlength placeholder
-    encode_rdata(buf, &record.data)?;
+    encode_rdata(compressor, buf, &record.data)?;
     let rdata_len = buf.len() - rdata_start - 2;
     if rdata_len > u16::MAX as usize {
         return Err(WireError::new("RDATA exceeds 65535 bytes"));
@@ -720,11 +780,17 @@ fn rdata_record_type(data: &RData) -> RecordType {
     }
 }
 
-fn encode_rdata(buf: &mut Vec<u8>, data: &RData) -> Result<(), WireError> {
+fn encode_rdata(
+    compressor: &mut NameCompressor,
+    buf: &mut Vec<u8>,
+    data: &RData,
+) -> Result<(), WireError> {
     match data {
         RData::A(a) => buf.extend_from_slice(&a.0.octets()),
         RData::AAAA(aaaa) => buf.extend_from_slice(&aaaa.0.octets()),
-        RData::CNAME(name) | RData::NS(name) | RData::PTR(name) => encode_name(buf, name)?,
+        RData::CNAME(name) | RData::NS(name) | RData::PTR(name) => {
+            compressor.write_name(buf, name)?
+        }
         RData::TXT(strings) => {
             for s in strings {
                 let bytes = s.as_bytes();
@@ -737,7 +803,7 @@ fn encode_rdata(buf: &mut Vec<u8>, data: &RData) -> Result<(), WireError> {
         }
         RData::MX { preference, exchange } => {
             buf.extend_from_slice(&preference.to_be_bytes());
-            encode_name(buf, exchange)?;
+            compressor.write_name(buf, exchange)?;
         }
         RData::SOA {
             mname,
@@ -748,8 +814,8 @@ fn encode_rdata(buf: &mut Vec<u8>, data: &RData) -> Result<(), WireError> {
             expire,
             minimum,
         } => {
-            encode_name(buf, mname)?;
-            encode_name(buf, rname)?;
+            compressor.write_name(buf, mname)?;
+            compressor.write_name(buf, rname)?;
             for v in [serial, refresh, retry, expire, minimum] {
                 buf.extend_from_slice(&v.to_be_bytes());
             }
@@ -763,7 +829,7 @@ fn encode_rdata(buf: &mut Vec<u8>, data: &RData) -> Result<(), WireError> {
             buf.extend_from_slice(&priority.to_be_bytes());
             buf.extend_from_slice(&weight.to_be_bytes());
             buf.extend_from_slice(&port.to_be_bytes());
-            encode_name(buf, target)?;
+            compressor.write_name(buf, target)?;
         }
         RData::SvcParams {
             priority,
@@ -771,7 +837,7 @@ fn encode_rdata(buf: &mut Vec<u8>, data: &RData) -> Result<(), WireError> {
             params,
         } => {
             buf.extend_from_slice(&priority.to_be_bytes());
-            encode_name(buf, target)?;
+            compressor.write_name(buf, target)?;
             buf.extend_from_slice(params);
         }
         RData::Unknown(raw) => buf.extend_from_slice(raw),
@@ -1019,7 +1085,14 @@ impl<'a> Decoder<'a> {
                 let mname_len = self.name_len_at(rdata_offset);
                 let rname = self.read_name_at(rdata_offset + mname_len)?;
                 let rname_len = self.name_len_at(rdata_offset + mname_len);
-                let tail = &rdata[mname_len + rname_len..];
+                // `name_len_at` measures against the whole message, so the
+                // combined name length may exceed the declared RDATA length on
+                // a malformed record. Reject before slicing.
+                let names_len = mname_len.saturating_add(rname_len);
+                if names_len > rdata.len() {
+                    return Err(WireError::new("SOA names exceed RDATA length"));
+                }
+                let tail = &rdata[names_len..];
                 if tail.len() < 20 {
                     return Err(WireError::new("truncated SOA record"));
                 }
@@ -1060,7 +1133,11 @@ impl<'a> Decoder<'a> {
                 let priority = u16::from_be_bytes([rdata[0], rdata[1]]);
                 let target = self.read_name_at(rdata_offset + 2)?;
                 let target_len = self.name_len_at(rdata_offset + 2);
-                let params = rdata[2 + target_len..].to_vec();
+                let params_start = 2usize.saturating_add(target_len);
+                if params_start > rdata.len() {
+                    return Err(WireError::new("SVCB/HTTPS target exceeds RDATA length"));
+                }
+                let params = rdata[params_start..].to_vec();
                 Ok(RData::SvcParams {
                     priority,
                     target,
@@ -1297,6 +1374,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_soa_names_exceeding_rdata() {
+        // A hostile SOA whose RDATA claims a 1-byte body but whose mname label
+        // runs past the RDATA boundary (still inside the message). Previously
+        // this panicked on `&rdata[mname_len + rname_len..]`.
+        let mut msg = vec![0u8; 12];
+        msg[0..2].copy_from_slice(&[0x00, 0x02]);
+        msg[2..4].copy_from_slice(&[0x81, 0x80]);
+        msg[6..8].copy_from_slice(&[0x00, 0x01]); // 1 answer
+        msg.push(0x00); // answer name: root
+        msg.extend_from_slice(&[0x00, 0x06, 0x00, 0x01]); // TYPE SOA, CLASS IN
+        msg.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // TTL 60
+        msg.extend_from_slice(&[0x00, 0x01]); // RDLENGTH 1
+        msg.push(0x05); // rdata: mname label-length byte (declared RDATA = 1 byte)
+        msg.extend_from_slice(b"aaaaa"); // mname label overruns the RDATA
+        msg.push(0x00); // mname terminator
+        msg.push(0x05); // rname label length
+        msg.extend_from_slice(b"bbbbb"); // rname label overruns the RDATA
+        msg.push(0x00); // rname terminator
+        assert!(Message::from_bytes(&msg).is_err());
+    }
+
+    #[test]
+    fn rejects_svcb_target_exceeding_rdata() {
+        // A hostile HTTPS record whose RDATA declares only the 2-byte priority
+        // but whose target name runs past the RDATA boundary. Previously this
+        // panicked on `rdata[2 + target_len..]`.
+        let mut msg = vec![0u8; 12];
+        msg[0..2].copy_from_slice(&[0x00, 0x03]);
+        msg[2..4].copy_from_slice(&[0x81, 0x80]);
+        msg[6..8].copy_from_slice(&[0x00, 0x01]); // 1 answer
+        msg.push(0x00); // answer name: root
+        msg.extend_from_slice(&[0x00, 0x41, 0x00, 0x01]); // TYPE HTTPS, CLASS IN
+        msg.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // TTL 60
+        msg.extend_from_slice(&[0x00, 0x02]); // RDLENGTH 2
+        msg.extend_from_slice(&[0x00, 0x01]); // priority
+        msg.push(0x05); // target label length
+        msg.extend_from_slice(b"ccccc"); // target label overruns the RDATA
+        msg.push(0x00); // target terminator
+        assert!(Message::from_bytes(&msg).is_err());
+    }
+
+    #[test]
     fn preserves_additional_sections() {
         let mut response = Message::response(9, OpCode::Query);
         response.add_additional(Record::from_rdata(
@@ -1311,5 +1430,110 @@ mod tests {
             decoded.additionals[0].data,
             RData::Unknown(vec![0x00, 0x01, 0x02])
         );
+    }
+
+    #[test]
+    fn compression_round_trips_and_shrinks() {
+        // Several records sharing the same owner name must (a) round-trip and
+        // (b) be emitted with a compression pointer instead of duplicated
+        // labels, so the message fits the 512-byte UDP budget.
+        let name = Name::from_ascii("www.example.com").unwrap();
+        let mut response = Message::response(42, OpCode::Query);
+        response.add_query(Query::query(name.clone(), RecordType::A));
+        for octet in [[93u8, 184, 216, 34], [93, 184, 216, 35], [93, 184, 216, 36]] {
+            response.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::A(rdata::A(Ipv4Addr::new(octet[0], octet[1], octet[2], octet[3]))),
+            ));
+        }
+        response.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::AAAA(rdata::AAAA(
+                "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap(),
+            )),
+        ));
+
+        let bytes = response.to_bytes().unwrap();
+
+        // The second answer's owner name must be a pointer to the first.
+        let header_len = 12;
+        let qname_len = 1 + 3 + 1 + 7 + 1 + 3 + 1; // www.example.com + root
+        let first_answer_name_offset = header_len + qname_len + 4; // + qtype/qclass
+        assert_eq!(bytes[first_answer_name_offset] & 0xC0, 0xC0);
+
+        let decoded = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.answers.len(), 4);
+        for answer in &decoded.answers {
+            assert_eq!(answer.name(), &name);
+        }
+
+        // Compare against the uncompressed size: four identical 17-byte owner
+        // names would alone cost 68 bytes; with compression they cost 8, so
+        // the whole response stays well under 128 bytes.
+        assert!(bytes.len() < 128, "expected compression to shrink message");
+    }
+
+    #[test]
+    fn compression_handles_shared_suffixes() {
+        let a = Name::from_ascii("alpha.example.com").unwrap();
+        let b = Name::from_ascii("beta.example.com").unwrap();
+        let mut response = Message::response(7, OpCode::Query);
+        response.add_answer(Record::from_rdata(
+            a.clone(),
+            60,
+            RData::CNAME(b.clone()),
+        ));
+        response.add_answer(Record::from_rdata(
+            b,
+            60,
+            RData::A(rdata::A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+
+        let bytes = response.to_bytes().unwrap();
+        let decoded = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.answers.len(), 2);
+        match &decoded.answers[0].data {
+            RData::CNAME(target) => assert_eq!(target.to_string(), "beta.example.com."),
+            other => panic!("expected CNAME, got {other:?}"),
+        }
+        match &decoded.answers[1].data {
+            RData::A(ip) => assert_eq!(ip.0, Ipv4Addr::new(1, 2, 3, 4)),
+            other => panic!("expected A, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compression_never_emits_forward_pointer() {
+        // The first name in a message has nothing to point at yet: it must be
+        // written literally, with no 0xC0 byte anywhere in the query section.
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("example.com").unwrap(),
+            RecordType::A,
+        ));
+        let bytes = query.to_bytes().unwrap();
+        assert!(!bytes[12..].contains(&0xC0));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_name_encode_round_trip(
+            label_count in 1usize..=8,
+            label_len in 1usize..=63,
+        ) {
+            let mut labels = Vec::new();
+            for i in 0..label_count {
+                let len = (label_len + i) % 63 + 1;
+                labels.push(vec![b'a' + (i % 26) as u8; len]);
+            }
+            let name = Name { labels };
+            let mut compressor = NameCompressor::new();
+            let mut buf = Vec::new();
+            compressor.write_name(&mut buf, &name).unwrap();
+            let decoded = super::Decoder::new(&buf, 0).read_name().expect("decodes");
+            assert_eq!(decoded.to_string(), name.to_string());
+        }
     }
 }

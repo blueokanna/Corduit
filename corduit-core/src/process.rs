@@ -26,7 +26,7 @@ mod windows_impl {
             }
 
             let mut buffer = vec![0u16; 1024];
-            let len = GetModuleFileNameExW(Some(handle), None, &mut buffer);
+            let len = GetModuleFileNameExW(handle, None, &mut buffer);
             let _ = CloseHandle(handle);
 
             if len == 0 {

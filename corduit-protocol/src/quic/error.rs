@@ -78,10 +78,4 @@ pub enum QuicError {
     UdpRelay(String),
 }
 
-impl From<aead::Error> for QuicError {
-    fn from(_: aead::Error) -> Self {
-        QuicError::Crypto("AEAD operation failed".to_string())
-    }
-}
-
 pub type Result<T> = std::result::Result<T, QuicError>;

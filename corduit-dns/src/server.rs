@@ -3,8 +3,8 @@
 use crate::config::DnsConfig;
 use crate::error::{DnsError, Result};
 use crate::resolver::DnsResolver;
-use crate::RecordType;
 use crate::wire::{BinDecodable, BinEncodable, Message, RData, Record, ResponseCode};
+use crate::RecordType;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -180,17 +180,27 @@ async fn handle_udp_query(
 
 /// Handle TCP DNS connection
 async fn handle_tcp_connection(mut stream: TcpStream, resolver: &DnsResolver) -> Result<()> {
+    const TCP_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     loop {
-        // Read length prefix
         let mut len_buf = [0u8; 2];
-        if stream.read_exact(&mut len_buf).await.is_err() {
-            break; // Connection closed
+        match tokio::time::timeout(TCP_QUERY_TIMEOUT, stream.read_exact(&mut len_buf)).await {
+            Ok(Ok(_)) => {}
+            _ => break,
         }
         let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 {
+            break;
+        }
 
         // Read query
         let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
+        if tokio::time::timeout(TCP_QUERY_TIMEOUT, stream.read_exact(&mut buf))
+            .await
+            .is_err()
+        {
+            break;
+        }
 
         let request = Message::from_bytes(&buf).map_err(|e| DnsError::Protocol(e.to_string()))?;
         let response = process_query(resolver, &request).await?;

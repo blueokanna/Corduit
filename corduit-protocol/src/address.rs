@@ -75,8 +75,6 @@ impl Address {
         }
     }
 
-    /// Encode into a `BufMut`. Returns an error if a domain name exceeds the
-    /// 255-byte wire limit instead of silently truncating the length byte.
     pub fn write_to(&self, buf: &mut impl BufMut) -> Result<()> {
         match self {
             Self::Ipv4(ip, port) => {
@@ -178,9 +176,8 @@ impl Address {
     }
 
     pub fn read_from(buf: &[u8]) -> Result<(Self, usize)> {
-        let mut cursor = Cursor::new(buf);
-        let addr = Self::read_from_cursor(&mut cursor)?;
-        Ok((addr, cursor.position() as usize))
+        let (addr, consumed) = AddressRef::parse(buf)?;
+        Ok((addr.to_owned(), consumed))
     }
 
     pub fn read_from_cursor(buf: &mut Cursor<&[u8]>) -> Result<Self> {
@@ -275,6 +272,104 @@ impl Address {
             Self::Ipv4(ip, port) => Some(SocketAddr::V4(SocketAddrV4::new(*ip, *port))),
             Self::Ipv6(ip, port) => Some(SocketAddr::V6(SocketAddrV6::new(*ip, *port, 0, 0))),
             Self::Domain(..) => None,
+        }
+    }
+}
+
+/// Borrowed, allocation-free view of a wire-encoded [`Address`].
+///
+/// The domain is a validated slice of the input buffer instead of an owned
+/// `String`, so hot paths that only need the host or port (routing, logging,
+/// connection tracking) never touch the heap. [`AddressRef::to_owned`]
+/// converts to the owned form when required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressRef<'a> {
+    Domain(&'a str, u16),
+    Ipv4(Ipv4Addr, u16),
+    Ipv6(Ipv6Addr, u16),
+}
+
+impl<'a> AddressRef<'a> {
+    pub fn parse(buf: &'a [u8]) -> Result<(Self, usize)> {
+        let mut cursor = Cursor::new(buf);
+        let addr = Self::parse_cursor(&mut cursor)?;
+        Ok((addr, cursor.position() as usize))
+    }
+
+    pub fn parse_cursor(buf: &mut Cursor<&'a [u8]>) -> Result<Self> {
+        if !buf.has_remaining() {
+            return Err(ProtocolError::BufferTooSmall);
+        }
+        let addr_type = AddressType::try_from(buf.get_u8())?;
+        match addr_type {
+            AddressType::IPv4 => {
+                if buf.remaining() < 6 {
+                    return Err(ProtocolError::BufferTooSmall);
+                }
+                let mut ip = [0u8; 4];
+                buf.copy_to_slice(&mut ip);
+                let port = buf.get_u16();
+                Ok(Self::Ipv4(Ipv4Addr::from(ip), port))
+            }
+            AddressType::IPv6 => {
+                if buf.remaining() < 18 {
+                    return Err(ProtocolError::BufferTooSmall);
+                }
+                let mut ip = [0u8; 16];
+                buf.copy_to_slice(&mut ip);
+                let port = buf.get_u16();
+                Ok(Self::Ipv6(Ipv6Addr::from(ip), port))
+            }
+            AddressType::Domain => {
+                if !buf.has_remaining() {
+                    return Err(ProtocolError::BufferTooSmall);
+                }
+                let len = buf.get_u8() as usize;
+                if buf.remaining() < len + 2 {
+                    return Err(ProtocolError::BufferTooSmall);
+                }
+                let pos = buf.position() as usize;
+                let domain = std::str::from_utf8(&buf.get_ref()[pos..pos + len])
+                    .map_err(|_| ProtocolError::AddressParse("Invalid UTF-8 domain".into()))?;
+                buf.advance(len);
+                let port = buf.get_u16();
+                Ok(Self::Domain(domain, port))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Domain(_, port) => *port,
+            Self::Ipv4(_, port) => *port,
+            Self::Ipv6(_, port) => *port,
+        }
+    }
+
+    /// The borrowed domain, if this is a domain address.
+    #[inline]
+    pub fn domain(&self) -> Option<&'a str> {
+        match self {
+            Self::Domain(domain, _) => Some(domain),
+            Self::Ipv4(..) | Self::Ipv6(..) => None,
+        }
+    }
+
+    #[inline]
+    pub fn address_type(&self) -> AddressType {
+        match self {
+            Self::Ipv4(..) => AddressType::IPv4,
+            Self::Ipv6(..) => AddressType::IPv6,
+            Self::Domain(..) => AddressType::Domain,
+        }
+    }
+
+    pub fn to_owned(&self) -> Address {
+        match self {
+            Self::Domain(domain, port) => Address::Domain(domain.to_string(), *port),
+            Self::Ipv4(ip, port) => Address::Ipv4(*ip, *port),
+            Self::Ipv6(ip, port) => Address::Ipv6(*ip, *port),
         }
     }
 }
@@ -415,6 +510,50 @@ mod tests {
         let parsed = Address::read_from_async(&mut cursor).await.unwrap();
         assert_eq!(addr, parsed);
     }
+
+    #[test]
+    fn test_address_ref_borrows_domain() {
+        let mut wire = Vec::new();
+        wire.push(AddressType::Domain as u8);
+        wire.push(11);
+        wire.extend_from_slice(b"example.com");
+        wire.extend_from_slice(&443u16.to_be_bytes());
+
+        let (parsed, consumed) = AddressRef::parse(&wire).unwrap();
+        assert_eq!(consumed, wire.len());
+        assert_eq!(parsed.port(), 443);
+        assert_eq!(parsed.address_type(), AddressType::Domain);
+
+        // The borrowed domain must point into the input buffer, not a copy.
+        let domain = parsed.domain().expect("domain address");
+        assert_eq!(domain, "example.com");
+        let in_wire = unsafe {
+            std::slice::from_raw_parts(domain.as_ptr(), domain.len())
+        };
+        assert_eq!(in_wire, &wire[2..13]);
+    }
+
+    #[test]
+    fn test_address_ref_owned_conversion_agrees() {
+        let owned = Address::Domain("cn.example.com".to_string(), 8080);
+        let wire = owned.to_bytes().unwrap();
+        let (borrowed, _) = AddressRef::parse(&wire).unwrap();
+        assert_eq!(borrowed.to_owned(), owned);
+
+        let ipv4 = Address::Ipv4(Ipv4Addr::new(9, 9, 9, 9), 53);
+        let wire = ipv4.to_bytes().unwrap();
+        let (borrowed, _) = AddressRef::parse(&wire).unwrap();
+        assert_eq!(borrowed.to_owned(), ipv4);
+        assert_eq!(borrowed.domain(), None);
+    }
+
+    #[test]
+    fn test_address_ref_rejects_truncated() {
+        assert!(AddressRef::parse(&[AddressType::Domain as u8, 5, b'a']).is_err());
+        assert!(AddressRef::parse(&[AddressType::Domain as u8, 5, b'a', b'b', b'c', b'd', b'e']).is_err());
+        assert!(AddressRef::parse(&[AddressType::IPv4 as u8, 1, 2]).is_err());
+        assert!(AddressRef::parse(&[AddressType::IPv4 as u8, 1, 2, 3, 4, 0, 0]).is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +657,21 @@ mod property_tests {
         fn prop_address_serialized_len_correct(addr in arb_address()) {
             let bytes = addr.to_bytes().unwrap();
             prop_assert_eq!(bytes.len(), addr.serialized_len());
+        }
+
+        #[test]
+        fn prop_address_ref_roundtrip(addr in arb_address()) {
+            let bytes = addr.to_bytes().unwrap();
+            let (borrowed, consumed) = AddressRef::parse(&bytes).unwrap();
+            prop_assert_eq!(consumed, addr.serialized_len());
+            prop_assert_eq!(&borrowed.to_owned(), &addr);
+            prop_assert_eq!(borrowed.port(), addr.port());
+            prop_assert_eq!(borrowed.address_type(), addr.address_type());
+            match (&addr, borrowed.domain()) {
+                (Address::Domain(d, _), Some(b)) => prop_assert_eq!(b, d),
+                (Address::Domain(..), None) => panic!("domain missing from AddressRef"),
+                _ => {}
+            }
         }
 
         #[test]

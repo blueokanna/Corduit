@@ -12,7 +12,7 @@ pub use handshake::{
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -33,12 +33,86 @@ pub enum WireGuardError {
     DecryptionFailed,
     #[error("Invalid packet")]
     InvalidPacket,
+    #[error("Replayed or out-of-order packet rejected")]
+    ReplayDetected,
+}
+
+/// Number of distinct nonces kept in the receive replay window.
+const REPLAY_WINDOW_SIZE: u64 = 2048;
+
+/// Receive-side replay filter (WireGuard "counter mode").
+///
+/// Tracks the highest authenticated nonce seen plus a window of recently
+/// accepted nonces so that a captured transport packet cannot be replayed,
+/// while still tolerating the out-of-order delivery UDP can produce.
+struct ReplayFilter {
+    highest: u64,
+    buffer: [u64; REPLAY_WINDOW_SIZE as usize],
+    count: usize,
+    initialized: bool,
+}
+
+impl ReplayFilter {
+    fn new() -> Self {
+        Self {
+            highest: 0,
+            buffer: [0; REPLAY_WINDOW_SIZE as usize],
+            count: 0,
+            initialized: false,
+        }
+    }
+
+    /// Atomically validate and record a packet nonce.
+    ///
+    /// Returns `true` when `nonce` is fresh (never seen, within the replay
+    /// window); returns `false` for duplicates, nonces too old to accept, and
+    /// nonces at or above `REJECT_AFTER_MESSAGES`. The caller must reject the
+    /// packet when this returns `false`.
+    fn check_and_record(&mut self, nonce: u64) -> bool {
+        if nonce >= REJECT_AFTER_MESSAGES {
+            return false;
+        }
+        if !self.initialized {
+            self.initialized = true;
+            self.highest = nonce;
+            self.buffer[0] = nonce;
+            self.count = 1;
+            return true;
+        }
+        if nonce > self.highest {
+            // New high-water mark: evict entries that slide out of the window.
+            // Accepted nonces are < REJECT_AFTER_MESSAGES (= u64::MAX - 2^13),
+            // so `n + REPLAY_WINDOW_SIZE` cannot overflow u64.
+            let mut write = 0usize;
+            for read in 0..self.count {
+                let n = self.buffer[read];
+                if n + REPLAY_WINDOW_SIZE > nonce && n != nonce {
+                    self.buffer[write] = n;
+                    write += 1;
+                }
+            }
+            self.count = write;
+            self.buffer[self.count] = nonce;
+            self.count += 1;
+            self.highest = nonce;
+            return true;
+        }
+        if self.highest - nonce >= REPLAY_WINDOW_SIZE {
+            return false; // too old to accept
+        }
+        if self.buffer[..self.count].contains(&nonce) {
+            return false; // duplicate
+        }
+        self.buffer[self.count] = nonce;
+        self.count += 1;
+        true
+    }
 }
 
 pub struct WireguardSession {
     pub transport_keys: TransportKeys,
     pub send_nonce: AtomicU64,
-    pub recv_nonce: AtomicU64,
+    recv_filter: Mutex<ReplayFilter>,
     pub created_at: std::time::Instant,
     pub last_sent: std::sync::atomic::AtomicU64,
     pub last_received: std::sync::atomic::AtomicU64,
@@ -49,7 +123,7 @@ impl WireguardSession {
         Self {
             transport_keys: keys,
             send_nonce: AtomicU64::new(0),
-            recv_nonce: AtomicU64::new(0),
+            recv_filter: Mutex::new(ReplayFilter::new()),
             created_at: std::time::Instant::now(),
             last_sent: std::sync::atomic::AtomicU64::new(0),
             last_received: std::sync::atomic::AtomicU64::new(0),
@@ -101,6 +175,18 @@ impl WireguardSession {
             packet[8], packet[9], packet[10], packet[11], packet[12], packet[13], packet[14],
             packet[15],
         ]);
+
+        // Reject replayed / too-old / exhausted nonces before spending any
+        // work on decryption (WireGuard counter-mode semantics).
+        {
+            let mut filter = self
+                .recv_filter
+                .lock()
+                .map_err(|_| WireGuardError::Crypto("replay filter poisoned".to_string()))?;
+            if !filter.check_and_record(nonce) {
+                return Err(WireGuardError::ReplayDetected);
+            }
+        }
 
         let ciphertext = &packet[16..];
 
@@ -309,6 +395,58 @@ mod tests {
         let server_decrypted = client_tunnel.decrypt_packet(&server_encrypted).unwrap();
 
         assert_eq!(server_plaintext.as_slice(), server_decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_replay_filter_rejects_duplicates() {
+        let (client_priv, _client_pub) = generate_keypair();
+        let (server_priv, server_pub) = generate_keypair();
+
+        let endpoint: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        let mut client_tunnel = WireGuardTunnel::new(client_priv, server_pub, None, endpoint);
+
+        let init_packet = client_tunnel.initiate_handshake().unwrap();
+        let init = HandshakeInitiation::from_bytes(&init_packet).unwrap();
+
+        let mut server_state = HandshakeState::new_responder(server_priv, server_pub, None);
+        server_state.process_initiation(&init).unwrap();
+        let (response, server_keys) = server_state.create_response().unwrap();
+
+        client_tunnel
+            .process_handshake_response(&response.to_bytes())
+            .unwrap();
+
+        let server_session = WireguardSession::new(TransportKeys {
+            send_key: server_keys.send_key,
+            recv_key: server_keys.recv_key,
+            send_index: server_keys.send_index,
+            recv_index: server_keys.recv_index,
+        });
+
+        let first = client_tunnel.encrypt_packet(b"first").unwrap();
+        assert_eq!(server_session.decrypt_packet(&first).unwrap(), b"first");
+
+        // Replaying the identical captured packet must be rejected.
+        assert!(matches!(
+            server_session.decrypt_packet(&first),
+            Err(WireGuardError::ReplayDetected)
+        ));
+    }
+
+    #[test]
+    fn test_replay_filter_allows_out_of_order() {
+        let mut filter = ReplayFilter::new();
+        assert!(filter.check_and_record(100));
+        // Lower nonce inside the window is fresh (out-of-order delivery).
+        assert!(filter.check_and_record(99));
+        // Duplicate is rejected.
+        assert!(!filter.check_and_record(99));
+        // Higher nonce advances the window.
+        assert!(filter.check_and_record(150));
+        // A nonce that slid out of the window is rejected.
+        assert!(!filter.check_and_record(100));
+        // Reject-after threshold is never accepted.
+        assert!(!filter.check_and_record(REJECT_AFTER_MESSAGES));
     }
 
     #[test]

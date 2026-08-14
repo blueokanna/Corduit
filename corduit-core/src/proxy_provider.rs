@@ -1,10 +1,6 @@
 use crate::config::{OutboundConfig, OutboundType};
 use crate::error::{Error, Result};
-use crate::outbound::{
-    DirectOutbound, HttpOutbound, Hysteria2Outbound, OutboundProxy, RejectOutbound,
-    ShadowsocksOutbound, Socks5Outbound, TrojanOutbound, TuicOutbound, VlessOutbound,
-    VmessOutbound, WireguardOutbound,
-};
+use crate::outbound::{build_outbound_proxy, OutboundProxy};
 use nextjson::{NsonDeserialize, NsonSerialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -233,87 +229,20 @@ impl ProxyProvider {
         let mut proxies: Vec<Arc<dyn OutboundProxy>> = Vec::new();
 
         for config in configs {
-            let proxy: Option<Arc<dyn OutboundProxy>> = match config.outbound_type {
-                OutboundType::Direct => Some(Arc::new(DirectOutbound::new(config.clone()))),
-                OutboundType::Reject => Some(Arc::new(RejectOutbound::new(config.clone()))),
-                OutboundType::Socks5 => match Socks5Outbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create SOCKS5 proxy '{}': {}", config.tag, e);
-                        None
-                    }
-                },
-                OutboundType::Http => match HttpOutbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create HTTP proxy '{}': {}", config.tag, e);
-                        None
-                    }
-                },
-                OutboundType::Shadowsocks => match ShadowsocksOutbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to create Shadowsocks proxy '{}': {}",
-                            config.tag,
-                            e
-                        );
-                        None
-                    }
-                },
-                OutboundType::Vmess => match VmessOutbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create VMess proxy '{}': {}", config.tag, e);
-                        None
-                    }
-                },
-                OutboundType::Vless => match VlessOutbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create VLess proxy '{}': {}", config.tag, e);
-                        None
-                    }
-                },
-                OutboundType::Trojan => match TrojanOutbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create Trojan proxy '{}': {}", config.tag, e);
-                        None
-                    }
-                },
-                OutboundType::Wireguard => match WireguardOutbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create WireGuard proxy '{}': {}", config.tag, e);
-                        None
-                    }
-                },
-                OutboundType::Tuic => match TuicOutbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create TUIC proxy '{}': {}", config.tag, e);
-                        None
-                    }
-                },
-                OutboundType::Hysteria2 => match Hysteria2Outbound::new(config.clone()) {
-                    Ok(p) => Some(Arc::new(p)),
-                    Err(e) => {
-                        tracing::warn!("Failed to create Hysteria2 proxy '{}': {}", config.tag, e);
-                        None
-                    }
-                },
-                _ => {
+            // Providers are lenient: a single bad proxy must not abort the
+            // whole subscription, so failures are logged and skipped.
+            match build_outbound_proxy(config) {
+                Ok(Some(p)) => proxies.push(p),
+                Ok(None) => {
                     tracing::warn!(
-                        "Unsupported proxy type '{:?}' in provider",
-                        config.outbound_type
+                        "Proxy type '{:?}' is not supported in providers; skipping '{}'",
+                        config.outbound_type,
+                        config.tag
                     );
-                    None
                 }
-            };
-
-            if let Some(p) = proxy {
-                proxies.push(p);
+                Err(e) => {
+                    tracing::warn!("Failed to create proxy '{}': {}", config.tag, e);
+                }
             }
         }
 

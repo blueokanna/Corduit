@@ -3,17 +3,13 @@ use crate::connection_tracker::{global_tracker, TrackedConnection};
 use crate::error::{Error, Result};
 use crate::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
 use crate::tls::SkipServerVerification;
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes128Gcm, Nonce,
-};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chacha20poly1305::ChaCha20Poly1305;
+use corduit_crypto::aead::{Aead, Aes128Gcm, ChaCha20Poly1305};
+use corduit_crypto::digest::Digest;
+use corduit_crypto::encoding::{encode as b64_encode, Config as B64Config};
+use corduit_crypto::hash::{Md5, Sha1, Sha256};
+use corduit_crypto::uuid::Uuid;
 use dashmap::DashMap;
-use md5::{Digest as Md5Digest, Md5};
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
-use sha1::Sha1;
-use sha2::Sha256;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,7 +17,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 const VMESS_VERSION: u8 = 1;
 const VMESS_AEAD_AUTH_LEN: usize = 16;
@@ -260,6 +255,11 @@ pub struct WebSocketStream<S> {
     read_pos: usize,
 }
 
+/// Largest WebSocket payload `read_frame` will accept. The length field is a
+/// 64-bit integer straight from the wire, so without a cap a malicious peer
+/// could request a multi-gigabyte allocation and abort the process.
+const MAX_WS_FRAME_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
+
 impl<S> WebSocketStream<S> {
     pub fn new(inner: S) -> Self {
         Self {
@@ -283,7 +283,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
         let mut key_bytes = [0u8; 16];
         getrandom::fill(&mut key_bytes)
             .map_err(|e| Error::protocol(format!("Failed to generate WebSocket key: {}", e)))?;
-        let ws_key = BASE64.encode(key_bytes);
+        let ws_key = b64_encode(&key_bytes, B64Config::STANDARD);
         let mut request = format!(
             "GET {} HTTP/1.1\r\n\
              Host: {}\r\n\
@@ -418,6 +418,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
 
         // Handle ping frame - read payload and continue (non-recursive)
         if opcode == 0x09 {
+            if payload_len > MAX_WS_FRAME_SIZE {
+                return Err(Error::protocol("WebSocket ping frame too large"));
+            }
             if payload_len > 0 {
                 let mut ping_data = vec![0u8; payload_len as usize];
                 self.inner.read_exact(&mut ping_data).await.ok();
@@ -441,6 +444,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
                 .await
                 .map_err(|e| Error::network(format!("Failed to read extended length: {}", e)))?;
             payload_len = u64::from_be_bytes(ext);
+        }
+
+        // Reject oversized frames before allocating any buffer.
+        if payload_len > MAX_WS_FRAME_SIZE {
+            return Err(Error::protocol(format!(
+                "WebSocket frame too large: {} bytes",
+                payload_len
+            )));
         }
 
         let mask = if masked {
@@ -488,7 +499,7 @@ fn compute_websocket_accept(key: &str) -> String {
     hasher.update(key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let result = hasher.finalize();
-    BASE64.encode(result)
+    b64_encode(&result, B64Config::STANDARD)
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for WebSocketStream<S> {
@@ -632,7 +643,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for WebSocketStream<S>
             frame.extend_from_slice(&(len as u64).to_be_bytes());
         }
 
-        let mask: [u8; 4] = rand::random();
+        let mask: [u8; 4] = crate::random::bytes();
         frame.extend_from_slice(&mask);
 
         for (i, byte) in buf.iter().enumerate() {
@@ -867,15 +878,12 @@ impl VmessOutbound {
 
     pub fn generate_auth_id(&self, timestamp: i64) -> [u8; 16] {
         let mut hasher = Md5::new();
-        hasher.update(self.uuid_bytes);
-        hasher.update(timestamp.to_be_bytes());
-        hasher.update(timestamp.to_be_bytes());
-        hasher.update(timestamp.to_be_bytes());
-        hasher.update(timestamp.to_be_bytes());
-        let result = hasher.finalize();
-        let mut auth_id = [0u8; 16];
-        auth_id.copy_from_slice(&result);
-        auth_id
+        hasher.update(&self.uuid_bytes);
+        hasher.update(&timestamp.to_be_bytes());
+        hasher.update(&timestamp.to_be_bytes());
+        hasher.update(&timestamp.to_be_bytes());
+        hasher.update(&timestamp.to_be_bytes());
+        hasher.finalize()
     }
 
     pub fn generate_request_key(&self) -> [u8; 16] {
@@ -950,12 +958,10 @@ impl VmessOutbound {
 
         let cipher = Aes128Gcm::new_from_slice(&header_key)
             .map_err(|e| Error::protocol(format!("Failed to create AES-GCM cipher: {}", e)))?;
-        let nonce = Nonce::try_from(header_nonce.as_slice())
-            .map_err(|_| Error::protocol("Invalid header nonce length"))?;
 
         let encrypted_header = cipher
-            .encrypt(&nonce, header_buf.as_ref())
-            .map_err(|e| Error::protocol(format!("Failed to encrypt header: {}", e)))?;
+            .encrypt(&header_nonce, header_buf.as_ref(), &[])
+            .map_err(|e| Error::protocol(format!("Failed to encrypt header: {:?}", e)))?;
 
         let header_length_key = kdf16(
             &self.cmd_key,
@@ -972,13 +978,11 @@ impl VmessOutbound {
 
         let length_cipher = Aes128Gcm::new_from_slice(&header_length_key)
             .map_err(|e| Error::protocol(format!("Failed to create length cipher: {}", e)))?;
-        let length_nonce = Nonce::try_from(header_length_nonce.as_slice())
-            .map_err(|_| Error::protocol("Invalid header length nonce"))?;
 
         let length_bytes = (encrypted_header.len() as u16).to_be_bytes();
         let encrypted_length = length_cipher
-            .encrypt(&length_nonce, length_bytes.as_ref())
-            .map_err(|e| Error::protocol(format!("Failed to encrypt length: {}", e)))?;
+            .encrypt(&header_length_nonce, length_bytes.as_ref(), &[])
+            .map_err(|e| Error::protocol(format!("Failed to encrypt length: {:?}", e)))?;
 
         let mut result =
             Vec::with_capacity(16 + 8 + encrypted_length.len() + encrypted_header.len());
@@ -1003,12 +1007,9 @@ impl VmessOutbound {
         let cipher = Aes128Gcm::new_from_slice(response_key)
             .map_err(|e| Error::protocol(format!("Failed to create response cipher: {}", e)))?;
 
-        let nonce = Nonce::try_from(&response_iv[..VMESS_AEAD_NONCE_LEN])
-            .map_err(|_| Error::protocol("Invalid response nonce length"))?;
-
         let decrypted = cipher
-            .decrypt(&nonce, data)
-            .map_err(|e| Error::protocol(format!("Failed to decrypt response header: {}", e)))?;
+            .decrypt(&response_iv[..VMESS_AEAD_NONCE_LEN], data, &[])
+            .map_err(|e| Error::protocol(format!("Failed to decrypt response header: {:?}", e)))?;
 
         if decrypted.len() < 4 {
             return Err(Error::protocol("Decrypted response header too short"));
@@ -1221,7 +1222,7 @@ impl VmessOutbound {
     ) -> Result<([u8; 16], [u8; 16], u8)> {
         let request_key = self.generate_request_key();
         let request_iv = self.generate_request_iv();
-        let response_header_byte: u8 = rand::random();
+        let response_header_byte: u8 = crate::random::u8();
 
         let (address_type, address_bytes) = match target {
             TargetAddr::Domain(domain, _) => {
@@ -1245,7 +1246,7 @@ impl VmessOutbound {
                 | VmessOption::CHUNK_MASKING
                 | VmessOption::GLOBAL_PADDING
                 | VmessOption::AUTHENTICATED_LENGTH,
-            padding_length: rand::random::<u8>() % 16,
+            padding_length: crate::random::u8() % 16,
             security: self.cipher,
             command: cmd,
             port: target.port(),
@@ -1441,12 +1442,10 @@ impl VmessOutbound {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[..2].copy_from_slice(&count.to_be_bytes());
         nonce_bytes[2..].copy_from_slice(&iv[2..12]);
-        let nonce = Nonce::try_from(nonce_bytes.as_slice())
-            .map_err(|_| Error::protocol("Invalid AES nonce length"))?;
 
         let encrypted = cipher
-            .encrypt(&nonce, data)
-            .map_err(|e| Error::protocol(format!("Failed to encrypt data: {}", e)))?;
+            .encrypt(&nonce_bytes, data, &[])
+            .map_err(|e| Error::protocol(format!("Failed to encrypt data: {:?}", e)))?;
 
         let length = (encrypted.len() as u16).to_be_bytes();
         let mut result = Vec::with_capacity(2 + encrypted.len());
@@ -1472,12 +1471,10 @@ impl VmessOutbound {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[..2].copy_from_slice(&count.to_be_bytes());
         nonce_bytes[2..].copy_from_slice(&iv[2..12]);
-        let nonce = chacha20poly1305::Nonce::try_from(nonce_bytes.as_slice())
-            .map_err(|_| Error::protocol("Invalid ChaCha20 nonce length"))?;
 
         let encrypted = cipher
-            .encrypt(&nonce, data)
-            .map_err(|e| Error::protocol(format!("Failed to encrypt data: {}", e)))?;
+            .encrypt(&nonce_bytes, data, &[])
+            .map_err(|e| Error::protocol(format!("Failed to encrypt data: {:?}", e)))?;
 
         let length = (encrypted.len() as u16).to_be_bytes();
         let mut result = Vec::with_capacity(2 + encrypted.len());
@@ -1515,12 +1512,10 @@ impl VmessOutbound {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[..2].copy_from_slice(&count.to_be_bytes());
         nonce_bytes[2..].copy_from_slice(&iv[2..12]);
-        let nonce = Nonce::try_from(nonce_bytes.as_slice())
-            .map_err(|_| Error::protocol("Invalid AES nonce length"))?;
 
         let decrypted = cipher
-            .decrypt(&nonce, data)
-            .map_err(|e| Error::protocol(format!("Failed to decrypt data: {}", e)))?;
+            .decrypt(&nonce_bytes, data, &[])
+            .map_err(|e| Error::protocol(format!("Failed to decrypt data: {:?}", e)))?;
 
         Ok(decrypted)
     }
@@ -1542,12 +1537,10 @@ impl VmessOutbound {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[..2].copy_from_slice(&count.to_be_bytes());
         nonce_bytes[2..].copy_from_slice(&iv[2..12]);
-        let nonce = chacha20poly1305::Nonce::try_from(nonce_bytes.as_slice())
-            .map_err(|_| Error::protocol("Invalid ChaCha20 nonce length"))?;
 
         let decrypted = cipher
-            .decrypt(&nonce, data)
-            .map_err(|e| Error::protocol(format!("Failed to decrypt data: {}", e)))?;
+            .decrypt(&nonce_bytes, data, &[])
+            .map_err(|e| Error::protocol(format!("Failed to decrypt data: {:?}", e)))?;
 
         Ok(decrypted)
     }
@@ -1822,10 +1815,7 @@ fn generate_cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
     let mut hasher = Md5::new();
     hasher.update(uuid);
     hasher.update(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
-    let result = hasher.finalize();
-    let mut key = [0u8; 16];
-    key.copy_from_slice(&result);
-    key
+    hasher.finalize()
 }
 
 fn generate_connection_nonce() -> [u8; 8] {
@@ -1885,12 +1875,10 @@ fn encrypt_chunk_static(
             let mut nonce_bytes = [0u8; 12];
             nonce_bytes[..2].copy_from_slice(&count.to_be_bytes());
             nonce_bytes[2..].copy_from_slice(&iv[2..12]);
-            let nonce = Nonce::try_from(nonce_bytes.as_slice())
-                .map_err(|_| Error::protocol("Invalid AES nonce length"))?;
 
             let encrypted = aes_cipher
-                .encrypt(&nonce, data)
-                .map_err(|e| Error::protocol(format!("Failed to encrypt data: {}", e)))?;
+                .encrypt(&nonce_bytes, data, &[])
+                .map_err(|e| Error::protocol(format!("Failed to encrypt data: {:?}", e)))?;
 
             let length = (encrypted.len() as u16).to_be_bytes();
             let mut result = Vec::with_capacity(2 + encrypted.len());
@@ -1909,12 +1897,10 @@ fn encrypt_chunk_static(
             let mut nonce_bytes = [0u8; 12];
             nonce_bytes[..2].copy_from_slice(&count.to_be_bytes());
             nonce_bytes[2..].copy_from_slice(&iv[2..12]);
-            let nonce = chacha20poly1305::Nonce::try_from(nonce_bytes.as_slice())
-                .map_err(|_| Error::protocol("Invalid ChaCha20 nonce length"))?;
 
             let encrypted = chacha_cipher
-                .encrypt(&nonce, data)
-                .map_err(|e| Error::protocol(format!("Failed to encrypt data: {}", e)))?;
+                .encrypt(&nonce_bytes, data, &[])
+                .map_err(|e| Error::protocol(format!("Failed to encrypt data: {:?}", e)))?;
 
             let length = (encrypted.len() as u16).to_be_bytes();
             let mut result = Vec::with_capacity(2 + encrypted.len());
@@ -1946,12 +1932,10 @@ fn decrypt_chunk_static(
             let mut nonce_bytes = [0u8; 12];
             nonce_bytes[..2].copy_from_slice(&count.to_be_bytes());
             nonce_bytes[2..].copy_from_slice(&iv[2..12]);
-            let nonce = Nonce::try_from(nonce_bytes.as_slice())
-                .map_err(|_| Error::protocol("Invalid AES nonce length"))?;
 
             let decrypted = aes_cipher
-                .decrypt(&nonce, data)
-                .map_err(|e| Error::protocol(format!("Failed to decrypt data: {}", e)))?;
+                .decrypt(&nonce_bytes, data, &[])
+                .map_err(|e| Error::protocol(format!("Failed to decrypt data: {:?}", e)))?;
 
             Ok(decrypted)
         }
@@ -1966,12 +1950,10 @@ fn decrypt_chunk_static(
             let mut nonce_bytes = [0u8; 12];
             nonce_bytes[..2].copy_from_slice(&count.to_be_bytes());
             nonce_bytes[2..].copy_from_slice(&iv[2..12]);
-            let nonce = chacha20poly1305::Nonce::try_from(nonce_bytes.as_slice())
-                .map_err(|_| Error::protocol("Invalid ChaCha20 nonce length"))?;
 
             let decrypted = chacha_cipher
-                .decrypt(&nonce, data)
-                .map_err(|e| Error::protocol(format!("Failed to decrypt data: {}", e)))?;
+                .decrypt(&nonce_bytes, data, &[])
+                .map_err(|e| Error::protocol(format!("Failed to decrypt data: {:?}", e)))?;
 
             Ok(decrypted)
         }

@@ -34,6 +34,9 @@ const SOCKS5_ADDR_IPV4: u8 = 0x01;
 const SOCKS5_ADDR_DOMAIN: u8 = 0x03;
 const SOCKS5_ADDR_IPV6: u8 = 0x04;
 
+//SETTING HTTP PACKAGE BYTES LIMIT
+const MAX_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 #[async_trait::async_trait]
 impl InboundListener for MixedInbound {
     async fn start(&self) -> Result<()> {
@@ -371,17 +374,6 @@ impl MixedInbound {
         }
         request_bytes.extend_from_slice(b"\r\n");
 
-        // Read body
-        let body = req.into_body();
-        let body_bytes = body
-            .collect()
-            .await
-            .map_err(|e| Error::network(format!("Failed to read request body: {}", e)))?
-            .to_bytes();
-        if !body_bytes.is_empty() {
-            request_bytes.extend_from_slice(&body_bytes);
-        }
-
         // For plain HTTP proxy, we use a duplex stream
         // Shutdown write side AFTER writing request to signal EOF to relay_tcp
         let target = TargetAddr::new_domain(host.clone(), port);
@@ -396,11 +388,29 @@ impl MixedInbound {
         // Use the client side to send request and receive response
         let (mut read_half, mut write_half) = tokio::io::split(client_side);
 
-        // Write the HTTP request and shutdown write side to signal end of request
         write_half
             .write_all(&request_bytes)
             .await
-            .map_err(|e| Error::network(format!("Failed to write request: {}", e)))?;
+            .map_err(|e| Error::network(format!("Failed to write request head: {}", e)))?;
+
+        let mut body = req.into_body();
+        loop {
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                body.frame(),
+            )
+            .await
+            .map_err(|_| Error::network("Request body read timed out"))?
+            .transpose()
+            .map_err(|e| Error::network(format!("Failed to read request body: {}", e)))?;
+            let Some(frame) = frame else { break };
+            if let Some(data) = frame.data_ref() {
+                write_half
+                    .write_all(data)
+                    .await
+                    .map_err(|e| Error::network(format!("Failed to write request body: {}", e)))?;
+            }
+        }
 
         // Shutdown write side to signal EOF to relay_tcp
         write_half
@@ -417,7 +427,6 @@ impl MixedInbound {
 
         let read_timeout = tokio::time::Duration::from_secs(30);
         let start = tokio::time::Instant::now();
-
         loop {
             if start.elapsed() > read_timeout {
                 break;
@@ -433,6 +442,12 @@ impl MixedInbound {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(n)) => {
                     response_buf.extend_from_slice(&temp_buf[..n]);
+                    if response_buf.len() > MAX_HTTP_RESPONSE_BYTES {
+                        return Err(Error::network(format!(
+                            "HTTP proxy response exceeded {} bytes",
+                            MAX_HTTP_RESPONSE_BYTES
+                        )));
+                    }
 
                     // Check if we've received complete headers
                     if !headers_complete {
@@ -546,128 +561,11 @@ impl MixedInbound {
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
     ) -> Result<()> {
-        // Read authentication request
-        let mut header = [0u8; 2];
-        stream.read_exact(&mut header).await.map_err(|e| {
-            Error::protocol(format!(
-                "Failed to read SOCKS5 header from {}: {}",
-                peer_addr, e
-            ))
-        })?;
+        const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-        let version = header[0];
-        let nmethods = header[1] as usize;
-
-        if version != SOCKS5_VERSION {
-            return Err(Error::protocol(format!(
-                "Invalid SOCKS version: {} (expected {})",
-                version, SOCKS5_VERSION
-            )));
-        }
-
-        // Read auth methods
-        let mut methods = vec![0u8; nmethods];
-        stream
-            .read_exact(&mut methods)
+        let target = tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::read_socks5_target(&mut stream))
             .await
-            .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 methods: {}", e)))?;
-
-        // For now, only support no authentication
-        if !methods.contains(&SOCKS5_AUTH_NONE) {
-            // Send "no acceptable methods"
-            stream.write_all(&[SOCKS5_VERSION, 0xFF]).await.ok();
-            return Err(Error::protocol("No acceptable SOCKS5 auth methods"));
-        }
-
-        // Send auth method selection (no auth)
-        stream
-            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
-            .await
-            .map_err(|e| Error::network(format!("Failed to send auth response: {}", e)))?;
-
-        // Read connection request
-        let mut request = [0u8; 4];
-        stream
-            .read_exact(&mut request)
-            .await
-            .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 request: {}", e)))?;
-
-        let version = request[0];
-        let cmd = request[1];
-        let atyp = request[3];
-
-        if version != SOCKS5_VERSION {
-            return Err(Error::protocol("Invalid SOCKS5 version in request"));
-        }
-
-        if cmd != SOCKS5_CMD_CONNECT {
-            // Only support CONNECT command
-            Self::send_socks5_error(&mut stream, 0x07).await; // Command not supported
-            return Err(Error::protocol(format!(
-                "Unsupported SOCKS5 command: {}",
-                cmd
-            )));
-        }
-
-        // Parse destination address
-        let target =
-            match atyp {
-                SOCKS5_ADDR_IPV4 => {
-                    let mut addr = [0u8; 4];
-                    stream.read_exact(&mut addr).await.map_err(|e| {
-                        Error::protocol(format!("Failed to read IPv4 address: {}", e))
-                    })?;
-                    let ip = Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
-                    let mut port_buf = [0u8; 2];
-                    stream
-                        .read_exact(&mut port_buf)
-                        .await
-                        .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
-                    let port = u16::from_be_bytes(port_buf);
-                    TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port))
-                }
-                SOCKS5_ADDR_DOMAIN => {
-                    let mut len = [0u8; 1];
-                    stream.read_exact(&mut len).await.map_err(|e| {
-                        Error::protocol(format!("Failed to read domain length: {}", e))
-                    })?;
-                    let mut domain = vec![0u8; len[0] as usize];
-                    stream
-                        .read_exact(&mut domain)
-                        .await
-                        .map_err(|e| Error::protocol(format!("Failed to read domain: {}", e)))?;
-                    let domain = String::from_utf8(domain)
-                        .map_err(|_| Error::protocol("Invalid domain encoding"))?;
-                    let mut port_buf = [0u8; 2];
-                    stream
-                        .read_exact(&mut port_buf)
-                        .await
-                        .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
-                    let port = u16::from_be_bytes(port_buf);
-                    TargetAddr::Domain(domain, port)
-                }
-                SOCKS5_ADDR_IPV6 => {
-                    let mut addr = [0u8; 16];
-                    stream.read_exact(&mut addr).await.map_err(|e| {
-                        Error::protocol(format!("Failed to read IPv6 address: {}", e))
-                    })?;
-                    let ip = Ipv6Addr::from(addr);
-                    let mut port_buf = [0u8; 2];
-                    stream
-                        .read_exact(&mut port_buf)
-                        .await
-                        .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
-                    let port = u16::from_be_bytes(port_buf);
-                    TargetAddr::Ip(SocketAddr::new(IpAddr::V6(ip), port))
-                }
-                _ => {
-                    Self::send_socks5_error(&mut stream, 0x08).await; // Address type not supported
-                    return Err(Error::protocol(format!(
-                        "Unsupported address type: {}",
-                        atyp
-                    )));
-                }
-            };
+            .map_err(|_| Error::protocol("SOCKS5 handshake timeout"))??;
 
         // Route the connection
         let outbound_tag = router
@@ -739,6 +637,122 @@ impl MixedInbound {
         tracker.untrack(&tracked.id);
 
         Ok(())
+    }
+
+    async fn read_socks5_target(stream: &mut TcpStream) -> Result<TargetAddr> {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await.map_err(|e| {
+            Error::protocol(format!("Failed to read SOCKS5 header: {}", e))
+        })?;
+
+        let version = header[0];
+        let nmethods = header[1] as usize;
+
+        if version != SOCKS5_VERSION {
+            return Err(Error::protocol(format!(
+                "Invalid SOCKS version: {} (expected {})",
+                version, SOCKS5_VERSION
+            )));
+        }
+
+        let mut methods = vec![0u8; nmethods];
+        stream
+            .read_exact(&mut methods)
+            .await
+            .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 methods: {}", e)))?;
+
+        if !methods.contains(&SOCKS5_AUTH_NONE) {
+            stream.write_all(&[SOCKS5_VERSION, 0xFF]).await.ok();
+            return Err(Error::protocol("No acceptable SOCKS5 auth methods"));
+        }
+
+        stream
+            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
+            .await
+            .map_err(|e| Error::network(format!("Failed to send auth response: {}", e)))?;
+
+        let mut request = [0u8; 4];
+        stream
+            .read_exact(&mut request)
+            .await
+            .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 request: {}", e)))?;
+
+        let version = request[0];
+        let cmd = request[1];
+        let atyp = request[3];
+
+        if version != SOCKS5_VERSION {
+            return Err(Error::protocol("Invalid SOCKS5 version in request"));
+        }
+
+        if cmd != SOCKS5_CMD_CONNECT {
+            Self::send_socks5_error(stream, 0x07).await;
+            return Err(Error::protocol(format!(
+                "Unsupported SOCKS5 command: {}",
+                cmd
+            )));
+        }
+
+        match atyp {
+            SOCKS5_ADDR_IPV4 => {
+                let mut addr = [0u8; 4];
+                stream
+                    .read_exact(&mut addr)
+                    .await
+                    .map_err(|e| Error::protocol(format!("Failed to read IPv4 address: {}", e)))?;
+                let ip = Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
+                let mut port_buf = [0u8; 2];
+                stream
+                    .read_exact(&mut port_buf)
+                    .await
+                    .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
+                let port = u16::from_be_bytes(port_buf);
+                Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port)))
+            }
+            SOCKS5_ADDR_DOMAIN => {
+                let mut len = [0u8; 1];
+                stream
+                    .read_exact(&mut len)
+                    .await
+                    .map_err(|e| Error::protocol(format!("Failed to read domain length: {}", e)))?;
+                let mut domain = vec![0u8; len[0] as usize];
+                stream
+                    .read_exact(&mut domain)
+                    .await
+                    .map_err(|e| Error::protocol(format!("Failed to read domain: {}", e)))?;
+                let domain = String::from_utf8(domain)
+                    .map_err(|_| Error::protocol("Invalid domain encoding"))?;
+                let mut port_buf = [0u8; 2];
+                stream
+                    .read_exact(&mut port_buf)
+                    .await
+                    .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
+                let port = u16::from_be_bytes(port_buf);
+                Ok(TargetAddr::Domain(domain, port))
+            }
+            SOCKS5_ADDR_IPV6 => {
+                let mut addr = [0u8; 16];
+                stream
+                    .read_exact(&mut addr)
+                    .await
+                    .map_err(|e| Error::protocol(format!("Failed to read IPv6 address: {}", e)))?;
+                let ip = Ipv6Addr::from(addr);
+                let mut port_buf = [0u8; 2];
+                stream
+                    .read_exact(&mut port_buf)
+                    .await
+                    .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
+                let port = u16::from_be_bytes(port_buf);
+                Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::V6(ip), port)))
+            }
+            _ => {
+                Self::send_socks5_error(stream, 0x08).await;
+                Err(Error::protocol(format!(
+                    "Unsupported address type: {}",
+                    atyp
+                )))
+            }
+        }
     }
 
     async fn send_socks5_error(stream: &mut TcpStream, error_code: u8) {

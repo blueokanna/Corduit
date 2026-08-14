@@ -53,6 +53,7 @@ pub mod process;
 pub mod provider_updater;
 pub mod proxy;
 pub mod proxy_provider;
+pub mod random;
 pub mod routing;
 pub mod rule_provider;
 pub mod tls;

@@ -54,6 +54,12 @@ enum DataValue {
 const MAGIC: &[u8] = b"\xab\xcd\xefMaxMind.com";
 /// Search-tree/data-section separator size in bytes.
 const DATA_SECTION_SEPARATOR: usize = 16;
+/// Maximum pointer-indirection depth while decoding. A hostile database can
+/// wire pointers in a cycle; without a bound this would recurse forever.
+const MAX_POINTER_DEPTH: usize = 32;
+/// Maximum entries decoded into a map or array. `read_size` can claim up to
+/// ~16.8M entries; capping here bounds the pre-allocation below.
+const MAX_CONTAINER_ENTRIES: usize = 65_536;
 
 /// A ready-to-query MMDB reader over an in-memory byte blob.
 pub struct MmdbReader {
@@ -91,7 +97,7 @@ impl MmdbReader {
         // The metadata is a data-section-format map; pointers inside it are
         // relative to the metadata start.
         let (value, _) = reader
-            .read_value(meta_start, meta_start)
+            .read_value(meta_start, meta_start, 0)
             .ok_or_else(|| "MMDB: metadata is corrupt".to_string())?;
 
         let DataValue::Map(entries) = value else {
@@ -285,8 +291,14 @@ impl MmdbReader {
     /// Decode one data field at `offset`, returning `(value, next_offset)`.
     ///
     /// `ptr_base` is the file offset pointers are relative to: the data-section
-    /// start for records, or the metadata start for the metadata map.
-    fn read_value(&self, offset: usize, ptr_base: usize) -> Option<(DataValue, usize)> {
+    /// start for records, or the metadata start for the metadata map. `depth`
+    /// bounds pointer indirection to stop cycles in a hostile database.
+    fn read_value(
+        &self,
+        offset: usize,
+        ptr_base: usize,
+        depth: usize,
+    ) -> Option<(DataValue, usize)> {
         let control = *self.data.get(offset)?;
         let type_bits = control >> 5;
         let size_bits = control & 0x1F;
@@ -334,8 +346,12 @@ impl MmdbReader {
                 }
                 _ => return None,
             };
+            // Bound pointer indirection: a cycle must not recurse forever.
+            if depth >= MAX_POINTER_DEPTH {
+                return None;
+            }
             let target = ptr_base.checked_add(value as usize)?;
-            let (resolved, _) = self.read_value(target, ptr_base)?;
+            let (resolved, _) = self.read_value(target, ptr_base, depth + 1)?;
             return Some((resolved, pos));
         }
 
@@ -353,15 +369,18 @@ impl MmdbReader {
             6 => DataValue::U32(u32::from_be_bytes(payload.try_into().ok()?)),
             7 => {
                 // Map: `size` = number of key/value pairs.
+                if size > MAX_CONTAINER_ENTRIES {
+                    return None;
+                }
                 let mut entries = Vec::with_capacity(size);
                 let mut p = pos;
                 for _ in 0..size {
-                    let (key, np) = self.read_value(p, ptr_base)?;
+                    let (key, np) = self.read_value(p, ptr_base, depth)?;
                     let DataValue::Str(key) = key else {
                         return None;
                     };
                     p = np;
-                    let (val, np) = self.read_value(p, ptr_base)?;
+                    let (val, np) = self.read_value(p, ptr_base, depth)?;
                     p = np;
                     entries.push((key, val));
                 }
@@ -376,10 +395,13 @@ impl MmdbReader {
             9 => DataValue::U64(u64::from_be_bytes(payload.try_into().ok()?)),
             11 => {
                 // Array: `size` = number of elements.
+                if size > MAX_CONTAINER_ENTRIES {
+                    return None;
+                }
                 let mut items = Vec::with_capacity(size);
                 let mut p = pos;
                 for _ in 0..size {
-                    let (val, np) = self.read_value(p, ptr_base)?;
+                    let (val, np) = self.read_value(p, ptr_base, depth)?;
                     p = np;
                     items.push(val);
                 }
@@ -398,9 +420,13 @@ impl MmdbReader {
     }
 
     /// Resolve the ISO 3166-1 alpha-2 country code for an IP, if present.
-    pub fn lookup_country(&self, ip: IpAddr) -> Option<String> {
+    ///
+    /// Returns the two raw uppercase bytes — no heap allocation, no UTF-8
+    /// round-trip. Country codes are exactly two ASCII letters by spec, so a
+    /// packed `[u8; 2]` is the tightest lossless representation.
+    pub fn lookup_country(&self, ip: IpAddr) -> Option<[u8; 2]> {
         let data_off = self.lookup(ip)?;
-        let (value, _) = self.read_value(data_off, self.data_start)?;
+        let (value, _) = self.read_value(data_off, self.data_start, 0)?;
         let DataValue::Map(entries) = value else {
             return None;
         };
@@ -410,7 +436,14 @@ impl MmdbReader {
         };
         let iso = country_entries.into_iter().find(|(k, _)| k == "iso_code")?.1;
         match iso {
-            DataValue::Str(code) => Some(code.to_uppercase()),
+            DataValue::Str(code) if code.len() == 2 => {
+                let b = code.as_bytes();
+                if b[0].is_ascii_alphabetic() && b[1].is_ascii_alphabetic() {
+                    Some([b[0].to_ascii_uppercase(), b[1].to_ascii_uppercase()])
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }

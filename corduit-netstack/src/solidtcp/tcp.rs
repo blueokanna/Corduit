@@ -114,7 +114,9 @@ impl TcpConnection {
         domain: Option<String>,
     ) -> Self {
         let config = TcpConfig::default();
-        let iss: u32 = rand::random();
+        let mut iss = [0u8; 4];
+        getrandom::fill(&mut iss).expect("OS RNG unavailable");
+        let iss = u32::from_le_bytes(iss);
         let mss = their_mss.unwrap_or(DEFAULT_MSS_V4).min(config.mss);
         let is_websocket = matches!(key.dst.port(), 80 | 443 | 8080 | 8443 | 9000);
         let initial_cwnd = (10 * mss as u32).min(64 * 1024);

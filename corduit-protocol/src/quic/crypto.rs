@@ -1,11 +1,8 @@
-use aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Aes256Gcm};
-use blake2::{Blake2b512, Digest};
 use bytes::{BufMut, Bytes, BytesMut};
-use chacha20poly1305::ChaCha20Poly1305;
-use hkdf::Hkdf;
-use rand::Rng;
-use sha2::Sha256;
+use corduit_crypto::aead::{Aead, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305};
+use corduit_crypto::digest::Digest;
+use corduit_crypto::hash::{Blake2b, Sha256};
+use corduit_crypto::kdf::Hkdf;
 
 use super::config::CipherKind;
 use super::error::{QuicError, Result};
@@ -34,23 +31,19 @@ impl Cipher {
     }
 
     pub fn encrypt(&self, nonce: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = aes_gcm::Nonce::try_from(nonce)
-            .map_err(|_| QuicError::Crypto("Invalid nonce length".into()))?;
         let result = match self {
-            Self::Aes256Gcm(c) => c.encrypt(&nonce, plaintext),
-            Self::Aes128Gcm(c) => c.encrypt(&nonce, plaintext),
-            Self::ChaCha20Poly1305(c) => c.encrypt(&nonce, plaintext),
+            Self::Aes256Gcm(c) => c.encrypt(nonce, plaintext, &[]),
+            Self::Aes128Gcm(c) => c.encrypt(nonce, plaintext, &[]),
+            Self::ChaCha20Poly1305(c) => c.encrypt(nonce, plaintext, &[]),
         };
         result.map_err(|_| QuicError::EncryptionFailed)
     }
 
     pub fn decrypt(&self, nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = aes_gcm::Nonce::try_from(nonce)
-            .map_err(|_| QuicError::Crypto("Invalid nonce length".into()))?;
         let result = match self {
-            Self::Aes256Gcm(c) => c.decrypt(&nonce, ciphertext),
-            Self::Aes128Gcm(c) => c.decrypt(&nonce, ciphertext),
-            Self::ChaCha20Poly1305(c) => c.decrypt(&nonce, ciphertext),
+            Self::Aes256Gcm(c) => c.decrypt(nonce, ciphertext, &[]),
+            Self::Aes128Gcm(c) => c.decrypt(nonce, ciphertext, &[]),
+            Self::ChaCha20Poly1305(c) => c.decrypt(nonce, ciphertext, &[]),
         };
         result.map_err(|_| QuicError::DecryptionFailed)
     }
@@ -98,7 +91,7 @@ impl CryptoContext {
 
     pub fn random_nonce() -> [u8; 12] {
         let mut nonce = [0u8; 12];
-        rand::rng().fill_bytes(&mut nonce);
+        let _ = getrandom::fill(&mut nonce);
         nonce
     }
 
@@ -148,7 +141,8 @@ fn derive_key_hkdf(password: &str, key_size: usize) -> Vec<u8> {
 }
 
 fn derive_key_blake2b(password: &str, key_size: usize) -> Vec<u8> {
-    let mut hasher = Blake2b512::new();
+    let mut hasher = Blake2b::new();
     hasher.update(password.as_bytes());
-    hasher.finalize()[..key_size].to_vec()
+    let digest = hasher.finalize();
+    digest[..key_size].to_vec()
 }

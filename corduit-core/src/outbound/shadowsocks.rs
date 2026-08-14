@@ -2,13 +2,11 @@ use crate::config::OutboundConfig;
 use crate::error::{Error, Result};
 use crate::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
 use crate::tls::yaml_value_to_string;
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm,
-};
-use chacha20poly1305::ChaCha20Poly1305;
-use hkdf::Hkdf;
-use sha1::Sha1;
+use corduit_crypto::aead::{Aead, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305};
+use corduit_crypto::digest::Digest;
+use corduit_crypto::encoding::{decode as b64_decode, Config as B64Config};
+use corduit_crypto::hash::{Blake3, Md5, Sha1};
+use corduit_crypto::kdf::Hkdf;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -682,8 +680,6 @@ impl CipherSpec {
 
 /// Derive key from password using EVP_BytesToKey (OpenSSL-style MD5)
 fn evp_bytes_to_key(password: &str, key_len: usize) -> Vec<u8> {
-    use md5::{Digest, Md5};
-
     let mut key = Vec::new();
     let mut prev: Vec<u8> = Vec::new();
     while key.len() < key_len {
@@ -714,13 +710,9 @@ fn derive_subkey(password: &str, salt: &[u8], key_len: usize) -> Result<Vec<u8>>
 /// The 2022 protocol uses the password directly as the key (base64-encoded)
 /// and derives session keys using BLAKE3
 fn derive_subkey_2022(password: &str, salt: &[u8], key_len: usize) -> Result<Vec<u8>> {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine as _;
-
     // For 2022 ciphers, the password is a base64-encoded key
-    let master_key = STANDARD
-        .decode(password)
-        .map_err(|e| Error::config(format!("Invalid 2022 cipher key (must be base64): {}", e)))?;
+    let master_key = b64_decode(password.as_bytes(), B64Config::STANDARD)
+        .map_err(|e| Error::config(format!("Invalid 2022 cipher key (must be base64): {:?}", e)))?;
 
     if master_key.len() != key_len {
         return Err(Error::config(format!(
@@ -731,11 +723,11 @@ fn derive_subkey_2022(password: &str, salt: &[u8], key_len: usize) -> Result<Vec
     }
 
     // Derive session key using BLAKE3 with salt
-    let mut hasher = blake3::Hasher::new_derive_key("shadowsocks 2022 session subkey");
+    let mut hasher = Blake3::new_derive_key("shadowsocks 2022 session subkey".as_bytes());
     hasher.update(&master_key);
     hasher.update(salt);
     let mut output = vec![0u8; key_len];
-    hasher.finalize_xof().fill(&mut output);
+    hasher.finalize_xof_into(&mut output);
 
     Ok(output)
 }
@@ -758,7 +750,7 @@ fn derive_subkey_for_cipher(
 #[allow(clippy::large_enum_variant)]
 enum AeadCipherInner {
     Aes256Gcm(Aes256Gcm),
-    Aes128Gcm(aes_gcm::Aes128Gcm),
+    Aes128Gcm(Aes128Gcm),
     ChaCha20Poly1305(ChaCha20Poly1305),
 }
 
@@ -775,7 +767,7 @@ impl AeadCipher {
                 Aes256Gcm::new_from_slice(&key).expect("validated key length"),
             ),
             CipherType::Aes128Gcm | CipherType::Aes128Gcm2022 => AeadCipherInner::Aes128Gcm(
-                aes_gcm::Aes128Gcm::new_from_slice(&key).expect("validated key length"),
+                Aes128Gcm::new_from_slice(&key).expect("validated key length"),
             ),
             CipherType::Chacha20Poly1305 | CipherType::Chacha20Poly13052022 => {
                 AeadCipherInner::ChaCha20Poly1305(
@@ -790,27 +782,27 @@ impl AeadCipher {
         }
     }
 
-    fn next_nonce(&mut self) -> chacha20poly1305::Nonce {
+    fn next_nonce(&mut self) -> [u8; 12] {
         // Shadowsocks AEAD uses little-endian nonce counter
         // The nonce is simply the counter value in little-endian format
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&self.counter.to_le_bytes());
         self.counter = self.counter.wrapping_add(1);
-        chacha20poly1305::Nonce::try_from(nonce.as_slice()).expect("fixed 12-byte nonce")
+        nonce
     }
 
     fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce = self.next_nonce();
         match &self.inner {
             AeadCipherInner::Aes256Gcm(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| Error::protocol(format!("AEAD encrypt failed: {}", e))),
+                .encrypt(&nonce, plaintext, &[])
+                .map_err(|e| Error::protocol(format!("AEAD encrypt failed: {:?}", e))),
             AeadCipherInner::Aes128Gcm(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| Error::protocol(format!("AEAD encrypt failed: {}", e))),
+                .encrypt(&nonce, plaintext, &[])
+                .map_err(|e| Error::protocol(format!("AEAD encrypt failed: {:?}", e))),
             AeadCipherInner::ChaCha20Poly1305(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| Error::protocol(format!("AEAD encrypt failed: {}", e))),
+                .encrypt(&nonce, plaintext, &[])
+                .map_err(|e| Error::protocol(format!("AEAD encrypt failed: {:?}", e))),
         }
     }
 
@@ -818,14 +810,14 @@ impl AeadCipher {
         let nonce = self.next_nonce();
         match &self.inner {
             AeadCipherInner::Aes256Gcm(cipher) => cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| Error::protocol(format!("AEAD decrypt failed: {}", e))),
+                .decrypt(&nonce, ciphertext, &[])
+                .map_err(|e| Error::protocol(format!("AEAD decrypt failed: {:?}", e))),
             AeadCipherInner::Aes128Gcm(cipher) => cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| Error::protocol(format!("AEAD decrypt failed: {}", e))),
+                .decrypt(&nonce, ciphertext, &[])
+                .map_err(|e| Error::protocol(format!("AEAD decrypt failed: {:?}", e))),
             AeadCipherInner::ChaCha20Poly1305(cipher) => cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| Error::protocol(format!("AEAD decrypt failed: {}", e))),
+                .decrypt(&nonce, ciphertext, &[])
+                .map_err(|e| Error::protocol(format!("AEAD decrypt failed: {:?}", e))),
         }
     }
 }
@@ -898,26 +890,26 @@ async fn recv_decrypted_chunk<R: tokio::io::AsyncRead + Unpin>(
 /// Encrypt UDP payload (single-shot, not chunked like TCP)
 fn encrypt_udp_payload(key: &[u8], plaintext: &[u8], cipher_spec: &CipherSpec) -> Result<Vec<u8>> {
     // UDP uses nonce = 0 for single-shot encryption
-    let nonce = chacha20poly1305::Nonce::try_from(&[0u8; 12][..]).expect("fixed 12-byte nonce");
+    let nonce = [0u8; 12];
 
     match cipher_spec.cipher_type {
         CipherType::Aes256Gcm | CipherType::Aes256Gcm2022 => {
             let cipher = Aes256Gcm::new_from_slice(key).expect("validated key length");
             cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| Error::protocol(format!("UDP AEAD encrypt failed: {}", e)))
+                .encrypt(&nonce, plaintext, &[])
+                .map_err(|e| Error::protocol(format!("UDP AEAD encrypt failed: {:?}", e)))
         }
         CipherType::Aes128Gcm | CipherType::Aes128Gcm2022 => {
-            let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("validated key length");
+            let cipher = Aes128Gcm::new_from_slice(key).expect("validated key length");
             cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| Error::protocol(format!("UDP AEAD encrypt failed: {}", e)))
+                .encrypt(&nonce, plaintext, &[])
+                .map_err(|e| Error::protocol(format!("UDP AEAD encrypt failed: {:?}", e)))
         }
         CipherType::Chacha20Poly1305 | CipherType::Chacha20Poly13052022 => {
             let cipher = ChaCha20Poly1305::new_from_slice(key).expect("validated key length");
             cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| Error::protocol(format!("UDP AEAD encrypt failed: {}", e)))
+                .encrypt(&nonce, plaintext, &[])
+                .map_err(|e| Error::protocol(format!("UDP AEAD encrypt failed: {:?}", e)))
         }
     }
 }
@@ -925,26 +917,26 @@ fn encrypt_udp_payload(key: &[u8], plaintext: &[u8], cipher_spec: &CipherSpec) -
 /// Decrypt UDP payload (single-shot, not chunked like TCP)
 fn decrypt_udp_payload(key: &[u8], ciphertext: &[u8], cipher_spec: &CipherSpec) -> Result<Vec<u8>> {
     // UDP uses nonce = 0 for single-shot decryption
-    let nonce = chacha20poly1305::Nonce::try_from(&[0u8; 12][..]).expect("fixed 12-byte nonce");
+    let nonce = [0u8; 12];
 
     match cipher_spec.cipher_type {
         CipherType::Aes256Gcm | CipherType::Aes256Gcm2022 => {
             let cipher = Aes256Gcm::new_from_slice(key).expect("validated key length");
             cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| Error::protocol(format!("UDP AEAD decrypt failed: {}", e)))
+                .decrypt(&nonce, ciphertext, &[])
+                .map_err(|e| Error::protocol(format!("UDP AEAD decrypt failed: {:?}", e)))
         }
         CipherType::Aes128Gcm | CipherType::Aes128Gcm2022 => {
-            let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("validated key length");
+            let cipher = Aes128Gcm::new_from_slice(key).expect("validated key length");
             cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| Error::protocol(format!("UDP AEAD decrypt failed: {}", e)))
+                .decrypt(&nonce, ciphertext, &[])
+                .map_err(|e| Error::protocol(format!("UDP AEAD decrypt failed: {:?}", e)))
         }
         CipherType::Chacha20Poly1305 | CipherType::Chacha20Poly13052022 => {
             let cipher = ChaCha20Poly1305::new_from_slice(key).expect("validated key length");
             cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| Error::protocol(format!("UDP AEAD decrypt failed: {}", e)))
+                .decrypt(&nonce, ciphertext, &[])
+                .map_err(|e| Error::protocol(format!("UDP AEAD decrypt failed: {:?}", e)))
         }
     }
 }
