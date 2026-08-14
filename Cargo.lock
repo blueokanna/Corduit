@@ -1618,6 +1618,8 @@ dependencies = [
 [[package]]
 name = "rustbinary"
 version = "0.1.5-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419f631d1a5e964dd743ba239748aa17cdf33178d4c32e48d6057e8d237a898a"
 dependencies = [
  "nextjson",
  "rustbinary-derive",

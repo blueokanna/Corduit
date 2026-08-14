@@ -39,13 +39,13 @@ jobs:
 
   # ---- MSRV job: the declared rust-version must really compile --------------
   msrv:
-    name: MSRV 1.78 (ubuntu)
+    name: MSRV 1.81 (ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.78
-        uses: dtolnay/rust-toolchain@1.78.0
+      - name: Install Rust 1.81
+        uses: dtolnay/rust-toolchain@1.81.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

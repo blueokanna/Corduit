@@ -15,7 +15,7 @@ edition = "2021"
 license = "PolyForm-Perimeter-1.0.1"
 version = "0.1.0"
 authors = ["blueokanna"]
-rust-version = "1.78"
+rust-version = "1.81"
 description = "A unified network proxy engine written in Rust"
 homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
@@ -139,10 +139,3 @@ corduit-dns = { path = "corduit-dns", version = "0.1.0" }
 corduit-lib = { path = "corduit-lib", version = "0.1.0" }
 corduit-netstack = { path = "corduit-netstack", version = "0.1.0" }
 corduit-protocol = { path = "corduit-protocol", version = "0.1.0" }
-
-# --- patched crates ----------------------------------------------------------
-# `rustbinary` 0.1.3 is vendored and lightly patched (its `core::error::Error`
-# impl requires Rust 1.81; we gate it behind the `std` feature) so the whole
-# workspace builds on the declared MSRV of Rust 1.78.
-[patch.crates-io]
-rustbinary = { path = "vendor/rustbinary" }

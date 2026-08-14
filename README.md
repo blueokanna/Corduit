@@ -6,7 +6,7 @@
 [![Crates.io](https://img.shields.io/crates/v/corduit-core)](https://crates.io/crates/corduit-core)
 [![docs.rs](https://img.shields.io/docsrs/corduit-core)](https://docs.rs/corduit-core)
 [![License](https://img.shields.io/badge/license-PolyForm--Perimeter--1.0.1-blue)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.78-blue)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.81-blue)](Cargo.toml)
 
 ---
 
@@ -483,10 +483,9 @@ cargo doc --workspace --all-features --no-deps
 cargo build --release --workspace
 ```
 
-MSRV: **Rust 1.78** (verified with `cargo +1.78.0 check/test`; `resolver = "2"`
+MSRV: **Rust 1.81** (verified with `cargo +1.81.0 check/test`; `resolver = "2"`
 with an MSRV-aware fallback in `.cargo/config.toml` keeps the lock
-compatible, and `rustbinary` is vendored under `vendor/` with a one-line
-`std`-gate patch because its upstream releases require Rust 1.81+).
+compatible).
 
 ### Publishing to crates.io
 
