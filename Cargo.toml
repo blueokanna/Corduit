@@ -90,7 +90,7 @@ ipnet = "2"
 lru = "0.18.2"
 
 # --- crypto ------------------------------------------------------------------
-getrandom = { version = "0.3", features = ["std"] }
+getrandom = { version = "0.4.3", features = ["std"] }
 
 # --- networking / system -----------------------------------------------------
 bitflags = "2"
@@ -117,7 +117,7 @@ wintun-bindings = { version = "0.7.39", features = ["async"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # --- platform bindings -------------------------------------------------------
-jni = "0.21"
+jni = "0.22"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

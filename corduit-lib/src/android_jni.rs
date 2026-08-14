@@ -1,8 +1,8 @@
 #![cfg(target_os = "android")]
 
-use jni::objects::{GlobalRef, JObject, JValue};
+use jni::objects::{Global, JObject, JValue};
 use jni::sys::jint;
-use jni::{JNIEnv, JavaVM};
+use jni::{EnvUnowned, JavaVM};
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
@@ -13,14 +13,14 @@ extern "C" {
 
 /// Use RwLock instead of OnceLock to allow resetting on VPN restart
 static JAVA_VM: RwLock<Option<JavaVM>> = RwLock::new(None);
-static VPN_SERVICE: RwLock<Option<GlobalRef>> = RwLock::new(None);
+static VPN_SERVICE: RwLock<Option<Global<JObject<'static>>>> = RwLock::new(None);
 static JNI_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
 pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeInitRustBridge<
     'local,
 >(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     vpn_service: JObject<'local>,
 ) {
     android_log(
@@ -29,58 +29,65 @@ pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeInitR
     );
     info!("=== Initializing Rust JNI bridge for VpnService ===");
 
-    // Clear any existing state first to support VPN restart
-    {
-        let mut vm_guard = JAVA_VM.write();
-        let mut service_guard = VPN_SERVICE.write();
-
-        // Drop old references
-        *vm_guard = None;
-        *service_guard = None;
-        JNI_INITIALIZED.store(false, Ordering::SeqCst);
-
-        android_log("INFO", "Cleared previous JNI state");
-    }
-
-    // Get and store JavaVM
-    match env.get_java_vm() {
-        Ok(vm) => {
+    // `Env` (which carries `get_java_vm`/`new_global_ref`) is entered through
+    // `with_env`. `resolve` turns a Java-exception result into a logged error.
+    env.with_env(|env| -> jni::errors::Result<()> {
+        // Clear any existing state first to support VPN restart
+        {
             let mut vm_guard = JAVA_VM.write();
+            let mut service_guard = VPN_SERVICE.write();
+
+            // Drop old references
+            *vm_guard = None;
+            *service_guard = None;
+            JNI_INITIALIZED.store(false, Ordering::SeqCst);
+
+            android_log("INFO", "Cleared previous JNI state");
+        }
+
+        // Get and store JavaVM
+        let vm = match env.get_java_vm() {
+            Ok(vm) => vm,
+            Err(e) => {
+                let msg = format!("Failed to get JavaVM: {:?}", e);
+                android_log("ERROR", &msg);
+                error!("{}", msg);
+                return Ok(());
+            }
+        };
+
+        let global_ref = match env.new_global_ref(vpn_service) {
+            Ok(global_ref) => global_ref,
+            Err(e) => {
+                let msg = format!("Failed to create global reference: {:?}", e);
+                android_log("ERROR", &msg);
+                error!("{}", msg);
+                return Ok(());
+            }
+        };
+
+        {
+            let mut vm_guard = JAVA_VM.write();
+            let mut service_guard = VPN_SERVICE.write();
             *vm_guard = Some(vm);
+            *service_guard = Some(global_ref);
             android_log("INFO", "JavaVM stored successfully");
             info!("JavaVM stored successfully");
-        }
-        Err(e) => {
-            let msg = format!("Failed to get JavaVM: {:?}", e);
-            android_log("ERROR", &msg);
-            error!("{}", msg);
-            return;
-        }
-    }
-
-    match env.new_global_ref(vpn_service) {
-        Ok(global_ref) => {
-            let mut service_guard = VPN_SERVICE.write();
-            *service_guard = Some(global_ref);
             android_log("INFO", "VpnService reference stored successfully");
             info!("VpnService reference stored successfully");
         }
-        Err(e) => {
-            let msg = format!("Failed to create global reference: {:?}", e);
-            android_log("ERROR", &msg);
-            error!("{}", msg);
-            return;
-        }
-    }
 
-    // Mark as initialized
-    JNI_INITIALIZED.store(true, Ordering::SeqCst);
+        // Mark as initialized
+        JNI_INITIALIZED.store(true, Ordering::SeqCst);
 
-    // Set up the protect callback in corduit-solidtcp
-    setup_protect_callback();
+        // Set up the protect callback
+        setup_protect_callback();
 
-    android_log("INFO", "=== JNI bridge initialization complete ===");
-    info!("=== JNI bridge initialization complete ===");
+        android_log("INFO", "=== JNI bridge initialization complete ===");
+        info!("=== JNI bridge initialization complete ===");
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 fn android_log(level: &str, message: &str) {
@@ -109,7 +116,7 @@ fn android_log(level: &str, message: &str) {
 pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeClearRustBridge<
     'local,
 >(
-    _env: JNIEnv<'local>,
+    _env: EnvUnowned<'local>,
     _vpn_service: JObject<'local>,
 ) {
     android_log("INFO", "Clearing Rust JNI bridge");
@@ -164,55 +171,45 @@ pub fn protect_socket_via_jni(fd: i32) -> bool {
         }
     };
 
-    // Attach current thread to JVM
-    let mut env = match vm.attach_current_thread() {
-        Ok(env) => env,
-        Err(e) => {
-            let msg = format!("Failed to attach thread to JVM: {:?}", e);
-            android_log("ERROR", &msg);
-            error!("{}", msg);
-            return false;
+    // jni 0.22: `attach_current_thread` runs a callback with the owned `Env`.
+    // Exceptions thrown by `VpnService.protect` surface as `Err`, and any
+    // pending Java exception is cleared so the thread can keep using JNI.
+    let result: jni::errors::Result<bool> = vm.attach_current_thread(|env| {
+        let obj = vpn_service_ref.as_obj();
+        match env.call_method(
+            obj,
+            jni::jni_str!("protect"),
+            jni::jni_sig!("(I)Z"),
+            &[JValue::Int(fd as jint)],
+        ) {
+            Ok(ret) => ret.z(),
+            Err(e) => {
+                if env.exception_check() {
+                    env.exception_describe();
+                    env.exception_clear();
+                }
+                Err(e)
+            }
         }
-    };
-
-    // Call VpnService.protect(int fd)
-    let result = env.call_method(
-        vpn_service_ref.as_obj(),
-        "protect",
-        "(I)Z",
-        &[JValue::Int(fd as jint)],
-    );
+    });
 
     match result {
-        Ok(ret) => match ret.z() {
-            Ok(protected) => {
-                if protected {
-                    let msg = format!("Socket fd={} protected successfully via JNI", fd);
-                    android_log("DEBUG", &msg);
-                    debug!("{}", msg);
-                } else {
-                    let msg = format!("VpnService.protect() returned false for fd={}", fd);
-                    android_log("WARN", &msg);
-                    warn!("{}", msg);
-                }
-                protected
+        Ok(protected) => {
+            if protected {
+                let msg = format!("Socket fd={} protected successfully via JNI", fd);
+                android_log("DEBUG", &msg);
+                debug!("{}", msg);
+            } else {
+                let msg = format!("VpnService.protect() returned false for fd={}", fd);
+                android_log("WARN", &msg);
+                warn!("{}", msg);
             }
-            Err(e) => {
-                let msg = format!("Failed to get boolean result: {:?}", e);
-                android_log("ERROR", &msg);
-                error!("{}", msg);
-                false
-            }
-        },
+            protected
+        }
         Err(e) => {
             let msg = format!("Failed to call VpnService.protect(): {:?}", e);
             android_log("ERROR", &msg);
             error!("{}", msg);
-            // Check for exceptions
-            if env.exception_check().unwrap_or(false) {
-                let _ = env.exception_describe();
-                let _ = env.exception_clear();
-            }
             false
         }
     }
