@@ -21,11 +21,7 @@ homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
 readme = "README.md"
 keywords = ["proxy", "protocol", "network", "tun", "rust"]
-categories = [
-    "network-programming",
-    "web-programming",
-    "asynchronous",
-]
+categories = ["network-programming", "web-programming", "asynchronous"]
 
 [workspace.dependencies]
 

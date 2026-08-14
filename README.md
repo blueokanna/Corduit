@@ -22,14 +22,14 @@ layer — configuration, routing, DNS, userspace networking, and wire protocols 
 lives in one workspace and ships as one unit: one design, one test run, one
 release.
 
-| | Clash (composite) | Corduit (unified) |
-|---|---|---|
-| Protocol implementations | Forked/embedded third-party | Native, in-repo, one version |
-| Rule engine | Separate crates glued together | Single typed `RuleConfig` pipeline |
-| DNS | Multiple optional crates | Dedicated `corduit-dns` with anti-spoofing |
-| TUN stack | External libraries | In-repo userspace TCP/IP (SolidTCP) |
-| Configuration | Many formats, many loaders | One validated `Config` model |
-| Release cadence | Per-component | Whole-workspace, atomic |
+|                          | Clash (composite)              | Corduit (unified)                          |
+| ------------------------ | ------------------------------ | ------------------------------------------ |
+| Protocol implementations | Forked/embedded third-party    | Native, in-repo, one version               |
+| Rule engine              | Separate crates glued together | Single typed `RuleConfig` pipeline         |
+| DNS                      | Multiple optional crates       | Dedicated `corduit-dns` with anti-spoofing |
+| TUN stack                | External libraries             | In-repo userspace TCP/IP (SolidTCP)        |
+| Configuration            | Many formats, many loaders     | One validated `Config` model               |
+| Release cadence          | Per-component                  | Whole-workspace, atomic                    |
 
 ---
 
@@ -289,26 +289,26 @@ All enums are strongly typed: `OutboundType` covers `direct`, `reject`,
 
 ## Supported Protocols
 
-| Layer | Protocols |
-|---|---|
+| Layer           | Protocols                                                                                            |
+| --------------- | ---------------------------------------------------------------------------------------------------- |
 | Proxy outbounds | Shadowsocks, VMess, VLESS, Trojan, TUIC, Hysteria2, SOCKS5, HTTP(S), QUIC, WireGuard, Direct, Reject |
-| Proxy groups | Selector, URL-test, Fallback, Load-balance, Relay |
-| Inbounds | HTTP, SOCKS5, Mixed, (redir / TProxy on Linux) |
-| Transports | WebSocket, h2, gRPC, TLS, QUIC |
-| DNS | UDP, TCP, DoH, DoT — client & server |
-| TUN | Userspace TCP/IP (SolidTCP) with NAT |
+| Proxy groups    | Selector, URL-test, Fallback, Load-balance, Relay                                                    |
+| Inbounds        | HTTP, SOCKS5, Mixed, (redir / TProxy on Linux)                                                       |
+| Transports      | WebSocket, h2, gRPC, TLS, QUIC                                                                       |
+| DNS             | UDP, TCP, DoH, DoT — client & server                                                                 |
+| TUN             | Userspace TCP/IP (SolidTCP) with NAT                                                                 |
 
 ---
 
 ## Platform Support
 
-| Platform | Inbound | TUN | Notes |
-|---|---|---|---|
-| Windows | ✓ | ✓ | wintun (auto-download or `embed-wintun` feature) |
-| Linux | ✓ | ✓ | requires `CAP_NET_ADMIN` for TUN |
-| macOS | ✓ | ✓ | requires root for TUN |
-| Android | ✓ | ✓ | VpnService via JNI (`corduit-lib`) |
-| Flutter | — | — | Hand-written C ABI via `corduit-lib` (`corduit_call`) |
+| Platform | Inbound | TUN | Notes                                                 |
+| -------- | ------- | --- | ----------------------------------------------------- |
+| Windows  | ✓       | ✓   | wintun (auto-download or `embed-wintun` feature)      |
+| Linux    | ✓       | ✓   | requires `CAP_NET_ADMIN` for TUN                      |
+| macOS    | ✓       | ✓   | requires root for TUN                                 |
+| Android  | ✓       | ✓   | VpnService via JNI (`corduit-lib`)                    |
+| Flutter  | —       | —   | Hand-written C ABI via `corduit-lib` (`corduit_call`) |
 
 ---
 
@@ -318,10 +318,10 @@ All enums are strongly typed: `OutboundType` covers `direct`, `reject`,
 codegen, no runtime. Any language that can call C can drive the whole engine
 through **two** entry points:
 
-| Entry point | Payload format | Use case |
-|---|---|---|
-| `corduit_call(method, args_json)` | `nextjson` (JSON) | Human-readable control plane |
-| `corduit_call_binary(method, payload, len)` | `rustbinary` (binary) | Compact, high-throughput |
+| Entry point                                 | Payload format        | Use case                     |
+| ------------------------------------------- | --------------------- | ---------------------------- |
+| `corduit_call(method, args_json)`           | `nextjson` (JSON)     | Human-readable control plane |
+| `corduit_call_binary(method, payload, len)` | `rustbinary` (binary) | Compact, high-throughput     |
 
 Memory rules (identical for both):
 
@@ -518,31 +518,32 @@ Corduit is audited as a dependency graph **and** at the source level:
   former `reqwest` (HTTP), `url`, `hickory-proto` (DNS) and `maxminddb`
   dependencies are replaced by in-repo implementations (`corduit-common`,
   `corduit-dns::wire`, `corduit-core::mmdb`).
-- The only remaining advisory is *informational*: `paste` (a transitive
+- The only remaining advisory is _informational_: `paste` (a transitive
   build-time macro helper pulled in by the Linux netlink stack) is
   unmaintained — it is not a security vulnerability and cannot be removed
   without replacing the whole `tun-rs` dependency chain.
 
 ### Source-level hardening (CWE review)
 
-| Check | Verdict |
-|---|---|
-| CWE-78 OS command injection | Fixed — interface names are validated before
-  PowerShell/netsh interpolation (`sanitize_interface_name`) |
-| CWE-190 integer truncation | Fixed — QUIC request payloads > 64 KiB are
-  rejected instead of truncated; SOCKS5 credentials are length-checked
-  (RFC 1929) |
+| Check                                                      | Verdict                                      |
+| ---------------------------------------------------------- | -------------------------------------------- |
+| CWE-78 OS command injection                                | Fixed — interface names are validated before |
+| PowerShell/netsh interpolation (`sanitize_interface_name`) |
+| CWE-190 integer truncation                                 | Fixed — QUIC request payloads > 64 KiB are   |
+
+rejected instead of truncated; SOCKS5 credentials are length-checked
+(RFC 1929) |
 | CWE-295 TLS certificate verification | Verified — `skip_cert_verify` is
-  off by default; native roots are used and verification is only bypassed
-  when explicitly configured |
+off by default; native roots are used and verification is only bypassed
+when explicitly configured |
 | CWE-22 path traversal | Verified — wintun extraction uses fixed entry names;
-  no user-controlled paths reach the filesystem |
+no user-controlled paths reach the filesystem |
 | CWE-502 deserialization | Verified — `nextjson`/`rustbinary` are
-  memory-safe, bounded, schema-driven formats |
+memory-safe, bounded, schema-driven formats |
 | CWE-798 hard-coded credentials | Verified — no credentials in production
-  code (test-only fixtures) |
+code (test-only fixtures) |
 | CWE-120 / CWE-416 memory safety | Verified — `unsafe` is confined to the
-  hand-verified FFI/platform boundary |
+hand-verified FFI/platform boundary |
 
 ### Runtime posture
 
