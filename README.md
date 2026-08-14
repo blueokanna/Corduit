@@ -1,6 +1,6 @@
 # Corduit
 
-> **A unified, non-composite network proxy engine written in Rust.**
+> **A unified, non-composite network proxy engine written in Rust 1.95.**
 > One engine. Every protocol.
 
 [![Crates.io](https://img.shields.io/crates/v/corduit-core)](https://crates.io/crates/corduit-core)
@@ -122,13 +122,13 @@ Corduit (workspace)
                        │          Corduit            │
                        │       (corduit-core)        │
                        │                             │
-  HTTP/SOCKS ─────────►│  inbound/*  ──►  routing.rs  │
-  redir/TProxy ────────►│              │      │       │
-  TUN (netstack) ──────►│              ▼      ▼       │
-                       │        outbound/*  DNS (dns) │
+  HTTP/SOCKS ─────────►│  inbound/*  ──►  routing.rs │
+  redir/TProxy ────────►│              │      │      │
+  TUN (netstack) ──────►│              ▼      ▼      │
+                       │        outbound/*  DNS (dns)│
                        │              │      │       │
                        │              ▼      ▼       │
-                       │       proxy groups   fake-IP │
+                       │       proxy groups  fake-IP │
                        └──────────────┬──────────────┘
                                       ▼
                           corduit-protocol (wire)
