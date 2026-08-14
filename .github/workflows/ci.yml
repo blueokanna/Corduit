@@ -39,13 +39,13 @@ jobs:
 
   # ---- MSRV job: the declared rust-version must really compile --------------
   msrv:
-    name: MSRV 1.81 (ubuntu)
+    name: MSRV 1.95 (ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.81
-        uses: dtolnay/rust-toolchain@1.81.0
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -115,8 +115,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: aarch64-unknown-linux-ohos
 

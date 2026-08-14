@@ -19,7 +19,7 @@ name = "rust_lib_corduit"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 # HarmonyOS (OpenHarmony) targets expose `target_os = "ohos"`; the
-# check-cfg for it lives in `.cargo/config.toml` so cargo 1.81 can parse
+# check-cfg for it lives in `.cargo/config.toml` so cargo 1.95 can parse
 # this manifest ([lints.rust].check-cfg needs cargo 1.80+).
 
 [dependencies]

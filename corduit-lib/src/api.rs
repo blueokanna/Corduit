@@ -654,7 +654,7 @@ pub async fn start_tun_mode(
 
     #[cfg(not(windows))]
     {
-        (tun_name, tun_address, tun_netmask);
+        let _ = (tun_name, tun_address, tun_netmask);
         Err("TUN mode is only supported on Windows".to_string())
     }
 }
@@ -960,8 +960,7 @@ pub async fn get_system_info() -> Result<SystemInfo> {
         .map(|process| process.memory())
         .unwrap_or_default();
     let cpu_threads = sys.cpus().len() as u32;
-    let cpu_cores = sys
-        .physical_core_count()
+    let cpu_cores = sysinfo::System::physical_core_count()
         .map(|c| c as u32)
         .unwrap_or(cpu_threads);
 
@@ -2392,7 +2391,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
 
             while let Some(packet) = tun_rx.recv().await {
                 packet_count += 1;
-                if packet_count <= 10 || packet_count % 100 == 0 {
+                if packet_count <= 10 || packet_count.is_multiple_of(100) {
                     tracing::debug!(
                         "Processing packet #{}: {} bytes",
                         packet_count,
@@ -2670,7 +2669,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         target_os = "android"
     )))]
     {
-        mode;
+        let _ = (mode, mode_int);
         Ok(TunStatus {
             enabled: false,
             interface_name: None,

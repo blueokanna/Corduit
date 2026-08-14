@@ -25,7 +25,7 @@ pub enum DecodeError {
 /// Decode a hex string (odd length or invalid digits rejected).
 #[cfg(feature = "alloc")]
 pub fn decode(input: &[u8]) -> Result<alloc::vec::Vec<u8>, DecodeError> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err(DecodeError::OddLength);
     }
     let mut out = alloc::vec::Vec::with_capacity(input.len() / 2);
