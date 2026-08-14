@@ -3,7 +3,9 @@
 use crate::config::{UpstreamConfig, UpstreamProtocol};
 use crate::error::{DnsError, Result};
 
-use crate::wire::{BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RecordType};
+use crate::wire::{
+    BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RecordType,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

@@ -395,14 +395,11 @@ impl MixedInbound {
 
         let mut body = req.into_body();
         loop {
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                body.frame(),
-            )
-            .await
-            .map_err(|_| Error::network("Request body read timed out"))?
-            .transpose()
-            .map_err(|e| Error::network(format!("Failed to read request body: {}", e)))?;
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(60), body.frame())
+                .await
+                .map_err(|_| Error::network("Request body read timed out"))?
+                .transpose()
+                .map_err(|e| Error::network(format!("Failed to read request body: {}", e)))?;
             let Some(frame) = frame else { break };
             if let Some(data) = frame.data_ref() {
                 write_half
@@ -641,9 +638,10 @@ impl MixedInbound {
 
     async fn read_socks5_target(stream: &mut TcpStream) -> Result<TargetAddr> {
         let mut header = [0u8; 2];
-        stream.read_exact(&mut header).await.map_err(|e| {
-            Error::protocol(format!("Failed to read SOCKS5 header: {}", e))
-        })?;
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 header: {}", e)))?;
 
         let version = header[0];
         let nmethods = header[1] as usize;

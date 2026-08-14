@@ -188,10 +188,7 @@ mod tests {
     #[test]
     fn rfc4648_vectors() {
         // RFC 4648 §10.
-        assert_eq!(
-            encode(b"", Config::STANDARD),
-            ""
-        );
+        assert_eq!(encode(b"", Config::STANDARD), "");
         assert_eq!(encode(b"f", Config::STANDARD), "Zg==");
         assert_eq!(encode(b"fo", Config::STANDARD), "Zm8=");
         assert_eq!(encode(b"foo", Config::STANDARD), "Zm9v");

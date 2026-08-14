@@ -130,6 +130,9 @@ pub use tun::{
     set_android_vpn_fd, ANDROID_PROXY_MODE, ANDROID_VPN_FD,
 };
 
+#[cfg(target_os = "ios")]
+pub use tun::{clear_ios_vpn_fd, get_ios_vpn_fd, set_ios_vpn_fd, IOS_VPN_FD};
+
 #[cfg(target_os = "android")]
 pub use android_vpn::{AndroidVpnProcessor, VpnTrafficStats};
 

@@ -1,9 +1,9 @@
+use corduit_crypto::uuid::Uuid;
+use nextjson::{NsonDeserialize, NsonSerialize};
 use quinn::{
     ClientConfig as QuinnClientConfig, Connection, Endpoint, ServerConfig as QuinnServerConfig,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use nextjson::{NsonDeserialize, NsonSerialize};
-use corduit_crypto::uuid::Uuid;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;

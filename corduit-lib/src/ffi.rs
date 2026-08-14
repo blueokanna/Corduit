@@ -15,14 +15,14 @@
 //! [`corduit_binary_free`]. Thread-safe: a shared multi-threaded Tokio runtime
 //! drives every async API internally.
 
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{c_char, CStr, CString};
 use std::future::Future;
 use std::ptr;
 use std::sync::OnceLock;
 
 use nextjson::NsonSerialize;
 
-use crate::api as api;
+use crate::api;
 
 // ---------------------------------------------------------------------------
 // Shared async runtime
@@ -386,7 +386,10 @@ async fn dispatch(method: &str, args: Args<'_>) -> HandlerResult {
             let password = args.string("password")?;
             let cipher = args.string("cipher")?;
             let timeout = args.u32("timeout_ms")?;
-            call(api::test_shadowsocks_latency(server, port, password, cipher, timeout)).await
+            call(api::test_shadowsocks_latency(
+                server, port, password, cipher, timeout,
+            ))
+            .await
         }
         "test_proxies_latency" => {
             let proxies = args.proxies("proxies")?;
@@ -430,9 +433,7 @@ async fn dispatch(method: &str, args: Args<'_>) -> HandlerResult {
             call(async move { api::set_windows_proxy_mode(mode) }).await
         }
         "get_windows_proxy_mode_str" => value(&api::get_windows_proxy_mode_str()),
-        "get_windows_tun_stats" => {
-            call(async move { api::get_windows_tun_stats() }).await
-        }
+        "get_windows_tun_stats" => call(async move { api::get_windows_tun_stats() }).await,
         "enable_uwp_loopback" => call(api::enable_uwp_loopback()).await,
         "open_uwp_loopback_utility" => call(api::open_uwp_loopback_utility()).await,
 
@@ -455,6 +456,18 @@ async fn dispatch(method: &str, args: Args<'_>) -> HandlerResult {
         "get_android_proxy_mode" => value(&api::get_android_proxy_mode()),
         "start_android_vpn" => call(api::start_android_vpn()).await,
         "stop_android_vpn" => call(api::stop_android_vpn()).await,
+
+        // ---- iOS ----
+        "set_ios_vpn_fd" => {
+            let fd = args.i32("fd")?;
+            api::set_ios_vpn_fd(fd);
+            ok_null()
+        }
+        "get_ios_vpn_fd" => value(&api::get_ios_vpn_fd()),
+        "clear_ios_vpn_fd" => {
+            api::clear_ios_vpn_fd();
+            ok_null()
+        }
 
         // ---- VPN fd (Android, legacy) ----
         "set_vpn_fd" => {
@@ -484,7 +497,7 @@ async fn dispatch(method: &str, args: Args<'_>) -> HandlerResult {
 /// `corduit_call_binary` semantics or payload schemas.
 pub const CORDUIT_API_VERSION: &str = "0.1.0";
 
-/// Every method accepted by [`dispatch`]. Cross-language hosts use
+/// Every method accepted by `dispatch`. Cross-language hosts use
 /// [`corduit_methods`] to validate their bindings against the running library
 /// instead of hard-coding method lists.
 pub const CORDUIT_METHODS: &[&str] = &[
@@ -756,6 +769,9 @@ mod tests {
     #[test]
     fn api_version_is_semver_like() {
         let version = CORDUIT_API_VERSION;
-        assert!(version.split('.').count() >= 2, "expected semver-ish string");
+        assert!(
+            version.split('.').count() >= 2,
+            "expected semver-ish string"
+        );
     }
 }

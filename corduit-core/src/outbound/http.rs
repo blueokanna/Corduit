@@ -21,9 +21,7 @@ pub struct HttpOutbound {
 /// `read_line` has no length limit: a misbehaving proxy that never sends a
 /// newline could grow memory without bound (until the caller's timeout). This
 /// helper stops as soon as the line is delimited, hits the cap, or hits EOF.
-async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> Result<String> {
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<String> {
     const MAX_LINE: usize = 4096;
     let mut line: Vec<u8> = Vec::with_capacity(128);
     loop {

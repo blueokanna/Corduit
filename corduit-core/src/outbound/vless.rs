@@ -799,10 +799,7 @@ mod tests {
             "sni".to_string(),
             nextjson::Value::String("custom.sni.com".to_string()),
         );
-        options.insert(
-            "skip-cert-verify".to_string(),
-            nextjson::Value::Bool(true),
-        );
+        options.insert("skip-cert-verify".to_string(), nextjson::Value::Bool(true));
         options.insert("udp".to_string(), nextjson::Value::Bool(true));
 
         let config = OutboundConfig {

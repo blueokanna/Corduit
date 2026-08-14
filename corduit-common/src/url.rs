@@ -43,7 +43,10 @@ impl fmt::Display for UrlError {
             UrlError::InvalidPort => write!(f, "URL has an invalid port"),
             UrlError::InvalidIpv6 => write!(f, "URL has a malformed bracketed IPv6 host"),
             UrlError::BareIpv6 => {
-                write!(f, "URL has an unbracketed IPv6 host (wrap it in square brackets)")
+                write!(
+                    f,
+                    "URL has an unbracketed IPv6 host (wrap it in square brackets)"
+                )
             }
             UrlError::UnsupportedScheme(s) => write!(f, "unsupported URL scheme '{s}'"),
         }
@@ -54,7 +57,7 @@ impl std::error::Error for UrlError {}
 
 /// A parsed absolute URL.
 ///
-/// Keeps the original text so [`Url::as_str`] / [`Url::to_string`] round-trip
+/// Keeps the original text so `as_str` / `to_string` round-trip
 /// exactly as parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Url {
@@ -371,27 +374,33 @@ mod tests {
         assert_eq!(Url::parse("://host"), Err(UrlError::EmptyScheme));
         assert_eq!(Url::parse("https://"), Err(UrlError::MissingHost));
         assert_eq!(Url::parse("https://host:port"), Err(UrlError::InvalidPort));
-        assert_eq!(
-            Url::parse("https://host:99999"),
-            Err(UrlError::InvalidPort)
-        );
+        assert_eq!(Url::parse("https://host:99999"), Err(UrlError::InvalidPort));
         assert_eq!(Url::parse("http://[::1"), Err(UrlError::InvalidIpv6));
-        assert_eq!(
-            Url::parse("http://2001:db8::1"),
-            Err(UrlError::BareIpv6)
-        );
+        assert_eq!(Url::parse("http://2001:db8::1"), Err(UrlError::BareIpv6));
     }
 
     #[test]
     fn round_trips_through_display() {
         let url = Url::parse("trojan://secret@example.com:443?allowInsecure=1").unwrap();
-        assert_eq!(url.to_string(), "trojan://secret@example.com:443?allowInsecure=1");
+        assert_eq!(
+            url.to_string(),
+            "trojan://secret@example.com:443?allowInsecure=1"
+        );
         assert_eq!(url.host_with_port(), "example.com:443");
     }
 
     #[test]
     fn proxy_schemes_are_accepted() {
-        for scheme in ["ss", "vmess", "vless", "trojan", "tuic", "hysteria2", "socks5", "http"] {
+        for scheme in [
+            "ss",
+            "vmess",
+            "vless",
+            "trojan",
+            "tuic",
+            "hysteria2",
+            "socks5",
+            "http",
+        ] {
             let url = Url::parse(&format!("{scheme}://user:pass@host:10086")).unwrap();
             assert_eq!(url.scheme(), scheme);
             assert_eq!(url.host_str(), Some("host"));

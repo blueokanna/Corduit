@@ -143,18 +143,17 @@ impl Socks5Inbound {
     ) -> Result<()> {
         const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-        let (target_addr, target_port, command) =
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-                if !Self::perform_handshake(&mut stream).await? {
-                    return Err(Error::protocol_with_info(
-                        "SOCKS5 handshake failed",
-                        "SOCKS5",
-                    ));
-                }
-                Self::read_request(&mut stream).await
-            })
-            .await
-            .map_err(|_| Error::protocol_with_info("SOCKS5 handshake timeout", "SOCKS5"))??;
+        let (target_addr, target_port, command) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            if !Self::perform_handshake(&mut stream).await? {
+                return Err(Error::protocol_with_info(
+                    "SOCKS5 handshake failed",
+                    "SOCKS5",
+                ));
+            }
+            Self::read_request(&mut stream).await
+        })
+        .await
+        .map_err(|_| Error::protocol_with_info("SOCKS5 handshake timeout", "SOCKS5"))??;
 
         // Handle different SOCKS5 commands
         match command {

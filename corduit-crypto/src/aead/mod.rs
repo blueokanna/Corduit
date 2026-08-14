@@ -36,8 +36,12 @@ impl core::fmt::Display for AeadError {
 #[cfg(feature = "alloc")]
 pub trait Aead {
     /// Encrypt `plaintext` with `nonce` and `aad`, returning `ciphertext || tag`.
-    fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8])
-        -> Result<alloc::vec::Vec<u8>, AeadError>;
+    fn encrypt(
+        &self,
+        nonce: &[u8],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<alloc::vec::Vec<u8>, AeadError>;
 
     /// Decrypt `ciphertext || tag` with `nonce` and `aad`, returning the
     /// plaintext only after the tag has been verified.

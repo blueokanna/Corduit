@@ -1,10 +1,10 @@
-use crate::error::{Result, CorduitError};
+use crate::error::{CorduitError, Result};
 use crate::logging::BridgeLogLayer;
 use crate::types::*;
 use crate::{get_corduit_instance, CORDUIT_INSTANCE};
+use corduit_core::Config;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use corduit_core::Config;
 
 static TRACING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -17,8 +17,7 @@ where
 {
     let json = nextjson::to_string(value)
         .map_err(|e| CorduitError::Parse(format!("bridge encode failed: {e}")))?;
-    nextjson::from_str(&json)
-        .map_err(|e| CorduitError::Parse(format!("bridge decode failed: {e}")))
+    nextjson::from_str(&json).map_err(|e| CorduitError::Parse(format!("bridge decode failed: {e}")))
 }
 
 pub fn init_app() {
@@ -58,7 +57,9 @@ fn init_tracing_safe() -> std::result::Result<(), ()> {
             .try_init();
 
         if result.is_ok() {
-            tracing::info!("Corduit FFI bridge initialized (Android) - logs visible in logcat and Flutter UI");
+            tracing::info!(
+                "Corduit FFI bridge initialized (Android) - logs visible in logcat and Flutter UI"
+            );
         }
         result.map_err(|error| {
             corduit_core::logging::add_log(format!(
@@ -556,28 +557,34 @@ pub async fn get_proxy_mode() -> std::result::Result<i32, String> {
 
 // ============== Platform-Specific API (Design Document Compliant) ==============
 pub fn set_vpn_fd(fd: i32) {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
+        #[cfg(target_os = "android")]
         corduit_netstack::set_android_vpn_fd(fd);
+        #[cfg(target_os = "ios")]
+        corduit_netstack::set_ios_vpn_fd(fd);
         tracing::info!("VPN fd set to {}", fd);
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = fd;
-        tracing::warn!("set_vpn_fd called on non-Android platform");
+        tracing::warn!("set_vpn_fd called on a platform without fd-based VPN");
     }
 }
 pub fn clear_vpn_fd() {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
+        #[cfg(target_os = "android")]
         corduit_netstack::clear_android_vpn_fd();
+        #[cfg(target_os = "ios")]
+        corduit_netstack::clear_ios_vpn_fd();
         tracing::info!("VPN fd cleared");
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        tracing::warn!("clear_vpn_fd called on non-Android platform");
+        tracing::warn!("clear_vpn_fd called on a platform without fd-based VPN");
     }
 }
 pub fn set_protect_socket_callback_enabled(enabled: bool) {
@@ -917,12 +924,7 @@ pub async fn set_log_level(level: String) -> Result<()> {
         "info" => tracing::Level::INFO,
         "debug" => tracing::Level::DEBUG,
         "trace" => tracing::Level::TRACE,
-        _ => {
-            return Err(CorduitError::Parse(format!(
-                "Invalid log level: {}",
-                level
-            )))
-        }
+        _ => return Err(CorduitError::Parse(format!("Invalid log level: {}", level))),
     };
 
     tracing::info!("Log level change requested: {}", level);
@@ -2794,9 +2796,7 @@ pub fn set_windows_proxy_mode(mode: String) -> Result<bool> {
             }
             if mode_int != 1 {
                 route_manager.disable_global_mode().map_err(|error| {
-                    CorduitError::Internal(format!(
-                        "Failed to disable global mode routes: {error}"
-                    ))
+                    CorduitError::Internal(format!("Failed to disable global mode routes: {error}"))
                 })?;
             }
         }
@@ -2975,6 +2975,46 @@ pub fn get_android_proxy_mode() -> String {
     }
 }
 
+// ============== iOS VPN Support ==============
+pub fn set_ios_vpn_fd(fd: i32) {
+    #[cfg(target_os = "ios")]
+    {
+        corduit_netstack::set_ios_vpn_fd(fd);
+        tracing::info!("iOS VPN fd set to {}", fd);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = fd;
+        tracing::warn!("set_ios_vpn_fd called on non-iOS platform");
+    }
+}
+
+pub fn get_ios_vpn_fd() -> i32 {
+    #[cfg(target_os = "ios")]
+    {
+        corduit_netstack::get_ios_vpn_fd()
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        -1
+    }
+}
+
+pub fn clear_ios_vpn_fd() {
+    #[cfg(target_os = "ios")]
+    {
+        corduit_netstack::clear_ios_vpn_fd();
+        tracing::info!("iOS VPN fd cleared");
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        tracing::warn!("clear_ios_vpn_fd called on non-iOS platform");
+    }
+}
+
 pub async fn start_android_vpn() -> Result<bool> {
     let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock().await;
     start_android_vpn_inner().await
@@ -3095,11 +3135,10 @@ async fn start_android_vpn_inner() -> Result<bool> {
             return Ok(false);
         };
 
-        let processor = std::sync::Arc::new(
-            corduit_netstack::AndroidVpnProcessor::new_with_proxy_addr(
+        let processor =
+            std::sync::Arc::new(corduit_netstack::AndroidVpnProcessor::new_with_proxy_addr(
                 proxy_addr, config.mtu, tun_tx,
-            ),
-        );
+            ));
         let packet_processor = std::sync::Arc::clone(&processor);
         let packet_task = tokio::spawn(async move {
             while let Some(packet) = tun_rx.recv().await {
@@ -3247,8 +3286,8 @@ mod config_conversion_tests {
 
     #[test]
     fn local_proxy_endpoint_follows_inbound_address_family() {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
         use corduit_core::{InboundConfig, InboundType};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
         let mut config = Config::default();
         config.inbounds.push(InboundConfig {

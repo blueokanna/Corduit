@@ -966,10 +966,7 @@ mod tests {
             "password".to_string(),
             nextjson::Value::String("test_pass".to_string()),
         );
-        options.insert(
-            "skip-cert-verify".to_string(),
-            nextjson::Value::Bool(true),
-        );
+        options.insert("skip-cert-verify".to_string(), nextjson::Value::Bool(true));
         options.insert("up".to_string(), nextjson::Value::Number(100.into()));
         options.insert("down".to_string(), nextjson::Value::Number(200.into()));
         options.insert(

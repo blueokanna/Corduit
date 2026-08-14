@@ -582,10 +582,22 @@ impl BinEncodable for Message {
         } else {
             0
         }) | ((self.metadata.op_code.to_u8() as u16) << 11)
-            | (if self.metadata.authoritative { 1 << 10 } else { 0 })
+            | (if self.metadata.authoritative {
+                1 << 10
+            } else {
+                0
+            })
             | (if self.metadata.truncation { 1 << 9 } else { 0 })
-            | (if self.metadata.recursion_desired { 1 << 8 } else { 0 })
-            | (if self.metadata.recursion_available { 1 << 7 } else { 0 })
+            | (if self.metadata.recursion_desired {
+                1 << 8
+            } else {
+                0
+            })
+            | (if self.metadata.recursion_available {
+                1 << 7
+            } else {
+                0
+            })
             | (self.metadata.response_code.to_u8() as u16);
         buf.extend_from_slice(&flags.to_be_bytes());
         buf.extend_from_slice(&(self.queries.len() as u16).to_be_bytes());
@@ -801,7 +813,10 @@ fn encode_rdata(
                 buf.extend_from_slice(bytes);
             }
         }
-        RData::MX { preference, exchange } => {
+        RData::MX {
+            preference,
+            exchange,
+        } => {
             buf.extend_from_slice(&preference.to_be_bytes());
             compressor.write_name(buf, exchange)?;
         }
@@ -910,8 +925,7 @@ impl<'a> Decoder<'a> {
                 if pos + 1 >= self.buf.len() {
                     return Err(WireError::new("truncated compression pointer"));
                 }
-                let pointer =
-                    (((len & 0x3F) as usize) << 8) | (self.buf[pos + 1] as usize);
+                let pointer = (((len & 0x3F) as usize) << 8) | (self.buf[pos + 1] as usize);
                 if pointer >= self.buf.len() {
                     return Err(WireError::new("compression pointer out of bounds"));
                 }
@@ -970,8 +984,7 @@ impl<'a> Decoder<'a> {
                 if pos + 1 >= self.buf.len() {
                     return Err(WireError::new("truncated compression pointer"));
                 }
-                let pointer =
-                    (((len & 0x3F) as usize) << 8) | (self.buf[pos + 1] as usize);
+                let pointer = (((len & 0x3F) as usize) << 8) | (self.buf[pos + 1] as usize);
                 if pointer >= self.buf.len() {
                     return Err(WireError::new("compression pointer out of bounds"));
                 }
@@ -1258,7 +1271,9 @@ mod tests {
         let aaaa_record = Record::from_rdata(
             name,
             300,
-            RData::AAAA(rdata::AAAA("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap())),
+            RData::AAAA(rdata::AAAA(
+                "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap(),
+            )),
         );
         response.add_answer(a_record);
         response.add_answer(aaaa_record);
@@ -1276,7 +1291,12 @@ mod tests {
         }
         match &decoded.answers[1].data {
             RData::AAAA(aaaa) => {
-                assert_eq!(aaaa.0, "2606:2800:220:1:248:1893:25c8:1946".parse::<Ipv6Addr>().unwrap())
+                assert_eq!(
+                    aaaa.0,
+                    "2606:2800:220:1:248:1893:25c8:1946"
+                        .parse::<Ipv6Addr>()
+                        .unwrap()
+                )
             }
             other => panic!("expected AAAA, got {other:?}"),
         }
@@ -1367,7 +1387,10 @@ mod tests {
         }
         match &decoded.answers[1].data {
             RData::TXT(strings) => {
-                assert_eq!(strings, &vec!["hello world".to_string(), "second".to_string()])
+                assert_eq!(
+                    strings,
+                    &vec!["hello world".to_string(), "second".to_string()]
+                )
             }
             other => panic!("expected TXT, got {other:?}"),
         }
@@ -1444,7 +1467,9 @@ mod tests {
             response.add_answer(Record::from_rdata(
                 name.clone(),
                 300,
-                RData::A(rdata::A(Ipv4Addr::new(octet[0], octet[1], octet[2], octet[3]))),
+                RData::A(rdata::A(Ipv4Addr::new(
+                    octet[0], octet[1], octet[2], octet[3],
+                ))),
             ));
         }
         response.add_answer(Record::from_rdata(
@@ -1480,11 +1505,7 @@ mod tests {
         let a = Name::from_ascii("alpha.example.com").unwrap();
         let b = Name::from_ascii("beta.example.com").unwrap();
         let mut response = Message::response(7, OpCode::Query);
-        response.add_answer(Record::from_rdata(
-            a.clone(),
-            60,
-            RData::CNAME(b.clone()),
-        ));
+        response.add_answer(Record::from_rdata(a.clone(), 60, RData::CNAME(b.clone())));
         response.add_answer(Record::from_rdata(
             b,
             60,

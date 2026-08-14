@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use ipnet::IpNet;
-use regex::Regex;
 use nextjson::{NsonDeserialize, NsonSerialize};
+use regex::Regex;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;

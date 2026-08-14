@@ -207,12 +207,12 @@ impl HttpClient {
         self
     }
 
-    /// Perform a GET request, following up to [`MAX_REDIRECTS`] redirects.
+    /// Perform a GET request, following up to `MAX_REDIRECTS` redirects.
     pub async fn get(&self, url: &str) -> Result<HttpResponse, HttpError> {
         self.get_bytes(url).await
     }
 
-    /// Perform a GET request, following up to [`MAX_REDIRECTS`] redirects.
+    /// Perform a GET request, following up to `MAX_REDIRECTS` redirects.
     pub async fn get_bytes(&self, url: &str) -> Result<HttpResponse, HttpError> {
         let mut current = Url::parse(url).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
         validate_scheme(&current)?;
@@ -245,9 +245,9 @@ impl HttpClient {
             .host_str()
             .ok_or_else(|| HttpError::InvalidUrl("URL has no host".into()))?;
         let is_https = url.scheme() == "https";
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| HttpError::InvalidUrl(format!("unknown default port for '{}'", url.scheme())))?;
+        let port = url.port_or_known_default().ok_or_else(|| {
+            HttpError::InvalidUrl(format!("unknown default port for '{}'", url.scheme()))
+        })?;
 
         let stream: Conn = if let Some(proxy) = self.proxy {
             let mut tcp = TcpStream::connect(proxy)
@@ -320,7 +320,9 @@ impl HttpClient {
 fn validate_scheme(url: &Url) -> Result<(), HttpError> {
     match url.scheme() {
         "http" | "https" => Ok(()),
-        other => Err(HttpError::InvalidUrl(format!("unsupported scheme '{other}'"))),
+        other => Err(HttpError::InvalidUrl(format!(
+            "unsupported scheme '{other}'"
+        ))),
     }
 }
 
@@ -344,12 +346,7 @@ fn resolve_redirect(base: &Url, location: &str) -> Result<Url, HttpError> {
     }
     if let Some(rest) = location.strip_prefix('/') {
         // absolute path
-        let joined = format!(
-            "{}://{}/{}",
-            base.scheme(),
-            base.host_with_port(),
-            rest
-        );
+        let joined = format!("{}://{}/{}", base.scheme(), base.host_with_port(), rest);
         return Url::parse(&joined).map_err(|e| HttpError::InvalidUrl(e.to_string()));
     }
     // relative path: resolve against the base directory
@@ -358,7 +355,11 @@ fn resolve_redirect(base: &Url, location: &str) -> Result<Url, HttpError> {
         Some(i) => &base_path[..=i],
         None => "/",
     };
-    let joined = format!("{}://{}{dir}{location}", base.scheme(), base.host_with_port());
+    let joined = format!(
+        "{}://{}{dir}{location}",
+        base.scheme(),
+        base.host_with_port()
+    );
     Url::parse(&joined).map_err(|e| HttpError::InvalidUrl(e.to_string()))
 }
 
@@ -396,7 +397,9 @@ async fn establish_connect_tunnel(
             .await
             .map_err(|e| HttpError::Proxy(format!("read CONNECT response: {e}")))?;
         if n == 0 {
-            return Err(HttpError::Proxy("proxy closed connection during CONNECT".into()));
+            return Err(HttpError::Proxy(
+                "proxy closed connection during CONNECT".into(),
+            ));
         }
         buf.extend_from_slice(&chunk[..n]);
         if buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -426,7 +429,10 @@ async fn establish_connect_tunnel(
 }
 
 /// Wrap a TCP stream in TLS for the given server name.
-async fn upgrade_tls(stream: TcpStream, host: &str) -> Result<tokio_rustls::client::TlsStream<TcpStream>, HttpError> {
+async fn upgrade_tls(
+    stream: TcpStream,
+    host: &str,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, HttpError> {
     let connector = tls_connector()?;
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|e| HttpError::Tls(format!("invalid server name '{host}': {e}")))?;

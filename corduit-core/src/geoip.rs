@@ -43,7 +43,7 @@ impl core::fmt::Display for CountryCode {
 }
 
 /// Number of `u64` words needed to hold all 26×26 alpha-2 combinations.
-const COUNTRY_MASK_WORDS: usize = (26 * 26 + 63) / 64;
+const COUNTRY_MASK_WORDS: usize = (26usize * 26).div_ceil(64);
 
 /// A set of [`CountryCode`]s packed into a 676-bit mask.
 ///
@@ -52,6 +52,12 @@ const COUNTRY_MASK_WORDS: usize = (26 * 26 + 63) / 64;
 /// `GEOIP,CN` / `GEOIP,HK`-style batches that must be evaluated per packet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CountryCodeSet([u64; COUNTRY_MASK_WORDS]);
+
+impl Default for CountryCodeSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CountryCodeSet {
     pub const fn new() -> Self {
@@ -139,8 +145,7 @@ impl GeoIpDatabase {
     }
 
     pub fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
-        if country_code.eq_ignore_ascii_case("LAN")
-            || country_code.eq_ignore_ascii_case("PRIVATE")
+        if country_code.eq_ignore_ascii_case("LAN") || country_code.eq_ignore_ascii_case("PRIVATE")
         {
             return is_private_ip(ip);
         }
@@ -331,8 +336,12 @@ mod tests {
     fn test_country_code_parse_and_match() {
         assert_eq!(CountryCode::parse("cn").unwrap().as_bytes(), b"CN");
         assert_eq!(CountryCode::parse("US").unwrap().as_bytes(), b"US");
-        assert!(CountryCode::parse("cn").unwrap().matches(&CountryCode::parse("CN").unwrap()));
-        assert!(!CountryCode::parse("CN").unwrap().matches(&CountryCode::parse("JP").unwrap()));
+        assert!(CountryCode::parse("cn")
+            .unwrap()
+            .matches(&CountryCode::parse("CN").unwrap()));
+        assert!(!CountryCode::parse("CN")
+            .unwrap()
+            .matches(&CountryCode::parse("JP").unwrap()));
         assert!(CountryCode::parse("C").is_none());
         assert!(CountryCode::parse("CHN").is_none());
         assert!(CountryCode::parse("").is_none());

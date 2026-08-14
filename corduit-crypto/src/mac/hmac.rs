@@ -43,7 +43,7 @@ impl<H: Digest> Hmac<H> {
         self.inner.update(data);
     }
 
-    /// Produce the tag, writing exactly [`H::OUTPUT_LEN`] bytes to `out`.
+    /// Produce the tag, writing exactly `H::OUTPUT_LEN` bytes to `out`.
     pub fn finalize_into(self, out: &mut [u8]) {
         debug_assert!(out.len() >= H::OUTPUT_LEN);
         let mut inner_digest = [0u8; 64];
@@ -102,7 +102,10 @@ mod tests {
     fn rfc2202_hmac_sha1() {
         // RFC 2202 test cases 1-3.
         assert_eq!(
-            hex(&hmac_sha1(b"\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b", b"Hi There")),
+            hex(&hmac_sha1(
+                b"\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b",
+                b"Hi There"
+            )),
             "b617318655057264e28bc0b6fb378c8ef146be00"
         );
         assert_eq!(

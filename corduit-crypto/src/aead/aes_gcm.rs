@@ -39,7 +39,7 @@ fn gf_mul(x: u128, y: u128) -> u128 {
 /// Increment the low 32 bits of a GCM counter block.
 fn inc32(counter: u128) -> u128 {
     let low = (counter & 0xffff_ffff).wrapping_add(1) & 0xffff_ffff;
-    (counter & !0xffff_ffffu128) | low as u128
+    (counter & !0xffff_ffffu128) | low
 }
 
 /// Streaming GHASH accumulator (AAD then ciphertext).
@@ -284,7 +284,7 @@ macro_rules! define_aes_gcm {
         }
 
         impl $name {
-            /// Create from a [`$keylen`]-byte key.
+            /// Create from a `$keylen`-byte key.
             pub fn new(key: &[u8; $keylen]) -> Self {
                 $name {
                     inner: AesGcm::new(key).expect("key length validated by type"),
@@ -352,12 +352,7 @@ mod tests {
             .collect()
     }
 
-    fn encrypt_vec(
-        cipher: &AesGcm,
-        nonce: &[u8],
-        aad: &[u8],
-        pt: &[u8],
-    ) -> (Vec<u8>, [u8; 16]) {
+    fn encrypt_vec(cipher: &AesGcm, nonce: &[u8], aad: &[u8], pt: &[u8]) -> (Vec<u8>, [u8; 16]) {
         let mut buf = pt.to_vec();
         let mut tag = [0u8; 16];
         cipher
@@ -458,7 +453,10 @@ mod tests {
         // Zero element annihilates.
         assert_eq!(gf_mul(0, 0x1234_5678_9abc_def0), 0);
         // The multiplicative identity: 1 = 2^127 in this representation.
-        assert_eq!(gf_mul(1u128 << 127, 0xdead_beef_1234_5678_9abc_def0_1234_5678), 0xdead_beef_1234_5678_9abc_def0_1234_5678);
+        assert_eq!(
+            gf_mul(1u128 << 127, 0xdead_beef_1234_5678_9abc_def0_1234_5678),
+            0xdead_beef_1234_5678_9abc_def0_1234_5678
+        );
     }
 
     #[test]

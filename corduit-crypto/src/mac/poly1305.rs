@@ -212,9 +212,15 @@ impl Poly1305 {
 
         // Add the pad (s) mod 2^128.
         let f0 = (w0 as u64).wrapping_add(self.pad[0] as u64);
-        let f1 = (w1 as u64).wrapping_add(self.pad[1] as u64).wrapping_add(f0 >> 32);
-        let f2 = (w2 as u64).wrapping_add(self.pad[2] as u64).wrapping_add(f1 >> 32);
-        let f3 = (w3 as u64).wrapping_add(self.pad[3] as u64).wrapping_add(f2 >> 32);
+        let f1 = (w1 as u64)
+            .wrapping_add(self.pad[1] as u64)
+            .wrapping_add(f0 >> 32);
+        let f2 = (w2 as u64)
+            .wrapping_add(self.pad[2] as u64)
+            .wrapping_add(f1 >> 32);
+        let f3 = (w3 as u64)
+            .wrapping_add(self.pad[3] as u64)
+            .wrapping_add(f2 >> 32);
 
         let mut out = [0u8; 16];
         out[0..4].copy_from_slice(&(f0 as u32).to_le_bytes());
@@ -248,10 +254,7 @@ mod tests {
         let msg = b"Cryptographic Forum Research Group";
         let mut mac = Poly1305::new(&key);
         mac.update(msg);
-        assert_eq!(
-            hex(&mac.finalize()),
-            "a8061dc1305136c6c22b8baf0c0127a9"
-        );
+        assert_eq!(hex(&mac.finalize()), "a8061dc1305136c6c22b8baf0c0127a9");
     }
 
     #[test]

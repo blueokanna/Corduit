@@ -1,7 +1,7 @@
 use crate::error::{NetStackError, Result};
 use bytes::BytesMut;
 use std::net::Ipv4Addr;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -51,6 +51,31 @@ pub fn set_android_proxy_mode(mode: i32) {
 #[cfg(target_os = "android")]
 pub fn get_android_proxy_mode() -> i32 {
     ANDROID_PROXY_MODE.load(Ordering::SeqCst)
+}
+
+/// Global iOS VPN file descriptor
+/// Set by the iOS layer (NetworkExtension PacketTunnelProvider) when the VPN starts
+#[cfg(target_os = "ios")]
+pub static IOS_VPN_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Set the iOS VPN file descriptor from the Swift/Objective-C layer
+#[cfg(target_os = "ios")]
+pub fn set_ios_vpn_fd(fd: i32) {
+    info!("Setting iOS VPN fd to {}", fd);
+    IOS_VPN_FD.store(fd, Ordering::SeqCst);
+}
+
+/// Get the current iOS VPN file descriptor
+#[cfg(target_os = "ios")]
+pub fn get_ios_vpn_fd() -> i32 {
+    IOS_VPN_FD.load(Ordering::SeqCst)
+}
+
+/// Clear the iOS VPN file descriptor (called when VPN stops)
+#[cfg(target_os = "ios")]
+pub fn clear_ios_vpn_fd() {
+    info!("Clearing iOS VPN fd");
+    IOS_VPN_FD.store(-1, Ordering::SeqCst);
 }
 
 /// TUN device configuration
@@ -145,7 +170,13 @@ impl TunDevice {
             return Err(error);
         }
 
-        #[cfg(all(unix, not(target_os = "android")))]
+        #[cfg(any(
+            all(target_os = "linux", not(target_env = "ohos")),
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+        ))]
         if let Err(error) = self.start_unix().await {
             self.running.store(false, Ordering::Release);
             return Err(error);
@@ -153,6 +184,12 @@ impl TunDevice {
 
         #[cfg(target_os = "android")]
         if let Err(error) = self.start_android().await {
+            self.running.store(false, Ordering::Release);
+            return Err(error);
+        }
+
+        #[cfg(target_os = "ios")]
+        if let Err(error) = self.start_ios().await {
             self.running.store(false, Ordering::Release);
             return Err(error);
         }
@@ -310,7 +347,10 @@ impl TunDevice {
             .map_err(NetStackError::InvalidConfig)?;
 
         let ip_str = self.config.address.to_string();
-        info!("Configuring adapter with IP: {}/{} and name {:?}", ip_str, prefix_len, name);
+        info!(
+            "Configuring adapter with IP: {}/{} and name {:?}",
+            ip_str, prefix_len, name
+        );
 
         // Set IP address using netsh
         let _ = Command::new("netsh")
@@ -380,7 +420,13 @@ impl TunDevice {
         Ok(())
     }
 
-    #[cfg(all(unix, not(target_os = "android")))]
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    ))]
     async fn start_unix(&mut self) -> Result<()> {
         use tun_rs::DeviceBuilder;
 
@@ -448,25 +494,24 @@ impl TunDevice {
         Ok(())
     }
 
-    /// Android TUN implementation
-    /// On Android, TUN device is created by VpnService and we receive the file descriptor
-    #[cfg(target_os = "android")]
-    async fn start_android(&mut self) -> Result<()> {
+    /// Shared fd-based TUN implementation for platforms where the OS creates
+    /// the TUN device and hands us the file descriptor (Android `VpnService`,
+    /// iOS `NetworkExtension`/`PacketTunnelProvider`). The descriptor is
+    /// duplicated so we never take ownership of the caller's fd.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    async fn start_from_fd(&mut self, fd: i32) -> Result<()> {
         use std::os::unix::io::FromRawFd;
-
-        // Check if we have a VPN file descriptor from the Android layer
-        let fd = ANDROID_VPN_FD.load(std::sync::atomic::Ordering::Relaxed);
 
         if fd < 0 {
             return Err(NetStackError::TunError(
-                "Android VPN file descriptor is not set".to_string(),
+                "VPN file descriptor is not set".to_string(),
             ));
         }
 
-        info!("Starting Android TUN with VPN fd={}", fd);
+        info!("Starting TUN with VPN fd={}", fd);
 
         // Duplicate the file descriptor so we don't take ownership of the original
-        // The original fd is owned by VpnService and must remain valid
+        // The original fd is owned by the OS VPN layer and must remain valid
         let dup_fd = unsafe { libc::dup(fd) };
         if dup_fd < 0 {
             return Err(NetStackError::TunError(format!(
@@ -603,8 +648,25 @@ impl TunDevice {
             info!("Android TUN write task stopped");
         });
 
-        info!("Android TUN initialized with fd={}", fd);
+        info!("TUN initialized with fd={}", fd);
         Ok(())
+    }
+
+    /// Android TUN implementation: the device is created by `VpnService` and
+    /// we receive the file descriptor through `set_android_vpn_fd`.
+    #[cfg(target_os = "android")]
+    async fn start_android(&mut self) -> Result<()> {
+        let fd = ANDROID_VPN_FD.load(Ordering::Relaxed);
+        self.start_from_fd(fd).await
+    }
+
+    /// iOS TUN implementation: the device is created by `NetworkExtension`
+    /// (`PacketTunnelProvider`) and we receive the file descriptor through
+    /// `set_ios_vpn_fd`.
+    #[cfg(target_os = "ios")]
+    async fn start_ios(&mut self) -> Result<()> {
+        let fd = IOS_VPN_FD.load(Ordering::Relaxed);
+        self.start_from_fd(fd).await
     }
 
     pub async fn stop(&mut self) -> Result<()> {

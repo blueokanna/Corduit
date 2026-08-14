@@ -212,9 +212,7 @@ mod humantime_serde {
         encoder.write_u64(duration.as_secs())
     }
 
-    pub fn deserialize<'de, D: FormatDecoder<'de>>(
-        decoder: &mut D,
-    ) -> Result<Duration, D::Error> {
+    pub fn deserialize<'de, D: FormatDecoder<'de>>(decoder: &mut D) -> Result<Duration, D::Error> {
         let secs = decoder.u64()?;
         Ok(Duration::from_secs(secs))
     }

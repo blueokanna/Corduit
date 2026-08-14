@@ -4,8 +4,8 @@
 
 use crate::error::{DnsError, Result};
 use crate::resolver::DnsResolver;
-use crate::RecordType;
 use crate::wire::{BinDecodable, BinEncodable, Message, RData, Record, ResponseCode};
+use crate::RecordType;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pki_types::pem::PemObject;
 use std::net::{IpAddr, SocketAddr};

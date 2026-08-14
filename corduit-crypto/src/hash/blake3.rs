@@ -23,7 +23,13 @@ const DERIVE_KEY_CONTEXT: u32 = 1 << 5;
 const DERIVE_KEY_MATERIAL: u32 = 1 << 6;
 
 const IV: [u32; 8] = [
-    0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a, 0x510e_527f, 0x9b05_688c, 0x1f83_d9ab,
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
     0x5be0_cd19,
 ];
 
@@ -69,9 +75,18 @@ fn compress(
     flags: u32,
 ) -> [u32; 16] {
     let mut state = [
-        chaining_value[0], chaining_value[1], chaining_value[2], chaining_value[3],
-        chaining_value[4], chaining_value[5], chaining_value[6], chaining_value[7],
-        IV[0], IV[1], IV[2], IV[3],
+        chaining_value[0],
+        chaining_value[1],
+        chaining_value[2],
+        chaining_value[3],
+        chaining_value[4],
+        chaining_value[5],
+        chaining_value[6],
+        chaining_value[7],
+        IV[0],
+        IV[1],
+        IV[2],
+        IV[3],
         counter as u32,
         (counter >> 32) as u32,
         block_len,
@@ -221,14 +236,19 @@ impl ChunkState {
     }
 }
 
-fn parent_output(left_child_cv: [u32; 8], right_child_cv: [u32; 8], key_words: [u32; 8], flags: u32) -> Output {
+fn parent_output(
+    left_child_cv: [u32; 8],
+    right_child_cv: [u32; 8],
+    key_words: [u32; 8],
+    flags: u32,
+) -> Output {
     let mut block_words = [0u32; 16];
     block_words[..8].copy_from_slice(&left_child_cv);
     block_words[8..].copy_from_slice(&right_child_cv);
     Output {
         input_cv: key_words,
         block_words,
-        counter: 0,                 // parents always use counter 0
+        counter: 0, // parents always use counter 0
         block_len: BLOCK_LEN as u32,
         flags: PARENT | flags,
     }

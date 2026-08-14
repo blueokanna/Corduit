@@ -104,12 +104,12 @@ impl From<corduit_protocol::Address> for TargetAddr {
     fn from(addr: corduit_protocol::Address) -> Self {
         match addr {
             corduit_protocol::Address::Domain(domain, port) => TargetAddr::Domain(domain, port),
-            corduit_protocol::Address::Ipv4(ip, port) => TargetAddr::Ip(
-                std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)),
-            ),
-            corduit_protocol::Address::Ipv6(ip, port) => TargetAddr::Ip(
-                std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0)),
-            ),
+            corduit_protocol::Address::Ipv4(ip, port) => TargetAddr::Ip(std::net::SocketAddr::V4(
+                std::net::SocketAddrV4::new(ip, port),
+            )),
+            corduit_protocol::Address::Ipv6(ip, port) => TargetAddr::Ip(std::net::SocketAddr::V6(
+                std::net::SocketAddrV6::new(ip, port, 0, 0),
+            )),
         }
     }
 }
@@ -234,11 +234,11 @@ impl OutboundManager {
         let mut proxy_group_configs: Vec<OutboundConfig> = Vec::new();
 
         for outbound_config in &config.outbounds {
-            let proxy: Option<Arc<dyn OutboundProxy>> =
-                match build_outbound_proxy(outbound_config) {
-                    Ok(proxy) => proxy,
-                    Err(e) => return Err(e),
-                };
+            let proxy: Option<Arc<dyn OutboundProxy>> = match build_outbound_proxy(outbound_config)
+            {
+                Ok(proxy) => proxy,
+                Err(e) => return Err(e),
+            };
 
             if let Some(p) = proxy {
                 let tag = p.tag().to_string();

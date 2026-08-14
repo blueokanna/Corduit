@@ -4,10 +4,10 @@
 
 use crate::error::{DnsError, Result};
 use crate::resolver::DnsResolver;
-use crate::RecordType;
-use corduit_crypto::encoding::{decode as b64_decode, Config as B64Config};
-use bytes::Bytes;
 use crate::wire::{BinDecodable, BinEncodable, Message, RData, Record, ResponseCode};
+use crate::RecordType;
+use bytes::Bytes;
+use corduit_crypto::encoding::{decode as b64_decode, Config as B64Config};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;

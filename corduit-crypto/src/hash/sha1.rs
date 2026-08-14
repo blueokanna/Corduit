@@ -5,7 +5,13 @@
 use crate::digest::Digest;
 use crate::util::{load_u32_be, rotl32, store_u32_be};
 
-const INIT: [u32; 5] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0];
+const INIT: [u32; 5] = [
+    0x6745_2301,
+    0xefcd_ab89,
+    0x98ba_dcfe,
+    0x1032_5476,
+    0xc3d2_e1f0,
+];
 
 /// SHA-1 hasher.
 #[derive(Clone)]

@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
 use crate::tls::{yaml_value_to_string, SkipServerVerification};
 use bytes::{Buf, BufMut, BytesMut};
+use corduit_crypto::uuid::Uuid;
 use parking_lot::RwLock;
 use quinn::{ClientConfig as QuinnClientConfig, Connection, Endpoint, RecvStream, SendStream};
 use std::net::SocketAddr;
@@ -12,7 +13,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-use corduit_crypto::uuid::Uuid;
 
 const TUIC_VERSION: u8 = 0x05;
 const TUIC_CMD_AUTHENTICATE: u8 = 0x00;
@@ -1060,10 +1060,7 @@ mod tests {
             "password".to_string(),
             nextjson::Value::String("test_pass".to_string()),
         );
-        options.insert(
-            "skip-cert-verify".to_string(),
-            nextjson::Value::Bool(true),
-        );
+        options.insert("skip-cert-verify".to_string(), nextjson::Value::Bool(true));
         options.insert(
             "congestion-controller".to_string(),
             nextjson::Value::String("bbr".to_string()),

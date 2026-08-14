@@ -3,9 +3,9 @@
 
 mod logging;
 
+use corduit_core::Corduit;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use corduit_core::Corduit;
 
 pub mod api;
 mod error;

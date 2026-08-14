@@ -116,7 +116,9 @@ impl MmdbReader {
             return Err(format!("MMDB: unsupported record_size {record_size}"));
         }
         let node_byte_size = (record_size as u32) * 2 / 8;
-        let search_tree_size = node_count.checked_mul(node_byte_size).ok_or("MMDB: tree overflow")?;
+        let search_tree_size = node_count
+            .checked_mul(node_byte_size)
+            .ok_or("MMDB: tree overflow")?;
 
         // Validate the advertised tree fits inside the file before the data.
         let data_start = search_tree_size as usize + DATA_SECTION_SEPARATOR;
@@ -199,10 +201,7 @@ impl MmdbReader {
                 let b1 = *self.data.get(off + 1)?;
                 let b2 = *self.data.get(off + 2)?;
                 let b3 = *self.data.get(off + 3)?;
-                (u32::from(b0) << 24)
-                    | (u32::from(b1) << 16)
-                    | (u32::from(b2) << 8)
-                    | u32::from(b3)
+                (u32::from(b0) << 24) | (u32::from(b1) << 16) | (u32::from(b2) << 8) | u32::from(b3)
             }
             _ => return None,
         };
@@ -434,7 +433,10 @@ impl MmdbReader {
         let DataValue::Map(country_entries) = country else {
             return None;
         };
-        let iso = country_entries.into_iter().find(|(k, _)| k == "iso_code")?.1;
+        let iso = country_entries
+            .into_iter()
+            .find(|(k, _)| k == "iso_code")?
+            .1;
         match iso {
             DataValue::Str(code) if code.len() == 2 => {
                 let b = code.as_bytes();

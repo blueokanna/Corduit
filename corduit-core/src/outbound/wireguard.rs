@@ -2,12 +2,12 @@ use crate::config::OutboundConfig;
 use crate::connection_tracker::{global_tracker, TrackedConnection};
 use crate::error::{Error, Result};
 use crate::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use corduit_protocol::wireguard::{public_key_from_private, WireGuardTunnel};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use corduit_protocol::wireguard::{public_key_from_private, WireGuardTunnel};
 
 const WG_HEADER_SIZE: usize = 32;
 const IP_HEADER_SIZE: usize = 20;
@@ -553,8 +553,9 @@ impl OutboundProxy for WireguardOutbound {
 }
 
 fn decode_base64_key(s: &str) -> std::result::Result<[u8; 32], String> {
-    let bytes = corduit_crypto::encoding::decode(s.as_bytes(), corduit_crypto::encoding::Config::STANDARD)
-        .map_err(|e| format!("Base64 decode error: {:?}", e))?;
+    let bytes =
+        corduit_crypto::encoding::decode(s.as_bytes(), corduit_crypto::encoding::Config::STANDARD)
+            .map_err(|e| format!("Base64 decode error: {:?}", e))?;
 
     if bytes.len() != 32 {
         return Err(format!("Key must be 32 bytes, got {}", bytes.len()));
@@ -630,8 +631,10 @@ mod tests {
         let (priv_key, _) = generate_keypair();
         let (_, peer_pub) = generate_keypair();
 
-        let priv_key_b64 = corduit_crypto::encoding::encode(&priv_key, corduit_crypto::encoding::Config::STANDARD);
-        let peer_pub_b64 = corduit_crypto::encoding::encode(&peer_pub, corduit_crypto::encoding::Config::STANDARD);
+        let priv_key_b64 =
+            corduit_crypto::encoding::encode(&priv_key, corduit_crypto::encoding::Config::STANDARD);
+        let peer_pub_b64 =
+            corduit_crypto::encoding::encode(&peer_pub, corduit_crypto::encoding::Config::STANDARD);
 
         let mut options = std::collections::HashMap::new();
         options.insert(
@@ -689,11 +692,17 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "private-key".to_string(),
-            nextjson::Value::String(corduit_crypto::encoding::encode(&priv_key, corduit_crypto::encoding::Config::STANDARD)),
+            nextjson::Value::String(corduit_crypto::encoding::encode(
+                &priv_key,
+                corduit_crypto::encoding::Config::STANDARD,
+            )),
         );
         options.insert(
             "public-key".to_string(),
-            nextjson::Value::String(corduit_crypto::encoding::encode(&peer_pub, corduit_crypto::encoding::Config::STANDARD)),
+            nextjson::Value::String(corduit_crypto::encoding::encode(
+                &peer_pub,
+                corduit_crypto::encoding::Config::STANDARD,
+            )),
         );
 
         let config = OutboundConfig {

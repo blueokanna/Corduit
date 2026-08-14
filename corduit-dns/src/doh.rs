@@ -5,10 +5,11 @@
 
 use crate::error::{DnsError, Result};
 use crate::util::random_id;
-use crate::RecordType;
-use corduit_crypto::encoding::{encode as b64_encode, Config as B64Config};
-use bytes::Bytes;
 use crate::wire::{BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RData};
+use crate::RecordType;
+use bytes::Bytes;
+use corduit_common::url::Url;
+use corduit_crypto::encoding::{encode as b64_encode, Config as B64Config};
 use rustls::pki_types::ServerName;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -17,7 +18,6 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, trace, warn};
-use corduit_common::url::Url;
 
 /// DoH request method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -141,11 +141,7 @@ impl DohClient {
     }
 
     /// Build DNS query message
-    fn build_query(
-        &self,
-        domain: &str,
-        record_type: crate::wire::RecordType,
-    ) -> Result<Vec<u8>> {
+    fn build_query(&self, domain: &str, record_type: crate::wire::RecordType) -> Result<Vec<u8>> {
         let name = Name::from_str(domain)
             .map_err(|e| DnsError::NameError(format!("Invalid domain name: {}", e)))?;
 
@@ -172,7 +168,7 @@ impl DohClient {
         // Build request based on method
         let (_uri, _body, content_type) = match self.method {
             DohMethod::Get => {
-                let encoded = b64_encode(&query, B64Config::URL_SAFE_NO_PAD);
+                let encoded = b64_encode(query, B64Config::URL_SAFE_NO_PAD);
                 let uri = format!("{}?dns={}", self.url, encoded);
                 (uri, Bytes::new(), None)
             }

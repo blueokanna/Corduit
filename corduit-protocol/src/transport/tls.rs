@@ -3,8 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use rustls::pki_types::ServerName;
 use nextjson::{NsonDeserialize, NsonSerialize};
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsConnector;
 

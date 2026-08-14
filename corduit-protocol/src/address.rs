@@ -527,9 +527,7 @@ mod tests {
         // The borrowed domain must point into the input buffer, not a copy.
         let domain = parsed.domain().expect("domain address");
         assert_eq!(domain, "example.com");
-        let in_wire = unsafe {
-            std::slice::from_raw_parts(domain.as_ptr(), domain.len())
-        };
+        let in_wire = unsafe { std::slice::from_raw_parts(domain.as_ptr(), domain.len()) };
         assert_eq!(in_wire, &wire[2..13]);
     }
 
@@ -550,7 +548,10 @@ mod tests {
     #[test]
     fn test_address_ref_rejects_truncated() {
         assert!(AddressRef::parse(&[AddressType::Domain as u8, 5, b'a']).is_err());
-        assert!(AddressRef::parse(&[AddressType::Domain as u8, 5, b'a', b'b', b'c', b'd', b'e']).is_err());
+        assert!(
+            AddressRef::parse(&[AddressType::Domain as u8, 5, b'a', b'b', b'c', b'd', b'e'])
+                .is_err()
+        );
         assert!(AddressRef::parse(&[AddressType::IPv4 as u8, 1, 2]).is_err());
         assert!(AddressRef::parse(&[AddressType::IPv4 as u8, 1, 2, 3, 4, 0, 0]).is_ok());
     }

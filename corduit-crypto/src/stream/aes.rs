@@ -48,9 +48,7 @@ const INV_SBOX: [u8; 256] = [
 ];
 
 /// Round constants.
-const RCON: [u32; 10] = [
-    0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36,
-];
+const RCON: [u32; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
 /// AES key schedule for a 128/192/256-bit key.
 ///
@@ -268,10 +266,7 @@ mod tests {
         let aes = Aes::new(&key).unwrap();
         let mut block = pt;
         aes.encrypt_block(&mut block);
-        assert_eq!(
-            hex(&block),
-            "69c4e0d86a7b0430d8cdb78070b4c55a"
-        );
+        assert_eq!(hex(&block), "69c4e0d86a7b0430d8cdb78070b4c55a");
         aes.decrypt_block(&mut block);
         assert_eq!(block, pt);
     }
@@ -289,10 +284,7 @@ mod tests {
         let aes = Aes::new(&key).unwrap();
         let mut block = pt;
         aes.encrypt_block(&mut block);
-        assert_eq!(
-            hex(&block),
-            "dda97ca4864cdfe06eaf70a0ec0d7191"
-        );
+        assert_eq!(hex(&block), "dda97ca4864cdfe06eaf70a0ec0d7191");
         aes.decrypt_block(&mut block);
         assert_eq!(block, pt);
     }
@@ -311,10 +303,7 @@ mod tests {
         let aes = Aes::new(&key).unwrap();
         let mut block = pt;
         aes.encrypt_block(&mut block);
-        assert_eq!(
-            hex(&block),
-            "8ea2b7ca516745bfeafc49904b496089"
-        );
+        assert_eq!(hex(&block), "8ea2b7ca516745bfeafc49904b496089");
         aes.decrypt_block(&mut block);
         assert_eq!(block, pt);
     }

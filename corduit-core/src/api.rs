@@ -329,10 +329,7 @@ impl ApiServer {
         let body = match read_body(req.into_body()).await {
             Ok(b) => b,
             Err(e) => {
-                return json_response(
-                    StatusCode::BAD_REQUEST,
-                    &ApiResponse::<String>::error(e),
-                );
+                return json_response(StatusCode::BAD_REQUEST, &ApiResponse::<String>::error(e));
             }
         };
         self.dispatch(method, &path, &body).await
@@ -367,7 +364,7 @@ impl ApiServer {
         }
     }
 
-    /// Build a `hyper` [`Service`] for `hyper::server::conn::http1::Builder`.
+    /// Build a `hyper` `Service` for `hyper::server::conn::http1::Builder`.
     pub fn into_service(
         self,
     ) -> impl hyper::service::Service<
@@ -393,10 +390,7 @@ pub fn create_service(
     proxy_manager: Arc<ProxyManager>,
     health_monitor: Arc<HealthMonitor>,
     traffic_stats: Arc<TrafficStatsManager>,
-) -> impl hyper::service::Service<
-    Request<Incoming>,
-    Response = Response<String>,
-    Error = Infallible,
-> + Clone {
+) -> impl hyper::service::Service<Request<Incoming>, Response = Response<String>, Error = Infallible>
+       + Clone {
     ApiServer::new(proxy_manager, health_monitor, traffic_stats).into_service()
 }

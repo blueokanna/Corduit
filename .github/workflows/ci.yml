@@ -103,37 +103,28 @@ jobs:
       - name: Check (iOS)
         run: cargo check --workspace --target aarch64-apple-ios
 
-  # ---- HarmonyOS: best-effort cross-check --------------------------------
-  # OpenHarmony ships its own rust toolchain; the standard rustup target
-  # (`aarch64-unknown-linux-ohos`) is not on crates.io so this job installs
-  # the OHOS toolchain from the official mirror. Best effort: a toolchain
-  # outage must not fail the whole pipeline.
+  # ---- HarmonyOS: cross-check the no_std crypto core ----------------------
+  # The `*-linux-ohos` targets are tier-3 but ship in the standard rustup
+  # distribution, so no custom toolchain or external mirror is needed. Only
+  # `corduit-crypto` (no_std, zero dependencies) is checked: the rest of the
+  # workspace requires the OHOS libc/bindings that a desktop runner cannot
+  # provide.
   harmonyos:
     name: HarmonyOS (aarch64-unknown-linux-ohos)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install OHOS rust toolchain
-        run: |
-          set -e
-          mkdir -p "$HOME/ohos-rust"
-          curl -fsSL "https://repo.huaweicloud.com/openharmony/compiler/rust/1.68.0/rust-1.68.0-x86_64-unknown-linux-gnu.tar.gz" -o rust.tgz
-          tar -xzf rust.tgz -C "$HOME/ohos-rust" --strip-components=1
-          "$HOME/ohos-rust/bin/rustc" --version
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-ohos
 
-      - name: Install OHOS targets
-        run: |
-          "$HOME/ohos-rust/bin/rustup" target add \
-            aarch64-unknown-linux-ohos \
-            x86_64-unknown-linux-ohos \
-            --toolchain 1.68.0-x86_64-unknown-linux-gnu
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Check no_std crypto (HarmonyOS)
-        run: |
-          export PATH="$HOME/ohos-rust/bin:$PATH"
-          cargo check -p corduit-crypto --target aarch64-unknown-linux-ohos
+        run: cargo check -p corduit-crypto --target aarch64-unknown-linux-ohos
 
   # ---- Lints: keep the tree warning-free -----------------------------------
   lint:

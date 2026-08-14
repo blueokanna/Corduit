@@ -3,9 +3,9 @@
 //! RFC 7858 compliant implementation for secure DNS queries.
 
 use crate::error::{DnsError, Result};
+use crate::wire::{BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RData};
 use crate::RecordType;
 use bytes::{BufMut, BytesMut};
-use crate::wire::{BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RData};
 use rustls::pki_types::ServerName;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -125,11 +125,7 @@ impl DotClient {
     }
 
     /// Build DNS query message
-    fn build_query(
-        &self,
-        domain: &str,
-        record_type: crate::wire::RecordType,
-    ) -> Result<Vec<u8>> {
+    fn build_query(&self, domain: &str, record_type: crate::wire::RecordType) -> Result<Vec<u8>> {
         let name = Name::from_str(domain)
             .map_err(|e| DnsError::NameError(format!("Invalid domain name: {}", e)))?;
 

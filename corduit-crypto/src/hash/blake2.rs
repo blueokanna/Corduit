@@ -32,7 +32,13 @@ const IV64: [u64; 8] = [
 ];
 
 const IV32: [u32; 8] = [
-    0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a, 0x510e_527f, 0x9b05_688c, 0x1f83_d9ab,
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
     0x5be0_cd19,
 ];
 
@@ -90,10 +96,7 @@ impl Blake2b {
     }
 
     /// BLAKE2b with a custom digest length and optional key.
-    pub fn with_params(
-        digest_len: usize,
-        key: &[u8],
-    ) -> Result<Self, crate::InvalidLength> {
+    pub fn with_params(digest_len: usize, key: &[u8]) -> Result<Self, crate::InvalidLength> {
         if digest_len == 0 || digest_len > MAX_DIGEST_B || key.len() > MAX_KEY_B {
             return Err(crate::InvalidLength);
         }

@@ -181,9 +181,10 @@ impl ProxyProvider {
 
         let client = corduit_common::HttpClient::new().with_timeout(Duration::from_secs(30));
 
-        let response = client.get(url).await.map_err(|e| {
-            Error::network(format!("Failed to fetch proxies from '{url}': {e}"))
-        })?;
+        let response = client
+            .get(url)
+            .await
+            .map_err(|e| Error::network(format!("Failed to fetch proxies from '{url}': {e}")))?;
 
         if !response.is_success() {
             return Err(Error::network(format!(

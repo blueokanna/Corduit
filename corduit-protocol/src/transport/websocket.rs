@@ -116,7 +116,10 @@ impl WebSocketTransport {
         let early_data_encoded = if early_data.len() <= self.config.max_early_data {
             b64_encode(early_data, B64Config::STANDARD)
         } else {
-            b64_encode(&early_data[..self.config.max_early_data], B64Config::STANDARD)
+            b64_encode(
+                &early_data[..self.config.max_early_data],
+                B64Config::STANDARD,
+            )
         };
 
         let path_with_early_data = if let Some(ref header_name) = self.config.early_data_header {

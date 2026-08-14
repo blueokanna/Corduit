@@ -464,8 +464,7 @@ impl Router {
             } else {
                 None
             };
-            let port_ranges = if matches!(rule.rule_type, RuleType::SrcPort | RuleType::DstPort)
-            {
+            let port_ranges = if matches!(rule.rule_type, RuleType::SrcPort | RuleType::DstPort) {
                 Self::compile_port_ranges(&rule.payload)?
             } else {
                 Vec::new()
@@ -537,10 +536,12 @@ impl Router {
     ) -> bool {
         match rule.rule_type {
             RuleType::Domain => domain.is_some_and(|d| d.eq_ignore_ascii_case(&rule.pattern)),
-            RuleType::DomainSuffix => domain
-                .is_some_and(|d| Self::matches_domain_suffix(d, &rule.pattern)),
-            RuleType::DomainKeyword => domain
-                .is_some_and(|d| contains_ignore_case(d, &rule.pattern)),
+            RuleType::DomainSuffix => {
+                domain.is_some_and(|d| Self::matches_domain_suffix(d, &rule.pattern))
+            }
+            RuleType::DomainKeyword => {
+                domain.is_some_and(|d| contains_ignore_case(d, &rule.pattern))
+            }
             RuleType::DomainRegex => {
                 if let Some(domain) = domain {
                     if let Some(regex) = &rule.regex {
@@ -603,8 +604,7 @@ impl Router {
             return false;
         }
         let start = domain.len() - suffix_len;
-        domain.as_bytes()[start - 1] == b'.'
-            && domain[start..].eq_ignore_ascii_case(pattern)
+        domain.as_bytes()[start - 1] == b'.' && domain[start..].eq_ignore_ascii_case(pattern)
     }
 
     /// Match a process name against a lowercased pattern, checking the full
@@ -867,7 +867,10 @@ mod tests {
     #[test]
     fn test_matches_process_name_with_path() {
         assert!(Router::matches_process_name("chrome", "/usr/bin/chrome"));
-        assert!(Router::matches_process_name("chrome", "C:\\Program Files\\chrome"));
+        assert!(Router::matches_process_name(
+            "chrome",
+            "C:\\Program Files\\chrome"
+        ));
     }
 
     #[test]
