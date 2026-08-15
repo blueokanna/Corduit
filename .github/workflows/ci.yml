@@ -103,29 +103,6 @@ jobs:
       - name: Check (iOS)
         run: cargo check --workspace --target aarch64-apple-ios
 
-  # ---- HarmonyOS: cross-check the no_std crypto core ----------------------
-  # The `*-linux-ohos` targets are tier-3 but ship in the standard rustup
-  # distribution, so no custom toolchain or external mirror is needed. Only
-  # `corduit-crypto` (no_std, zero dependencies) is checked: the rest of the
-  # workspace requires the OHOS libc/bindings that a desktop runner cannot
-  # provide.
-  harmonyos:
-    name: HarmonyOS (aarch64-unknown-linux-ohos)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust 1.95
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          targets: aarch64-unknown-linux-ohos
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check no_std crypto (HarmonyOS)
-        run: cargo check -p corduit-crypto --target aarch64-unknown-linux-ohos
-
   # ---- Lints: keep the tree warning-free -----------------------------------
   lint:
     name: clippy (stable)
@@ -146,3 +123,43 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+  # ---- Wiki: publish docs after CI succeeds on main ------------------------
+  # The `wiki/` directory in the repository is the source of truth. After every
+  # green push to `main` it is pushed to the GitHub wiki (…/Corduit.wiki.git).
+  #
+  # Authentication uses the automatic `GITHUB_TOKEN` by default. If your
+  # repository does not allow that token to push to the wiki, define a repo
+  # secret `WIKI_PAT` with a fine-grained PAT that has "Read and write" access
+  # to the wiki — the expression below falls back to it automatically.
+  wiki:
+    name: Publish Wiki
+    needs: [native, msrv, lint]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      WIKI_TOKEN: ${{ secrets.WIKI_PAT || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone wiki repository
+        run: |
+          git clone "https://x-access-token:${WIKI_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki-out
+
+      - name: Sync wiki pages
+        run: |
+          # Replace the wiki content with the tracked source of truth.
+          rm -rf wiki-out/*
+          cp -R wiki/* wiki-out/
+          cd wiki-out
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No wiki changes to publish."
+          else
+            git commit -m "docs: sync wiki from main ($(date -u +'%Y-%m-%dT%H:%M:%SZ'))"
+            git push origin HEAD:master
+          fi

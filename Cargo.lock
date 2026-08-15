@@ -30,15 +30,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85965b6739a430150bdd138e2374a98af0c3ee0d030b3bb7fc3bddff58d0102e"
 
 [[package]]
-name = "android_system_properties"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -180,17 +171,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrono"
-version = "0.4.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
-dependencies = [
- "iana-time-zone",
- "num-traits",
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -216,172 +196,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
-name = "corduit-common"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "rustls",
- "rustls-native-certs",
- "tokio",
- "tokio-rustls",
- "tokio-test",
- "webpki-roots",
-]
-
-[[package]]
-name = "corduit-core"
+name = "corduit"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "bitflags 2.13.1",
  "bytes",
- "chrono",
- "corduit-common",
- "corduit-crypto",
- "corduit-protocol",
- "dashmap",
- "futures",
- "getrandom 0.4.3",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "ipnet",
- "libc",
- "lru",
- "nextjson",
- "once_cell",
- "parking_lot",
- "proptest",
- "quinn",
- "regex",
- "rustls",
- "rustls-native-certs",
- "socket2",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-test",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "corduit-crypto"
-version = "0.1.0"
-
-[[package]]
-name = "corduit-dns"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "corduit-common",
- "corduit-crypto",
- "dashmap",
- "getrandom 0.4.3",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "ipnet",
- "nextjson",
- "parking_lot",
- "proptest",
- "rustls",
- "rustls-pki-types",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-test",
- "tracing",
- "tracing-subscriber",
- "webpki-roots",
-]
-
-[[package]]
-name = "corduit-lib"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "corduit-common",
- "corduit-core",
- "corduit-crypto",
- "corduit-netstack",
- "futures",
- "getrandom 0.4.3",
- "jni",
- "nextjson",
- "once_cell",
- "parking_lot",
- "proptest",
- "rustbinary",
- "sysinfo",
- "tokio",
- "tokio-test",
- "tracing",
- "tracing-android",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "corduit-netstack"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "corduit-common",
- "corduit-dns",
- "dashmap",
- "futures",
- "getrandom 0.4.3",
- "libc",
- "lru",
- "nextjson",
- "once_cell",
- "parking_lot",
- "pin-project-lite",
- "smoltcp",
- "thiserror",
- "tokio",
- "tokio-test",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "tun-rs",
- "wintun-bindings",
- "zip",
-]
-
-[[package]]
-name = "corduit-protocol"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "corduit-crypto",
  "dashmap",
  "futures",
  "getrandom 0.4.3",
  "h2",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ipnet",
+ "jni",
+ "libc",
+ "lru",
  "nextjson",
+ "once_cell",
  "parking_lot",
  "pin-project-lite",
  "proptest",
  "quinn",
+ "regex",
+ "rustbinary",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "smoltcp",
+ "socket2",
+ "sysinfo",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-test",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
+ "tracing-android",
+ "tracing-subscriber",
+ "tun-rs",
+ "tzcraft",
+ "webpki-roots",
+ "windows 0.62.2",
+ "wintun-bindings",
+ "zip",
 ]
 
 [[package]]
@@ -911,30 +772,6 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "iana-time-zone"
-version = "0.1.65"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
-dependencies = [
- "android_system_properties",
- "core-foundation-sys",
- "iana-time-zone-haiku",
- "js-sys",
- "log",
- "wasm-bindgen",
- "windows-core 0.62.2",
-]
-
-[[package]]
-name = "iana-time-zone-haiku"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -2245,6 +2082,16 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "tzcraft"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9557e2b2550e58b7b59e71ec0b7cf44711af36a516877c4049db07672a78617"
+dependencies = [
+ "nextjson",
+ "rustbinary",
+]
 
 [[package]]
 name = "unarray"

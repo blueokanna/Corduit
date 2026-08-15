@@ -1,7 +1,0 @@
-# Corduit cargo configuration
-#
-# The `check-cfg` entry for HarmonyOS (`target_os = "ohos"`) lives here
-# because the manifest-level `[lints.rust]` table needs cargo 1.80+.
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ohos"))'] }

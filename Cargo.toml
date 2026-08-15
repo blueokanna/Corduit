@@ -1,21 +1,9 @@
-[workspace]
-resolver = "2"
-members = [
-    "corduit-common",
-    "corduit-core",
-    "corduit-crypto",
-    "corduit-dns",
-    "corduit-lib",
-    "corduit-netstack",
-    "corduit-protocol",
-]
-
-[workspace.package]
+[package]
+name = "corduit"
+version = "0.1.0"
 edition = "2021"
 license-file = "LICENSE"
-version = "0.1.0"
 authors = ["blueokanna"]
-rust-version = "1.95"
 description = "A unified network proxy engine written in Rust"
 homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
@@ -23,7 +11,16 @@ readme = "README.md"
 keywords = ["proxy", "protocol", "network", "tun", "rust"]
 categories = ["network-programming", "web-programming", "asynchronous"]
 
-[workspace.dependencies]
+# Protocol feature-gated modules (all enabled by default).
+[features]
+default = ["quic", "tls", "wireguard", "tuic", "tuic-quinn"]
+quic = []
+tls = []
+wireguard = []
+tuic = []
+tuic-quinn = []
+
+[dependencies]
 
 # --- async runtime / concurrency --------------------------------------------
 async-trait = "0.1"
@@ -33,17 +30,15 @@ once_cell = "1"
 parking_lot = "0.12"
 pin-project-lite = "0.2"
 tokio = { version = "1", features = ["full"] }
-tokio-test = "0.4"
 tokio-util = { version = "0.7", features = ["net", "codec", "io", "compat"] }
 
 # --- error handling ----------------------------------------------------------
 thiserror = "2.0.20"
 
-# --- nextjson / rustbinary (native) --------
+# --- required codec / time libraries ----------------------------------------
 nextjson = { version = "0.1.3", features = ["derive"] }
-nextjson-derive = "0.1.3"
 rustbinary = { version = "=0.1.5-alpha.1", features = ["derive"] }
-rustbinary-derive = "0.1.4"
+tzcraft = { version = "0.1.0", features = ["std", "serde", "binary"] }
 
 # --- tracing / telemetry -----------------------------------------------------
 tracing = "0.1"
@@ -90,10 +85,6 @@ getrandom = { version = "0.4.3", features = ["std"] }
 # --- networking / system -----------------------------------------------------
 bitflags = "2"
 bytes = "1"
-chrono = { version = "0.4", default-features = false, features = [
-    "clock",
-    "std",
-] }
 libc = "0.2"
 regex = "1"
 smoltcp = { version = "0.13.1", default-features = false, features = [
@@ -123,14 +114,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Threading",
 ] }
 
-# --- dev ---------------------------------------------------------------------
+[dev-dependencies]
 proptest = "1.11.0"
-
-# --- internal crates (path for local dev; version required for publishing) ---
-corduit-common = { path = "corduit-common", version = "0.1.0" }
-corduit-core = { path = "corduit-core", version = "0.1.0" }
-corduit-crypto = { path = "corduit-crypto", version = "0.1.0" }
-corduit-dns = { path = "corduit-dns", version = "0.1.0" }
-corduit-lib = { path = "corduit-lib", version = "0.1.0" }
-corduit-netstack = { path = "corduit-netstack", version = "0.1.0" }
-corduit-protocol = { path = "corduit-protocol", version = "0.1.0" }
+tokio-test = "0.4"
