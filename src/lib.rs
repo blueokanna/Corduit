@@ -12,6 +12,27 @@
 //! * [`dns`]      — DNS resolver, cache, fake-IP and DoH/DoT servers.
 //! * [`netstack`] — userspace TCP/IP stack for TUN-based transparent proxy.
 //! * [`protocol`] — wire protocols & transports (TLS, QUIC, TUIC, WireGuard…).
+//!
+//! ## Examples
+//!
+//! Runnable, offline-friendly examples live in [`examples/`](https://github.com/blueokanna/Corduit/tree/main/examples)
+//! (listed in the docs sidebar on docs.rs):
+//!
+//! * `minimal` — smallest real proxy: one mixed inbound + DIRECT outbound.
+//! * `typed_config` — full [`Config`] built in Rust, with proxy groups, rules
+//!   and hot reload via [`engine::Corduit::reload`].
+//! * `json_api` — the JSON-string facade ([`api::start_proxy_from_yaml`] and
+//!   friends) with runtime status queries.
+//! * `providers` — end-to-end `rule_providers` + `proxy_providers` using
+//!   local files, a selector group with `use:`, and `rule-set` rules.
+//! * `routing_modes` — direct / rule / global mode decisions through
+//!   [`engine::routing::Router`], without binding any sockets.
+//! * `rpc_server` — the loopback JSON-RPC server: `GET /health`,
+//!   `POST /rpc` over raw TCP, and the shared [`rpc::dispatch`] table.
+//!
+//! Run any of them with `cargo run --example <name>`. Each one binds only to
+//! `127.0.0.1` on a high port (override via `CORDUIT_PORT` /
+//! `CORDUIT_RPC_PORT`) and makes no outbound network calls by default.
 
 // HarmonyOS uses a non-standard `target_os = "ohos"` value.
 #![allow(unexpected_cfgs)]

@@ -1,6 +1,7 @@
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
+use crate::engine::inbound::auth::{socks5_userpass, InboundAuth, SOCKS5_AUTH_USERPASS};
 use crate::engine::inbound::{bind_tcp_listener, InboundListener};
 use crate::engine::outbound::{OutboundManager, TargetAddr};
 use crate::engine::routing::Router;
@@ -27,6 +28,7 @@ pub struct Socks5Inbound {
     config: InboundConfig,
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
+    auth: Arc<InboundAuth>,
     cancel_token: CancellationToken,
     running: Arc<std::sync::atomic::AtomicBool>,
     /// UDP sessions for UDP ASSOCIATE
@@ -54,11 +56,13 @@ impl Socks5Inbound {
         config: InboundConfig,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
+        auth: Arc<InboundAuth>,
     ) -> Self {
         Self {
             config,
             router,
             outbound_manager,
+            auth,
             cancel_token: CancellationToken::new(),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             udp_sessions: Arc::new(DashMap::new()),
@@ -79,6 +83,7 @@ impl Socks5Inbound {
 
         let router = Arc::clone(&self.router);
         let outbound_manager = Arc::clone(&self.outbound_manager);
+        let auth = Arc::clone(&self.auth);
         let cancel_token = self.cancel_token.clone();
         let running = Arc::clone(&self.running);
 
@@ -96,8 +101,9 @@ impl Socks5Inbound {
                             Ok((stream, peer_addr)) => {
                                 let router = Arc::clone(&router);
                                 let outbound_manager = Arc::clone(&outbound_manager);
+                                let auth = Arc::clone(&auth);
                                 tokio::spawn(async move {
-                                    if let Err(err) = Self::handle_connection(stream, peer_addr, router, outbound_manager).await {
+                                    if let Err(err) = Self::handle_connection(stream, peer_addr, router, outbound_manager, auth).await {
                                         tracing::debug!("SOCKS5 connection error from {}: {}", peer_addr, err);
                                     }
                                 });
@@ -140,11 +146,12 @@ impl Socks5Inbound {
         peer_addr: SocketAddr,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
+        auth: Arc<InboundAuth>,
     ) -> Result<()> {
         const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
         let (target_addr, target_port, command) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-            if !Self::perform_handshake(&mut stream).await? {
+            if !Self::perform_handshake(&mut stream, &auth).await? {
                 return Err(Error::protocol_with_info(
                     "SOCKS5 handshake failed",
                     "SOCKS5",
@@ -559,7 +566,10 @@ impl Socks5Inbound {
         }
     }
 
-    async fn perform_handshake(stream: &mut tokio::net::TcpStream) -> Result<bool> {
+    async fn perform_handshake(
+        stream: &mut tokio::net::TcpStream,
+        auth: &InboundAuth,
+    ) -> Result<bool> {
         let mut buf = [0u8; 2];
         stream
             .read_exact(&mut buf)
@@ -576,6 +586,24 @@ impl Socks5Inbound {
             .read_exact(&mut methods)
             .await
             .map_err(|e| Error::network(format!("Failed to read SOCKS5 methods: {}", e)))?;
+
+        if auth.required() {
+            // Credentials configured: only RFC 1929 user/pass is acceptable.
+            if !methods.contains(&SOCKS5_AUTH_USERPASS) {
+                stream.write_all(&[0x05, 0xFF]).await.map_err(|e| {
+                    Error::network(format!("Failed to write SOCKS5 response: {}", e))
+                })?;
+                return Ok(false);
+            }
+            stream
+                .write_all(&[0x05, SOCKS5_AUTH_USERPASS])
+                .await
+                .map_err(|e| Error::network(format!("Failed to write SOCKS5 response: {}", e)))?;
+            if !socks5_userpass(stream, auth).await? {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
 
         // Check if no authentication is supported
         let supports_no_auth = methods.contains(&0x00);

@@ -1,6 +1,9 @@
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
+use crate::engine::inbound::auth::{
+    check_proxy_authorization, socks5_userpass, InboundAuth, SOCKS5_AUTH_USERPASS,
+};
 use crate::engine::inbound::{bind_tcp_listener, InboundListener};
 use crate::engine::outbound::{OutboundManager, TargetAddr};
 use crate::engine::routing::Router;
@@ -22,6 +25,7 @@ pub struct MixedInbound {
     config: InboundConfig,
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
+    auth: Arc<InboundAuth>,
     cancel_token: CancellationToken,
     running: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -54,11 +58,13 @@ impl MixedInbound {
         config: InboundConfig,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
+        auth: Arc<InboundAuth>,
     ) -> Self {
         Self {
             config,
             router,
             outbound_manager,
+            auth,
             cancel_token: CancellationToken::new(),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -78,6 +84,7 @@ impl MixedInbound {
 
         let router = Arc::clone(&self.router);
         let outbound_manager = Arc::clone(&self.outbound_manager);
+        let auth = Arc::clone(&self.auth);
         let cancel_token = self.cancel_token.clone();
         let running = Arc::clone(&self.running);
 
@@ -95,8 +102,9 @@ impl MixedInbound {
                             Ok((stream, peer_addr)) => {
                                 let router = Arc::clone(&router);
                                 let outbound_manager = Arc::clone(&outbound_manager);
+                                let auth = Arc::clone(&auth);
                                 tokio::spawn(async move {
-                                    if let Err(err) = Self::handle_connection(stream, peer_addr, router, outbound_manager).await {
+                                    if let Err(err) = Self::handle_connection(stream, peer_addr, router, outbound_manager, auth).await {
                                         tracing::debug!("Mixed connection error from {}: {}", peer_addr, err);
                                     }
                                 });
@@ -138,6 +146,7 @@ impl MixedInbound {
         peer_addr: SocketAddr,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
+        auth: Arc<InboundAuth>,
     ) -> Result<()> {
         // Peek at first byte to detect protocol
         let mut peek_buf = [0u8; 1];
@@ -153,11 +162,11 @@ impl MixedInbound {
         if first_byte == SOCKS5_VERSION {
             // SOCKS5 protocol
             tracing::debug!("Detected SOCKS5 protocol from {}", peer_addr);
-            Self::handle_socks5(stream, peer_addr, router, outbound_manager).await
+            Self::handle_socks5(stream, peer_addr, router, outbound_manager, auth).await
         } else {
             // Assume HTTP protocol
             tracing::debug!("Detected HTTP protocol from {}", peer_addr);
-            Self::handle_http(stream, peer_addr, router, outbound_manager).await
+            Self::handle_http(stream, peer_addr, router, outbound_manager, auth).await
         }
     }
 
@@ -168,13 +177,17 @@ impl MixedInbound {
         peer_addr: SocketAddr,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
+        auth: Arc<InboundAuth>,
     ) -> Result<()> {
         let io = TokioIo::new(stream);
 
         let service = service_fn(move |req: Request<hyper::body::Incoming>| {
             let router = Arc::clone(&router);
             let outbound_manager = Arc::clone(&outbound_manager);
-            async move { Self::handle_http_request(req, peer_addr, router, outbound_manager).await }
+            let auth = Arc::clone(&auth);
+            async move {
+                Self::handle_http_request(req, peer_addr, router, outbound_manager, auth).await
+            }
         });
 
         if let Err(err) = http1::Builder::new()
@@ -202,12 +215,28 @@ impl MixedInbound {
         peer_addr: SocketAddr,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
+        auth: Arc<InboundAuth>,
     ) -> std::result::Result<Response<BoxBody<Bytes, std::io::Error>>, std::convert::Infallible>
     {
         let method = req.method().clone();
         let uri = req.uri().clone();
 
         tracing::debug!("HTTP {} {} from {}", method, uri, peer_addr);
+
+        // Enforce configured inbound credentials before serving anything
+        // (CWE-306), including CONNECT tunnels.
+        if !check_proxy_authorization(req.headers(), &auth) {
+            tracing::info!("Rejecting unauthenticated HTTP request from {}", peer_addr);
+            return Ok(Response::builder()
+                .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                .header("Proxy-Authenticate", "Basic realm=\"corduit\"")
+                .body(
+                    Full::new(Bytes::from("Proxy authentication required"))
+                        .map_err(|_| std::io::Error::other("body error"))
+                        .boxed(),
+                )
+                .unwrap());
+        }
 
         // Handle CONNECT method for HTTPS tunneling
         if method == Method::CONNECT {
@@ -454,12 +483,16 @@ impl MixedInbound {
         peer_addr: SocketAddr,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
+        auth: Arc<InboundAuth>,
     ) -> Result<()> {
         const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-        let target = tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::read_socks5_target(&mut stream))
-            .await
-            .map_err(|_| Error::protocol("SOCKS5 handshake timeout"))??;
+        let target = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            Self::read_socks5_target(&mut stream, &auth),
+        )
+        .await
+        .map_err(|_| Error::protocol("SOCKS5 handshake timeout"))??;
 
         // Route the connection
         let outbound_tag = router
@@ -533,7 +566,7 @@ impl MixedInbound {
         Ok(())
     }
 
-    async fn read_socks5_target(stream: &mut TcpStream) -> Result<TargetAddr> {
+    async fn read_socks5_target(stream: &mut TcpStream, auth: &InboundAuth) -> Result<TargetAddr> {
         let mut header = [0u8; 2];
         stream
             .read_exact(&mut header)
@@ -556,15 +589,32 @@ impl MixedInbound {
             .await
             .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 methods: {}", e)))?;
 
-        if !methods.contains(&SOCKS5_AUTH_NONE) {
-            stream.write_all(&[SOCKS5_VERSION, 0xFF]).await.ok();
-            return Err(Error::protocol("No acceptable SOCKS5 auth methods"));
+        if auth.required() {
+            // Credentials configured: only RFC 1929 user/pass is acceptable.
+            if !methods.contains(&SOCKS5_AUTH_USERPASS) {
+                stream.write_all(&[SOCKS5_VERSION, 0xFF]).await.ok();
+                return Err(Error::protocol(
+                    "SOCKS5 client did not offer username/password auth",
+                ));
+            }
+            stream
+                .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_USERPASS])
+                .await
+                .map_err(|e| Error::network(format!("Failed to send auth response: {}", e)))?;
+            if !socks5_userpass(stream, auth).await? {
+                return Err(Error::protocol("SOCKS5 authentication failed"));
+            }
+        } else {
+            // No credentials configured: NO-AUTH only.
+            if !methods.contains(&SOCKS5_AUTH_NONE) {
+                stream.write_all(&[SOCKS5_VERSION, 0xFF]).await.ok();
+                return Err(Error::protocol("No acceptable SOCKS5 auth methods"));
+            }
+            stream
+                .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
+                .await
+                .map_err(|e| Error::network(format!("Failed to send auth response: {}", e)))?;
         }
-
-        stream
-            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
-            .await
-            .map_err(|e| Error::network(format!("Failed to send auth response: {}", e)))?;
 
         let mut request = [0u8; 4];
         stream

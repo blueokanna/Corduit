@@ -165,6 +165,12 @@ impl Default for GeoIpDatabase {
     }
 }
 
+/// Guards the "Country.mmdb not found" warning so it is emitted at most once
+/// per process (routers can be constructed repeatedly, e.g. on hot reload or
+/// in tests, and the missing DB is a normal recoverable state).
+static GEOIP_MISSING_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub struct GeoIpManager {
     database: Arc<RwLock<GeoIpDatabase>>,
 }
@@ -207,11 +213,21 @@ impl GeoIpManager {
                 }
             },
             Some(path) => {
-                tracing::warn!(
-                    "GeoIP database {} not found; continuing without GeoIP rules \
-                     (set CORDUIT_GEOIP_DB to enable)",
-                    path.display()
-                );
+                // A missing database is a normal, recoverable state (GEOIP
+                // rules just miss). Warn once per process instead of on every
+                // router construction so test/restart loops don't flood logs.
+                if !GEOIP_MISSING_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    tracing::warn!(
+                        "GeoIP database {} not found; continuing without GeoIP rules \
+                         (set CORDUIT_GEOIP_DB to enable)",
+                        path.display()
+                    );
+                } else {
+                    tracing::debug!(
+                        "GeoIP database {} not found (already warned); GEOIP rules disabled",
+                        path.display()
+                    );
+                }
                 GeoIpDatabase::new()
             }
             None => GeoIpDatabase::new(),

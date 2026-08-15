@@ -168,12 +168,13 @@ impl OutboundProxy for SelectorOutbound {
     }
 
     fn server_addr(&self) -> Option<(String, u16)> {
-        // Try to get the server address from the currently selected proxy
+        // Try to get the server address from the currently selected proxy.
+        // `server_addr` is a sync trait method, so never block the async
+        // runtime thread — `try_read` fails gracefully when contended.
         let selected = self.get_selected();
-
-        // Use blocking read since this is a sync function
-        // We need to check the registry for the selected proxy
-        let registry = self.registry.blocking_read();
+        let Ok(registry) = self.registry.try_read() else {
+            return None;
+        };
         if let Some(proxy) = registry.get(&selected) {
             proxy.server_addr()
         } else {
@@ -213,9 +214,12 @@ impl OutboundProxy for SelectorOutbound {
     }
 
     fn supports_udp(&self) -> bool {
-        // Check if the currently selected proxy supports UDP
+        // Check if the currently selected proxy supports UDP. Sync trait
+        // method: use a non-blocking read so we never block the runtime.
         let selected = self.get_selected();
-        let registry = self.registry.blocking_read();
+        let Ok(registry) = self.registry.try_read() else {
+            return false;
+        };
         if let Some(proxy) = registry.get(&selected) {
             proxy.supports_udp()
         } else {

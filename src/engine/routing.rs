@@ -247,12 +247,17 @@ impl Router {
 
         let rules = self.rules.read().await;
 
+        // DNS is resolved lazily and cached for the duration of this request.
+        // Pure domain-rule configs (the common case, e.g. clash-rules sets)
+        // never touch the resolver; only the no-rule China shortcut and
+        // geoip/ip-cidr rules that need an IP trigger a lookup — at most once
+        // per request, reused across every IP-based rule.
+        let mut resolved_ips: Option<Vec<IpAddr>> = None;
+
         // The mainland-China auto-direct shortcut is a fallback for configs
         // with no rules at all. Once rules are configured (e.g. the clash-rules
         // sets), rules are evaluated strictly in order — Clash semantics — so
         // an explicit rule always wins over the shortcut.
-        let resolved_ips = Self::resolve_destination_ips(domain, ip).await;
-
         if rules.is_empty() {
             if Self::is_mainland_china_domain(domain) {
                 tracing::info!(
@@ -263,7 +268,13 @@ impl Router {
                 return direct_outbound;
             }
 
-            if self.is_mainland_china_ip(&resolved_ips).await {
+            if resolved_ips.is_none() {
+                resolved_ips = Some(Self::resolve_destination_ips(domain, ip).await);
+            }
+            if self
+                .is_mainland_china_ip(resolved_ips.as_deref().unwrap_or(&[]))
+                .await
+            {
                 tracing::info!(
                     "Mainland China destination identified: domain={:?}, ips={:?} -> '{}'",
                     domain,
@@ -282,13 +293,18 @@ impl Router {
                 && ip.is_none()
                 && matches!(rule.rule_type, RuleType::Geoip | RuleType::IpCidr)
             {
-                for resolved_ip in &resolved_ips {
-                    if self
-                        .matches_rule(rule, domain, Some(*resolved_ip), port, process_name)
-                        .await
-                    {
-                        matched = true;
-                        break;
+                if resolved_ips.is_none() {
+                    resolved_ips = Some(Self::resolve_destination_ips(domain, ip).await);
+                }
+                if let Some(resolved_ips) = resolved_ips.as_deref() {
+                    for resolved_ip in resolved_ips {
+                        if self
+                            .matches_rule(rule, domain, Some(*resolved_ip), port, process_name)
+                            .await
+                        {
+                            matched = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -765,6 +781,11 @@ fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
 mod tests {
     use super::*;
     use crate::engine::config::{OutboundConfig, OutboundType};
+
+    /// The runtime proxy mode is a process-global; tests that set it must be
+    /// serialized so parallel execution cannot interleave different modes.
+    pub(super) static MODE_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     /// Deterministic matcher that mimics a real GeoIP database for a small set
@@ -844,6 +865,8 @@ mod tests {
     async fn mainland_cn_domain_follows_rule_when_configured() {
         // With rules configured, the explicit MATCH rule wins over the
         // mainland-China auto-direct shortcut (Clash rule-order semantics).
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
         let outbound = router
@@ -855,6 +878,8 @@ mod tests {
 
     #[tokio::test]
     async fn mainland_cn_ip_follows_rule_when_configured() {
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
         let outbound = router
@@ -872,6 +897,8 @@ mod tests {
     #[tokio::test]
     async fn mainland_cn_domain_auto_direct_without_rules() {
         // No rules configured: the auto-direct fallback still applies.
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router_no_rules();
 
         let outbound = router
@@ -883,6 +910,8 @@ mod tests {
 
     #[tokio::test]
     async fn mainland_cn_ip_auto_direct_without_rules() {
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router_no_rules();
 
         let outbound = router
@@ -899,6 +928,8 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_ip_still_uses_configured_proxy_rule() {
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
         let outbound = router
@@ -911,6 +942,146 @@ mod tests {
             .await;
 
         assert_eq!(outbound, "proxy");
+    }
+
+    /// DIRECT + SOCKS5 + a selector group over both. `resolve_default_outbounds`
+    /// picks the selector group as the global outbound, so GLOBAL mode must
+    /// send every connection through it.
+    fn grouped_routing_test_router() -> Router {
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "outbounds".to_string(),
+            nextjson::Value::Array(vec![
+                nextjson::Value::String("DIRECT".to_string()),
+                nextjson::Value::String("socks-node".to_string()),
+            ]),
+        );
+
+        let config = Config {
+            general: crate::engine::config::GeneralConfig {
+                mode: Mode::Rule,
+                ..crate::engine::config::GeneralConfig::default()
+            },
+            inbounds: vec![crate::engine::config::InboundConfig {
+                inbound_type: crate::engine::config::InboundType::Mixed,
+                tag: "mixed-in".to_string(),
+                listen: "127.0.0.1".to_string(),
+                port: 17896,
+                options: Default::default(),
+            }],
+            outbounds: vec![
+                OutboundConfig {
+                    outbound_type: OutboundType::Direct,
+                    tag: "DIRECT".to_string(),
+                    server: None,
+                    port: None,
+                    options: Default::default(),
+                },
+                OutboundConfig {
+                    outbound_type: OutboundType::Socks5,
+                    tag: "socks-node".to_string(),
+                    server: Some("127.0.0.1".to_string()),
+                    port: Some(1080),
+                    options: Default::default(),
+                },
+                OutboundConfig {
+                    outbound_type: OutboundType::Selector,
+                    tag: "PROXY".to_string(),
+                    server: None,
+                    port: None,
+                    options,
+                },
+            ],
+            rules: vec![RuleConfig {
+                rule_type: RuleType::Match,
+                payload: String::new(),
+                outbound: "DIRECT".to_string(),
+                process_name: None,
+            }],
+            ..Config::default()
+        };
+        let rules = Router::compile_rules(&config.rules).unwrap();
+
+        Router {
+            config: Arc::new(RwLock::new(config)),
+            rules: RwLock::new(rules),
+            defaults: RwLock::new(DefaultOutbounds {
+                direct: "DIRECT".to_string(),
+                global: Some("PROXY".to_string()),
+                default: "DIRECT".to_string(),
+            }),
+            geoip_manager: Arc::new(StubCountryMatcher),
+            rule_provider_manager: Arc::new(RuleProviderManager::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn global_mode_routes_all_traffic_through_proxy_group() {
+        // GLOBAL must send every connection (any domain/IP/port) through the
+        // proxy group, regardless of the rule table.
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::GLOBAL);
+        let router = grouped_routing_test_router();
+
+        for (domain, ip) in [
+            (Some("example.com"), None),
+            (None, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))),
+            (Some("www.example.cn"), None),
+            (None, Some(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))),
+            (None, None),
+        ] {
+            let outbound = router.match_outbound(domain, ip, Some(443), None).await;
+            assert_eq!(
+                outbound, "PROXY",
+                "GLOBAL must route domain={:?} ip={:?} through the proxy group",
+                domain, ip
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn global_mode_uses_first_proxy_when_no_group() {
+        // Without a group, GLOBAL falls back to the first non-direct/reject
+        // outbound instead of DIRECT.
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::GLOBAL);
+        let router = mainland_routing_test_router();
+
+        let outbound = router
+            .match_outbound(Some("example.com"), None, Some(443), None)
+            .await;
+        assert_eq!(outbound, "proxy");
+    }
+
+    #[tokio::test]
+    async fn direct_mode_routes_all_traffic_to_direct() {
+        // DIRECT must route everything (even domains matched by rules) to the
+        // direct outbound.
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::DIRECT);
+        let router = grouped_routing_test_router();
+
+        for (domain, ip) in [
+            (Some("example.com"), None),
+            (None, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))),
+        ] {
+            let outbound = router.match_outbound(domain, ip, Some(443), None).await;
+            assert_eq!(outbound, "DIRECT");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_mode_follows_general_mode() {
+        // Runtime mode 0 (CONFIG) falls back to `general.mode`; here it is
+        // Rule, so the rule table decides.
+        let _mode_guard = MODE_LOCK.lock().await;
+        set_runtime_proxy_mode(proxy_mode::CONFIG);
+        let router = grouped_routing_test_router();
+
+        let outbound = router
+            .match_outbound(Some("example.com"), None, Some(443), None)
+            .await;
+        assert_eq!(outbound, "DIRECT");
     }
 
     #[test]
@@ -1277,6 +1448,15 @@ mod property_tests {
         fn prop_rules_match_in_priority_order(
             domain in "[a-z]{5,10}\\.[a-z]{2,4}"
         ) {
+            // This test is about rule priority only. Clear the process-global
+            // rule-provider staging so `Router::new` never touches the network
+            // (other tests may have staged a real HTTP provider), and pin the
+            // runtime mode to CONFIG under the mode lock so parallel mode
+            // tests cannot interleave a different mode.
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _mode_guard = rt.block_on(async { tests::MODE_LOCK.lock().await });
+            set_runtime_proxy_mode(proxy_mode::CONFIG);
+
             let rules = vec![
                 RuleConfig {
                     rule_type: RuleType::Domain,
@@ -1312,7 +1492,6 @@ mod property_tests {
                 ..Default::default()
             };
 
-            let rt = tokio::runtime::Runtime::new().unwrap();
             let result = rt.block_on(async {
                 let router = Router::new(std::sync::Arc::new(RwLock::new(config))).await.unwrap();
                 router.match_outbound(Some(&domain), None, None, None).await

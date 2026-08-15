@@ -22,11 +22,37 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use corduit::engine::{Config, Corduit};
+//! use corduit::engine::{
+//!     Config, Corduit, GeneralConfig, InboundConfig, InboundType, OutboundConfig, OutboundType,
+//! };
 //!
 //! #[tokio::main]
 //! async fn main() -> corduit::engine::Result<()> {
-//!     let engine = Corduit::new(Config::default()).await?;
+//!     // `Config::default()` alone fails validation (no inbound), so build a
+//!     // real one: one mixed inbound + a DIRECT outbound.
+//!     let config = Config {
+//!         general: GeneralConfig {
+//!             mixed_port: Some(17890),
+//!             ..GeneralConfig::default()
+//!         },
+//!         inbounds: vec![InboundConfig {
+//!             inbound_type: InboundType::Mixed,
+//!             tag: "mixed-in".to_string(),
+//!             listen: "127.0.0.1".to_string(),
+//!             port: 17890,
+//!             options: Default::default(),
+//!         }],
+//!         outbounds: vec![OutboundConfig {
+//!             outbound_type: OutboundType::Direct,
+//!             tag: "DIRECT".to_string(),
+//!             server: None,
+//!             port: None,
+//!             options: Default::default(),
+//!         }],
+//!         ..Config::default()
+//!     };
+//!
+//!     let engine = Corduit::new(config).await?;
 //!     engine.start().await?;
 //!     // ... run the proxy ...
 //!     engine.stop().await

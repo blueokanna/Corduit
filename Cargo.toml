@@ -1,14 +1,14 @@
 [package]
 name = "corduit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license-file = "LICENSE"
 authors = ["blueokanna"]
-description = "A unified network proxy engine written in Rust"
+description = "A unified network proxy engine core written in Rust"
 homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
 readme = "README.md"
-keywords = ["proxy", "protocol", "network", "tun", "rust"]
+keywords = ["proxy", "protocol", "network", "tun", "vpn"]
 categories = ["network-programming", "web-programming", "asynchronous"]
 
 [features]

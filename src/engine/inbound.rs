@@ -7,10 +7,13 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
+mod auth;
 mod forward;
 mod http;
 mod mixed;
 mod socks5;
+
+pub use auth::InboundAuth;
 
 use http::HttpInbound;
 use mixed::MixedInbound;
@@ -91,17 +94,24 @@ impl InboundManager {
 
         {
             let config_read = config.read().await;
+            // Thread the shared credential set into every listener so the
+            // configured `general.authentication` is actually enforced.
+            let auth = Arc::new(InboundAuth::new(
+                config_read.general.authentication.as_deref(),
+            ));
             for inbound_config in &config_read.inbounds {
                 let listener: Box<dyn InboundListener> = match inbound_config.inbound_type {
                     InboundType::Http => Box::new(HttpInbound::new(
                         inbound_config.clone(),
                         Arc::clone(&router),
                         Arc::clone(&outbound_manager),
+                        Arc::clone(&auth),
                     )),
                     InboundType::Socks5 => Box::new(Socks5Inbound::new(
                         inbound_config.clone(),
                         Arc::clone(&router),
                         Arc::clone(&outbound_manager),
+                        Arc::clone(&auth),
                     )),
                     InboundType::Mixed => {
                         // Mixed supports both HTTP and SOCKS5 with auto-detection
@@ -109,6 +119,7 @@ impl InboundManager {
                             inbound_config.clone(),
                             Arc::clone(&router),
                             Arc::clone(&outbound_manager),
+                            Arc::clone(&auth),
                         ))
                     }
                     _ => {
@@ -155,6 +166,9 @@ impl InboundManager {
 
         let new_listeners = {
             let config_read = self.config.read().await;
+            let auth = Arc::new(InboundAuth::new(
+                config_read.general.authentication.as_deref(),
+            ));
             let mut new_listeners: Vec<Box<dyn InboundListener>> = Vec::new();
             for inbound_config in &config_read.inbounds {
                 let listener: Box<dyn InboundListener> = match inbound_config.inbound_type {
@@ -162,16 +176,19 @@ impl InboundManager {
                         inbound_config.clone(),
                         Arc::clone(&self.router),
                         Arc::clone(&self.outbound_manager),
+                        Arc::clone(&auth),
                     )),
                     InboundType::Socks5 => Box::new(Socks5Inbound::new(
                         inbound_config.clone(),
                         Arc::clone(&self.router),
                         Arc::clone(&self.outbound_manager),
+                        Arc::clone(&auth),
                     )),
                     InboundType::Mixed => Box::new(MixedInbound::new(
                         inbound_config.clone(),
                         Arc::clone(&self.router),
                         Arc::clone(&self.outbound_manager),
+                        Arc::clone(&auth),
                     )),
                     _ => {
                         tracing::warn!(

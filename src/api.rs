@@ -341,6 +341,8 @@ pub async fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, Strin
 
     if let Some(corduit) = guard.as_ref() {
         let config = corduit.config();
+        let proxy_manager = corduit.proxy_manager();
+        let outbound_manager = proxy_manager.outbound_manager();
         let mut groups = Vec::new();
 
         for outbound in &config.outbounds {
@@ -353,18 +355,50 @@ pub async fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, Strin
                 _ => continue,
             };
 
-            let proxies: Vec<String> = outbound
+            // Member tags live under the canonical `outbounds` key (the same
+            // key the engine's selector/url-test/… groups read). `proxies`
+            // is tolerated as a legacy alias.
+            let mut proxies: Vec<String> = outbound
                 .options
-                .get("proxies")
+                .get("outbounds")
+                .or_else(|| outbound.options.get("proxies"))
                 .and_then(|v| v.as_array())
                 .map(|seq| {
                     seq.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .filter_map(|v| v.as_str().map(str::to_string))
                         .collect()
                 })
                 .unwrap_or_default();
 
-            let selected = proxies.first().cloned().unwrap_or_default();
+            // Expand `use: [provider, …]` into the provider's current proxy
+            // tags so the reported members match what the group can select.
+            if let Some(use_value) = outbound.options.get("use") {
+                let use_names: Vec<String> = if let Some(arr) = use_value.as_array() {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                } else if let Some(s) = use_value.as_str() {
+                    nextjson::from_str::<Vec<String>>(s).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let providers = outbound_manager.proxy_provider_manager();
+                for name in use_names {
+                    if let Some(provider) = providers.get_provider(&name).await {
+                        for proxy in provider.get_proxies().await {
+                            let tag = proxy.tag().to_string();
+                            if !proxies.contains(&tag) {
+                                proxies.push(tag);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Report the live selection if one was made at runtime.
+            let selected = outbound_manager
+                .get_selector_proxy(&outbound.tag)
+                .unwrap_or_else(|| proxies.first().cloned().unwrap_or_default());
 
             groups.push(ProxyGroupDto {
                 tag: outbound.tag.clone(),
@@ -3381,6 +3415,12 @@ mod config_conversion_tests {
             }]
         }"#;
         assert!(configure_rule_providers(secure).is_ok());
+
+        // `configure_rule_providers` stages into the process-global runtime
+        // static; tests run in parallel, so leave no real provider behind for
+        // other tests (e.g. routing property tests construct routers that load
+        // staged providers from the network).
+        crate::engine::set_runtime_rule_providers(Vec::new());
     }
 
     #[test]
@@ -3404,6 +3444,10 @@ mod config_conversion_tests {
             }]
         }"#;
         assert!(configure_proxy_providers(secure).is_ok());
+
+        // Leave no staged provider in the process-global static for parallel
+        // tests.
+        crate::engine::proxy_provider::set_runtime_proxy_providers(Vec::new());
     }
 
     #[test]
