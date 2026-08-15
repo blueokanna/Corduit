@@ -6,7 +6,7 @@ use crate::engine::rule_provider::RuleProviderManager;
 use ipnet::IpNet;
 use lru::LruCache;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -81,13 +81,25 @@ fn runtime_rule_providers() -> Vec<RuleProviderConfig> {
     }
 }
 
+/// Whether two rule provider configs differ in any field that affects the
+/// loaded rule set. Unchanged providers are left untouched on reload so their
+/// rules keep working while the provider updater refreshes them in place.
+fn rule_provider_config_changed(a: &RuleProviderConfig, b: &RuleProviderConfig) -> bool {
+    a.provider_type != b.provider_type
+        || a.behavior != b.behavior
+        || a.url != b.url
+        || a.path != b.path
+        || a.interval != b.interval
+}
+
 pub struct Router {
     config: Arc<RwLock<Config>>,
     rules: RwLock<Vec<CompiledRule>>,
     /// Pre-resolved default outbound tags — no per-request scan of `outbounds`.
     defaults: RwLock<DefaultOutbounds>,
     geoip_manager: Arc<dyn CountryMatcher>,
-    rule_provider_manager: RuleProviderManager,
+    /// Arc so the background provider updater can share the same manager.
+    rule_provider_manager: Arc<RuleProviderManager>,
 }
 
 /// Fallback outbound tags resolved once per configuration, not per request.
@@ -119,7 +131,7 @@ impl Router {
         let rules = Self::compile_rules(&config.read().await.rules)?;
         let geoip_manager: Arc<dyn CountryMatcher> =
             Arc::new(GeoIpManager::from_embedded_country_database());
-        let rule_provider_manager = RuleProviderManager::new();
+        let rule_provider_manager = Arc::new(RuleProviderManager::new());
         let provider_configs = runtime_rule_providers();
         let configured_names: HashSet<&str> = provider_configs
             .iter()
@@ -180,6 +192,12 @@ impl Router {
         &self.rule_provider_manager
     }
 
+    /// Shared handle to the rule provider manager (used by the background
+    /// provider updater for interval refreshes).
+    pub fn rule_provider_manager_arc(&self) -> Arc<RuleProviderManager> {
+        Arc::clone(&self.rule_provider_manager)
+    }
+
     pub async fn match_outbound(
         &self,
         domain: Option<&str>,
@@ -227,27 +245,34 @@ impl Router {
             return direct_outbound;
         }
 
-        if Self::is_mainland_china_domain(domain) {
-            tracing::info!(
-                "Mainland China domain identified: domain={:?} -> '{}'",
-                domain,
-                direct_outbound
-            );
-            return direct_outbound;
-        }
-
-        let resolved_ips = Self::resolve_destination_ips(domain, ip).await;
-        if self.is_mainland_china_ip(&resolved_ips).await {
-            tracing::info!(
-                "Mainland China destination identified: domain={:?}, ips={:?} -> '{}'",
-                domain,
-                resolved_ips,
-                direct_outbound
-            );
-            return direct_outbound;
-        }
-
         let rules = self.rules.read().await;
+
+        // The mainland-China auto-direct shortcut is a fallback for configs
+        // with no rules at all. Once rules are configured (e.g. the clash-rules
+        // sets), rules are evaluated strictly in order — Clash semantics — so
+        // an explicit rule always wins over the shortcut.
+        let resolved_ips = Self::resolve_destination_ips(domain, ip).await;
+
+        if rules.is_empty() {
+            if Self::is_mainland_china_domain(domain) {
+                tracing::info!(
+                    "Mainland China domain identified: domain={:?} -> '{}'",
+                    domain,
+                    direct_outbound
+                );
+                return direct_outbound;
+            }
+
+            if self.is_mainland_china_ip(&resolved_ips).await {
+                tracing::info!(
+                    "Mainland China destination identified: domain={:?}, ips={:?} -> '{}'",
+                    domain,
+                    resolved_ips,
+                    direct_outbound
+                );
+                return direct_outbound;
+            }
+        }
 
         for rule in rules.iter() {
             let mut matched = self
@@ -397,6 +422,53 @@ impl Router {
         {
             let mut defaults_guard = self.defaults.write().await;
             *defaults_guard = defaults;
+        }
+        self.refresh_rule_providers().await?;
+        Ok(())
+    }
+
+    /// Synchronize the loaded rule providers with the runtime configuration:
+    /// remove providers that disappeared, add new ones, and replace providers
+    /// whose config changed. Unchanged providers keep their loaded rules and
+    /// are refreshed in the background by the provider updater.
+    async fn refresh_rule_providers(&self) -> Result<()> {
+        let desired = runtime_rule_providers();
+        let current: HashSet<String> = self
+            .rule_provider_manager
+            .get_provider_names()
+            .await
+            .into_iter()
+            .collect();
+
+        let mut desired_map: HashMap<String, RuleProviderConfig> = HashMap::new();
+        for config in desired {
+            let name = config.name.clone();
+            if desired_map.insert(name.clone(), config).is_some() {
+                return Err(Error::config(format!(
+                    "Duplicate rule provider name '{name}'"
+                )));
+            }
+        }
+
+        // Remove providers that are no longer configured.
+        for name in &current {
+            if !desired_map.contains_key(name) {
+                self.rule_provider_manager.remove_provider(name).await;
+            }
+        }
+
+        // Add new providers and replace changed ones.
+        for (name, config) in desired_map {
+            match self.rule_provider_manager.get_provider(&name).await {
+                Some(existing) if !rule_provider_config_changed(existing.config(), &config) => {}
+                Some(_) => {
+                    self.rule_provider_manager.remove_provider(&name).await;
+                    self.rule_provider_manager.add_provider(config).await?;
+                }
+                None => {
+                    self.rule_provider_manager.add_provider(config).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -756,24 +828,62 @@ mod tests {
                 default: "proxy".to_string(),
             }),
             geoip_manager: Arc::new(StubCountryMatcher),
-            rule_provider_manager: RuleProviderManager::new(),
+            rule_provider_manager: Arc::new(RuleProviderManager::new()),
         }
     }
 
+    /// Same topology as `mainland_routing_test_router` but with an empty rule
+    /// list, so the no-rule auto-direct fallback can be exercised.
+    fn mainland_routing_test_router_no_rules() -> Router {
+        let mut router = mainland_routing_test_router();
+        router.rules = RwLock::new(Vec::new());
+        router
+    }
+
     #[tokio::test]
-    async fn mainland_cn_domain_overrides_proxy_match_rule() {
+    async fn mainland_cn_domain_follows_rule_when_configured() {
+        // With rules configured, the explicit MATCH rule wins over the
+        // mainland-China auto-direct shortcut (Clash rule-order semantics).
         let router = mainland_routing_test_router();
 
         let outbound = router
             .match_outbound(Some("WWW.EXAMPLE.CN."), None, Some(443), None)
             .await;
 
+        assert_eq!(outbound, "proxy");
+    }
+
+    #[tokio::test]
+    async fn mainland_cn_ip_follows_rule_when_configured() {
+        let router = mainland_routing_test_router();
+
+        let outbound = router
+            .match_outbound(
+                None,
+                Some(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))),
+                Some(53),
+                None,
+            )
+            .await;
+
+        assert_eq!(outbound, "proxy");
+    }
+
+    #[tokio::test]
+    async fn mainland_cn_domain_auto_direct_without_rules() {
+        // No rules configured: the auto-direct fallback still applies.
+        let router = mainland_routing_test_router_no_rules();
+
+        let outbound = router
+            .match_outbound(Some("www.example.cn"), None, Some(443), None)
+            .await;
+
         assert_eq!(outbound, "bypass");
     }
 
     #[tokio::test]
-    async fn mainland_cn_ip_overrides_proxy_match_rule() {
-        let router = mainland_routing_test_router();
+    async fn mainland_cn_ip_auto_direct_without_rules() {
+        let router = mainland_routing_test_router_no_rules();
 
         let outbound = router
             .match_outbound(
@@ -944,7 +1054,7 @@ mod property_tests {
                     default: "proxy".to_string(),
                 }),
                 geoip_manager: Arc::new(GeoIpManager::new()),
-                rule_provider_manager: RuleProviderManager::new(),
+                rule_provider_manager: Arc::new(RuleProviderManager::new()),
             };
 
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -997,7 +1107,7 @@ mod property_tests {
                     default: "proxy".to_string(),
                 }),
                 geoip_manager: Arc::new(GeoIpManager::new()),
-                rule_provider_manager: RuleProviderManager::new(),
+                rule_provider_manager: Arc::new(RuleProviderManager::new()),
             };
 
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1041,7 +1151,7 @@ mod property_tests {
                     default: "proxy".to_string(),
                 }),
                 geoip_manager: Arc::new(GeoIpManager::new()),
-                rule_provider_manager: RuleProviderManager::new(),
+                rule_provider_manager: Arc::new(RuleProviderManager::new()),
             };
 
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1146,7 +1256,7 @@ mod property_tests {
                     default: "proxy".to_string(),
                 }),
                 geoip_manager: Arc::new(GeoIpManager::new()),
-                rule_provider_manager: RuleProviderManager::new(),
+                rule_provider_manager: Arc::new(RuleProviderManager::new()),
             };
 
             let rt = tokio::runtime::Runtime::new().unwrap();

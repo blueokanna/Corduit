@@ -120,6 +120,9 @@ impl Corduit {
         // Start outbound connections pool
         self.proxy_manager.start_outbounds().await?;
 
+        // Start background provider refreshes (proxy/rule providers, health checks)
+        self.proxy_manager.start_providers().await?;
+
         // Mark as running and record start time
         self.running
             .store(true, std::sync::atomic::Ordering::Relaxed);

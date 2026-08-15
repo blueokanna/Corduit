@@ -2,6 +2,9 @@ use crate::engine::config::Config;
 use crate::engine::error::Result;
 use crate::engine::inbound::InboundManager;
 use crate::engine::outbound::OutboundManager;
+use crate::engine::provider_updater::{
+    ProviderRegistrySync, ProviderUpdater, ProviderUpdaterConfig,
+};
 use crate::engine::routing::Router;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -12,16 +15,33 @@ pub struct ProxyManager {
     inbound_manager: InboundManager,
     outbound_manager: Arc<OutboundManager>,
     router: Arc<Router>,
+    /// Background worker that refreshes proxy/rule providers and runs health
+    /// checks on their configured intervals.
+    provider_updater: ProviderUpdater,
 }
 
 impl ProxyManager {
     /// Create a new proxy manager
     pub async fn new(config: Config) -> Result<Self> {
         let config_arc = Arc::new(RwLock::new(config));
+
+        // Router first: it loads rule providers and validates that every
+        // RULE-SET rule references a configured provider.
         let router = Arc::new(Router::new(config_arc.clone()).await?);
 
-        // Create outbound manager first (wrapped in Arc for sharing)
+        // Outbound manager next: it loads proxy providers into the shared
+        // registry so proxy groups can reference provider proxies.
         let outbound_manager = Arc::new(OutboundManager::new(config_arc.clone()).await?);
+
+        // Provider updater shares the live managers so interval refreshes
+        // affect the same proxies/rules traffic is using; the registry sync
+        // hook makes refreshed provider nodes reachable without a reload.
+        let provider_updater = ProviderUpdater::new(ProviderUpdaterConfig::default())
+            .with_proxy_provider_manager(outbound_manager.proxy_provider_manager())
+            .with_rule_provider_manager(router.rule_provider_manager_arc())
+            .with_proxy_registry_sync(
+                Arc::clone(&outbound_manager) as Arc<dyn ProviderRegistrySync>
+            );
 
         // Create inbound manager with reference to outbound manager
         let inbound_manager = InboundManager::new(
@@ -36,6 +56,7 @@ impl ProxyManager {
             inbound_manager,
             outbound_manager,
             router,
+            provider_updater,
         })
     }
 
@@ -49,8 +70,19 @@ impl ProxyManager {
         self.outbound_manager.start().await
     }
 
+    /// Start the background provider updater (interval refresh + health check).
+    pub async fn start_providers(&self) -> Result<()> {
+        self.provider_updater.start().await
+    }
+
+    /// Stop the background provider updater.
+    pub async fn stop_providers(&self) -> Result<()> {
+        self.provider_updater.stop().await
+    }
+
     /// Stop all proxy services
     pub async fn stop(&self) -> Result<()> {
+        self.stop_providers().await?;
         self.inbound_manager.stop().await?;
         self.outbound_manager.stop().await?;
         Ok(())

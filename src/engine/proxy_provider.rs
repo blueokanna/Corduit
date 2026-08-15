@@ -5,8 +5,32 @@ use nextjson::{NsonDeserialize, NsonSerialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+/// Runtime proxy provider configuration, injected by the API layer before an
+/// engine instance is created or reloaded. Mirrors `RUNTIME_RULE_PROVIDERS`
+/// in `routing.rs`; the engine consumes this so provider declarations do not
+/// have to live inside `Config`.
+static RUNTIME_PROXY_PROVIDERS: once_cell::sync::Lazy<StdRwLock<Vec<ProxyProviderConfig>>> =
+    once_cell::sync::Lazy::new(|| StdRwLock::new(Vec::new()));
+
+/// Replace the runtime proxy provider configuration.
+pub fn set_runtime_proxy_providers(providers: Vec<ProxyProviderConfig>) {
+    match RUNTIME_PROXY_PROVIDERS.write() {
+        Ok(mut guard) => *guard = providers,
+        Err(poisoned) => *poisoned.into_inner() = providers,
+    }
+}
+
+/// Snapshot of the currently configured proxy providers.
+pub fn runtime_proxy_providers() -> Vec<ProxyProviderConfig> {
+    match RUNTIME_PROXY_PROVIDERS.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyProviderType {
@@ -485,6 +509,12 @@ impl ProxyProviderManager {
                 name
             )))
         }
+    }
+
+    /// Remove every provider. Used on reload so outbound rebuilds start from a
+    /// clean slate instead of accumulating stale providers.
+    pub async fn clear(&self) {
+        self.providers.write().await.clear();
     }
 
     pub async fn provider_count(&self) -> usize {

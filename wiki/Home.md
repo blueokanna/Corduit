@@ -62,6 +62,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
 | [Getting-Started](Getting-Started) | 从零开始：安装、起代理、三种前端都跑通 |
 | [Architecture](Architecture) | 架构图（Mermaid）：模块、分发表、请求生命周期 |
 | [Configuration](Configuration) | 完整配置项参考 + 示例 |
+| [Rules](Rules) | 规则引擎：三种模式、规则类型语义、rule/proxy provider、clash-rules 对照 |
 | [Rust-API](Rust-API) | Rust 类型化 API 完整用法 |
 | [FFI-API](FFI-API) | C ABI：C / Dart 绑定示例 |
 | [RPC-API](RPC-API) | HTTP / WebSocket JSON-RPC 用法 |

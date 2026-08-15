@@ -378,14 +378,52 @@ impl ConfigValidator {
                 )));
             }
 
+            // Proxy providers supply dynamic outbound tags that are not known
+            // at config-validation time. When any provider is declared, member
+            // references that are neither static outbounds nor builtins are
+            // allowed (they are resolved at group-construction time); when no
+            // provider is declared the check stays strict so typos fail early.
+            let provider_names: std::collections::HashSet<String> =
+                crate::engine::proxy_provider::runtime_proxy_providers()
+                    .iter()
+                    .map(|provider| provider.name.clone())
+                    .collect();
+            let has_dynamic_tags = !provider_names.is_empty();
+
             for member in &members {
                 let is_builtin =
                     member.eq_ignore_ascii_case("direct") || member.eq_ignore_ascii_case("reject");
-                if !is_builtin && !outbound_tags.contains(member.as_str()) {
+                let is_static =
+                    outbound_tags.contains(member.as_str()) || provider_names.contains(member);
+                if !is_builtin && !is_static && !has_dynamic_tags {
                     return Err(Error::config(format!(
                         "Proxy group '{}' references non-existent outbound: {}",
                         outbound.tag, member
                     )));
+                }
+            }
+
+            // A group's `use:` option must reference a declared proxy provider.
+            if let Some(use_value) = outbound.options.get("use") {
+                let use_names: Vec<String> = if let Some(arr) = use_value.as_array() {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                } else if let Some(s) = use_value.as_str() {
+                    nextjson::from_str::<Vec<String>>(s).unwrap_or_default()
+                } else {
+                    return Err(Error::config(format!(
+                        "Proxy group '{}' has an invalid 'use' value",
+                        outbound.tag
+                    )));
+                };
+                for use_name in use_names {
+                    if !provider_names.contains(&use_name) {
+                        return Err(Error::config(format!(
+                            "Proxy group '{}' references unknown proxy provider: {}",
+                            outbound.tag, use_name
+                        )));
+                    }
                 }
             }
         }

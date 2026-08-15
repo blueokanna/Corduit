@@ -94,6 +94,11 @@ fn init_tracing_safe() -> std::result::Result<(), ()> {
 pub async fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
     tracing::info!("Starting proxy from config JSON...");
 
+    // This public entry point must honor `rule_providers` / `proxy_providers`
+    // just like initialize/reload/test-config do.
+    configure_rule_providers(&yaml_config).map_err(|e| e.to_string())?;
+    configure_proxy_providers(&yaml_config).map_err(|e| e.to_string())?;
+
     let config: Config =
         nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {}", e))?;
     {
@@ -696,6 +701,7 @@ pub async fn initialize_corduit(config_json: String) -> Result<()> {
     tracing::info!("Initializing corduit...");
 
     configure_rule_providers(&config_json)?;
+    configure_proxy_providers(&config_json)?;
     let config: CorduitConfig = nextjson::from_str(&config_json)
         .map_err(|e| CorduitError::Parse(format!("Invalid config JSON: {}", e)))?;
     let core_config = convert_ffi_config_to_core(config)?;
@@ -771,6 +777,7 @@ pub async fn stop_corduit() -> Result<()> {
 
 pub async fn reload_corduit(config_json: String) -> Result<()> {
     configure_rule_providers(&config_json)?;
+    configure_proxy_providers(&config_json)?;
     let config: CorduitConfig = nextjson::from_str(&config_json)
         .map_err(|e| CorduitError::Parse(format!("Invalid config JSON: {}", e)))?;
 
@@ -878,6 +885,7 @@ pub async fn get_traffic_stats() -> Result<TrafficStats> {
 
 pub async fn test_config(config_json: String) -> Result<bool> {
     configure_rule_providers(&config_json)?;
+    configure_proxy_providers(&config_json)?;
     let config: CorduitConfig = nextjson::from_str(&config_json)
         .map_err(|e| CorduitError::Parse(format!("Invalid config JSON: {}", e)))?;
 
@@ -1204,6 +1212,64 @@ fn configure_rule_providers(config_json: &str) -> Result<()> {
     }
 
     crate::engine::set_runtime_rule_providers(providers);
+    Ok(())
+}
+
+/// Parse and validate the `proxy_providers` section of a config document, then
+/// stage it for the engine via the runtime side-channel. Mirrors the rule
+/// provider handling so both provider kinds behave identically across
+/// initialize / reload / test-config.
+fn configure_proxy_providers(config_json: &str) -> Result<()> {
+    use crate::engine::proxy_provider::{ProxyProviderConfig, ProxyProviderType};
+
+    let value: nextjson::Value = nextjson::from_str(config_json)
+        .map_err(|error| CorduitError::Parse(format!("Invalid config JSON: {error}")))?;
+    let providers = value
+        .get("proxy_providers")
+        .cloned()
+        .unwrap_or_else(|| nextjson::Value::Array(Vec::new()));
+    let providers: Vec<ProxyProviderConfig> = nextjson_to_core(&providers)
+        .map_err(|error| CorduitError::Parse(format!("Invalid proxy providers: {error}")))?;
+
+    for provider in &providers {
+        if provider.interval < 60 {
+            return Err(CorduitError::Parse(format!(
+                "Proxy provider '{}' interval must be at least 60 seconds",
+                provider.name
+            )));
+        }
+        match provider.provider_type {
+            ProxyProviderType::Http => {
+                let url = provider.url.as_deref().ok_or_else(|| {
+                    CorduitError::Parse(format!(
+                        "HTTP proxy provider '{}' requires a URL",
+                        provider.name
+                    ))
+                })?;
+                let parsed = crate::common::url::Url::parse(url).map_err(|error| {
+                    CorduitError::Parse(format!(
+                        "Invalid URL for proxy provider '{}': {error}",
+                        provider.name
+                    ))
+                })?;
+                if parsed.scheme() != "https" {
+                    return Err(CorduitError::Parse(format!(
+                        "Proxy provider '{}' must use HTTPS",
+                        provider.name
+                    )));
+                }
+            }
+            ProxyProviderType::File if provider.path.is_none() => {
+                return Err(CorduitError::Parse(format!(
+                    "File proxy provider '{}' requires a path",
+                    provider.name
+                )));
+            }
+            ProxyProviderType::File => {}
+        }
+    }
+
+    crate::engine::proxy_provider::set_runtime_proxy_providers(providers);
     Ok(())
 }
 
@@ -3315,6 +3381,64 @@ mod config_conversion_tests {
             }]
         }"#;
         assert!(configure_rule_providers(secure).is_ok());
+    }
+
+    #[test]
+    fn proxy_provider_urls_must_use_https() {
+        let insecure = r#"{
+            "proxy_providers": [{
+                "name": "subscription",
+                "type": "http",
+                "url": "http://example.com/sub.txt",
+                "interval": 3600
+            }]
+        }"#;
+        assert!(configure_proxy_providers(insecure).is_err());
+
+        let secure = r#"{
+            "proxy_providers": [{
+                "name": "subscription",
+                "type": "http",
+                "url": "https://example.com/sub.txt",
+                "interval": 3600
+            }]
+        }"#;
+        assert!(configure_proxy_providers(secure).is_ok());
+    }
+
+    #[test]
+    fn proxy_provider_interval_must_be_at_least_60s() {
+        let too_fast = r#"{
+            "proxy_providers": [{
+                "name": "subscription",
+                "type": "file",
+                "path": "providers/sub.txt",
+                "interval": 30
+            }]
+        }"#;
+        assert!(configure_proxy_providers(too_fast).is_err());
+
+        let ok = r#"{
+            "proxy_providers": [{
+                "name": "subscription",
+                "type": "file",
+                "path": "providers/sub.txt",
+                "interval": 60
+            }]
+        }"#;
+        assert!(configure_proxy_providers(ok).is_ok());
+    }
+
+    #[test]
+    fn file_proxy_provider_requires_path() {
+        let missing_path = r#"{
+            "proxy_providers": [{
+                "name": "subscription",
+                "type": "file",
+                "interval": 3600
+            }]
+        }"#;
+        assert!(configure_proxy_providers(missing_path).is_err());
     }
 
     #[test]

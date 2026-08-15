@@ -1,5 +1,6 @@
 use crate::engine::config::{Config, OutboundConfig, OutboundType};
 use crate::engine::error::{Error, Result};
+use crate::engine::proxy_provider::{runtime_proxy_providers, ProxyProviderManager};
 use parking_lot::RwLock as ParkingRwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -121,6 +122,12 @@ pub struct OutboundManager {
     proxies: ProxyRegistry,
     /// Lifecycle list (start/stop/tags); replaced atomically on reload.
     proxy_list: parking_lot::RwLock<Vec<Arc<dyn OutboundProxy>>>,
+    /// Loaded `proxy-providers`; their proxies are registered in `proxies`
+    /// and can be referenced by proxy groups (Clash `use:` / provider tags).
+    proxy_providers: Arc<ProxyProviderManager>,
+    /// Tags that came from proxy providers, so a background refresh can
+    /// replace exactly those entries in the shared registry.
+    provider_tags: parking_lot::RwLock<std::collections::HashSet<String>>,
 }
 
 #[async_trait::async_trait]
@@ -210,29 +217,45 @@ pub(crate) fn build_outbound_proxy(
 impl OutboundManager {
     pub async fn new(config: Arc<RwLock<Config>>) -> Result<Self> {
         let proxies: ProxyRegistry = Arc::new(RwLock::new(HashMap::new()));
-        let proxy_list = {
+        let proxy_providers = Arc::new(ProxyProviderManager::new());
+        let (proxy_list, provider_tags) = {
             let config_read = config.read().await;
-            Self::build_outbounds(&config_read, &proxies).await?
+            Self::build_outbounds(&config_read, &proxies, &proxy_providers).await?
         };
 
         Ok(Self {
             config,
             proxies,
             proxy_list: parking_lot::RwLock::new(proxy_list),
+            proxy_providers,
+            provider_tags: parking_lot::RwLock::new(provider_tags),
         })
     }
 
+    /// Shared handle to the proxy provider manager (used by the background
+    /// provider updater for interval refreshes and health checks).
+    pub fn proxy_provider_manager(&self) -> Arc<ProxyProviderManager> {
+        Arc::clone(&self.proxy_providers)
+    }
+
     /// Build the outbound registry and lifecycle list from a configuration.
+    /// Returns the lifecycle list and the set of tags owned by proxy providers.
     ///
-    /// The group pass runs after the leaf proxies so selector/urltest/…
-    /// groups can reference them through the shared registry.
+    /// Pass order matters: leaf proxies first, then proxy-provider proxies
+    /// (so groups can reference provider tags), then groups themselves.
     async fn build_outbounds(
         config: &Config,
         registry: &ProxyRegistry,
-    ) -> Result<Vec<Arc<dyn OutboundProxy>>> {
+        provider_manager: &ProxyProviderManager,
+    ) -> Result<(
+        Vec<Arc<dyn OutboundProxy>>,
+        std::collections::HashSet<String>,
+    )> {
         let mut proxy_list: Vec<Arc<dyn OutboundProxy>> = Vec::new();
         let mut proxy_group_configs: Vec<OutboundConfig> = Vec::new();
+        let mut provider_tags: std::collections::HashSet<String> = Default::default();
 
+        // Pass 1: leaf proxies (everything except proxy groups).
         for outbound_config in &config.outbounds {
             let proxy: Option<Arc<dyn OutboundProxy>> = match build_outbound_proxy(outbound_config)
             {
@@ -245,24 +268,143 @@ impl OutboundManager {
                 proxy_list.push(p.clone());
                 registry.write().await.insert(tag, p);
             } else {
-                // Group types (Selector/Urltest/…) are resolved in a second
-                // pass once every leaf proxy is in the registry.
+                // Group types (Selector/Urltest/…) are resolved in a final
+                // pass once every leaf and provider proxy is in the registry.
                 proxy_group_configs.push(outbound_config.clone());
             }
         }
 
-        // Second pass: create proxy groups with access to the registry.
-        for group_config in proxy_group_configs {
-            let proxy: Arc<dyn OutboundProxy> = Arc::new(SelectorOutbound::new(
-                group_config.clone(),
-                registry.clone(),
-            )?);
+        // Pass 2: proxy providers. Load each configured provider (parses its
+        // subscription) and register every resulting proxy by tag so proxy
+        // groups can reference them. Failures abort startup — a broken
+        // provider must never silently fall back to direct.
+        let provider_configs = runtime_proxy_providers();
+        for provider_config in provider_configs {
+            provider_manager.add_provider(provider_config).await?;
+        }
+        for proxy in provider_manager.get_all_proxies().await {
+            let tag = proxy.tag().to_string();
+            provider_tags.insert(tag.clone());
+            proxy_list.push(proxy.clone());
+            registry.write().await.insert(tag, proxy);
+        }
+
+        // Pass 3: proxy groups with access to the registry. A group's
+        // `use: [provider]` option is expanded into explicit member tags
+        // before construction (Clash semantics).
+        for mut group_config in proxy_group_configs {
+            Self::expand_provider_use(&mut group_config, provider_manager).await?;
+            let proxy: Arc<dyn OutboundProxy> =
+                Arc::new(SelectorOutbound::new(group_config, registry.clone())?);
             let tag = proxy.tag().to_string();
             proxy_list.push(proxy.clone());
             registry.write().await.insert(tag, proxy);
         }
 
-        Ok(proxy_list)
+        Ok((proxy_list, provider_tags))
+    }
+
+    /// Re-sync provider-origin entries in the shared registry after the
+    /// background updater refreshed the providers. Removes tags that
+    /// disappeared from the subscriptions and re-registers current nodes.
+    pub async fn sync_provider_proxies(&self) -> Result<()> {
+        let current: Vec<Arc<dyn OutboundProxy>> = self.proxy_providers.get_all_proxies().await;
+        let current_tags: std::collections::HashSet<String> = current
+            .iter()
+            .map(|proxy| proxy.tag().to_string())
+            .collect();
+
+        let mut registry = self.proxies.write().await;
+        let mut tags = self.provider_tags.write();
+        // Drop entries whose provider node disappeared.
+        let stale: Vec<String> = tags
+            .iter()
+            .filter(|tag| !current_tags.contains(*tag))
+            .cloned()
+            .collect();
+        for tag in stale {
+            registry.remove(&tag);
+            tags.remove(&tag);
+        }
+        // Register or refresh current nodes.
+        for proxy in current {
+            let tag = proxy.tag().to_string();
+            tags.insert(tag.clone());
+            registry.insert(tag, proxy);
+        }
+        tracing::info!("Synced {} provider proxies into the registry", tags.len());
+        Ok(())
+    }
+
+    /// Expand a proxy group's `use: [provider, …]` option (Clash semantics)
+    /// into explicit `outbounds` members resolved from the loaded providers.
+    /// Explicitly listed `outbounds` are kept and provider members appended.
+    async fn expand_provider_use(
+        group_config: &mut OutboundConfig,
+        provider_manager: &ProxyProviderManager,
+    ) -> Result<()> {
+        let Some(use_value) = group_config.options.get("use") else {
+            return Ok(());
+        };
+
+        let use_names: Vec<String> = if let Some(arr) = use_value.as_array() {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        } else if let Some(s) = use_value.as_str() {
+            nextjson::from_str::<Vec<String>>(s).unwrap_or_default()
+        } else {
+            return Err(Error::config(format!(
+                "Proxy group '{}' has an invalid 'use' value",
+                group_config.tag
+            )));
+        };
+
+        if use_names.is_empty() {
+            return Ok(());
+        }
+
+        let mut members: Vec<String> = group_config
+            .options
+            .get("outbounds")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for use_name in &use_names {
+            let provider = provider_manager
+                .get_provider(use_name)
+                .await
+                .ok_or_else(|| {
+                    Error::config(format!(
+                        "Proxy group '{}' references unknown proxy provider '{}'",
+                        group_config.tag, use_name
+                    ))
+                })?;
+            for proxy in provider.get_proxies().await {
+                let tag = proxy.tag().to_string();
+                if !members.contains(&tag) {
+                    members.push(tag);
+                }
+            }
+        }
+
+        if members.is_empty() {
+            return Err(Error::config(format!(
+                "Proxy group '{}' has no outbounds after expanding 'use'",
+                group_config.tag
+            )));
+        }
+
+        group_config.options.insert(
+            "outbounds".to_string(),
+            nextjson::Value::Array(members.into_iter().map(nextjson::Value::String).collect()),
+        );
+        Ok(())
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -288,14 +430,16 @@ impl OutboundManager {
     /// Rebuild the proxy pool from the current configuration. Removed
     /// outbounds are dropped; the registry is replaced atomically.
     pub async fn reload(&self) -> Result<()> {
-        let new_list = {
+        let rebuilt = {
             let config = self.config.read().await;
-            // Reset the registry first so outbounds removed from the config
-            // do not linger and stay reachable by tag.
+            // Reset the registry and providers first so outbounds removed
+            // from the config do not linger and stay reachable by tag.
             self.proxies.write().await.clear();
-            Self::build_outbounds(&config, &self.proxies).await?
+            self.proxy_providers.clear().await;
+            Self::build_outbounds(&config, &self.proxies, &self.proxy_providers).await?
         };
-        *self.proxy_list.write() = new_list;
+        *self.proxy_list.write() = rebuilt.0;
+        *self.provider_tags.write() = rebuilt.1;
         tracing::info!(
             "OutboundManager reloaded {} proxies",
             self.proxy_list.read().len()
@@ -363,5 +507,146 @@ impl OutboundManager {
     pub fn get_selector_proxy(&self, group_tag: &str) -> Option<String> {
         let selections = get_global_selector_selections();
         selections.read().get(group_tag).cloned()
+    }
+}
+
+/// Bridge between the background provider updater and this manager's shared
+/// proxy registry: after providers are refreshed, replace the provider-owned
+/// registry entries so new nodes are immediately reachable by groups.
+#[async_trait::async_trait]
+impl crate::engine::provider_updater::ProviderRegistrySync for OutboundManager {
+    async fn sync_providers(&self) -> Result<()> {
+        self.sync_provider_proxies().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::config::{GeneralConfig, InboundConfig, InboundType};
+    use crate::engine::proxy_provider::{
+        set_runtime_proxy_providers, HealthCheckConfig, ProxyProviderConfig, ProxyProviderType,
+    };
+
+    fn test_config() -> Config {
+        Config {
+            general: GeneralConfig::default(),
+            dns: crate::engine::config::DnsConfig::default(),
+            inbounds: vec![InboundConfig {
+                inbound_type: InboundType::Mixed,
+                tag: "mixed-in".to_string(),
+                listen: "127.0.0.1".to_string(),
+                port: 17890,
+                options: Default::default(),
+            }],
+            outbounds: vec![
+                OutboundConfig {
+                    outbound_type: OutboundType::Direct,
+                    tag: "DIRECT".to_string(),
+                    server: None,
+                    port: None,
+                    options: Default::default(),
+                },
+                OutboundConfig {
+                    outbound_type: OutboundType::Selector,
+                    tag: "PROXY".to_string(),
+                    server: None,
+                    port: None,
+                    options: {
+                        let mut options = HashMap::new();
+                        options.insert(
+                            "use".to_string(),
+                            nextjson::Value::Array(vec![nextjson::Value::String(
+                                "sub".to_string(),
+                            )]),
+                        );
+                        options.insert(
+                            "outbounds".to_string(),
+                            nextjson::Value::Array(vec![nextjson::Value::String(
+                                "DIRECT".to_string(),
+                            )]),
+                        );
+                        options
+                    },
+                },
+            ],
+            rules: Vec::new(),
+        }
+    }
+
+    fn write_subscription(path: &std::path::Path, tags: &[&str]) {
+        let proxies: Vec<nextjson::Value> = tags
+            .iter()
+            .map(|tag| {
+                nextjson::from_str::<nextjson::Value>(&format!(
+                    r#"{{"type":"socks5","tag":"{tag}","server":"127.0.0.1","port":1080}}"#
+                ))
+                .expect("valid proxy json")
+            })
+            .collect();
+        let doc = nextjson::Value::Array(proxies);
+        let content = nextjson::to_string(&doc).expect("serialize subscription");
+        std::fs::write(path, content).expect("write subscription file");
+    }
+
+    #[tokio::test]
+    async fn proxy_providers_register_into_registry_and_sync() {
+        let dir =
+            std::env::temp_dir().join(format!("corduit-outbound-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sub_path = dir.join("sub.json");
+
+        // First generation: p1.
+        write_subscription(&sub_path, &["p1"]);
+        set_runtime_proxy_providers(vec![ProxyProviderConfig {
+            name: "sub".to_string(),
+            provider_type: ProxyProviderType::File,
+            url: None,
+            path: Some(sub_path.to_string_lossy().to_string()),
+            interval: 60,
+            health_check: HealthCheckConfig {
+                enable: false,
+                ..HealthCheckConfig::default()
+            },
+        }]);
+
+        let manager = OutboundManager::new(Arc::new(RwLock::new(test_config())))
+            .await
+            .expect("outbound manager builds with provider");
+        assert!(
+            manager.get_proxy_async("p1").await.is_some(),
+            "provider proxy p1 must be registered"
+        );
+
+        // Group `use: [sub]` must have expanded p1 into its members.
+        let group = manager
+            .get_proxy_async("PROXY")
+            .await
+            .expect("selector group exists");
+        let outbounds = group.tag().to_string();
+        assert_eq!(outbounds, "PROXY");
+
+        // Second generation: subscription now yields p2 (p1 gone).
+        write_subscription(&sub_path, &["p2"]);
+        manager
+            .proxy_provider_manager()
+            .reload_provider("sub")
+            .await
+            .expect("provider reload");
+        manager
+            .sync_provider_proxies()
+            .await
+            .expect("registry sync");
+
+        assert!(
+            manager.get_proxy_async("p2").await.is_some(),
+            "refreshed proxy p2 must be registered after sync"
+        );
+        assert!(
+            manager.get_proxy_async("p1").await.is_none(),
+            "stale proxy p1 must be removed after sync"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

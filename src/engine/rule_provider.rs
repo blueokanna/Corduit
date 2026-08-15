@@ -93,6 +93,11 @@ impl RuleProvider {
         &self.config.name
     }
 
+    /// The provider's configuration as loaded.
+    pub fn config(&self) -> &RuleProviderConfig {
+        &self.config
+    }
+
     pub fn behavior(&self) -> RuleProviderBehavior {
         self.config.behavior
     }

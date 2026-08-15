@@ -6,6 +6,15 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 
+/// Hook invoked after proxy providers are refreshed in the background, so the
+/// component that owns the live proxy registry can re-sync provider proxies.
+/// The refresh itself is owned by `ProxyProviderManager`; this hook closes the
+/// loop back to the registry (e.g. `OutboundManager`) without coupling the two.
+#[async_trait::async_trait]
+pub trait ProviderRegistrySync: Send + Sync {
+    async fn sync_providers(&self) -> Result<()>;
+}
+
 pub struct ProviderUpdaterConfig {
     pub check_interval: Duration,
     pub enable_proxy_provider_update: bool,
@@ -28,6 +37,9 @@ pub struct ProviderUpdater {
     config: ProviderUpdaterConfig,
     proxy_provider_manager: Option<Arc<ProxyProviderManager>>,
     rule_provider_manager: Option<Arc<RuleProviderManager>>,
+    /// Re-syncs the live proxy registry after provider refreshes so refreshed
+    /// nodes are actually reachable without a full reload.
+    proxy_registry_sync: Option<Arc<dyn ProviderRegistrySync>>,
     running: Arc<RwLock<bool>>,
     shutdown_tx: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
@@ -38,6 +50,7 @@ impl ProviderUpdater {
             config,
             proxy_provider_manager: None,
             rule_provider_manager: None,
+            proxy_registry_sync: None,
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: Arc::new(RwLock::new(None)),
         }
@@ -50,6 +63,11 @@ impl ProviderUpdater {
 
     pub fn with_rule_provider_manager(mut self, manager: Arc<RuleProviderManager>) -> Self {
         self.rule_provider_manager = Some(manager);
+        self
+    }
+
+    pub fn with_proxy_registry_sync(mut self, sync: Arc<dyn ProviderRegistrySync>) -> Self {
+        self.proxy_registry_sync = Some(sync);
         self
     }
 
@@ -71,10 +89,19 @@ impl ProviderUpdater {
         let config = self.config.clone();
         let proxy_manager = self.proxy_provider_manager.clone();
         let rule_manager = self.rule_provider_manager.clone();
+        let proxy_registry_sync = self.proxy_registry_sync.clone();
         let running = Arc::clone(&self.running);
 
         tokio::spawn(async move {
-            Self::update_loop(config, proxy_manager, rule_manager, running, shutdown_rx).await;
+            Self::update_loop(
+                config,
+                proxy_manager,
+                rule_manager,
+                proxy_registry_sync,
+                running,
+                shutdown_rx,
+            )
+            .await;
         });
 
         tracing::info!(
@@ -89,6 +116,7 @@ impl ProviderUpdater {
         config: ProviderUpdaterConfig,
         proxy_manager: Option<Arc<ProxyProviderManager>>,
         rule_manager: Option<Arc<RuleProviderManager>>,
+        proxy_registry_sync: Option<Arc<dyn ProviderRegistrySync>>,
         running: Arc<RwLock<bool>>,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
@@ -106,6 +134,16 @@ impl ProviderUpdater {
                     if config.enable_proxy_provider_update {
                         if let Some(ref manager) = proxy_manager {
                             Self::update_proxy_providers(manager).await;
+                            // Refreshed nodes are new proxy objects; re-sync the
+                            // shared registry so groups pick them up immediately.
+                            if let Some(ref sync) = proxy_registry_sync {
+                                if let Err(error) = sync.sync_providers().await {
+                                    tracing::warn!(
+                                        "Failed to re-sync proxy registry after provider update: {}",
+                                        error
+                                    );
+                                }
+                            }
                         }
                     }
 

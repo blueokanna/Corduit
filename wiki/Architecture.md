@@ -22,10 +22,12 @@ flowchart TB
 
     ENGINE --> EC["config/<br/>校验过的配置模型"]
     ENGINE --> EI["inbound/<br/>HTTP / SOCKS5 / mixed 监听"]
-    ENGINE --> EO["outbound/<br/>Direct/SS/VMess/VLESS/Trojan/TUIC/Hy2/WireGuard..."]
-    ENGINE --> ER["routing.rs<br/>规则 → 出站匹配"]
+    ENGINE --> EO["outbound/<br/>Direct/SS/VMess/VLESS/Trojan/TUIC/Hy2/WireGuard...<br/>+ proxy-provider 节点注册表"]
+    ENGINE --> ER["routing.rs<br/>规则 → 出站匹配 + rule-provider 管理"]
     ENGINE --> EG["geoip.rs + mmdb.rs<br/>CountryMatcher + MMDB 读取"]
     ENGINE --> EP["proxy.rs<br/>ProxyManager 协调器"]
+    ENGINE --> EU["provider_updater.rs<br/>后台：订阅/规则刷新 + 健康检查"]
+    ENGINE --> EPP["proxy_provider.rs<br/>ProxyProviderManager（订阅节点）"]
     ENGINE --> ET["traffic_stats.rs<br/>流量统计"]
 ```
 
@@ -95,6 +97,25 @@ sequenceDiagram
 ```
 
 > 注意：`ProxyManager::reload` 先替换配置、释放写锁，再让各子管理器各自拿读锁重载。Tokio 的 `RwLock` 不可重入，持写锁等读锁会死锁——这是刻意设计。
+
+重载时 provider 的同步（`Router::reload` + `OutboundManager::reload`）：
+
+```mermaid
+sequenceDiagram
+    participant R as Router
+    participant RPM as RuleProviderManager
+    participant O as OutboundManager
+    participant PPM as ProxyProviderManager
+
+    R->>R: 重编译规则 + 默认出站
+    R->>RPM: 删除消失的 provider；新增/替换配置变化的；未变的不动
+    O->>O: 清空注册表 + 清空 provider
+    O->>PPM: 按 runtime 配置重新加载订阅，节点重新注册
+    PPM-->>O: 节点按 tag 进入共享注册表
+    O-->>R: ok
+```
+
+ProviderUpdater 在 `Corduit::start` 时启动、`stop` 时停止，默认 60 秒 tick，按各自 `interval` 刷新订阅/规则并跑健康检查（见 [Rules](Rules#6-后台-providerupdater)）。
 
 ## 安全边界
 
