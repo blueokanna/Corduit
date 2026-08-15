@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
+mod forward;
 mod http;
 mod mixed;
 mod socks5;

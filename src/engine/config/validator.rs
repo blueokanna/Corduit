@@ -191,39 +191,16 @@ impl ConfigValidator {
                 OutboundType::Direct | OutboundType::Reject => {
                     // Direct and Reject don't need server/port
                 }
-                OutboundType::Socks5 | OutboundType::Http => {
-                    if outbound.server.is_none() {
-                        return Err(Error::config(format!(
-                            "Outbound {} requires server address",
-                            outbound.tag
-                        )));
-                    }
-                    if outbound.port.is_none() {
-                        return Err(Error::config(format!(
-                            "Outbound {} requires server port",
-                            outbound.tag
-                        )));
-                    }
-                }
-                OutboundType::Shadowsocks
+                OutboundType::Socks5
+                | OutboundType::Http
+                | OutboundType::Shadowsocks
                 | OutboundType::Vmess
                 | OutboundType::Vless
                 | OutboundType::Trojan
                 | OutboundType::Wireguard
                 | OutboundType::Tuic
                 | OutboundType::Hysteria2 => {
-                    if outbound.server.is_none() {
-                        return Err(Error::config(format!(
-                            "Outbound {} requires server address",
-                            outbound.tag
-                        )));
-                    }
-                    if outbound.port.is_none() {
-                        return Err(Error::config(format!(
-                            "Outbound {} requires server port",
-                            outbound.tag
-                        )));
-                    }
+                    Self::require_outbound_endpoint(outbound)?;
                 }
                 OutboundType::Quic => {
                     return Err(Error::config(format!(
@@ -249,6 +226,37 @@ impl ConfigValidator {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Validate that a server-based outbound has a non-empty server and a
+    /// valid port (1..=65535).
+    fn require_outbound_endpoint(outbound: &OutboundConfig) -> Result<()> {
+        let server = outbound
+            .server
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "Outbound '{}' requires a non-empty server address",
+                    outbound.tag
+                ))
+            })?;
+
+        let port = outbound.port.ok_or_else(|| {
+            Error::config(format!(
+                "Outbound '{}' requires a server port",
+                outbound.tag
+            ))
+        })?;
+        if port == 0 {
+            return Err(Error::config(format!(
+                "Outbound '{}' has invalid server port: must be between 1 and 65535",
+                outbound.tag
+            )));
+        }
+        let _ = server;
         Ok(())
     }
 
@@ -324,6 +332,61 @@ impl ConfigValidator {
                     "Rule references non-existent outbound: {}",
                     rule.outbound
                 )));
+            }
+        }
+
+        // Proxy groups (selector/url-test/fallback/load-balance/relay) reference
+        // other outbounds by tag through their `outbounds` option. Validate those
+        // references eagerly so a typo fails config validation instead of at
+        // runtime when traffic is routed.
+        for outbound in &config.outbounds {
+            if !matches!(
+                outbound.outbound_type,
+                OutboundType::Selector
+                    | OutboundType::Urltest
+                    | OutboundType::Fallback
+                    | OutboundType::Loadbalance
+                    | OutboundType::Relay
+            ) {
+                continue;
+            }
+
+            let Some(outbounds_value) = outbound.options.get("outbounds") else {
+                return Err(Error::config(format!(
+                    "Proxy group '{}' requires an 'outbounds' list",
+                    outbound.tag
+                )));
+            };
+
+            let members: Vec<String> = if let Some(arr) = outbounds_value.as_array() {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            } else if let Some(s) = outbounds_value.as_str() {
+                nextjson::from_str::<Vec<String>>(s).unwrap_or_default()
+            } else {
+                return Err(Error::config(format!(
+                    "Proxy group '{}' has an invalid 'outbounds' value",
+                    outbound.tag
+                )));
+            };
+
+            if members.is_empty() {
+                return Err(Error::config(format!(
+                    "Proxy group '{}' must reference at least one outbound",
+                    outbound.tag
+                )));
+            }
+
+            for member in &members {
+                let is_builtin =
+                    member.eq_ignore_ascii_case("direct") || member.eq_ignore_ascii_case("reject");
+                if !is_builtin && !outbound_tags.contains(member.as_str()) {
+                    return Err(Error::config(format!(
+                        "Proxy group '{}' references non-existent outbound: {}",
+                        outbound.tag, member
+                    )));
+                }
             }
         }
 

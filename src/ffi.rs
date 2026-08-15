@@ -288,7 +288,10 @@ mod tests {
         unsafe {
             let s = CStr::from_ptr(resp.data).to_str().unwrap().to_string();
             drop(CString::from_raw(resp.data));
-            assert!(s.contains("version") || s.contains("0.1"), "unexpected: {s}");
+            assert!(
+                s.contains("version") || s.contains("0.1"),
+                "unexpected: {s}"
+            );
         }
     }
 
@@ -304,7 +307,8 @@ mod tests {
             if resp.code == 0 && !resp.data.is_null() {
                 let bytes = std::slice::from_raw_parts(resp.data, resp.len).to_vec();
                 corduit_binary_free(resp);
-                let v: nextjson::Value = rustbinary::deserialize(&bytes).unwrap_or(nextjson::Value::Null);
+                let v: nextjson::Value =
+                    rustbinary::deserialize(&bytes).unwrap_or(nextjson::Value::Null);
                 let _ = v;
             }
         }

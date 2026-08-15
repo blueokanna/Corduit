@@ -365,8 +365,9 @@ async fn run_websocket(upgraded: hyper::upgrade::Upgraded) -> Result<(), ServerE
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_WS_MESSAGE))
         .max_frame_size(Some(MAX_WS_MESSAGE));
-    let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(ws_config))
-        .await;
+    let mut ws =
+        WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(ws_config))
+            .await;
 
     while let Some(msg) = ws.next().await {
         let msg = msg.map_err(|e| ServerError(format!("websocket read: {e}")))?;
@@ -477,7 +478,10 @@ fn json_response(status: StatusCode, body: &str) -> Response<BoxBody<Bytes, hype
         .header(CONTENT_TYPE, "application/json")
         .header("Access-Control-Allow-Origin", "*")
         .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        .header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        .header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type",
+        )
         .header("Access-Control-Max-Age", "86400")
         .body(
             Full::new(Bytes::from(body.to_string()))
@@ -493,13 +497,12 @@ fn cors_response(status: StatusCode, body: Bytes) -> Response<BoxBody<Bytes, hyp
         .status(status)
         .header("Access-Control-Allow-Origin", "*")
         .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        .header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        .header("Access-Control-Max-Age", "86400")
-        .body(
-            Full::new(body)
-                .map_err(|never| match never {})
-                .boxed(),
+        .header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type",
         )
+        .header("Access-Control-Max-Age", "86400")
+        .body(Full::new(body).map_err(|never| match never {}).boxed())
         .expect("static response")
 }
 
@@ -517,13 +520,10 @@ mod tests {
         server.spawn()
     }
 
-    async fn post_rpc(
-        addr: SocketAddr,
-        token: Option<&str>,
-        body: &str,
-    ) -> (StatusCode, String) {
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http();
+    async fn post_rpc(addr: SocketAddr, token: Option<&str>, body: &str) -> (StatusCode, String) {
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http();
         let mut builder = Request::builder()
             .method(Method::POST)
             .uri(format!("http://{addr}/rpc"))
@@ -543,8 +543,9 @@ mod tests {
     #[tokio::test]
     async fn health_endpoint_is_open() {
         let h = spawn_test_server().await;
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http();
         let resp = client
             .request(
                 Request::builder()
@@ -608,7 +609,10 @@ mod tests {
     #[tokio::test]
     async fn oversize_body_is_rejected() {
         let h = spawn_test_server().await;
-        let big = format!(r#"{{"method":"x","params":{{"pad":"{}"}}}}"#, "a".repeat(MAX_REQUEST_BODY + 1));
+        let big = format!(
+            r#"{{"method":"x","params":{{"pad":"{}"}}}}"#,
+            "a".repeat(MAX_REQUEST_BODY + 1)
+        );
         let (status, _) = post_rpc(h.addr(), Some("test-token-123"), &big).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         h.stop();
@@ -620,8 +624,12 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let uri = format!("ws://{}/ws?token=test-token-123", h.addr());
         let req = uri.into_client_request().unwrap();
-        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("connect");
-        ws.send(Message::text(r#"{"method":"get_version"}"#)).await.unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("connect");
+        ws.send(Message::text(r#"{"method":"get_version"}"#))
+            .await
+            .unwrap();
         let msg = ws.next().await.unwrap().unwrap();
         let text = msg.into_text().unwrap();
         let parsed: nextjson::Value = nextjson::from_str(&text).unwrap();

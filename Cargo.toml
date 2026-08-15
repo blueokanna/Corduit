@@ -11,7 +11,6 @@ readme = "README.md"
 keywords = ["proxy", "protocol", "network", "tun", "rust"]
 categories = ["network-programming", "web-programming", "asynchronous"]
 
-# Protocol feature-gated modules (all enabled by default).
 [features]
 default = ["quic", "tls", "wireguard", "tuic", "tuic-quinn"]
 quic = []
@@ -43,7 +42,6 @@ tzcraft = { version = "0.1.0", features = ["std", "serde", "binary"] }
 # --- tracing / telemetry -----------------------------------------------------
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-android = "0.2"
 
 # --- HTTP --------------------------------------------------------------------
 h2 = "0.4"
@@ -99,11 +97,10 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
 socket2 = { version = "0.6", features = ["all"] }
 sysinfo = "0.39.6"
 tun-rs = { version = "2.8.8", features = ["async", "async_framed"] }
+
+[target.'cfg(windows)'.dependencies]
 wintun-bindings = { version = "0.7.39", features = ["async"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-
-# --- platform bindings -------------------------------------------------------
-jni = "0.22"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
@@ -113,6 +110,10 @@ windows = { version = "0.62.2", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+tracing-android = "0.2"
 
 [dev-dependencies]
 proptest = "1.11.0"

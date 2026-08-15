@@ -12,11 +12,9 @@ use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-//SETTING HTTP PACKAGE BYTES LIMIT
-const MAX_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// HTTP proxy inbound listener
 pub struct HttpInbound {
     config: InboundConfig,
@@ -319,23 +317,9 @@ impl HttpInbound {
             .get_proxy(&outbound_tag)
             .ok_or_else(|| Error::config(format!("Outbound '{}' not found", outbound_tag)))?;
 
-        // Build the HTTP request to send to the target
         let method = req.method().clone();
         let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-        let mut request_bytes = Vec::new();
-        request_bytes.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method, path).as_bytes());
-
-        // Forward headers, excluding proxy-specific ones
-        for (key, value) in req.headers() {
-            let key_lower = key.as_str().to_lowercase();
-            if key_lower != "proxy-connection" && key_lower != "proxy-authorization" {
-                request_bytes.extend_from_slice(
-                    format!("{}: {}\r\n", key, value.to_str().unwrap_or("")).as_bytes(),
-                );
-            }
-        }
-        request_bytes.extend_from_slice(b"\r\n");
+        let is_head = method == Method::HEAD;
 
         let target = TargetAddr::new_domain(host.clone(), port);
         let (client_side, server_side) = tokio::io::duplex(64 * 1024);
@@ -344,139 +328,37 @@ impl HttpInbound {
 
         let (mut read_half, mut write_half) = tokio::io::split(client_side);
 
-        // Write the request head, then stream the body chunk-by-chunk. Buffering
-        // the whole body (an unbounded `collect()`) lets a client exhaust memory
-        // with a single oversized POST.
-        write_half
-            .write_all(&request_bytes)
-            .await
-            .map_err(|e| Error::network(format!("Failed to write request head: {}", e)))?;
-
-        let mut body = req.into_body();
-        loop {
-            let frame = tokio::time::timeout(std::time::Duration::from_secs(60), body.frame())
-                .await
-                .map_err(|_| Error::network("Request body read timed out"))?
-                .transpose()
-                .map_err(|e| Error::network(format!("Failed to read request body: {}", e)))?;
-            let Some(frame) = frame else { break };
-            if let Some(data) = frame.data_ref() {
-                write_half
-                    .write_all(data)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to write request body: {}", e)))?;
-            }
-        }
+        // Re-serialize the request with correct HTTP/1.1 framing: hop-by-hop
+        // headers are stripped and any body is re-encoded as chunked (hyper has
+        // already decoded the client's framing, so forwarding it verbatim would
+        // desync the origin — CWE-444). The body is streamed, never buffered.
+        let forwarded_headers = req.headers().clone();
+        crate::engine::inbound::forward::send_request(
+            &mut write_half,
+            &method,
+            path,
+            &forwarded_headers,
+            &host,
+            port,
+            req.into_body(),
+        )
+        .await?;
 
         write_half
             .shutdown()
             .await
             .map_err(|e| Error::network(format!("Failed to shutdown write: {}", e)))?;
 
-        // Read the response with a timeout
-        let mut response_buf = Vec::new();
-        let mut temp_buf = [0u8; 8192];
-        let mut headers_complete = false;
-        let mut content_length: Option<usize> = None;
-        let mut body_read = 0usize;
-
-        let read_timeout = tokio::time::Duration::from_secs(30);
-        let start = tokio::time::Instant::now();
-
-        loop {
-            if start.elapsed() > read_timeout {
-                break;
-            }
-
-            let read_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
-                read_half.read(&mut temp_buf),
-            )
-            .await;
-
-            match read_result {
-                Ok(Ok(0)) => break, // EOF
-                Ok(Ok(n)) => {
-                    response_buf.extend_from_slice(&temp_buf[..n]);
-                    if response_buf.len() > MAX_HTTP_RESPONSE_BYTES {
-                        return Err(Error::network(format!(
-                            "HTTP proxy response exceeded {} bytes",
-                            MAX_HTTP_RESPONSE_BYTES
-                        )));
-                    }
-
-                    // Check if we've received complete headers
-                    if !headers_complete {
-                        if let Some(header_end) = find_header_end(&response_buf) {
-                            headers_complete = true;
-                            // Parse Content-Length if present
-                            let headers_str = String::from_utf8_lossy(&response_buf[..header_end]);
-                            for line in headers_str.lines() {
-                                if line.to_lowercase().starts_with("content-length:") {
-                                    if let Some(len_str) = line.split(':').nth(1) {
-                                        content_length = len_str.trim().parse().ok();
-                                    }
-                                }
-                            }
-                            body_read = response_buf.len() - header_end - 4; // 4 for \r\n\r\n
-                        }
-                    } else {
-                        body_read += n;
-                    }
-
-                    // Check if we've received the complete response
-                    if headers_complete {
-                        if let Some(cl) = content_length {
-                            if body_read >= cl {
-                                break;
-                            }
-                        } else {
-                            // No Content-Length, check for Connection: close or chunked encoding
-                            // For simplicity, continue reading until timeout or EOF
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::debug!("Read error: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - if we have headers, we might have the complete response
-                    if headers_complete && !response_buf.is_empty() {
-                        break;
-                    }
-                }
-            }
-        }
+        // Parse the origin's raw response into a real hyper Response so it is
+        // re-framed correctly for the client (status + headers + de-chunked,
+        // size-bounded body).
+        let response =
+            crate::engine::inbound::forward::read_http_response(&mut read_half, is_head).await?;
 
         // Cleanup - relay_handle should complete when remote closes connection
         let _ = relay_handle.await;
 
-        if response_buf.is_empty() {
-            return Err(Error::network("No response received from server"));
-        }
-
-        // Parse the response status from the raw data
-        let response_str = String::from_utf8_lossy(&response_buf);
-        let status_code = if let Some(first_line) = response_str.lines().next() {
-            // Parse "HTTP/1.1 200 OK" format
-            first_line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(200)
-        } else {
-            200
-        };
-
-        Ok(Response::builder()
-            .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK))
-            .body(
-                Full::new(Bytes::from(response_buf))
-                    .map_err(|_| std::io::Error::other("body error"))
-                    .boxed(),
-            )
-            .unwrap())
+        Ok(response)
     }
 
     fn parse_connect_uri(uri: &Uri) -> Option<(String, u16)> {
@@ -555,9 +437,4 @@ impl HttpInbound {
 
         Ok(())
     }
-}
-
-/// Find the end of HTTP headers (position of \r\n\r\n)
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    (0..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
 }
