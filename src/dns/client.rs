@@ -6,6 +6,7 @@ use crate::dns::error::{DnsError, Result};
 use crate::dns::wire::{
     BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RecordType,
 };
+use crate::protocol::tls::{ClientConfig as TlsClientConfig, TlsConnector};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +32,7 @@ pub struct DnsClient {
     /// Query timeout
     timeout: Duration,
     /// TLS connector for DoT/DoH
-    tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
+    tls_connector: Option<Arc<TlsConnector>>,
 }
 
 impl DnsClient {
@@ -53,16 +54,15 @@ impl DnsClient {
         })
     }
 
-    /// Create TLS connector
-    fn create_tls_connector() -> Result<tokio_rustls::TlsConnector> {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
+    /// Create TLS connector (courierust, system roots)
+    fn create_tls_connector() -> Result<TlsConnector> {
+        TlsConnector::new(TlsClientConfig {
+            server_name: None,
+            alpn: Vec::new(),
+            skip_cert_verify: false,
+            enable_sni: true,
+        })
+        .map_err(|e| DnsError::Tls(format!("Failed to create TLS connector: {e}")))
     }
 
     /// Query DNS
@@ -157,29 +157,26 @@ impl DnsClient {
         Ok(response)
     }
 
-    /// Query via DNS over TLS (DoT)
+    /// Query via DNS over TLS (DoT) — courierust TLS bridged to tokio.
     async fn query_dot(&self, message: &Message) -> Result<Message> {
         let addr = self.resolve_address().await?;
         let connector = self
             .tls_connector
             .as_ref()
-            .ok_or(DnsError::Tls("TLS connector not initialized".to_string()))?;
-
+            .ok_or(DnsError::Tls("TLS connector not initialized".to_string()))?
+            .clone();
         let server_name = self
             .config
             .server_name
-            .as_ref()
+            .clone()
+            .or_else(|| Some(self.config.address.clone()))
             .ok_or(DnsError::Config("Server name required for DoT".to_string()))?;
-
-        let server_name = rustls::pki_types::ServerName::try_from(server_name.as_str())
-            .map_err(|e| DnsError::Tls(format!("Invalid server name: {}", e)))?
-            .to_owned();
 
         let tcp_stream = timeout(self.timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| DnsError::Timeout)??;
 
-        let mut tls_stream = timeout(self.timeout, connector.connect(server_name, tcp_stream))
+        let mut tls_stream = timeout(self.timeout, connector.connect(tcp_stream, &server_name))
             .await
             .map_err(|_| DnsError::Timeout)?
             .map_err(|e| DnsError::Tls(e.to_string()))?;
@@ -188,105 +185,84 @@ impl DnsClient {
             .to_bytes()
             .map_err(|e| DnsError::Protocol(e.to_string()))?;
 
-        // TCP DNS uses 2-byte length prefix
+        // TCP DNS uses 2-byte length prefix (RFC 7858).
         let len = (data.len() as u16).to_be_bytes();
         tls_stream.write_all(&len).await?;
         tls_stream.write_all(&data).await?;
 
-        // Read response length
+        // Read response length.
         let mut len_buf = [0u8; 2];
         timeout(self.timeout, tls_stream.read_exact(&mut len_buf))
             .await
             .map_err(|_| DnsError::Timeout)??;
         let len = u16::from_be_bytes(len_buf) as usize;
 
-        // Read response
+        // Read response.
         let mut buf = vec![0u8; len];
         timeout(self.timeout, tls_stream.read_exact(&mut buf))
             .await
             .map_err(|_| DnsError::Timeout)??;
 
-        let response = Message::from_bytes(&buf).map_err(|e| DnsError::Protocol(e.to_string()))?;
-        Ok(response)
+        Message::from_bytes(&buf).map_err(|e| DnsError::Protocol(e.to_string()))
     }
 
-    /// Query via DNS over HTTPS (DoH)
+    /// Query via DNS over HTTPS (DoH) — courierust HTTP client.
     async fn query_doh(&self, message: &Message) -> Result<Message> {
         let data = message
             .to_bytes()
             .map_err(|e| DnsError::Protocol(e.to_string()))?;
 
-        // Build DoH URL
-        let host = &self.config.address;
-        let path = self.config.path.as_deref().unwrap_or("/dns-query");
+        // Build the DoH URL.
+        let host = self.config.address.clone();
+        let path = self
+            .config
+            .path
+            .clone()
+            .unwrap_or_else(|| "/dns-query".to_string());
         let port = self.config.port.unwrap_or(443);
+        let url = format!("https://{host}:{port}{path}");
 
-        // Use base64url encoding for GET request
-        let _encoded = crate::crypto::encoding::encode(
-            &data,
-            crate::crypto::encoding::Config::URL_SAFE_NO_PAD,
-        );
-
-        let url = format!("https://{}:{}{}", host, port, path);
-
-        // For simplicity, we'll use POST with application/dns-message
-        // A full implementation would use hyper client
         debug!("DoH query to {}", url);
 
-        // Create TLS connection
-        let connector = self
-            .tls_connector
-            .as_ref()
-            .ok_or(DnsError::Tls("TLS connector not initialized".to_string()))?;
+        // courierust client (blocking engine bridged to tokio).
+        let client = build_doh_client(self.timeout);
+        let url = url.clone();
+        let data = data.clone();
+        let body = tokio::task::spawn_blocking(move || {
+            let mut req =
+                courierust::courierust_http::Request::<courierust::courierust_body::Body>::new(
+                    courierust::courierust_http::Method::POST,
+                    "/",
+                );
+            req.headers.insert(
+                courierust::courierust_http::HeaderName::from_static("content-type"),
+                courierust::courierust_http::HeaderValue::from_static("application/dns-message"),
+            );
+            req.headers.insert(
+                courierust::courierust_http::HeaderName::from_static("accept"),
+                courierust::courierust_http::HeaderValue::from_static("application/dns-message"),
+            );
+            req.body = courierust::courierust_body::Body::from(data);
+            let resp = client
+                .execute(&url, req)
+                .map_err(|e| DnsError::Http(format!("DoH request failed: {e}")))?;
+            let status = resp.status.as_u16();
+            if status != 200 {
+                return Err(DnsError::Http(format!(
+                    "DoH server returned status {status}"
+                )));
+            }
+            let body = resp
+                .body
+                .collect_limited(128 * 1024)
+                .map_err(|e| DnsError::Http(format!("DoH response too large: {e}")))?;
+            Ok::<Vec<u8>, DnsError>(body.to_vec())
+        })
+        .await
+        .map_err(|e| DnsError::Http(format!("DoH worker panicked: {e}")))?;
 
-        let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-            .map_err(|e| DnsError::Tls(format!("Invalid server name: {}", e)))?
-            .to_owned();
-
-        let addr = self.resolve_address().await?;
-        let tcp_stream = timeout(self.timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| DnsError::Timeout)??;
-
-        let mut tls_stream = timeout(self.timeout, connector.connect(server_name, tcp_stream))
-            .await
-            .map_err(|_| DnsError::Timeout)?
-            .map_err(|e| DnsError::Tls(e.to_string()))?;
-
-        // Build HTTP/1.1 POST request
-        let request = format!(
-            "POST {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Content-Type: application/dns-message\r\n\
-             Accept: application/dns-message\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            path,
-            host,
-            data.len()
-        );
-
-        tls_stream.write_all(request.as_bytes()).await?;
-        tls_stream.write_all(&data).await?;
-
-        // Read HTTP response
-        let mut response_buf = Vec::new();
-        timeout(self.timeout, tls_stream.read_to_end(&mut response_buf))
-            .await
-            .map_err(|_| DnsError::Timeout)??;
-
-        // Parse HTTP response (simple parsing)
-        let response_str = String::from_utf8_lossy(&response_buf);
-        let body_start = response_str
-            .find("\r\n\r\n")
-            .ok_or(DnsError::Http("Invalid HTTP response".to_string()))?
-            + 4;
-
-        let body = &response_buf[body_start..];
-
-        let response = Message::from_bytes(body).map_err(|e| DnsError::Protocol(e.to_string()))?;
-        Ok(response)
+        let body = body?;
+        Message::from_bytes(&body).map_err(|e| DnsError::Protocol(e.to_string()))
     }
 
     /// Resolve upstream server address
@@ -340,6 +316,41 @@ pub fn create_clients(servers: &[String], timeout: Duration) -> Vec<DnsClient> {
             UpstreamConfig::parse(s).and_then(|config| DnsClient::new(config, timeout).ok())
         })
         .collect()
+}
+
+/// Build a courierust HTTP client for DoH queries (system roots, HTTP/2,
+/// bounded bodies).
+fn build_doh_client(timeout: Duration) -> courierust::courierust_client::Client {
+    use courierust::courierust_client::{ClientConfig, TlsSettings};
+    use courierust::courierust_tls::TlsVersion;
+
+    let tls = TlsSettings {
+        roots: crate::common::roots::system_root_store().clone(),
+        verify: true,
+        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        now: unix_now(),
+        min_version: TlsVersion::Tls12,
+        max_version: TlsVersion::Tls13,
+    };
+    courierust::courierust_client::Client::with_config(ClientConfig {
+        http2: true,
+        max_redirects: 3,
+        max_body: 128 * 1024,
+        max_header_list: 16 * 1024,
+        connect_timeout: Some(timeout),
+        read_timeout: Some(timeout),
+        handshake_timeout: Some(timeout),
+        tls: Some(tls),
+        ..Default::default()
+    })
+}
+
+/// Current Unix time in seconds (for certificate validity checks).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

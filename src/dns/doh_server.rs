@@ -1,39 +1,40 @@
-//! DNS over HTTPS (DoH) server implementation
+//! DNS over HTTPS (DoH) server — RFC 8484, on courierust.
 //!
-//! RFC 8484 compliant DoH server supporting both GET and POST methods.
+//! The HTTP/1.1 server is [`crate::common::http_server::HttpServer`]
+//! (courierust's H/1 codec + TLS). The synchronous handler bridges into the
+//! async resolver with a captured `tokio::runtime::Handle`, so the engine's
+//! DNS resolver stays fully async while each DoH request is answered on a
+//! dedicated server thread.
 
+use crate::common::http_server::{error_response, HttpServer, HttpServerConfig, TlsIdentity};
 use crate::crypto::encoding::{decode as b64_decode, Config as B64Config};
 use crate::dns::error::{DnsError, Result};
 use crate::dns::resolver::DnsResolver;
-use crate::dns::wire::{BinDecodable, BinEncodable, Message, RData, Record, ResponseCode};
-use crate::dns::RecordType;
-use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pki_types::pem::PemObject;
-use std::net::{IpAddr, SocketAddr};
+use crate::dns::wire::{BinDecodable, BinEncodable, Message};
+use courierust::courierust_http::{
+    Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
+};
+use courierust::courierust_tls::TlsVersion;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::sync::broadcast;
-use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, trace, warn};
+use tokio::sync::{broadcast, Mutex};
+use tracing::{info, warn};
 
-/// DoH server configuration
+/// Cap for a POSTed DNS message (a DNS message is at most 65535 bytes).
+const MAX_DOH_BODY: usize = 65_536;
+
+/// DoH server configuration.
 #[derive(Debug, Clone)]
 pub struct DohServerConfig {
-    /// Listen address
+    /// Listen address.
     pub listen: SocketAddr,
-    /// TLS certificate path
+    /// TLS certificate path.
     pub cert_path: String,
-    /// TLS private key path
+    /// TLS private key path.
     pub key_path: String,
-    /// DNS query path (default: /dns-query)
+    /// DNS query path (default: /dns-query).
     pub path: String,
-    /// Enable HTTP/2
+    /// Enable HTTP/2.
     pub http2: bool,
 }
 
@@ -49,325 +50,193 @@ impl Default for DohServerConfig {
     }
 }
 
-/// DNS over HTTPS server
+/// DNS over HTTPS server.
 pub struct DohServer {
-    /// Configuration
+    /// Configuration.
     config: DohServerConfig,
-    /// DNS resolver
+    /// DNS resolver.
     resolver: Arc<DnsResolver>,
-    /// TLS acceptor
-    tls_acceptor: Option<TlsAcceptor>,
-    /// Shutdown signal sender
+    /// The underlying blocking HTTP server (bound lazily in `start`).
+    server: Mutex<Option<HttpServer>>,
+    /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
 }
 
 impl DohServer {
-    /// Create a new DoH server
+    /// Create a new DoH server.
     pub fn new(config: DohServerConfig, resolver: Arc<DnsResolver>) -> Result<Self> {
-        let tls_acceptor = if !config.cert_path.is_empty() && !config.key_path.is_empty() {
-            Some(Self::create_tls_acceptor(
-                &config.cert_path,
-                &config.key_path,
+        let (shutdown_tx, _) = broadcast::channel(1);
+        Ok(Self {
+            config,
+            resolver,
+            server: Mutex::new(None),
+            shutdown_tx,
+        })
+    }
+
+    /// Start the DoH server. Returns after the server is bound and
+    /// listening; blocks (as an async task) until [`Self::stop`] is called.
+    pub async fn start(&self) -> Result<()> {
+        let tls = if !self.config.cert_path.is_empty() && !self.config.key_path.is_empty() {
+            Some(TlsIdentity::from_pem_files(
+                &self.config.cert_path,
+                &self.config.key_path,
             )?)
         } else {
             None
         };
 
-        let (shutdown_tx, _) = broadcast::channel(1);
-
-        Ok(Self {
-            config,
-            resolver,
-            tls_acceptor,
-            shutdown_tx,
-        })
-    }
-
-    /// Create TLS acceptor from certificate and key files
-    fn create_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-        let certs = Self::load_certs(cert_path)?;
-        let key = Self::load_private_key(key_path)?;
-
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| DnsError::Tls(format!("TLS config error: {}", e)))?;
-
-        Ok(TlsAcceptor::from(Arc::new(config)))
-    }
-
-    /// Load certificates from PEM file
-    fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
-            .map_err(|e| DnsError::Config(format!("Failed to open cert file: {}", e)))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| DnsError::Config(format!("Failed to parse certificate: {}", e)))?;
-
-        if certs.is_empty() {
-            return Err(DnsError::Config(
-                "No certificates found in file".to_string(),
-            ));
-        }
-
-        Ok(certs)
-    }
-
-    /// Load private key from PEM file
-    fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-        PrivateKeyDer::from_pem_file(path)
-            .map_err(|e| DnsError::Config(format!("No private key found in file: {}", e)))
-    }
-
-    /// Start the DoH server
-    pub async fn start(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.config.listen).await?;
-        info!("DoH server listening on {}", self.config.listen);
-
         let resolver = self.resolver.clone();
         let path = self.config.path.clone();
-        let tls_acceptor = self.tls_acceptor.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let runtime = tokio::runtime::Handle::current();
 
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, addr)) => {
-                            let resolver = resolver.clone();
-                            let path = path.clone();
-                            let tls_acceptor = tls_acceptor.clone();
+        let handler =
+            Arc::new(move |req: Request<Body>| handle_request(req, &resolver, &path, &runtime));
 
-                            tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(
-                                    stream,
-                                    addr,
-                                    resolver,
-                                    path,
-                                    tls_acceptor,
-                                ).await {
-                                    debug!("DoH connection error from {}: {}", addr, e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("DoH accept error: {}", e);
-                        }
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("DoH server shutting down");
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle a single connection
-    async fn handle_connection(
-        stream: tokio::net::TcpStream,
-        addr: SocketAddr,
-        resolver: Arc<DnsResolver>,
-        path: String,
-        tls_acceptor: Option<TlsAcceptor>,
-    ) -> Result<()> {
-        trace!("DoH connection from {}", addr);
-
-        if let Some(acceptor) = tls_acceptor {
-            let tls_stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {}", e)))?;
-
-            let io = TokioIo::new(tls_stream);
-            let service = service_fn(move |req| {
-                let resolver = resolver.clone();
-                let path = path.clone();
-                async move { Self::handle_request(req, resolver, path).await }
-            });
-
-            hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
-                .map_err(|e| DnsError::Http(format!("HTTP error: {}", e)))?;
-        } else {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req| {
-                let resolver = resolver.clone();
-                let path = path.clone();
-                async move { Self::handle_request(req, resolver, path).await }
-            });
-
-            hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
-                .map_err(|e| DnsError::Http(format!("HTTP error: {}", e)))?;
-        }
-
-        Ok(())
-    }
-
-    /// Handle HTTP request
-    async fn handle_request(
-        req: Request<Incoming>,
-        resolver: Arc<DnsResolver>,
-        expected_path: String,
-    ) -> std::result::Result<Response<Full<Bytes>>, hyper::Error> {
-        let path = req.uri().path();
-
-        if path != expected_path {
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from("Not Found")))
-                .unwrap());
-        }
-
-        let result = match *req.method() {
-            Method::GET => Self::handle_get_request(&req, &resolver).await,
-            Method::POST => Self::handle_post_request(req, &resolver).await,
-            _ => {
-                return Ok(Response::builder()
-                    .status(StatusCode::METHOD_NOT_ALLOWED)
-                    .body(Full::new(Bytes::from("Method Not Allowed")))
-                    .unwrap());
-            }
+        let cfg = HttpServerConfig {
+            listen: self.config.listen,
+            tls,
+            min_version: TlsVersion::Tls12,
+            max_version: TlsVersion::Tls13,
+            max_head: 16 * 1024,
+            max_body: MAX_DOH_BODY,
+            read_timeout: Some(std::time::Duration::from_secs(30)),
+            tunnel_handler: None,
+            handler,
         };
 
-        match result {
-            Ok(dns_response) => {
-                let response_bytes = dns_response.to_bytes().unwrap_or_else(|_| vec![]);
+        let mut server = HttpServer::bind(cfg)?;
+        server.start()?;
+        info!("DoH server listening on {}", server.local_addr()?);
+        *self.server.lock().await = Some(server);
 
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "application/dns-message")
-                    .header("Cache-Control", "max-age=300")
-                    .body(Full::new(Bytes::from(response_bytes)))
-                    .unwrap())
-            }
-            Err(e) => {
-                warn!("DoH query error: {}", e);
-                Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from(format!("DNS Error: {}", e))))
-                    .unwrap())
-            }
+        // Wait for shutdown, then tear the listener down.
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let _ = shutdown_rx.recv().await;
+        if let Some(mut s) = self.server.lock().await.take() {
+            s.shutdown();
         }
+        info!("DoH server stopped");
+        Ok(())
     }
 
-    /// Handle GET request (base64url encoded DNS query in ?dns= parameter)
-    async fn handle_get_request(
-        req: &Request<Incoming>,
-        resolver: &DnsResolver,
-    ) -> Result<Message> {
-        let query_string = req.uri().query().unwrap_or("");
-
-        let dns_param = query_string
-            .split('&')
-            .find_map(|param| {
-                let (key, value) = param.split_once('=')?;
-
-                if key == "dns" {
-                    Some(value)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| DnsError::Protocol("Missing 'dns' query parameter".to_string()))?;
-
-        let query_bytes = b64_decode(dns_param.as_bytes(), B64Config::URL_SAFE_NO_PAD)
-            .map_err(|e| DnsError::Protocol(format!("Invalid base64: {:?}", e)))?;
-
-        Self::process_dns_query(&query_bytes, resolver).await
-    }
-
-    /// Handle POST request (binary DNS message in body)
-    async fn handle_post_request(
-        req: Request<Incoming>,
-        resolver: &DnsResolver,
-    ) -> Result<Message> {
-        let content_type = req
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !content_type.contains("application/dns-message") {
-            return Err(DnsError::Protocol(format!(
-                "Invalid content-type: {}",
-                content_type
-            )));
-        }
-
-        // Cap the body: a DNS message over TCP/DoH is at most 65535 bytes, so
-        // buffering more than that is either garbage or an attack. Without a
-        // limit a hostile client could stream an unbounded body into memory.
-        let limited = http_body_util::Limited::new(req.into_body(), 65_536);
-        let body = limited
-            .collect()
-            .await
-            .map_err(|e| DnsError::Http(format!("Failed to read body: {}", e)))?
-            .to_bytes();
-
-        Self::process_dns_query(&body, resolver).await
-    }
-
-    /// Process DNS query and generate response
-    async fn process_dns_query(query_bytes: &[u8], resolver: &DnsResolver) -> Result<Message> {
-        let request = Message::from_bytes(query_bytes)
-            .map_err(|e| DnsError::Protocol(format!("Invalid DNS message: {}", e)))?;
-
-        let mut response = Message::response(request.metadata.id, request.metadata.op_code);
-        response.metadata.recursion_desired = request.metadata.recursion_desired;
-        response.metadata.recursion_available = true;
-
-        for query in &request.queries {
-            response.add_query(query.clone());
-        }
-
-        for query in &request.queries {
-            let name = query.name().to_string();
-            let record_type = RecordType::from(query.query_type());
-
-            trace!("DoH query: {} {:?}", name, record_type);
-
-            match resolver.resolve(&name, record_type).await {
-                Ok(ips) => {
-                    for ip in ips {
-                        let rdata = match ip {
-                            IpAddr::V4(v4) => RData::A(crate::dns::wire::rdata::A(v4)),
-                            IpAddr::V6(v6) => RData::AAAA(crate::dns::wire::rdata::AAAA(v6)),
-                        };
-
-                        let record = Record::from_rdata(query.name().clone(), 300, rdata);
-                        response.add_answer(record);
-                    }
-
-                    if response.answers.is_empty() {
-                        response.metadata.response_code = ResponseCode::NXDomain;
-                    } else {
-                        response.metadata.response_code = ResponseCode::NoError;
-                    }
-                }
-                Err(e) => {
-                    warn!("DoH resolution failed for {}: {}", name, e);
-                    response.metadata.response_code = ResponseCode::ServFail;
-                }
-            }
-        }
-
-        Ok(response)
-    }
-
-    /// Stop the DoH server
+    /// Stop the DoH server.
     pub fn stop(&self) {
         let _ = self.shutdown_tx.send(());
     }
 
-    /// Get the listen address
+    /// Get the listen address.
     pub fn listen_addr(&self) -> SocketAddr {
         self.config.listen
     }
+}
+
+/// The HTTP handler: validates the path and method, decodes the DNS query,
+/// resolves it through the (async) engine and returns the DNS response.
+fn handle_request(
+    req: Request<Body>,
+    resolver: &DnsResolver,
+    expected_path: &str,
+    runtime: &tokio::runtime::Handle,
+) -> Response<Body> {
+    if req.uri.as_str() != expected_path {
+        return error_response(StatusCode::NOT_FOUND, "Not Found");
+    }
+
+    let result = match req.method {
+        Method::GET => handle_get_request(&req, resolver, runtime),
+        Method::POST => handle_post_request(&req, resolver, runtime),
+        _ => {
+            return error_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+        }
+    };
+
+    match result {
+        Ok(dns_response) => {
+            let response_bytes = dns_response.to_bytes().unwrap_or_default();
+            let mut resp = Response::new(StatusCode::OK);
+            resp.headers.insert(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/dns-message"),
+            );
+            resp.headers.insert(
+                HeaderName::from_static("cache-control"),
+                HeaderValue::from_static("max-age=300"),
+            );
+            resp.body = Body::from(response_bytes);
+            resp
+        }
+        Err(e) => {
+            warn!("DoH query error: {}", e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("DNS Error: {e}"),
+            )
+        }
+    }
+}
+
+/// GET handler: base64url-encoded query in `?dns=`.
+fn handle_get_request(
+    req: &Request<Body>,
+    resolver: &DnsResolver,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Message> {
+    let query_string = req.uri.query().unwrap_or_default();
+
+    let dns_param = query_string
+        .split('&')
+        .find_map(|param| {
+            let (key, value) = param.split_once('=')?;
+            (key == "dns").then_some(value)
+        })
+        .ok_or_else(|| DnsError::Protocol("Missing 'dns' query parameter".to_string()))?;
+
+    let query_bytes = b64_decode(dns_param.as_bytes(), B64Config::URL_SAFE_NO_PAD)
+        .map_err(|e| DnsError::Protocol(format!("Invalid base64: {:?}", e)))?;
+
+    process_dns_query(&query_bytes, resolver, runtime)
+}
+
+/// POST handler: binary DNS message in the body.
+fn handle_post_request(
+    req: &Request<Body>,
+    resolver: &DnsResolver,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Message> {
+    let content_type = req
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !content_type.contains("application/dns-message") {
+        return Err(DnsError::Protocol(format!(
+            "Invalid content-type: {}",
+            content_type
+        )));
+    }
+
+    // The server already materialized the body with a hard cap; pull the
+    // bytes out for the resolver.
+    let body = req
+        .body
+        .as_bytes()
+        .ok_or_else(|| DnsError::Http("Empty request body".to_string()))?;
+
+    process_dns_query(body, resolver, runtime)
+}
+
+/// Process a DNS query and generate the response, blocking on the async
+/// resolver from the server thread.
+fn process_dns_query(
+    query_bytes: &[u8],
+    resolver: &DnsResolver,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Message> {
+    let request = Message::from_bytes(query_bytes)
+        .map_err(|e| DnsError::Protocol(format!("Invalid DNS message: {}", e)))?;
+    runtime.block_on(crate::dns::server::process_query(resolver, &request))
 }
 
 #[cfg(test)]
@@ -391,7 +260,7 @@ mod tests {
         let resolver = Arc::new(DnsResolver::new(dns_config).unwrap());
 
         let config = DohServerConfig {
-            listen: "127.0.0.1:18443".parse().unwrap(),
+            listen: "127.0.0.1:0".parse().unwrap(),
             cert_path: String::new(),
             key_path: String::new(),
             path: "/dns-query".to_string(),

@@ -5,6 +5,21 @@
 //! dashboard, a desktop GUI or any language with an HTTP/WebSocket stack can
 //! drive the engine without linking Rust.
 //!
+//! # Implementation
+//!
+//! The transport is built entirely on `courierust` — no `hyper`, no
+//! `tokio-tungstenite`:
+//!
+//! * HTTP/1.1 framing comes from [`crate::common::http_server`], a blocking
+//!   server over courierust's H/1 codec (one thread per connection);
+//! * WebSocket upgrades ride the server's raw-connection handoff: the
+//!   handler returns a `101 Switching Protocols` carrying an internal marker
+//!   header, and the connection is handed to a blocking RFC 6455 codec
+//!   ([`WsServer`]) that speaks the protocol from scratch;
+//! * async RPC dispatch is bridged with a captured
+//!   `tokio::runtime::Handle` (`block_on`), the same pattern the DoH server
+//!   uses.
+//!
 //! # Security model
 //!
 //! * Binds to a loopback address only (never `0.0.0.0`) — the server is not
@@ -33,32 +48,24 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty, Full, Limited};
-use hyper::body::Incoming;
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
-use tokio_tungstenite::WebSocketStream;
-use tokio_util::sync::CancellationToken;
+use courierust::courierust_http::{
+    Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
+};
+use courierust::courierust_io::{Read as CRead, Write as CWrite};
+use courierust::courierust_tls::TlsVersion;
 
+use crate::common::http_server::{HttpServer, HttpServerConfig, RawConnection, TUNNEL_MARKER};
 use crate::crypto::util::ct_eq;
 
 /// Maximum accepted JSON-RPC request body (config uploads can be large).
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024; // 16 MiB
 /// Maximum accepted WebSocket message size.
 const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024; // 16 MiB
-/// Upper bound on a single connection's lifetime. Bounds idle keep-alive
-/// connections (resource hygiene); a dashboard never needs longer.
+/// Upper bound on a single connection's read idle time. Bounds idle
+/// keep-alive / WebSocket connections (resource hygiene); a dashboard never
+/// needs longer between requests.
 const CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Error produced by the RPC server.
@@ -79,40 +86,57 @@ impl From<std::io::Error> for ServerError {
     }
 }
 
-impl From<hyper::Error> for ServerError {
-    fn from(e: hyper::Error) -> Self {
-        ServerError(e.to_string())
-    }
-}
-
 /// A bound (not yet started) RPC server.
 pub struct RpcServer {
-    listener: TcpListener,
+    server: HttpServer,
     addr: SocketAddr,
-    token: Arc<str>,
 }
 
-/// A running RPC server. Drop the task handle or call [`stop`](Self::stop) to
+/// A running RPC server. Call [`stop`](Self::stop) or [`join`](Self::join) to
 /// shut it down gracefully.
 pub struct RpcServerHandle {
     addr: SocketAddr,
     token_set: bool,
-    task: tokio::task::JoinHandle<()>,
-    shutdown: CancellationToken,
-    running: Arc<AtomicBool>,
+    server: std::sync::Mutex<Option<HttpServer>>,
 }
 
 impl RpcServer {
     /// Bind a TCP listener at `addr`. Use a loopback address (`127.0.0.1`,
     /// `::1`) — the server deliberately never binds to all interfaces.
     pub async fn bind(addr: SocketAddr, token: String) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
-        let addr = listener.local_addr()?;
-        Ok(Self {
-            listener,
-            addr,
-            token: Arc::from(token.as_str()),
-        })
+        let runtime = tokio::runtime::Handle::current();
+        let token: Arc<str> = Arc::from(token.as_str());
+
+        // Synchronous HTTP handler: routes /health and /rpc, and converts a
+        // WebSocket upgrade into a 101 + raw-connection handoff.
+        let handler_token = token.clone();
+        let handler_runtime = runtime.clone();
+        let handler = Arc::new(move |req: Request<Body>| -> Response<Body> {
+            handle_http_request(req, &handler_token, &handler_runtime)
+        });
+
+        // WebSocket tunnel: runs the RFC 6455 message loop on the blocking
+        // raw connection after the 101 has been written.
+        let tunnel_runtime = runtime.clone();
+        let tunnel_handler = Arc::new(move |conn: RawConnection| {
+            run_ws_tunnel(conn, &tunnel_runtime);
+        });
+
+        let config = HttpServerConfig {
+            listen: addr,
+            tls: None,
+            min_version: TlsVersion::Tls12,
+            max_version: TlsVersion::Tls13,
+            max_head: 64 * 1024,
+            max_body: MAX_REQUEST_BODY,
+            read_timeout: Some(CONNECTION_LIFETIME),
+            tunnel_handler: Some(tunnel_handler),
+            handler,
+        };
+
+        let server = HttpServer::bind(config)?;
+        let addr = server.local_addr()?;
+        Ok(Self { server, addr })
     }
 
     /// The actual bound address (useful when binding to port `0`).
@@ -120,22 +144,15 @@ impl RpcServer {
         self.addr
     }
 
-    /// Spawn the accept loop on the current Tokio runtime and return a
-    /// controller handle.
-    pub fn spawn(self) -> RpcServerHandle {
-        let shutdown = CancellationToken::new();
-        let running = Arc::new(AtomicBool::new(false));
-        let task_shutdown = shutdown.clone();
-        let task_running = running.clone();
-        let task = tokio::spawn(async move {
-            accept_loop(self.listener, self.token, task_shutdown, task_running).await;
-        });
+    /// Start the accept loop on a background thread and return a controller
+    /// handle. Call this from inside a Tokio runtime: the handler bridges
+    /// into the async engine with the runtime's handle.
+    pub fn spawn(mut self) -> RpcServerHandle {
+        self.server.start().expect("start RPC server accept loop");
         RpcServerHandle {
             addr: self.addr,
             token_set: true,
-            task,
-            shutdown,
-            running,
+            server: std::sync::Mutex::new(Some(self.server)),
         }
     }
 }
@@ -153,196 +170,150 @@ impl RpcServerHandle {
 
     /// Whether the accept loop is currently running.
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(HttpServer::is_running)
+            .unwrap_or(false)
     }
 
     /// Request a graceful shutdown of the accept loop.
     pub fn stop(&self) {
-        self.shutdown.cancel();
-    }
-
-    /// Wait for the accept loop task to finish.
-    pub async fn join(self) {
-        let _ = self.task.await;
-    }
-}
-
-/// Accept loop: accept connections until cancelled, spawning one handler per
-/// connection.
-async fn accept_loop(
-    listener: TcpListener,
-    token: Arc<str>,
-    shutdown: CancellationToken,
-    running: Arc<AtomicBool>,
-) {
-    running.store(true, Ordering::SeqCst);
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => break,
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, peer)) => {
-                        let token = token.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, &token).await {
-                                tracing::debug!("RPC connection {peer} ended: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        if shutdown.is_cancelled() {
-                            break;
-                        }
-                        tracing::debug!("RPC accept error: {e}");
-                        // Transient accept errors (e.g. EMFILE) — back off and
-                        // keep serving instead of spinning.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-            }
+        if let Some(server) = self.server.lock().unwrap().as_ref() {
+            server.stop();
         }
     }
-    running.store(false, Ordering::SeqCst);
-}
 
-/// Serve one connection: HTTP/1.1 with WebSocket upgrade support.
-async fn serve_connection(stream: TcpStream, token: &str) -> Result<(), ServerError> {
-    let io = TokioIo::new(stream);
-    let token = token.to_string();
-    let service = service_fn(move |req: Request<Incoming>| {
-        let token = token.clone();
-        async move { handle_request(req, &token).await }
-    });
-    let conn = http1::Builder::new()
-        .keep_alive(true)
-        .serve_connection(io, service)
-        .with_upgrades();
-    // Bound the connection lifetime so idle keep-alive sockets cannot pile up.
-    match tokio::time::timeout(CONNECTION_LIFETIME, conn).await {
-        Ok(result) => Ok(result?),
-        Err(_) => Ok(()), // idle for too long — drop the connection
+    /// Stop the accept loop and wait for it to exit.
+    pub fn join(self) {
+        if let Some(mut server) = self.server.lock().unwrap().take() {
+            server.shutdown();
+        }
     }
 }
 
 /// Route a single HTTP request (or WebSocket upgrade).
-async fn handle_request(
-    mut req: Request<Incoming>,
+fn handle_http_request(
+    req: Request<Body>,
     token: &str,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ServerError> {
+    runtime: &tokio::runtime::Handle,
+) -> Response<Body> {
     // CORS preflight for browser dashboards served from another origin.
-    if req.method() == Method::OPTIONS {
-        return Ok(cors_response(StatusCode::NO_CONTENT, Bytes::new()));
+    if req.method == Method::OPTIONS {
+        return cors_response(StatusCode::NO_CONTENT);
     }
 
-    let path = req.uri().path().to_string();
+    let path = req.uri.path().to_string();
 
+    // WebSocket upgrade — the 101 carries the internal handoff marker so the
+    // connection thread hands the raw socket to the WS loop.
     if is_websocket_upgrade(&req) {
-        return handle_websocket_upgrade(&mut req, token).await;
+        return websocket_upgrade_response(&req, token);
     }
 
     // Unauthenticated health probe (no sensitive data).
-    if req.method() == Method::GET && path == "/health" {
-        return Ok(json_response(StatusCode::OK, r#"{"ok":true}"#));
+    if req.method == Method::GET && path == "/health" {
+        return json_response(StatusCode::OK, r#"{"ok":true}"#);
     }
 
     // Only `POST /rpc` is the JSON-RPC endpoint.
-    if req.method() != Method::POST || path != "/rpc" {
-        return Ok(json_response(
+    if req.method != Method::POST || path != "/rpc" {
+        return json_response(
             StatusCode::NOT_FOUND,
             r#"{"code":1,"error":"not found"}"#,
-        ));
+        );
     }
 
     // Bearer-token authorization (constant-time comparison).
     let authorized = req
-        .headers()
-        .get(AUTHORIZATION)
+        .headers
+        .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|t| ct_eq(t.as_bytes(), token.as_bytes()))
         .unwrap_or(false);
     if !authorized {
-        return Ok(json_response(
+        return json_response(
             StatusCode::UNAUTHORIZED,
             r#"{"code":1,"error":"unauthorized"}"#,
-        ));
+        );
     }
 
-    let body = match read_bounded(req.into_body()).await {
-        Ok(b) => b,
-        Err(()) => {
-            return Ok(json_response(
+    // The blocking server caps the body at `max_body` and answers oversized
+    // requests with 413 before the handler runs; the `Some(_)` arm below is
+    // defensive only. An empty body flows through and is reported as a
+    // logical JSON-RPC error ("missing 'method'").
+    let body = match req.body.as_bytes() {
+        Some(b) if b.len() <= MAX_REQUEST_BODY => b.to_vec(),
+        Some(_) => {
+            return json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 r#"{"code":1,"error":"request too large"}"#,
-            ))
+            )
         }
+        None => Vec::new(),
     };
 
-    let response = process_payload(&body).await;
-    Ok(json_response(StatusCode::OK, &response))
+    let response = runtime.block_on(process_payload(&body));
+    json_response(StatusCode::OK, &response)
 }
 
 /// Handle a WebSocket upgrade request after token validation.
-async fn handle_websocket_upgrade(
-    req: &mut Request<Incoming>,
-    token: &str,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ServerError> {
+fn websocket_upgrade_response(req: &Request<Body>, token: &str) -> Response<Body> {
     // Browsers cannot set the Authorization header on WebSocket connections,
     // so the token is carried as `?token=...` in the request URI.
-    let query_token = req.uri().query().and_then(|q| {
-        q.split('&')
-            .find_map(|kv| kv.strip_prefix("token="))
-            .map(|v| v.to_string())
-    });
+    let query_token = req
+        .uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")))
+        .map(str::to_string);
     let Some(query_token) = query_token else {
-        return Ok(json_response(
+        return json_response(
             StatusCode::UNAUTHORIZED,
             r#"{"code":1,"error":"missing token"}"#,
-        ));
+        );
     };
     if !ct_eq(query_token.as_bytes(), token.as_bytes()) {
-        return Ok(json_response(
+        return json_response(
             StatusCode::UNAUTHORIZED,
             r#"{"code":1,"error":"unauthorized"}"#,
-        ));
+        );
     }
 
     // RFC 6455 requires the client key to compute the accept value.
     let ws_key = req
-        .headers()
-        .get(hyper::header::SEC_WEBSOCKET_KEY)
+        .headers
+        .get("sec-websocket-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let Some(ws_key) = ws_key else {
-        return Ok(json_response(
+        return json_response(
             StatusCode::BAD_REQUEST,
             r#"{"code":1,"error":"missing Sec-WebSocket-Key"}"#,
-        ));
+        );
     };
 
-    // `hyper::upgrade::on` returns an `OnUpgrade` future that resolves once the
-    // upgrade is performed — which happens *after* this service returns the 101
-    // response. Awaiting it here would deadlock, so it is spawned instead.
-    let on_upgrade = hyper::upgrade::on(req);
-    tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                if let Err(e) = run_websocket(upgraded).await {
-                    tracing::debug!("RPC WebSocket closed: {e}");
-                }
-            }
-            Err(e) => tracing::debug!("RPC WebSocket upgrade failed: {e}"),
-        }
-    });
-
-    let accept = websocket_accept(&ws_key);
-    Ok(Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header(hyper::header::CONNECTION, "Upgrade")
-        .header(hyper::header::UPGRADE, "websocket")
-        .header(hyper::header::SEC_WEBSOCKET_ACCEPT, accept)
-        .body(empty_body())
-        .expect("static response body"))
+    let mut resp = Response::new(StatusCode::SWITCHING_PROTOCOLS);
+    resp.headers.insert(
+        HeaderName::from_static("connection"),
+        HeaderValue::from_static("Upgrade"),
+    );
+    resp.headers.insert(
+        HeaderName::from_static("upgrade"),
+        HeaderValue::from_static("websocket"),
+    );
+    resp.headers.insert(
+        HeaderName::from_static("sec-websocket-accept"),
+        HeaderValue::from(websocket_accept(&ws_key)),
+    );
+    // Internal marker: after this response is written, the connection thread
+    // hands the raw socket to the tunnel handler (the WS message loop).
+    resp.headers.insert(
+        HeaderName::from_static(TUNNEL_MARKER),
+        HeaderValue::from_static("1"),
+    );
+    resp
 }
 
 /// Compute the RFC 6455 `Sec-WebSocket-Accept` value for a client key:
@@ -359,42 +330,237 @@ fn websocket_accept(client_key: &str) -> String {
     crate::crypto::encoding::encode(&digest, crate::crypto::encoding::Config::STANDARD)
 }
 
-/// Run the WebSocket message loop: every message is one JSON-RPC request.
-/// The token was already validated during the upgrade handshake.
-async fn run_websocket(upgraded: hyper::upgrade::Upgraded) -> Result<(), ServerError> {
-    let ws_config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_WS_MESSAGE))
-        .max_frame_size(Some(MAX_WS_MESSAGE));
-    let mut ws =
-        WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(ws_config))
-            .await;
+fn is_websocket_upgrade(req: &Request<Body>) -> bool {
+    let upgrade = req
+        .headers
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let connection = req
+        .headers
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")));
+    upgrade && connection
+}
 
-    while let Some(msg) = ws.next().await {
-        let msg = msg.map_err(|e| ServerError(format!("websocket read: {e}")))?;
-        match msg {
-            Message::Text(text) => {
-                let resp = process_payload(text.as_bytes()).await;
-                ws.send(Message::text(resp))
-                    .await
-                    .map_err(|e| ServerError(format!("websocket write: {e}")))?;
+// ---------------------------------------------------------------------------
+// Blocking RFC 6455 server-side WebSocket codec
+// ---------------------------------------------------------------------------
+
+/// A message yielded by the server-side WebSocket codec.
+enum WsMsg {
+    Text(Vec<u8>),
+    Binary(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong,
+    Close,
+}
+
+/// A blocking RFC 6455 server over a [`RawConnection`].
+///
+/// Server-to-client frames are unmasked; client-to-server frames MUST be
+/// masked (RFC 6455 §5.1) — an unmasked client frame is a protocol
+/// violation and closes the connection. Fragmented data messages are
+/// reassembled; control frames (ping/pong/close) are never fragmented and
+/// are returned to the caller as they arrive.
+struct WsServer {
+    conn: RawConnection,
+    /// Opcode of the in-progress fragmented data message (`None` = idle).
+    frag_opcode: Option<u8>,
+    /// Payload accumulated so far for the fragmented message.
+    frag_payload: Vec<u8>,
+    /// Hard cap for a single (possibly fragmented) message.
+    max_message: usize,
+}
+
+impl WsServer {
+    fn new(conn: RawConnection, max_message: usize) -> Self {
+        Self {
+            conn,
+            frag_opcode: None,
+            frag_payload: Vec::new(),
+            max_message,
+        }
+    }
+
+    /// Read one complete message. Fragmented data messages are reassembled;
+    /// control frames are returned as-is.
+    fn read(&mut self) -> Result<WsMsg, String> {
+        loop {
+            let (fin, opcode, payload) = self.read_frame()?;
+            match opcode {
+                0x0 => {
+                    // Continuation of a fragmented data message.
+                    let op = self
+                        .frag_opcode
+                        .ok_or("continuation frame without a started message")?;
+                    if self.frag_payload.len() + payload.len() > self.max_message {
+                        return Err("websocket message too large".to_string());
+                    }
+                    self.frag_payload.extend_from_slice(&payload);
+                    if fin {
+                        let msg = if op == 0x1 {
+                            WsMsg::Text(std::mem::take(&mut self.frag_payload))
+                        } else {
+                            WsMsg::Binary(std::mem::take(&mut self.frag_payload))
+                        };
+                        self.frag_opcode = None;
+                        return Ok(msg);
+                    }
+                }
+                0x1 | 0x2 => {
+                    // New data message. A fresh one while a fragmented
+                    // message is in flight is a protocol violation.
+                    if self.frag_opcode.is_some() {
+                        return Err("new data frame during fragmented message".to_string());
+                    }
+                    if fin {
+                        return Ok(if opcode == 0x1 {
+                            WsMsg::Text(payload)
+                        } else {
+                            WsMsg::Binary(payload)
+                        });
+                    }
+                    self.frag_opcode = Some(opcode);
+                    self.frag_payload = payload;
+                }
+                0x8 => return Ok(WsMsg::Close),
+                0x9 => return Ok(WsMsg::Ping(payload)),
+                0xA => return Ok(WsMsg::Pong),
+                _ => return Err(format!("unsupported websocket opcode 0x{opcode:x}")),
             }
-            Message::Binary(bin) => {
-                let resp = process_payload(&bin).await;
-                ws.send(Message::text(resp))
-                    .await
-                    .map_err(|e| ServerError(format!("websocket write: {e}")))?;
+        }
+    }
+
+    /// Read one raw frame: header, extended length, mask, unmasked payload.
+    fn read_frame(&mut self) -> Result<(bool, u8, Vec<u8>), String> {
+        let mut hdr = [0u8; 2];
+        read_exact(&mut self.conn, &mut hdr)?;
+        let fin = hdr[0] & 0x80 != 0;
+        let opcode = hdr[0] & 0x0F;
+        let masked = hdr[1] & 0x80 != 0;
+        let mut len = (hdr[1] & 0x7F) as u64;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            read_exact(&mut self.conn, &mut ext)?;
+            len = u16::from_be_bytes(ext) as u64;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            read_exact(&mut self.conn, &mut ext)?;
+            len = u64::from_be_bytes(ext);
+        }
+        // Reject oversized frames before allocating any buffer.
+        if len > self.max_message as u64 {
+            return Err(format!("websocket frame too large: {len} bytes"));
+        }
+        if !masked {
+            return Err("client-to-server frames must be masked".to_string());
+        }
+        let mut mask = [0u8; 4];
+        read_exact(&mut self.conn, &mut mask)?;
+        let mut payload = vec![0u8; len as usize];
+        read_exact(&mut self.conn, &mut payload)?;
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[i % 4];
+        }
+        Ok((fin, opcode, payload))
+    }
+
+    fn send_text(&mut self, data: &[u8]) -> Result<(), String> {
+        self.send_frame(0x1, data)
+    }
+
+    fn send_pong(&mut self, data: &[u8]) -> Result<(), String> {
+        self.send_frame(0xA, data)
+    }
+
+    fn send_close(&mut self) -> Result<(), String> {
+        // 1000 = normal closure.
+        self.send_frame(0x8, &[0x03, 0xe8])
+    }
+
+    /// Write one unmasked server frame (FIN always set — the server never
+    /// fragments its own messages here).
+    fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
+        let mut out = Vec::with_capacity(payload.len() + 10);
+        out.push(0x80 | opcode);
+        let len = payload.len();
+        if len < 126 {
+            out.push(len as u8);
+        } else if len <= u16::MAX as usize {
+            out.push(126);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            out.push(127);
+            out.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        out.extend_from_slice(payload);
+        write_all(&mut self.conn, &out)?;
+        CWrite::flush(&mut self.conn).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Run the WebSocket message loop: every message is one JSON-RPC request.
+/// The token was already validated during the upgrade handshake. Runs on
+/// the connection thread; async dispatch is bridged with `block_on`.
+fn run_ws_tunnel(conn: RawConnection, runtime: &tokio::runtime::Handle) {
+    let mut ws = WsServer::new(conn, MAX_WS_MESSAGE);
+    loop {
+        match ws.read() {
+            Ok(WsMsg::Text(data)) | Ok(WsMsg::Binary(data)) => {
+                let resp = runtime.block_on(process_payload(&data));
+                if let Err(e) = ws.send_text(resp.as_bytes()) {
+                    tracing::debug!("RPC WebSocket write failed: {e}");
+                    break;
+                }
             }
-            Message::Ping(payload) => {
-                ws.send(Message::Pong(payload))
-                    .await
-                    .map_err(|e| ServerError(format!("websocket pong: {e}")))?;
+            Ok(WsMsg::Ping(payload)) => {
+                if ws.send_pong(&payload).is_err() {
+                    break;
+                }
             }
-            Message::Close(_) => break,
-            _ => {}
+            Ok(WsMsg::Pong) => {}
+            Ok(WsMsg::Close) => {
+                let _ = ws.send_close();
+                break;
+            }
+            Err(e) => {
+                tracing::debug!("RPC WebSocket closed: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// Read a buffer in full over a courierust reader.
+fn read_exact<R: CRead>(reader: &mut R, mut buf: &mut [u8]) -> Result<(), String> {
+    while !buf.is_empty() {
+        match CRead::read(reader, buf) {
+            Ok(0) => return Err("connection closed mid-read".to_string()),
+            Ok(n) => buf = &mut buf[n..],
+            Err(e) => return Err(e.to_string()),
         }
     }
     Ok(())
 }
+
+/// Write a buffer in full over a courierust writer.
+fn write_all<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<(), String> {
+    while !data.is_empty() {
+        match CWrite::write(writer, data) {
+            Ok(0) => return Err("write returned 0 bytes".to_string()),
+            Ok(n) => data = &data[n..],
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC payload handling
+// ---------------------------------------------------------------------------
 
 /// Parse one JSON-RPC payload and produce the JSON response string.
 async fn process_payload(body: &[u8]) -> String {
@@ -436,79 +602,51 @@ fn encode_response(result: Result<nextjson::Value, String>) -> String {
         .unwrap_or_else(|_| r#"{"code":1,"error":"response encode failed"}"#.to_string())
 }
 
-/// Read a request body, rejecting anything above [`MAX_REQUEST_BODY`].
-async fn read_bounded(body: Incoming) -> Result<Bytes, ()> {
-    let limited = Limited::new(body, MAX_REQUEST_BODY);
-    match limited.collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(_) => Err(()),
-    }
-}
-
-fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
-    let upgrade_header = req
-        .headers()
-        .get(hyper::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let connection_header = req
-        .headers()
-        .get(hyper::header::CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-        });
-    // Hyper only performs the upgrade when the request carries both headers;
-    // otherwise our 101 response would never be followed by an upgraded IO.
-    upgrade_header && connection_header
-}
-
-fn empty_body() -> BoxBody<Bytes, hyper::Error> {
-    Empty::<Bytes>::new()
-        .map_err(|never| match never {})
-        .boxed()
-}
-
 /// Build a JSON response with permissive CORS headers (localhost-only
 /// service, token-gated).
-fn json_response(status: StatusCode, body: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/json")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        .header(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type",
-        )
-        .header("Access-Control-Max-Age", "86400")
-        .body(
-            Full::new(Bytes::from(body.to_string()))
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .expect("static response")
+fn json_response(status: StatusCode, body: &str) -> Response<Body> {
+    let mut resp = Response::new(status);
+    resp.headers.insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("application/json"),
+    );
+    add_cors(&mut resp);
+    resp.body = Body::from(body.as_bytes().to_vec());
+    resp
 }
 
 /// Build a CORS preflight response.
-fn cors_response(status: StatusCode, body: Bytes) -> Response<BoxBody<Bytes, hyper::Error>> {
-    Response::builder()
-        .status(status)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        .header(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type",
-        )
-        .header("Access-Control-Max-Age", "86400")
-        .body(Full::new(body).map_err(|never| match never {}).boxed())
-        .expect("static response")
+fn cors_response(status: StatusCode) -> Response<Body> {
+    let mut resp = Response::new(status);
+    add_cors(&mut resp);
+    resp
+}
+
+/// Permissive CORS headers for the locally-hosted dashboard.
+fn add_cors(resp: &mut Response<Body>) {
+    resp.headers.insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        HeaderValue::from_static("*"),
+    );
+    resp.headers.insert(
+        HeaderName::from_static("access-control-allow-methods"),
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    resp.headers.insert(
+        HeaderName::from_static("access-control-allow-headers"),
+        HeaderValue::from_static("Authorization, Content-Type"),
+    );
+    resp.headers.insert(
+        HeaderName::from_static("access-control-max-age"),
+        HeaderValue::from_static("86400"),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::time::Duration;
 
     async fn spawn_test_server() -> RpcServerHandle {
         let server = RpcServer::bind(
@@ -520,132 +658,236 @@ mod tests {
         server.spawn()
     }
 
-    async fn post_rpc(addr: SocketAddr, token: Option<&str>, body: &str) -> (StatusCode, String) {
-        let client =
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build_http();
-        let mut builder = Request::builder()
-            .method(Method::POST)
-            .uri(format!("http://{addr}/rpc"))
-            .header(CONTENT_TYPE, "application/json");
+    /// Raw HTTP/1.1 client (test-only, plain `std` sockets). Sends a single
+    /// request with `Connection: close` and returns `(status, body)`.
+    fn http_request(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: &str,
+    ) -> (u16, String) {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
         if let Some(t) = token {
-            builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
+            req.push_str(&format!("Authorization: Bearer {t}\r\n"));
         }
-        let req = builder
-            .body(Full::new(Bytes::from(body.to_string())))
-            .unwrap();
-        let resp = client.request(req).await.expect("request");
-        let status = resp.status();
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, String::from_utf8_lossy(&bytes).to_string())
+        req.push_str("\r\n");
+        req.push_str(body);
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        let status: u16 = text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
     }
 
-    #[tokio::test]
-    async fn health_endpoint_is_open() {
-        let h = spawn_test_server().await;
-        let client =
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build_http();
-        let resp = client
-            .request(
-                Request::builder()
-                    .uri(format!("http://{}/health", h.addr()))
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
-            )
-            .await
+    fn post_rpc(addr: SocketAddr, token: Option<&str>, body: &str) -> (u16, String) {
+        http_request(addr, "POST", "/rpc", token, body)
+    }
+
+    /// Perform the WebSocket upgrade handshake; returns the connected socket
+    /// and the HTTP status line's status code.
+    fn ws_handshake(addr: SocketAddr, token: &str) -> (std::net::TcpStream, u16) {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&bytes).contains("\"ok\":true"));
+        let key = "dGhlIHNhbXBsZSBub25jZQ=="; // RFC 6455 sample key
+        let req = format!(
+            "GET /ws?token={token} HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: {key}\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if head.len() > 64 * 1024 {
+                panic!("handshake response too large");
+            }
+        }
+        let status: u16 = String::from_utf8_lossy(&head)
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (stream, status)
+    }
+
+    /// Send one masked text frame (client side).
+    fn ws_send_text(stream: &mut std::net::TcpStream, data: &[u8]) {
+        let mut frame = vec![0x81];
+        let len = data.len();
+        if len < 126 {
+            frame.push(0x80 | len as u8);
+        } else if len <= u16::MAX as usize {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        let mask = [0x01, 0x02, 0x03, 0x04];
+        frame.extend_from_slice(&mask);
+        for (i, byte) in data.iter().enumerate() {
+            frame.push(byte ^ mask[i % 4]);
+        }
+        stream.write_all(&frame).unwrap();
+    }
+
+    /// Read one server frame; returns `(opcode, payload)` (server frames are
+    /// unmasked).
+    fn ws_read_frame(stream: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
+        let mut hdr = [0u8; 2];
+        stream.read_exact(&mut hdr).unwrap();
+        let opcode = hdr[0] & 0x0F;
+        let mut len = (hdr[1] & 0x7F) as u64;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).unwrap();
+            len = u16::from_be_bytes(ext) as u64;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).unwrap();
+            len = u64::from_be_bytes(ext);
+        }
+        let mut payload = vec![0u8; len as usize];
+        stream.read_exact(&mut payload).unwrap();
+        (opcode, payload)
+    }
+
+    /// Send a masked close frame (1000).
+    fn ws_send_close(stream: &mut std::net::TcpStream) {
+        let mut frame = vec![0x88, 0x80 | 2, 0x01, 0x02, 0x03, 0x04, 0x03, 0xe8];
+        // Mask the 2-byte close payload.
+        for i in 0..2 {
+            frame[6 + i] ^= [0x01, 0x02, 0x03, 0x04][i % 4];
+        }
+        stream.write_all(&frame).unwrap();
+    }
+
+    #[test]
+    fn health_endpoint_is_open() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt.block_on(spawn_test_server());
+        let (status, body) = http_request(h.addr(), "GET", "/health", None, "");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"ok\":true"));
         h.stop();
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        assert!(!h.is_running());
     }
 
-    #[tokio::test]
-    async fn http_rpc_requires_token() {
-        let h = spawn_test_server().await;
+    #[test]
+    fn http_rpc_requires_token() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt.block_on(spawn_test_server());
         // No token -> 401
-        let (status, body) = post_rpc(h.addr(), None, r#"{"method":"get_version"}"#).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = post_rpc(h.addr(), None, r#"{"method":"get_version"}"#);
+        assert_eq!(status, 401);
         assert!(body.contains("unauthorized"));
         // Wrong token -> 401
-        let (status, _) = post_rpc(h.addr(), Some("wrong"), r#"{"method":"get_version"}"#).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = post_rpc(h.addr(), Some("wrong"), r#"{"method":"get_version"}"#);
+        assert_eq!(status, 401);
         h.stop();
     }
 
-    #[tokio::test]
-    async fn http_rpc_dispatch_roundtrip() {
-        let h = spawn_test_server().await;
+    #[test]
+    fn http_rpc_dispatch_roundtrip() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt.block_on(spawn_test_server());
         let (status, body) = post_rpc(
             h.addr(),
             Some("test-token-123"),
             r#"{"method":"get_version"}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
+        );
+        assert_eq!(status, 200);
         let parsed: nextjson::Value = nextjson::from_str(&body).unwrap();
         assert_eq!(parsed.get("code").and_then(|v| v.as_i64()), Some(0));
         assert!(parsed.get("data").is_some());
         h.stop();
     }
 
-    #[tokio::test]
-    async fn http_rpc_unknown_method_is_error() {
-        let h = spawn_test_server().await;
+    #[test]
+    fn http_rpc_unknown_method_is_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt.block_on(spawn_test_server());
         let (status, body) = post_rpc(
             h.addr(),
             Some("test-token-123"),
             r#"{"method":"no_such_method"}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK); // transport-level OK, logical error
+        );
+        assert_eq!(status, 200); // transport-level OK, logical error
         let parsed: nextjson::Value = nextjson::from_str(&body).unwrap();
         assert_eq!(parsed.get("code").and_then(|v| v.as_i64()), Some(1));
         assert!(parsed.get("error").and_then(|v| v.as_str()).is_some());
         h.stop();
     }
 
-    #[tokio::test]
-    async fn oversize_body_is_rejected() {
-        let h = spawn_test_server().await;
+    #[test]
+    fn oversize_body_is_rejected() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt.block_on(spawn_test_server());
         let big = format!(
             r#"{{"method":"x","params":{{"pad":"{}"}}}}"#,
             "a".repeat(MAX_REQUEST_BODY + 1)
         );
-        let (status, _) = post_rpc(h.addr(), Some("test-token-123"), &big).await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let (status, _) = post_rpc(h.addr(), Some("test-token-123"), &big);
+        assert_eq!(status, 413);
         h.stop();
     }
 
-    #[tokio::test]
-    async fn websocket_roundtrip() {
-        let h = spawn_test_server().await;
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let uri = format!("ws://{}/ws?token=test-token-123", h.addr());
-        let req = uri.into_client_request().unwrap();
-        let (mut ws, _) = tokio_tungstenite::connect_async(req)
-            .await
-            .expect("connect");
-        ws.send(Message::text(r#"{"method":"get_version"}"#))
-            .await
-            .unwrap();
-        let msg = ws.next().await.unwrap().unwrap();
-        let text = msg.into_text().unwrap();
+    #[test]
+    fn websocket_roundtrip() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt.block_on(spawn_test_server());
+        let (mut ws, status) = ws_handshake(h.addr(), "test-token-123");
+        assert_eq!(status, 101);
+
+        ws_send_text(&mut ws, r#"{"method":"get_version"}"#.as_bytes());
+        let (opcode, payload) = ws_read_frame(&mut ws);
+        assert_eq!(opcode, 0x1); // text
+        let text = String::from_utf8(payload).unwrap();
         let parsed: nextjson::Value = nextjson::from_str(&text).unwrap();
         assert_eq!(parsed.get("code").and_then(|v| v.as_i64()), Some(0));
-        ws.send(Message::Close(None)).await.unwrap();
+
+        // Graceful close: server replies with a close frame.
+        ws_send_close(&mut ws);
+        let (opcode, _) = ws_read_frame(&mut ws);
+        assert_eq!(opcode, 0x8);
         h.stop();
     }
 
-    #[tokio::test]
-    async fn websocket_rejects_bad_token() {
-        let h = spawn_test_server().await;
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let uri = format!("ws://{}/ws?token=wrong", h.addr());
-        let req = uri.into_client_request().unwrap();
-        let res = tokio_tungstenite::connect_async(req).await;
-        assert!(res.is_err(), "connection with a bad token must be refused");
+    #[test]
+    fn websocket_rejects_bad_token() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt.block_on(spawn_test_server());
+        let (_ws, status) = ws_handshake(h.addr(), "wrong");
+        assert_eq!(status, 401, "connection with a bad token must be refused");
         h.stop();
     }
 }

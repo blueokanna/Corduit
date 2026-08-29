@@ -2,17 +2,11 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
-    #[error("QUIC error: {0}")]
-    Quic(String),
-
     #[error("TLS error: {0}")]
     Tls(String),
 
     #[error("WireGuard error: {0}")]
     WireGuard(String),
-
-    #[error("TUIC error: {0}")]
-    Tuic(String),
 
     #[error("Crypto error: {0}")]
     Crypto(String),
@@ -52,39 +46,3 @@ pub enum ProtocolError {
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
-
-impl From<quinn::ConnectionError> for ProtocolError {
-    fn from(e: quinn::ConnectionError) -> Self {
-        ProtocolError::Quic(e.to_string())
-    }
-}
-
-impl From<quinn::ConnectError> for ProtocolError {
-    fn from(e: quinn::ConnectError) -> Self {
-        ProtocolError::Quic(e.to_string())
-    }
-}
-
-impl From<quinn::WriteError> for ProtocolError {
-    fn from(e: quinn::WriteError) -> Self {
-        ProtocolError::Quic(e.to_string())
-    }
-}
-
-impl From<quinn::ReadToEndError> for ProtocolError {
-    fn from(e: quinn::ReadToEndError) -> Self {
-        ProtocolError::Quic(e.to_string())
-    }
-}
-
-impl From<quinn::ClosedStream> for ProtocolError {
-    fn from(e: quinn::ClosedStream) -> Self {
-        ProtocolError::Quic(e.to_string())
-    }
-}
-
-impl From<rustls::Error> for ProtocolError {
-    fn from(e: rustls::Error) -> Self {
-        ProtocolError::Tls(e.to_string())
-    }
-}

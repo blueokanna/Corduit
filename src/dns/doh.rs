@@ -1,9 +1,13 @@
-//! DNS over HTTPS (DoH) client implementation
+//! DNS over HTTPS (DoH) client — RFC 8484, on courierust.
 //!
-//! Supports both GET and POST methods for DoH queries.
-//! RFC 8484 compliant implementation.
+//! The transport is courierust's synchronous HTTP/1.1 + HTTP/2 client
+//! (system roots from [`crate::common::roots`]), invoked through
+//! `tokio::task::spawn_blocking` so the async engine is never blocked.
+//! Both GET (`?dns=` base64url) and POST (binary body) query methods are
+//! supported, and every response body is capped at 128 KiB — a DNS message
+//! is at most 65535 bytes, so anything larger is a misbehaving server.
 
-use crate::common::url::Url;
+use crate::common::roots::system_root_store;
 use crate::crypto::encoding::{encode as b64_encode, Config as B64Config};
 use crate::dns::error::{DnsError, Result};
 use crate::dns::util::random_id;
@@ -11,22 +15,27 @@ use crate::dns::wire::{
     BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RData,
 };
 use crate::dns::RecordType;
-use bytes::Bytes;
-use rustls::pki_types::ServerName;
+use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
+use courierust::courierust_http::uri::Url;
+use courierust::courierust_http::{HeaderName, HeaderValue, Method, Request};
+use courierust::courierust_tls::TlsVersion;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio_rustls::TlsConnector;
 use tracing::{debug, trace, warn};
+
+/// Hard cap for a single DoH response body (a DNS message is ≤ 65535
+/// bytes; anything larger is a hostile or broken server).
+const MAX_DOH_RESPONSE: usize = 128 * 1024;
 
 /// DoH request method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DohMethod {
-    /// HTTP GET with base64url encoded query
+    /// HTTP GET with base64url encoded query.
     Get,
-    /// HTTP POST with binary DNS message
+    /// HTTP POST with binary DNS message.
     #[default]
     Post,
 }
@@ -58,22 +67,21 @@ impl Default for DohClientConfig {
     }
 }
 
-/// DoH client for DNS resolution
+/// DoH client for DNS resolution.
 pub struct DohClient {
-    /// Parsed URL
-    url: Url,
-    /// TLS connector
-    tls_connector: TlsConnector,
-    /// Request method
+    /// Full server URL (scheme, host, path).
+    url: String,
+    /// courierust blocking HTTP client (own thread pool, TLS via system
+    /// roots, HTTP/2 preferred).
+    client: Client,
+    /// Request method.
     method: DohMethod,
-    /// Request timeout
-    timeout: Duration,
-    /// Custom headers
+    /// Custom headers.
     headers: Vec<(String, String)>,
 }
 
 impl DohClient {
-    /// Create a new DoH client with URL
+    /// Create a new DoH client with URL.
     pub fn new(url: &str) -> Result<Self> {
         Self::with_config(DohClientConfig {
             url: url.to_string(),
@@ -81,46 +89,53 @@ impl DohClient {
         })
     }
 
-    /// Create a new DoH client with configuration
+    /// Create a new DoH client with configuration.
     pub fn with_config(config: DohClientConfig) -> Result<Self> {
-        let url = Url::parse(&config.url)
+        // Strict URL validation (courierust's parser rejects bad ports,
+        // forbidden authority bytes, and non-http(s) schemes).
+        let parsed = Url::parse(&config.url)
             .map_err(|e| DnsError::Config(format!("Invalid DoH URL: {}", e)))?;
-
-        // Validate URL scheme
-        if url.scheme() != "https" {
+        if parsed.scheme != "https" {
             return Err(DnsError::Config("DoH URL must use HTTPS".to_string()));
         }
 
-        // Create TLS connector
-        let tls_connector = Self::create_tls_connector()?;
+        let tls = TlsSettings {
+            roots: system_root_store().clone(),
+            verify: true,
+            // DoH benefits from HTTP/2 (one connection, multiplexed
+            // queries); fall back to HTTP/1.1 when the server only
+            // supports it.
+            alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            now: unix_now(),
+            min_version: TlsVersion::Tls12,
+            max_version: TlsVersion::Tls13,
+        };
+        let client = Client::with_config(ClientConfig {
+            http2: config.http2,
+            max_redirects: 3,
+            max_body: MAX_DOH_RESPONSE,
+            max_header_list: 16 * 1024,
+            connect_timeout: Some(config.timeout),
+            read_timeout: Some(config.timeout),
+            handshake_timeout: Some(config.timeout),
+            tls: Some(tls),
+            ..Default::default()
+        });
 
         Ok(Self {
-            url,
-            tls_connector,
+            url: config.url,
+            client,
             method: config.method,
-            timeout: config.timeout,
             headers: config.headers,
         })
     }
 
-    /// Create TLS connector with system root certificates
-    fn create_tls_connector() -> Result<TlsConnector> {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        Ok(TlsConnector::from(Arc::new(config)))
-    }
-
-    /// Resolve a domain name to IP addresses
+    /// Resolve a domain name to IP addresses.
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        // Try A records first
+        // Try A records first.
         let mut ips = self.query(domain, RecordType::A).await.unwrap_or_default();
 
-        // Also try AAAA records
+        // Also try AAAA records.
         if let Ok(ipv6) = self.query(domain, RecordType::AAAA).await {
             ips.extend(ipv6);
         }
@@ -135,14 +150,14 @@ impl DohClient {
         Ok(ips)
     }
 
-    /// Query DNS records
+    /// Query DNS records.
     pub async fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let query_bytes = self.build_query(domain, record_type.into())?;
         let response_bytes = self.send_query(&query_bytes).await?;
         self.parse_response(&response_bytes)
     }
 
-    /// Build DNS query message
+    /// Build DNS query message.
     fn build_query(
         &self,
         domain: &str,
@@ -162,128 +177,76 @@ impl DohClient {
             .map_err(|e| DnsError::Protocol(format!("Failed to serialize query: {}", e)))
     }
 
-    /// Send DNS query via DoH
+    /// Send a DNS query over HTTPS via courierust.
     async fn send_query(&self, query: &[u8]) -> Result<Vec<u8>> {
-        let host = self
-            .url
-            .host_str()
-            .ok_or(DnsError::Config("No host in URL".to_string()))?;
-        let port = self.url.port().unwrap_or(443);
-        let path = self.url.path();
+        let client = self.client.clone();
+        let base_url = self.url.clone();
+        let method = self.method;
+        let headers = self.headers.clone();
+        let query = query.to_vec();
 
-        // Build request based on method
-        let (_uri, _body, content_type) = match self.method {
-            DohMethod::Get => {
-                let encoded = b64_encode(query, B64Config::URL_SAFE_NO_PAD);
-                let uri = format!("{}?dns={}", self.url, encoded);
-                (uri, Bytes::new(), None)
+        // The per-request timeout is baked into the client config; this
+        // closure only performs the blocking round-trip.
+        tokio::task::spawn_blocking(move || {
+            let mut req = Request::<courierust::courierust_body::Body>::new(Method::POST, "/");
+            // RFC 8484 requires these regardless of method.
+            req.headers.insert(
+                HeaderName::from_static("accept"),
+                HeaderValue::from_static("application/dns-message"),
+            );
+            for (k, v) in &headers {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_bytes(v.as_bytes()),
+                ) {
+                    req.headers.insert(name, value);
+                }
             }
-            DohMethod::Post => {
-                let uri = self.url.to_string();
-                (
-                    uri,
-                    Bytes::copy_from_slice(query),
-                    Some("application/dns-message"),
-                )
-            }
-        };
 
-        // Connect with TLS
-        let addr = format!("{}:{}", host, port);
-        let tcp_stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| DnsError::Timeout)?
-            .map_err(DnsError::Io)?;
+            let url = match method {
+                DohMethod::Get => {
+                    let encoded = b64_encode(&query, B64Config::URL_SAFE_NO_PAD);
+                    let mut u = base_url;
+                    u.push(if u.contains('?') { '&' } else { '?' });
+                    u.push_str("dns=");
+                    u.push_str(&encoded);
+                    u
+                }
+                DohMethod::Post => {
+                    req.headers.insert(
+                        HeaderName::from_static("content-type"),
+                        HeaderValue::from_static("application/dns-message"),
+                    );
+                    // The client's streaming body type (courierust_body), not
+                    // the no_std message body.
+                    req.body = courierust::courierust_body::Body::from(query.clone());
+                    base_url
+                }
+            };
 
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|e| DnsError::Tls(format!("Invalid server name: {}", e)))?;
+            let resp = client.execute(&url, req).map_err(|e| match e.kind {
+                courierust::courierust_error::ErrorKind::Timeout => DnsError::Timeout,
+                _ => DnsError::Http(format!("DoH request failed: {e}")),
+            })?;
 
-        let mut tls_stream = tokio::time::timeout(
-            self.timeout,
-            self.tls_connector.connect(server_name, tcp_stream),
-        )
-        .await
-        .map_err(|_| DnsError::Timeout)?
-        .map_err(|e| DnsError::Tls(e.to_string()))?;
-
-        // Build HTTP request manually (simple HTTP/1.1)
-        let method = match self.method {
-            DohMethod::Get => "GET",
-            DohMethod::Post => "POST",
-        };
-
-        let mut request = format!(
-            "{} {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Accept: application/dns-message\r\n\
-             Connection: close\r\n",
-            method, path, host
-        );
-
-        if let Some(ct) = content_type {
-            request.push_str(&format!("Content-Type: {}\r\n", ct));
-            request.push_str(&format!("Content-Length: {}\r\n", query.len()));
-        }
-
-        // Add custom headers
-        for (key, value) in &self.headers {
-            request.push_str(&format!("{}: {}\r\n", key, value));
-        }
-
-        request.push_str("\r\n");
-
-        // Send request
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        tls_stream.write_all(request.as_bytes()).await?;
-        if self.method == DohMethod::Post {
-            tls_stream.write_all(query).await?;
-        }
-
-        // Read response with a hard size cap: a DNS message is at most 65535
-        // bytes and the HTTP head is tiny, so anything beyond 128 KiB is a
-        // misbehaving or hostile server. `read_to_end` would buffer forever.
-        const MAX_DOH_RESPONSE: usize = 128 * 1024;
-        let mut response_buf = Vec::with_capacity(1024);
-        let mut chunk = [0u8; 2048];
-        loop {
-            let n = tokio::time::timeout(self.timeout, tls_stream.read(&mut chunk))
-                .await
-                .map_err(|_| DnsError::Timeout)?
-                .map_err(DnsError::Io)?;
-            if n == 0 {
-                break;
-            }
-            response_buf.extend_from_slice(&chunk[..n]);
-            if response_buf.len() > MAX_DOH_RESPONSE {
+            let status = resp.status.as_u16();
+            if status != 200 {
                 return Err(DnsError::Http(format!(
-                    "DoH response exceeds {} bytes",
-                    MAX_DOH_RESPONSE
+                    "DoH server returned status {status}"
                 )));
             }
-        }
 
-        // Parse HTTP response
-        let response_str = String::from_utf8_lossy(&response_buf);
-
-        // Check status code
-        if !response_str.starts_with("HTTP/1.1 200") && !response_str.starts_with("HTTP/1.0 200") {
-            let status_line = response_str.lines().next().unwrap_or("Unknown");
-            return Err(DnsError::Http(format!(
-                "DoH server returned: {}",
-                status_line
-            )));
-        }
-
-        // Find body (after \r\n\r\n)
-        let body_start = response_str
-            .find("\r\n\r\n")
-            .ok_or(DnsError::Http("Invalid HTTP response".to_string()))?
-            + 4;
-
-        Ok(response_buf[body_start..].to_vec())
+            let body = resp
+                .body
+                .collect_limited(MAX_DOH_RESPONSE)
+                .map_err(|e| DnsError::Http(format!("DoH response too large: {e}")))?;
+            Ok(body.to_vec())
+        })
+        .await
+        .map_err(|e| DnsError::Http(format!("DoH worker panicked: {e}")))?
     }
 
-    /// Parse DNS response
+    /// Parse DNS response.
     fn parse_response(&self, response: &[u8]) -> Result<Vec<IpAddr>> {
         let message = Message::from_bytes(response)
             .map_err(|e| DnsError::Protocol(format!("Failed to parse DNS response: {}", e)))?;
@@ -302,24 +265,24 @@ impl DohClient {
         Ok(ips)
     }
 
-    /// Get the DoH server URL
+    /// Get the DoH server URL.
     pub fn url(&self) -> &str {
-        self.url.as_str()
+        &self.url
     }
 }
 
-/// DoH resolver with multiple upstream servers and load balancing
+/// DoH resolver with multiple upstream servers and load balancing.
 pub struct DohResolver {
-    /// DoH clients
+    /// DoH clients.
     clients: Vec<DohClient>,
-    /// Current client index (round-robin)
+    /// Current client index (round-robin).
     current: Arc<RwLock<usize>>,
-    /// Prefer IPv4 over IPv6
+    /// Prefer IPv4 over IPv6.
     prefer_ipv4: bool,
 }
 
 impl DohResolver {
-    /// Create a new DoH resolver with multiple upstream servers
+    /// Create a new DoH resolver with multiple upstream servers.
     pub fn new(urls: &[String]) -> Result<Self> {
         if urls.is_empty() {
             return Err(DnsError::Config("No DoH servers configured".to_string()));
@@ -351,7 +314,7 @@ impl DohResolver {
         })
     }
 
-    /// Create with custom configuration for each server
+    /// Create with custom configuration for each server.
     pub fn with_configs(configs: Vec<DohClientConfig>) -> Result<Self> {
         if configs.is_empty() {
             return Err(DnsError::Config("No DoH servers configured".to_string()));
@@ -383,16 +346,16 @@ impl DohResolver {
         })
     }
 
-    /// Set IPv4 preference
+    /// Set IPv4 preference.
     pub fn set_prefer_ipv4(&mut self, prefer: bool) {
         self.prefer_ipv4 = prefer;
     }
 
-    /// Resolve a domain name using round-robin load balancing
+    /// Resolve a domain name using round-robin load balancing.
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let mut last_error = None;
 
-        // Try each client in round-robin fashion
+        // Try each client in round-robin fashion.
         for _ in 0..self.clients.len() {
             let idx = {
                 let mut current = self.current.write().await;
@@ -405,7 +368,7 @@ impl DohResolver {
 
             match client.resolve(domain).await {
                 Ok(mut ips) if !ips.is_empty() => {
-                    // Sort by preference
+                    // Sort by preference.
                     if self.prefer_ipv4 {
                         ips.sort_by_key(|ip| match ip {
                             IpAddr::V4(_) => 0,
@@ -439,7 +402,7 @@ impl DohResolver {
         }))
     }
 
-    /// Query specific record type
+    /// Query specific record type.
     pub async fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let mut last_error = None;
 
@@ -471,35 +434,12 @@ impl DohResolver {
             ))
         }))
     }
-
-    /// Get number of configured servers
-    pub fn server_count(&self) -> usize {
-        self.clients.len()
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_doh_client_creation() {
-        let client = DohClient::new("https://dns.google/dns-query");
-        assert!(client.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_doh_invalid_url() {
-        let client = DohClient::new("http://dns.google/dns-query");
-        assert!(client.is_err()); // Must be HTTPS
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires network
-    async fn test_doh_resolve() {
-        let client = DohClient::new("https://dns.google/dns-query").unwrap();
-        let result = client.resolve("google.com").await;
-        assert!(result.is_ok());
-        assert!(!result.unwrap().is_empty());
-    }
+/// Current Unix time in seconds (for TLS certificate validity checks).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

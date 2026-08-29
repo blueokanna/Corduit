@@ -1,31 +1,36 @@
-//! DNS over TLS (DoT) server implementation
+//! DNS over TLS (DoT) server — RFC 7858, on courierust's TLS.
 //!
-//! RFC 7858 compliant DoT server for secure DNS queries.
+//! Each accepted connection is handled on a dedicated thread: a courierust
+//! TLS handshake, then the RFC 7858 2-byte length-prefixed DNS exchange.
+//! Queries are resolved through the async engine by blocking on a captured
+//! `tokio::runtime::Handle` (the same seam the DoH server uses).
 
+use crate::common::http_server::TlsIdentity;
 use crate::dns::error::{DnsError, Result};
 use crate::dns::resolver::DnsResolver;
-use crate::dns::wire::{BinDecodable, BinEncodable, Message, RData, Record, ResponseCode};
-use crate::dns::RecordType;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pki_types::pem::PemObject;
-use std::net::{IpAddr, SocketAddr};
+use crate::dns::wire::{BinDecodable, BinEncodable, Message};
+use courierust::courierust_io::{Read as CRead, Write as CWrite};
+use courierust::courierust_tls::{ServerConfig, TlsAcceptor, TlsVersion};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use std::time::Duration;
 use tokio::sync::broadcast;
-use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
-/// DoT server configuration
+/// Poll interval of the accept loop while idle.
+const ACCEPT_POLL: Duration = Duration::from_millis(5);
+
+/// DoT server configuration.
 #[derive(Debug, Clone)]
 pub struct DotServerConfig {
-    /// Listen address (default: 127.0.0.1:853)
+    /// Listen address (default: 127.0.0.1:853).
     pub listen: SocketAddr,
-    /// TLS certificate path
+    /// TLS certificate path.
     pub cert_path: String,
-    /// TLS private key path
+    /// TLS private key path.
     pub key_path: String,
-    /// Connection timeout in seconds
+    /// Connection timeout in seconds.
     pub timeout_secs: u64,
 }
 
@@ -40,20 +45,20 @@ impl Default for DotServerConfig {
     }
 }
 
-/// DNS over TLS server
+/// DNS over TLS server.
 pub struct DotServer {
-    /// Configuration
+    /// Configuration.
     config: DotServerConfig,
-    /// DNS resolver
+    /// DNS resolver.
     resolver: Arc<DnsResolver>,
-    /// TLS acceptor
-    tls_acceptor: TlsAcceptor,
-    /// Shutdown signal sender
+    /// TLS identity (cert chain + key).
+    identity: TlsIdentity,
+    /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
 }
 
 impl DotServer {
-    /// Create a new DoT server
+    /// Create a new DoT server.
     pub fn new(config: DotServerConfig, resolver: Arc<DnsResolver>) -> Result<Self> {
         if config.cert_path.is_empty() || config.key_path.is_empty() {
             return Err(DnsError::Config(
@@ -61,234 +66,190 @@ impl DotServer {
             ));
         }
 
-        let tls_acceptor = Self::create_tls_acceptor(&config.cert_path, &config.key_path)?;
+        let identity = TlsIdentity::from_pem_files(&config.cert_path, &config.key_path)
+            .map_err(|e| DnsError::Config(format!("Failed to load TLS identity: {e}")))?;
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             config,
             resolver,
-            tls_acceptor,
+            identity,
             shutdown_tx,
         })
     }
 
-    /// Create TLS acceptor from certificate and key files
-    fn create_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-        let certs = Self::load_certs(cert_path)?;
-        let key = Self::load_private_key(key_path)?;
-
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| DnsError::Tls(format!("TLS config error: {}", e)))?;
-
-        Ok(TlsAcceptor::from(Arc::new(config)))
-    }
-
-    /// Load certificates from PEM file
-    fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
-            .map_err(|e| DnsError::Config(format!("Failed to open cert file: {}", e)))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| DnsError::Config(format!("Failed to parse certificate: {}", e)))?;
-
-        if certs.is_empty() {
-            return Err(DnsError::Config(
-                "No certificates found in file".to_string(),
-            ));
-        }
-
-        Ok(certs)
-    }
-
-    /// Load private key from PEM file
-    fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-        PrivateKeyDer::from_pem_file(path)
-            .map_err(|e| DnsError::Config(format!("No private key found in file: {}", e)))
-    }
-
-    /// Start the DoT server
+    /// Start the DoT server. Returns after the listener is bound; blocks (as
+    /// an async task) until [`Self::stop`] is called.
     pub async fn start(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.config.listen).await?;
+        let listener = TcpListener::bind(self.config.listen).map_err(DnsError::Io)?;
+        listener.set_nonblocking(true).map_err(DnsError::Io)?;
         info!("DoT server listening on {}", self.config.listen);
 
         let resolver = self.resolver.clone();
-        let tls_acceptor = self.tls_acceptor.clone();
-        let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
+        let identity = self.identity.clone();
+        let timeout = Duration::from_secs(self.config.timeout_secs);
+        let shutdown = Arc::new(AtomicBool::new(false));
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
+        // Accept loop on a dedicated thread (non-blocking poll + flag).
+        let loop_shutdown = shutdown.clone();
+        let accept_thread = std::thread::Builder::new()
+            .name("corduit-dot-accept".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Handle::current();
+                while !loop_shutdown.load(Ordering::SeqCst) {
+                    match listener.accept() {
                         Ok((stream, addr)) => {
                             let resolver = resolver.clone();
-                            let tls_acceptor = tls_acceptor.clone();
-
-                            tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(
-                                    stream,
-                                    addr,
-                                    resolver,
-                                    tls_acceptor,
-                                    timeout,
-                                ).await {
-                                    debug!("DoT connection error from {}: {}", addr, e);
-                                }
-                            });
+                            let identity = identity.clone();
+                            let runtime = runtime.clone();
+                            std::thread::Builder::new()
+                                .name("corduit-dot-conn".into())
+                                .spawn(move || {
+                                    if let Err(e) = handle_connection(
+                                        stream, addr, &resolver, &identity, &runtime, timeout,
+                                    ) {
+                                        debug!("DoT connection error from {}: {}", addr, e);
+                                    }
+                                })
+                                .ok();
                         }
-                        Err(e) => {
-                            error!("DoT accept error: {}", e);
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(ACCEPT_POLL);
                         }
+                        Err(_) => break,
                     }
                 }
-                _ = shutdown_rx.recv() => {
-                    info!("DoT server shutting down");
-                    break;
-                }
-            }
-        }
+            })
+            .map_err(|e| DnsError::Io(e))?;
 
+        let _ = shutdown_rx.recv().await;
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = accept_thread.join();
+        info!("DoT server stopped");
         Ok(())
     }
 
-    /// Handle a single TLS connection
-    async fn handle_connection(
-        stream: tokio::net::TcpStream,
-        addr: SocketAddr,
-        resolver: Arc<DnsResolver>,
-        tls_acceptor: TlsAcceptor,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
-        trace!("DoT connection from {}", addr);
-
-        let tls_stream = tokio::time::timeout(timeout, tls_acceptor.accept(stream))
-            .await
-            .map_err(|_| DnsError::Timeout)?
-            .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {}", e)))?;
-
-        let mut tls_stream = tls_stream;
-
-        loop {
-            // Read length prefix (2 bytes, big-endian)
-            let mut len_buf = [0u8; 2];
-            match tokio::time::timeout(timeout, tls_stream.read_exact(&mut len_buf)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => break, // Connection closed
-                Err(_) => break,     // Timeout
-            }
-
-            let query_len = u16::from_be_bytes(len_buf) as usize;
-
-            // Sanity check
-            if query_len > 65535 || query_len == 0 {
-                warn!("DoT invalid query length: {}", query_len);
-                break;
-            }
-
-            // Read query
-            let mut query_buf = vec![0u8; query_len];
-            match tokio::time::timeout(timeout, tls_stream.read_exact(&mut query_buf)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    debug!("DoT read error: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    debug!("DoT read timeout");
-                    break;
-                }
-            }
-
-            // Process query
-            let response = match Self::process_dns_query(&query_buf, &resolver).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    warn!("DoT query processing error: {}", e);
-                    continue;
-                }
-            };
-
-            // Serialize response
-            let response_bytes = match response.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!("DoT response serialization error: {}", e);
-                    continue;
-                }
-            };
-
-            // Write response with length prefix
-            let len_bytes = (response_bytes.len() as u16).to_be_bytes();
-            if let Err(e) = tls_stream.write_all(&len_bytes).await {
-                debug!("DoT write error: {}", e);
-                break;
-            }
-            if let Err(e) = tls_stream.write_all(&response_bytes).await {
-                debug!("DoT write error: {}", e);
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Process DNS query and generate response
-    async fn process_dns_query(query_bytes: &[u8], resolver: &DnsResolver) -> Result<Message> {
-        let request = Message::from_bytes(query_bytes)
-            .map_err(|e| DnsError::Protocol(format!("Invalid DNS message: {}", e)))?;
-
-        let mut response = Message::response(request.metadata.id, request.metadata.op_code);
-        response.metadata.recursion_desired = request.metadata.recursion_desired;
-        response.metadata.recursion_available = true;
-
-        for query in &request.queries {
-            response.add_query(query.clone());
-        }
-
-        for query in &request.queries {
-            let name = query.name().to_string();
-            let record_type = RecordType::from(query.query_type());
-
-            trace!("DoT query: {} {:?}", name, record_type);
-
-            match resolver.resolve(&name, record_type).await {
-                Ok(ips) => {
-                    for ip in ips {
-                        let rdata = match ip {
-                            IpAddr::V4(v4) => RData::A(crate::dns::wire::rdata::A(v4)),
-                            IpAddr::V6(v6) => RData::AAAA(crate::dns::wire::rdata::AAAA(v6)),
-                        };
-
-                        let record = Record::from_rdata(query.name().clone(), 300, rdata);
-                        response.add_answer(record);
-                    }
-
-                    if response.answers.is_empty() {
-                        response.metadata.response_code = ResponseCode::NXDomain;
-                    } else {
-                        response.metadata.response_code = ResponseCode::NoError;
-                    }
-                }
-                Err(e) => {
-                    warn!("DoT resolution failed for {}: {}", name, e);
-                    response.metadata.response_code = ResponseCode::ServFail;
-                }
-            }
-        }
-
-        Ok(response)
-    }
-
-    /// Stop the DoT server
+    /// Stop the DoT server.
     pub fn stop(&self) {
         let _ = self.shutdown_tx.send(());
     }
 
-    /// Get the listen address
+    /// Get the listen address.
     pub fn listen_addr(&self) -> SocketAddr {
         self.config.listen
     }
+}
+
+/// Handle a single TLS connection: handshake, then length-prefixed DNS
+/// request/response until the peer closes or times out.
+fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    resolver: &DnsResolver,
+    identity: &TlsIdentity,
+    runtime: &tokio::runtime::Handle,
+    timeout: Duration,
+) -> Result<()> {
+    trace!("DoT connection from {}", addr);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let stream = Arc::new(stream);
+    let acceptor = TlsAcceptor::new(ServerConfig {
+        identity: courierust::courierust_tls::Identity {
+            cert_chain: identity.cert_chain.clone(),
+            private_key: identity.private_key.clone(),
+            is_rsa: identity.is_rsa,
+        },
+        alpn: Vec::new(),
+        min_version: TlsVersion::Tls12,
+        max_version: TlsVersion::Tls13,
+        session_ticket_key: None,
+    });
+    let mut tls = acceptor
+        .accept(stream.clone(), stream.clone())
+        .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {e}")))?;
+
+    loop {
+        // Read the 2-byte big-endian length prefix.
+        let mut len_buf = [0u8; 2];
+        match read_exact(&mut tls, &mut len_buf) {
+            Ok(()) => {}
+            Err(DnsError::Timeout) | Err(DnsError::Io(_)) | Err(_) => break,
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > 65535 {
+            break;
+        }
+
+        let mut query = vec![0u8; len];
+        if read_exact(&mut tls, &mut query).is_err() {
+            break;
+        }
+
+        let request = match Message::from_bytes(&query) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!("DoT malformed query from {}: {}", addr, e);
+                break;
+            }
+        };
+        let response = match runtime.block_on(crate::dns::server::process_query(resolver, &request))
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("DoT resolution failed for {}: {}", addr, e);
+                break;
+            }
+        };
+        let response_data = response
+            .to_bytes()
+            .map_err(|e| DnsError::Protocol(format!("Failed to serialize response: {e}")))?;
+
+        let mut out = Vec::with_capacity(2 + response_data.len());
+        out.extend_from_slice(&(response_data.len() as u16).to_be_bytes());
+        out.extend_from_slice(&response_data);
+        if write_all(&mut tls, &out).is_err() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Read exactly `out.len()` bytes over a courierust reader.
+fn read_exact<R: CRead>(reader: &mut R, out: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < out.len() {
+        match CRead::read(reader, &mut out[filled..]) {
+            Ok(0) => return Err(DnsError::Protocol("connection closed".into())),
+            Ok(n) => filled += n,
+            Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
+                std::thread::yield_now();
+            }
+            Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::Timeout) => {
+                return Err(DnsError::Timeout);
+            }
+            Err(e) => return Err(DnsError::Tls(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Write a buffer in full over a courierust writer.
+fn write_all<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<()> {
+    while !data.is_empty() {
+        match CWrite::write(writer, data) {
+            Ok(0) => return Err(DnsError::Protocol("write returned 0 bytes".into())),
+            Ok(n) => data = &data[n..],
+            Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
+                std::thread::yield_now();
+            }
+            Err(e) => return Err(DnsError::Tls(e.to_string())),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -298,28 +259,20 @@ mod tests {
     #[test]
     fn test_dot_server_config_default() {
         let config = DotServerConfig::default();
-        assert_eq!(config.listen.port(), 853);
         assert_eq!(config.timeout_secs, 30);
+        assert_eq!(config.listen.port(), 853);
     }
 
     #[test]
     fn test_dot_server_requires_tls() {
-        use crate::dns::config::DnsConfig;
-
-        let dns_config = DnsConfig {
-            nameservers: vec!["8.8.8.8".to_string()],
-            ..Default::default()
-        };
-        let resolver = Arc::new(DnsResolver::new(dns_config).unwrap());
-
-        let config = DotServerConfig {
-            listen: "127.0.0.1:18853".parse().unwrap(),
-            cert_path: String::new(),
-            key_path: String::new(),
-            timeout_secs: 30,
-        };
-
-        let server = DotServer::new(config, resolver);
-        assert!(server.is_err());
+        let config = DotServerConfig::default();
+        let resolver = Arc::new(
+            crate::dns::resolver::DnsResolver::new(crate::dns::config::DnsConfig {
+                nameservers: vec!["8.8.8.8".to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        assert!(DotServer::new(config, resolver).is_err());
     }
 }

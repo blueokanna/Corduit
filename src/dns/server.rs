@@ -217,8 +217,11 @@ async fn handle_tcp_connection(mut stream: TcpStream, resolver: &DnsResolver) ->
     Ok(())
 }
 
-/// Process DNS query and generate response
-async fn process_query(resolver: &DnsResolver, request: &Message) -> Result<Message> {
+/// Process DNS query and generate response.
+///
+/// Shared by the UDP/TCP servers and the DoH/DoT servers (which bridge to
+/// this async helper through `tokio::runtime::Handle::block_on`).
+pub(crate) async fn process_query(resolver: &DnsResolver, request: &Message) -> Result<Message> {
     let mut response = Message::response(request.metadata.id, request.metadata.op_code);
     response.metadata.recursion_desired = request.metadata.recursion_desired;
     response.metadata.recursion_available = true;

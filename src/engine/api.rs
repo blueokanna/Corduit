@@ -2,11 +2,8 @@ use crate::engine::config::Config;
 use crate::engine::health_check::{HealthMonitor, HealthStatus};
 use crate::engine::proxy::ProxyManager;
 use crate::engine::traffic_stats::TrafficStatsManager;
-use hyper::body::Incoming;
-use hyper::http::{header, Method, Request, Response, StatusCode};
-use hyper::service::service_fn;
+use courierust::courierust_http::{Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use nextjson::{NsonDeserialize, NsonSerialize};
-use std::convert::Infallible;
 use std::sync::Arc;
 
 /// API server state (plain `Arc`, no nested wrappers).
@@ -91,8 +88,8 @@ struct ConfigUpdateRequest {
 // JSON plumbing (hand-written, nextjson only)
 // ---------------------------------------------------------------------------
 
-/// Serialize `value` to JSON and wrap it in a `hyper` response.
-fn json_response<T: NsonSerialize>(status: StatusCode, value: &T) -> Response<String> {
+/// Serialize `value` to JSON and wrap it in a courierust response.
+fn json_response<T: NsonSerialize>(status: StatusCode, value: &T) -> Response<Body> {
     let (status, body) = match nextjson::to_string(value) {
         Ok(json) => (status, json),
         Err(e) => (
@@ -100,33 +97,35 @@ fn json_response<T: NsonSerialize>(status: StatusCode, value: &T) -> Response<St
             format!(r#"{{"success":false,"error":"response encode failed: {e}"}}"#),
         ),
     };
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json"),
+    let mut response = Response::new(status);
+    response.headers.insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("application/json"),
     );
+    response.body = Body::from(body.into_bytes());
     response
 }
 
-/// Read the entire request body as a UTF-8 string, bounded to 16 MiB so a
-/// hostile client cannot force unbounded buffering.
+/// The entire request body as a UTF-8 string, bounded to 16 MiB so a
+/// hostile client cannot force unbounded buffering. The serving transport
+/// (courierust H/1) materializes the body with its own cap before the
+/// handler runs; the cap here is a defensive second gate.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-async fn read_body(body: Incoming) -> Result<String, String> {
-    let limited = http_body_util::Limited::new(body, MAX_BODY_BYTES);
-    let bytes = http_body_util::BodyExt::collect(limited)
-        .await
-        .map_err(|_| "request body exceeds 16 MiB limit or is malformed".to_string())?
-        .to_bytes();
-    String::from_utf8(bytes.to_vec()).map_err(|_| "request body is not valid UTF-8".to_string())
+fn read_body(req: &Request<Body>) -> Result<String, String> {
+    let bytes = match req.body.as_bytes() {
+        Some(b) if b.len() <= MAX_BODY_BYTES => b.to_vec(),
+        Some(_) => return Err("request body exceeds 16 MiB limit".to_string()),
+        None => Vec::new(),
+    };
+    String::from_utf8(bytes).map_err(|_| "request body is not valid UTF-8".to_string())
 }
 
 // ---------------------------------------------------------------------------
 // Handlers (plain `&ApiState`, no framework extractors)
 // ---------------------------------------------------------------------------
 
-async fn get_server_info(state: &ApiState) -> Response<String> {
+async fn get_server_info(state: &ApiState) -> Response<Body> {
     let active_connections = state.traffic_stats.active_connections();
     json_response(
         StatusCode::OK,
@@ -138,7 +137,7 @@ async fn get_server_info(state: &ApiState) -> Response<String> {
     )
 }
 
-async fn get_traffic_stats(state: &ApiState) -> Response<String> {
+async fn get_traffic_stats(state: &ApiState) -> Response<Body> {
     let stats = state.traffic_stats.global_stats();
     json_response(
         StatusCode::OK,
@@ -152,7 +151,7 @@ async fn get_traffic_stats(state: &ApiState) -> Response<String> {
     )
 }
 
-async fn reset_traffic_stats(state: &ApiState) -> Response<String> {
+async fn reset_traffic_stats(state: &ApiState) -> Response<Body> {
     state.traffic_stats.reset().await;
     json_response(
         StatusCode::OK,
@@ -160,7 +159,7 @@ async fn reset_traffic_stats(state: &ApiState) -> Response<String> {
     )
 }
 
-async fn get_health_status(state: &ApiState) -> Response<String> {
+async fn get_health_status(state: &ApiState) -> Response<Body> {
     let health_statuses: Vec<HealthResponse> = state
         .health_monitor
         .get_all_health()
@@ -188,7 +187,7 @@ async fn get_health_status(state: &ApiState) -> Response<String> {
     json_response(StatusCode::OK, &ApiResponse::success(health_statuses))
 }
 
-async fn get_proxies(state: &ApiState) -> Response<String> {
+async fn get_proxies(state: &ApiState) -> Response<Body> {
     let config = state.proxy_manager.get_config().await;
     let proxies: Vec<ProxyInfo> = config
         .outbounds
@@ -213,7 +212,7 @@ async fn get_proxies(state: &ApiState) -> Response<String> {
     json_response(StatusCode::OK, &ApiResponse::success(proxies))
 }
 
-async fn get_proxy(state: &ApiState, tag: &str) -> Response<String> {
+async fn get_proxy(state: &ApiState, tag: &str) -> Response<Body> {
     let config = state.proxy_manager.get_config().await;
 
     if let Some(outbound) = config.outbounds.into_iter().find(|o| o.tag == tag) {
@@ -241,12 +240,12 @@ async fn get_proxy(state: &ApiState, tag: &str) -> Response<String> {
     }
 }
 
-async fn get_config(state: &ApiState) -> Response<String> {
+async fn get_config(state: &ApiState) -> Response<Body> {
     let config = state.proxy_manager.get_config().await;
     json_response(StatusCode::OK, &ApiResponse::success(config))
 }
 
-async fn update_config(state: &ApiState, body: String) -> Response<String> {
+async fn update_config(state: &ApiState, body: String) -> Response<Body> {
     let request: ConfigUpdateRequest = match nextjson::from_str(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -268,7 +267,7 @@ async fn update_config(state: &ApiState, body: String) -> Response<String> {
     }
 }
 
-async fn get_rules(state: &ApiState) -> Response<String> {
+async fn get_rules(state: &ApiState) -> Response<Body> {
     let config = state.proxy_manager.get_config().await;
     let rules: Vec<nextjson::Value> = config
         .rules
@@ -295,7 +294,7 @@ fn path_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
-/// API server built directly on `hyper` — no web framework, no serde.
+/// API server built on courierust's HTTP types — no web framework, no serde.
 pub struct ApiServer {
     state: ApiState,
 }
@@ -322,11 +321,13 @@ impl ApiServer {
         &self.state
     }
 
-    /// Serve one HTTP request.
-    pub async fn serve(&self, req: Request<Incoming>) -> Response<String> {
-        let method = req.method().clone();
-        let path = req.uri().path().to_owned();
-        let body = match read_body(req.into_body()).await {
+    /// Serve one HTTP request. Wire this into any courierust-based server
+    /// (e.g. [`crate::common::http_server::HttpServer`]) by adapting the
+    /// request/response pair.
+    pub async fn serve(&self, req: Request<Body>) -> Response<Body> {
+        let method = req.method.clone();
+        let path = req.uri.path().to_owned();
+        let body = match read_body(&req) {
             Ok(b) => b,
             Err(e) => {
                 return json_response(StatusCode::BAD_REQUEST, &ApiResponse::<String>::error(e));
@@ -336,7 +337,7 @@ impl ApiServer {
     }
 
     /// Match `(method, path)` to a handler and run it.
-    async fn dispatch(&self, method: Method, path: &str, body: &str) -> Response<String> {
+    async fn dispatch(&self, method: Method, path: &str, body: &str) -> Response<Body> {
         // `/api/v1/proxies/:tag` (GET) — parameterized route handled first.
         let segments = path_segments(path);
         if segments.len() == 4
@@ -363,34 +364,15 @@ impl ApiServer {
             ),
         }
     }
-
-    /// Build a `hyper` `Service` for `hyper::server::conn::http1::Builder`.
-    pub fn into_service(
-        self,
-    ) -> impl hyper::service::Service<
-        Request<Incoming>,
-        Response = Response<String>,
-        Error = Infallible,
-    > + Clone {
-        let state = Arc::new(self.state);
-        service_fn(move |req: Request<Incoming>| {
-            let state = state.clone();
-            async move {
-                let server = ApiServer {
-                    state: (*state).clone(),
-                };
-                Ok::<_, Infallible>(server.serve(req).await)
-            }
-        })
-    }
 }
 
 /// Convenience constructor for embedding the dashboard into a server task.
-pub fn create_service(
+/// The returned server exposes [`ApiServer::serve`], which pairs with any
+/// courierust-based HTTP transport.
+pub fn create_server(
     proxy_manager: Arc<ProxyManager>,
     health_monitor: Arc<HealthMonitor>,
     traffic_stats: Arc<TrafficStatsManager>,
-) -> impl hyper::service::Service<Request<Incoming>, Response = Response<String>, Error = Infallible>
-       + Clone {
-    ApiServer::new(proxy_manager, health_monitor, traffic_stats).into_service()
+) -> ApiServer {
+    ApiServer::new(proxy_manager, health_monitor, traffic_stats)
 }

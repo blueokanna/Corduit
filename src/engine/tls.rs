@@ -13,19 +13,14 @@ pub fn yaml_value_to_string(value: &nextjson::Value) -> String {
     }
 }
 
-/// Install the default rustls crypto provider (ring).
+/// No-op kept for API compatibility.
 ///
-/// Several TLS consumers in the workspace (quinn, tokio-rustls and the
-/// protocol layer) build `rustls` configurations that expect a process-wide
-/// crypto provider to be active. This function is idempotent: once a provider
-/// is installed, subsequent calls are no-ops, so it is safe to invoke from
-/// every entry point (`Corduit::new`, FFI `init_app`, …).
+/// The old implementation installed the `ring` crypto provider for rustls.
+/// TLS is now provided by courierust (self-contained, zero dependencies),
+/// so there is no global provider to install. The function remains so entry
+/// points (`Corduit::new`, FFI `init_app`, …) don't need to change.
 pub fn install_crypto_provider() {
-    use rustls::crypto::CryptoProvider;
-
-    if CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
+    // Intentionally empty: courierust carries its own crypto primitives.
 }
 
 #[derive(Clone)]
@@ -104,14 +99,11 @@ pub mod shadow_tls {
             self.obfuscation_enabled = enabled;
         }
 
-        pub async fn connect<S>(
+        pub async fn connect(
             &self,
-            stream: S,
+            stream: tokio::net::TcpStream,
             server_name: &str,
-        ) -> Result<ShadowTlsStream<tokio_rustls::client::TlsStream<S>>>
-        where
-            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-        {
+        ) -> Result<ShadowTlsStream> {
             let tls_stream =
                 self.inner
                     .connect(stream, server_name)
@@ -133,14 +125,14 @@ pub mod shadow_tls {
         }
     }
 
-    pub struct ShadowTlsStream<S> {
-        inner: TlsStream<S>,
+    pub struct ShadowTlsStream {
+        inner: crate::protocol::tls::BoxStream,
         #[allow(dead_code)]
         obfuscation_enabled: bool,
     }
 
-    impl<S> ShadowTlsStream<S> {
-        pub fn into_inner(self) -> TlsStream<S> {
+    impl ShadowTlsStream {
+        pub fn into_inner(self) -> crate::protocol::tls::BoxStream {
             self.inner
         }
     }

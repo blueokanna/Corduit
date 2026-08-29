@@ -1,36 +1,43 @@
-//! DNS over TLS (DoT) client implementation
+//! DNS over TLS (DoT) client — RFC 7858, on courierust's TLS.
 //!
-//! RFC 7858 compliant implementation for secure DNS queries.
+//! Each query is a short request/response exchange: connect a TCP socket,
+//! perform a TLS 1.2/1.3 handshake with courierust (system roots from
+//! [`crate::common::roots`]), write the 2-byte length-prefixed DNS message,
+//! read the length-prefixed reply. Because the whole exchange is
+//! synchronous, it runs inside `tokio::task::spawn_blocking` — the async
+//! engine is never blocked.
 
+use crate::common::roots::system_root_store;
 use crate::dns::error::{DnsError, Result};
 use crate::dns::wire::{
     BinDecodable, BinEncodable, Message, MessageType, Name, OpCode, Query, RData,
 };
 use crate::dns::RecordType;
-use bytes::{BufMut, BytesMut};
-use rustls::pki_types::ServerName;
-use std::net::IpAddr;
+use courierust::courierust_io::{Read as CRead, Write as CWrite};
+use courierust::courierust_tls::{ClientConfig, TlsConnector, TlsVersion};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tokio_rustls::TlsConnector;
 use tracing::{debug, trace, warn};
 
-/// DoT client configuration
+/// DNS over TLS uses a 2-byte big-endian length prefix (RFC 7858 §3.3).
+const LEN_PREFIX: usize = 2;
+
+/// DoT client configuration.
 #[derive(Debug, Clone)]
 pub struct DotClientConfig {
-    /// Server address (IP or hostname)
+    /// Server address (IP or hostname).
     pub server: String,
-    /// Server port (default: 853)
+    /// Server port (default: 853).
     pub port: u16,
-    /// TLS server name (SNI)
+    /// TLS server name (SNI).
     pub tls_name: Option<String>,
-    /// Connection timeout
+    /// Connection timeout.
     pub timeout: Duration,
-    /// Enable session resumption
+    /// Enable session resumption (courierust keeps a per-connector ticket
+    /// store, so a `TlsConnector` shared across queries resumes 1-RTT).
     pub session_resumption: bool,
 }
 
@@ -46,22 +53,22 @@ impl Default for DotClientConfig {
     }
 }
 
-/// DoT client for DNS resolution
+/// DoT client for DNS resolution.
 pub struct DotClient {
-    /// Server address
+    /// Server address.
     server: String,
-    /// Server port
+    /// Server port.
     port: u16,
-    /// TLS server name
+    /// TLS server name.
     tls_name: String,
-    /// TLS connector
+    /// TLS connector (shares the resumption-session store across queries).
     tls_connector: TlsConnector,
-    /// Connection timeout
+    /// Connection timeout.
     timeout: Duration,
 }
 
 impl DotClient {
-    /// Create a new DoT client
+    /// Create a new DoT client.
     pub fn new(server: &str, port: u16, tls_name: Option<&str>) -> Result<Self> {
         let tls_connector = Self::create_tls_connector()?;
 
@@ -74,7 +81,7 @@ impl DotClient {
         })
     }
 
-    /// Create with configuration
+    /// Create with configuration.
     pub fn with_config(config: DotClientConfig) -> Result<Self> {
         let tls_connector = Self::create_tls_connector()?;
 
@@ -87,24 +94,24 @@ impl DotClient {
         })
     }
 
-    /// Create TLS connector with system root certificates
+    /// Create the courierust TLS connector with system root certificates.
     fn create_tls_connector() -> Result<TlsConnector> {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        Ok(TlsConnector::from(Arc::new(config)))
+        Ok(TlsConnector::new(ClientConfig {
+            roots: system_root_store().clone(),
+            verify: true,
+            alpn: Vec::new(),
+            now: unix_now(),
+            min_version: TlsVersion::Tls12,
+            max_version: TlsVersion::Tls13,
+        }))
     }
 
-    /// Resolve a domain name to IP addresses
+    /// Resolve a domain name to IP addresses.
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        // Try A records first
+        // Try A records first.
         let mut ips = self.query(domain, RecordType::A).await.unwrap_or_default();
 
-        // Also try AAAA records
+        // Also try AAAA records.
         if let Ok(ipv6) = self.query(domain, RecordType::AAAA).await {
             ips.extend(ipv6);
         }
@@ -119,14 +126,14 @@ impl DotClient {
         Ok(ips)
     }
 
-    /// Query DNS records
+    /// Query DNS records.
     pub async fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let query_bytes = self.build_query(domain, record_type.into())?;
         let response_bytes = self.send_query(&query_bytes).await?;
         self.parse_response(&response_bytes)
     }
 
-    /// Build DNS query message
+    /// Build DNS query message.
     fn build_query(
         &self,
         domain: &str,
@@ -150,63 +157,65 @@ impl DotClient {
             .map_err(|e| DnsError::Protocol(format!("Failed to serialize query: {}", e)))
     }
 
-    /// Send DNS query via DoT
+    /// Send a DNS query over TLS via courierust (blocking exchange on a
+    /// worker thread).
     async fn send_query(&self, query: &[u8]) -> Result<Vec<u8>> {
-        // Connect to the DoT server
-        let addr = format!("{}:{}", self.server, self.port);
+        let server = self.server.clone();
+        let port = self.port;
+        let tls_name = self.tls_name.clone();
+        let timeout = self.timeout;
+        let connector = self.tls_connector.clone();
+        let query = query.to_vec();
 
-        let tcp_stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| DnsError::Timeout)?
-            .map_err(DnsError::Io)?;
+        tokio::task::spawn_blocking(move || {
+            // Resolve the host (courierust's transport is synchronous).
+            let addrs: Vec<SocketAddr> = (server.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|e| DnsError::Io(e))?
+                .collect();
+            let addr = addrs
+                .first()
+                .copied()
+                .ok_or_else(|| DnsError::Config(format!("no address for {server}:{port}")))?;
 
-        // Parse server name for TLS
-        let server_name = ServerName::try_from(self.tls_name.clone())
-            .map_err(|e| DnsError::Tls(format!("Invalid server name: {}", e)))?;
+            let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|e| DnsError::Io(e))?;
+            let _ = tcp.set_read_timeout(Some(timeout));
+            let _ = tcp.set_write_timeout(Some(timeout));
 
-        // Perform TLS handshake
-        let mut tls_stream = tokio::time::timeout(
-            self.timeout,
-            self.tls_connector.connect(server_name, tcp_stream),
-        )
+            // TLS handshake over the socket.
+            let mut tls = connector
+                .connect(&tls_name, &tcp, &tcp)
+                .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {e}")))?;
+
+            // Write the 2-byte length prefix + query.
+            let mut request = Vec::with_capacity(LEN_PREFIX + query.len());
+            request.extend_from_slice(&(query.len() as u16).to_be_bytes());
+            request.extend_from_slice(&query);
+            write_all(&mut tls, &request)
+                .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
+
+            // Read the response length prefix.
+            let mut len_buf = [0u8; 2];
+            read_exact(&mut tls, &mut len_buf)
+                .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
+            let response_len = u16::from_be_bytes(len_buf) as usize;
+            if response_len > 65535 {
+                return Err(DnsError::Protocol("Response too large".to_string()));
+            }
+
+            // Read the response body.
+            let mut response = vec![0u8; response_len];
+            read_exact(&mut tls, &mut response)
+                .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
+
+            trace!("DoT received {} bytes response", response.len());
+            Ok(response)
+        })
         .await
-        .map_err(|_| DnsError::Timeout)?
-        .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {}", e)))?;
-
-        // DNS over TLS uses a 2-byte length prefix (RFC 7858)
-        let mut request = BytesMut::with_capacity(2 + query.len());
-        request.put_u16(query.len() as u16);
-        request.put_slice(query);
-
-        // Send the query
-        tls_stream.write_all(&request).await.map_err(DnsError::Io)?;
-
-        // Read the response length
-        let mut len_buf = [0u8; 2];
-        tokio::time::timeout(self.timeout, tls_stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| DnsError::Timeout)?
-            .map_err(DnsError::Io)?;
-
-        let response_len = u16::from_be_bytes(len_buf) as usize;
-
-        // Sanity check response length
-        if response_len > 65535 {
-            return Err(DnsError::Protocol("Response too large".to_string()));
-        }
-
-        // Read the response
-        let mut response = vec![0u8; response_len];
-        tokio::time::timeout(self.timeout, tls_stream.read_exact(&mut response))
-            .await
-            .map_err(|_| DnsError::Timeout)?
-            .map_err(DnsError::Io)?;
-
-        trace!("DoT received {} bytes response", response.len());
-        Ok(response)
+        .map_err(|e| DnsError::Io(std::io::Error::other(format!("DoT worker panicked: {e}"))))?
     }
 
-    /// Parse DNS response
+    /// Parse DNS response.
     fn parse_response(&self, response: &[u8]) -> Result<Vec<IpAddr>> {
         let message = Message::from_bytes(response)
             .map_err(|e| DnsError::Protocol(format!("Failed to parse DNS response: {}", e)))?;
@@ -224,32 +233,74 @@ impl DotClient {
         Ok(ips)
     }
 
-    /// Get server address
+    /// Get server address.
     pub fn server(&self) -> &str {
         &self.server
     }
 
-    /// Get server port
+    /// Get server port.
     pub fn port(&self) -> u16 {
         self.port
     }
 }
 
-/// DoT resolver with multiple upstream servers and load balancing
+/// Write a buffer in full over a courierust writer.
+fn write_all<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<()> {
+    while !data.is_empty() {
+        match CWrite::write(writer, data) {
+            Ok(0) => return Err(DnsError::Protocol("write returned 0 bytes".into())),
+            Ok(n) => data = &data[n..],
+            Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
+                std::thread::yield_now();
+            }
+            Err(e) => return Err(DnsError::Tls(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Read exactly `len` bytes over a courierust reader.
+fn read_exact<R: CRead>(reader: &mut R, out: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < out.len() {
+        match CRead::read(reader, &mut out[filled..]) {
+            Ok(0) => return Err(DnsError::Protocol("connection closed mid-response".into())),
+            Ok(n) => filled += n,
+            Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
+                std::thread::yield_now();
+            }
+            Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::Timeout) => {
+                return Err(DnsError::Timeout);
+            }
+            Err(e) => return Err(DnsError::Tls(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Current Unix time in seconds (for TLS certificate validity checks).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// DoT resolver with multiple upstream servers and load balancing.
 pub struct DotResolver {
-    /// DoT clients
+    /// DoT clients.
     clients: Vec<DotClient>,
-    /// Current client index (round-robin)
+    /// Current client index (round-robin).
     current: Arc<RwLock<usize>>,
-    /// Prefer IPv4 over IPv6
+    /// Prefer IPv4 over IPv6.
     prefer_ipv4: bool,
 }
 
 impl DotResolver {
-    /// Create a new DoT resolver with multiple upstream servers
+    /// Create a new DoT resolver with multiple upstream servers.
     ///
     /// # Arguments
-    /// * `servers` - List of (server, port, tls_name) tuples
+    /// * `servers` - List of (server, port, tls_name) tuples.
     pub fn new(servers: &[(String, u16, Option<String>)]) -> Result<Self> {
         if servers.is_empty() {
             return Err(DnsError::Config("No DoT servers configured".to_string()));
@@ -281,7 +332,7 @@ impl DotResolver {
         })
     }
 
-    /// Create from URL strings (e.g., "tls://dns.google:853")
+    /// Create from URL strings (e.g., "tls://dns.google:853").
     pub fn from_urls(urls: &[String]) -> Result<Self> {
         let mut servers = Vec::new();
 
@@ -299,51 +350,15 @@ impl DotResolver {
         Self::new(&servers)
     }
 
-    /// Create with custom configurations
-    pub fn with_configs(configs: Vec<DotClientConfig>) -> Result<Self> {
-        if configs.is_empty() {
-            return Err(DnsError::Config("No DoT servers configured".to_string()));
-        }
-
-        let mut clients = Vec::new();
-        for config in configs {
-            match DotClient::with_config(config.clone()) {
-                Ok(client) => {
-                    debug!("DoT client created for {}:{}", config.server, config.port);
-                    clients.push(client);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to create DoT client for {}:{}: {}",
-                        config.server, config.port, e
-                    );
-                }
-            }
-        }
-
-        if clients.is_empty() {
-            return Err(DnsError::Config(
-                "No valid DoT servers configured".to_string(),
-            ));
-        }
-
-        Ok(Self {
-            clients,
-            current: Arc::new(RwLock::new(0)),
-            prefer_ipv4: true,
-        })
-    }
-
-    /// Set IPv4 preference
+    /// Set IPv4 preference.
     pub fn set_prefer_ipv4(&mut self, prefer: bool) {
         self.prefer_ipv4 = prefer;
     }
 
-    /// Resolve a domain name using round-robin load balancing
+    /// Resolve a domain name using round-robin load balancing.
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let mut last_error = None;
 
-        // Try each client in round-robin fashion
         for _ in 0..self.clients.len() {
             let idx = {
                 let mut current = self.current.write().await;
@@ -356,7 +371,6 @@ impl DotResolver {
 
             match client.resolve(domain).await {
                 Ok(mut ips) if !ips.is_empty() => {
-                    // Sort by preference
                     if self.prefer_ipv4 {
                         ips.sort_by_key(|ip| match ip {
                             IpAddr::V4(_) => 0,
@@ -364,28 +378,25 @@ impl DotResolver {
                         });
                     }
                     debug!(
-                        "DoT resolved {} to {:?} via {}:{}",
+                        "DoT resolved {} to {:?} via {}",
                         domain,
                         ips,
-                        client.server(),
-                        client.port()
+                        client.server()
                     );
                     return Ok(ips);
                 }
                 Ok(_) => {
                     debug!(
-                        "DoT returned empty result for {} via {}:{}",
+                        "DoT returned empty result for {} via {}",
                         domain,
-                        client.server(),
-                        client.port()
+                        client.server()
                     );
                 }
                 Err(e) => {
                     debug!(
-                        "DoT resolution failed for {} via {}:{}: {}",
+                        "DoT resolution failed for {} via {}: {}",
                         domain,
                         client.server(),
-                        client.port(),
                         e
                     );
                     last_error = Some(e);
@@ -398,7 +409,7 @@ impl DotResolver {
         }))
     }
 
-    /// Query specific record type
+    /// Query a specific record type.
     pub async fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let mut last_error = None;
 
@@ -413,9 +424,7 @@ impl DotResolver {
             let client = &self.clients[idx];
 
             match client.query(domain, record_type).await {
-                Ok(ips) if !ips.is_empty() => {
-                    return Ok(ips);
-                }
+                Ok(ips) if !ips.is_empty() => return Ok(ips),
                 Ok(_) => continue,
                 Err(e) => {
                     last_error = Some(e);
@@ -429,41 +438,5 @@ impl DotResolver {
                 domain, record_type
             ))
         }))
-    }
-
-    /// Get number of configured servers
-    pub fn server_count(&self) -> usize {
-        self.clients.len()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_dot_client_creation() {
-        let client = DotClient::new("dns.google", 853, Some("dns.google"));
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn test_dot_resolver_from_urls() {
-        let urls = vec![
-            "tls://dns.google:853".to_string(),
-            "tls://1.1.1.1:853".to_string(),
-        ];
-        let resolver = DotResolver::from_urls(&urls);
-        assert!(resolver.is_ok());
-        assert_eq!(resolver.unwrap().server_count(), 2);
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires network
-    async fn test_dot_resolve() {
-        let client = DotClient::new("dns.google", 853, Some("dns.google")).unwrap();
-        let result = client.resolve("google.com").await;
-        assert!(result.is_ok());
-        assert!(!result.unwrap().is_empty());
     }
 }

@@ -64,15 +64,16 @@ impl Default for InboundAuth {
 ///
 /// Returns `true` when authentication is not required, or when the presented
 /// credentials match a configured entry. The base64 payload is bounded and
-/// must decode to valid UTF-8 `user:pass`.
-pub fn check_proxy_authorization(headers: &hyper::HeaderMap, auth: &InboundAuth) -> bool {
+/// must decode to valid UTF-8 `user:pass`. The header map is generic so both
+/// the courierust H/1 inbound and any legacy `http`-based caller can use it.
+pub fn check_proxy_authorization<M>(headers: &M, auth: &InboundAuth) -> bool
+where
+    M: HeaderLookup,
+{
     if !auth.required() {
         return true;
     }
-    let Some(value) = headers.get("proxy-authorization") else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
+    let Some(value) = headers.lookup("proxy-authorization") else {
         return false;
     };
     let Some(encoded) = value
@@ -94,6 +95,25 @@ pub fn check_proxy_authorization(headers: &hyper::HeaderMap, auth: &InboundAuth)
         return false;
     };
     auth.check(username, password)
+}
+
+/// Look up a header value by (case-insensitive) name. Implemented for the
+/// courierust header map and for `http::HeaderMap` (kept for any legacy
+/// callers until they are fully migrated).
+pub trait HeaderLookup {
+    fn lookup(&self, name: &str) -> Option<&str>;
+}
+
+impl HeaderLookup for courierust::courierust_http::HeaderMap {
+    fn lookup(&self, name: &str) -> Option<&str> {
+        self.get(name).and_then(|v| v.to_str().ok())
+    }
+}
+
+impl HeaderLookup for http::HeaderMap {
+    fn lookup(&self, name: &str) -> Option<&str> {
+        self.get(name).and_then(|v| v.to_str().ok())
+    }
 }
 
 /// SOCKS5 RFC 1929 username/password sub-negotiation.

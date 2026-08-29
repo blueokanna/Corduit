@@ -197,16 +197,8 @@ impl ConfigValidator {
                 | OutboundType::Vmess
                 | OutboundType::Vless
                 | OutboundType::Trojan
-                | OutboundType::Wireguard
-                | OutboundType::Tuic
-                | OutboundType::Hysteria2 => {
+                | OutboundType::Wireguard => {
                     Self::require_outbound_endpoint(outbound)?;
-                }
-                OutboundType::Quic => {
-                    return Err(Error::config(format!(
-                        "QUIC outbound '{}' is not implemented",
-                        outbound.tag
-                    )));
                 }
                 // Proxy group types don't need server/port
                 OutboundType::Selector

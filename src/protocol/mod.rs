@@ -10,14 +10,11 @@
 //! |---|---|
 //! | [`address`] | SOCKS-style address encoding/decoding (`Address`, `AddressType`) |
 //! | [`transport`] | Layered transports: TLS, h2, gRPC, WebSocket |
-//! | [`quic`] | QUIC (quinn-based) client/server/crypto/session helpers |
-//! | [`tls`] | TLS client/server/verifier layers over rustls |
+//! | [`tls`] | TLS client/server layers over courierust |
 //! | [`wireguard`] | WireGuard handshake & data-path primitives (curve25519, ChaCha20Poly1305) |
-//! | [`tuic`] | TUIC v5 protocol |
-//! | [`tuic_quinn`] | TUIC over QUIC |
 //!
 //! Feature-gated modules are marked with the corresponding crate feature
-//! (`quic`, `tls`, `wireguard`, `tuic`, `tuic-quinn`).
+//! (`tls`, `wireguard`).
 //!
 //! ## Quick start
 //!
@@ -82,21 +79,11 @@ pub mod address;
 pub mod error;
 pub mod transport;
 
-#[cfg(feature = "quic")]
-pub mod quic;
-
 #[cfg(feature = "tls")]
 pub mod tls;
 
 #[cfg(feature = "wireguard")]
 pub mod wireguard;
-
-#[cfg(feature = "tuic")]
-pub mod tuic;
-
-#[cfg(feature = "tuic-quinn")]
-#[path = "tuic-quinn/mod.rs"]
-pub mod tuic_quinn;
 
 pub use address::{Address, AddressType};
 pub use error::{ProtocolError, Result};
@@ -111,20 +98,9 @@ pub mod prelude {
         WebSocketTransport, WsStream,
     };
 
-    #[cfg(feature = "quic")]
-    pub use crate::protocol::quic::prelude::*;
-
     #[cfg(feature = "tls")]
     pub use crate::protocol::tls::{TlsAcceptor, TlsConnector, TlsStream as TlsModuleStream};
 
     #[cfg(feature = "wireguard")]
     pub use crate::protocol::wireguard::{WireGuardError, WireGuardTunnel};
-
-    #[cfg(feature = "tuic")]
-    pub use crate::protocol::tuic::{TuicClient, TuicConnection, TuicServer};
-
-    #[cfg(feature = "tuic-quinn")]
-    pub use crate::protocol::tuic_quinn::{
-        TuicQuinnConfig, TuicQuinnConnection, TuicQuinnEndpoint, TuicQuinnError,
-    };
 }

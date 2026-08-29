@@ -3,12 +3,10 @@ use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
-use crate::engine::tls::SkipServerVerification;
+use crate::engine::tls::{ClientConfig, TlsConnector};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::TlsConnector;
 
 const VLESS_VERSION: u8 = 0x00;
 
@@ -182,32 +180,19 @@ impl VlessOutbound {
     }
 
     fn create_tls_connector(&self) -> Result<TlsConnector> {
-        use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-
-        let mut root_store = RootCertStore::empty();
-        let certs = rustls_native_certs::load_native_certs();
-        for cert in certs.certs {
-            root_store.add(cert).ok();
-        }
-
-        let builder = ClientConfig::builder().with_root_certificates(root_store);
-
-        let mut tls_config = if self.skip_cert_verify {
-            let verifier = Arc::new(SkipServerVerification);
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth()
-        } else {
-            builder.with_no_client_auth()
+        let config = ClientConfig {
+            server_name: Some(self.sni.clone()),
+            alpn: self.alpn.clone(),
+            skip_cert_verify: self.skip_cert_verify,
+            enable_sni: true,
         };
-
-        tls_config.alpn_protocols = self.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
-
-        Ok(TlsConnector::from(Arc::new(tls_config)))
+        TlsConnector::new(config).map_err(|e| Error::Tls {
+            message: format!("Failed to create VLess TLS connector: {e}"),
+            source: None,
+        })
     }
 
-    async fn connect_tls(&self) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    async fn connect_tls(&self) -> Result<Box<dyn AsyncReadWrite>> {
         let addr = format!("{}:{}", self.server, self.port);
         let stream = TcpStream::connect(&addr).await.map_err(|e| {
             Error::network(format!("Failed to connect to VLess server {}: {}", addr, e))
@@ -216,11 +201,8 @@ impl VlessOutbound {
         stream.set_nodelay(true).ok();
 
         let connector = self.create_tls_connector()?;
-        let server_name = ServerName::try_from(self.sni.clone())
-            .map_err(|_| Error::config(format!("Invalid SNI: {}", self.sni)))?;
-
         let tls_stream = connector
-            .connect(server_name, stream)
+            .connect(stream, &self.sni)
             .await
             .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?;
 

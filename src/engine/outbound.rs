@@ -5,18 +5,15 @@ use parking_lot::RwLock as ParkingRwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::RwLock;
 
 mod direct;
 mod http;
-mod hysteria2;
 mod reject;
 mod selector;
 mod shadowsocks;
 mod socks5;
 mod trojan;
-mod tuic;
 mod vless;
 mod vmess;
 mod wireguard;
@@ -24,13 +21,11 @@ mod wireguard;
 pub use direct::relay_bidirectional_with_connection;
 pub use direct::DirectOutbound;
 pub use http::HttpOutbound;
-pub use hysteria2::Hysteria2Outbound;
 pub use reject::RejectOutbound;
 pub use selector::SelectorOutbound;
 pub use shadowsocks::ShadowsocksOutbound;
 pub use socks5::Socks5Outbound;
 pub use trojan::TrojanOutbound;
-pub use tuic::TuicOutbound;
 pub use vless::VlessOutbound;
 pub use vmess::VmessOutbound;
 pub use wireguard::WireguardOutbound;
@@ -173,8 +168,8 @@ pub trait OutboundProxy: Send + Sync {
     ) -> Result<std::time::Duration>;
 }
 
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+/// Re-exported from `common`: the engine's canonical async duplex stream.
+pub use crate::common::AsyncReadWrite;
 
 /// Single source of truth for constructing an outbound proxy from a config.
 ///
@@ -197,14 +192,6 @@ pub(crate) fn build_outbound_proxy(
         OutboundType::Vless => Some(Arc::new(VlessOutbound::new(config.clone())?)),
         OutboundType::Trojan => Some(Arc::new(TrojanOutbound::new(config.clone())?)),
         OutboundType::Wireguard => Some(Arc::new(WireguardOutbound::new(config.clone())?)),
-        OutboundType::Tuic => Some(Arc::new(TuicOutbound::new(config.clone())?)),
-        OutboundType::Hysteria2 => Some(Arc::new(Hysteria2Outbound::new(config.clone())?)),
-        OutboundType::Quic => {
-            return Err(Error::config(format!(
-                "QUIC outbound '{}' is not implemented; refusing unsafe direct fallback",
-                config.tag
-            )));
-        }
         OutboundType::Selector
         | OutboundType::Urltest
         | OutboundType::Fallback

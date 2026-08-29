@@ -1032,41 +1032,36 @@ impl VmessOutbound {
         Ok(stream)
     }
 
-    /// Connect with TLS if enabled
-    async fn connect_tls(&self) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    /// Connect with TLS if enabled (courierust TLS, boxed async stream).
+    async fn connect_tls(&self) -> Result<Box<dyn AsyncReadWrite>> {
         let tcp_stream = self.connect_tcp().await?;
 
-        let sni = self.sni.as_deref().unwrap_or(&self.server);
-
-        // Build TLS config
-        let mut root_store = rustls::RootCertStore::empty();
-        let certs = rustls_native_certs::load_native_certs();
-        for cert in certs.certs {
-            root_store.add(cert).ok();
-        }
-
-        let tls_config = if self.skip_cert_verify {
-            let verifier = std::sync::Arc::new(crate::engine::tls::SkipServerVerification);
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth()
-        } else {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        };
-
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
-        let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
-            .map_err(|_| Error::config(format!("Invalid SNI: {}", sni)))?;
-
-        let tls_stream = connector
-            .connect(server_name, tcp_stream)
+        let sni = self.sni.as_deref().unwrap_or(&self.server).to_string();
+        let connector = self.create_tls_connector()?;
+        connector
+            .connect(tcp_stream, &sni)
             .await
-            .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?;
+            .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))
+    }
 
-        Ok(tls_stream)
+    /// Build the courierust TLS connector from the VMess options.
+    fn create_tls_connector(&self) -> Result<crate::engine::tls::TlsConnector> {
+        let mut alpn = self.quic_alpn.clone();
+        if alpn.is_empty() {
+            // VMess-over-TLS/WS speaks h2 / http1.1 unless the user pinned
+            // QUIC ALPN.
+            alpn = vec!["h2".into(), "http/1.1".into()];
+        }
+        let config = crate::engine::tls::ClientConfig {
+            server_name: self.sni.clone(),
+            alpn,
+            skip_cert_verify: self.skip_cert_verify,
+            enable_sni: true,
+        };
+        crate::engine::tls::TlsConnector::new(config).map_err(|e| Error::Tls {
+            message: format!("Failed to create VMess TLS connector: {e}"),
+            source: None,
+        })
     }
 
     /// Connect and return a boxed stream (TCP, TLS, or WebSocket)

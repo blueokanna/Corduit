@@ -4,17 +4,15 @@ use crate::engine::error::{Error, Result};
 use crate::engine::inbound::auth::{
     check_proxy_authorization, socks5_userpass, InboundAuth, SOCKS5_AUTH_USERPASS,
 };
-use crate::engine::inbound::{bind_tcp_listener, InboundListener};
+use crate::engine::inbound::{bind_tcp_listener, forward, InboundListener};
 use crate::engine::outbound::{OutboundManager, TargetAddr};
 use crate::engine::routing::Router;
-use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, Uri};
-use hyper_util::rt::TokioIo;
+use courierust::courierust_h1 as h1;
+use courierust::courierust_http::{
+    Body, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
+};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +35,15 @@ const SOCKS5_CMD_CONNECT: u8 = 0x01;
 const SOCKS5_ADDR_IPV4: u8 = 0x01;
 const SOCKS5_ADDR_DOMAIN: u8 = 0x03;
 const SOCKS5_ADDR_IPV6: u8 = 0x04;
+
+/// A pending CONNECT tunnel: the destination and the outbound that will
+/// relay it.
+struct TunnelJob {
+    target: TargetAddr,
+    host: String,
+    port: u16,
+    outbound_tag: String,
+}
 
 #[async_trait::async_trait]
 impl InboundListener for MixedInbound {
@@ -173,220 +180,211 @@ impl MixedInbound {
     // ============== HTTP Handling ==============
 
     async fn handle_http(
-        stream: TcpStream,
+        mut stream: TcpStream,
         peer_addr: SocketAddr,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
         auth: Arc<InboundAuth>,
     ) -> Result<()> {
-        let io = TokioIo::new(stream);
+        const MAX_HEAD: usize = 64 * 1024;
+        const MAX_BODY: usize = 64 * 1024 * 1024;
 
-        let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-            let router = Arc::clone(&router);
-            let outbound_manager = Arc::clone(&outbound_manager);
-            let auth = Arc::clone(&auth);
-            async move {
-                Self::handle_http_request(req, peer_addr, router, outbound_manager, auth).await
+        // Shared slot for the CONNECT tunnel handoff (handler → loop).
+        let tunnel_job: Arc<Mutex<Option<TunnelJob>>> = Arc::new(Mutex::new(None));
+
+        // Keep-alive loop over courierust's H/1 codec (pure functions on the
+        // accumulated buffer — the codec's blocking readers do not fit the
+        // async stream, so framing is done here).
+        loop {
+            let Some(req) = read_http_request(&mut stream, MAX_HEAD, MAX_BODY).await? else {
+                return Ok(());
+            };
+            let keep_alive = request_keeps_alive(&req);
+            let resp = Self::handle_http_request(
+                req,
+                peer_addr,
+                &router,
+                &outbound_manager,
+                &auth,
+                &tunnel_job,
+            )
+            .await;
+            write_http_response(&mut stream, &resp).await?;
+
+            // CONNECT: the marker response hands the raw stream to the
+            // tunnel relay (which blocks for the tunnel's lifetime).
+            if resp.headers.contains_key(TUNNEL_MARKER) {
+                let job = tunnel_job.lock().unwrap().take();
+                if let Some(job) = job {
+                    Self::relay_connect_tunnel(stream, job, &router, &outbound_manager).await;
+                }
+                return Ok(());
             }
-        });
-
-        if let Err(err) = http1::Builder::new()
-            .preserve_header_case(true)
-            .title_case_headers(true)
-            .serve_connection(io, service)
-            .with_upgrades()
-            .await
-        {
-            // Filter out common non-error conditions
-            let err_str = err.to_string();
-            if !err_str.contains("connection closed")
-                && !err_str.contains("connection reset")
-                && !err_str.contains("broken pipe")
-            {
-                tracing::debug!("HTTP serve error from {}: {}", peer_addr, err);
+            if !keep_alive || response_wants_close(&resp) {
+                break;
             }
         }
-
         Ok(())
     }
 
     async fn handle_http_request(
-        req: Request<hyper::body::Incoming>,
+        req: Request<Body>,
         peer_addr: SocketAddr,
-        router: Arc<Router>,
-        outbound_manager: Arc<OutboundManager>,
-        auth: Arc<InboundAuth>,
-    ) -> std::result::Result<Response<BoxBody<Bytes, std::io::Error>>, std::convert::Infallible>
-    {
-        let method = req.method().clone();
-        let uri = req.uri().clone();
+        router: &Router,
+        outbound_manager: &OutboundManager,
+        auth: &InboundAuth,
+        tunnel_job: &Mutex<Option<TunnelJob>>,
+    ) -> Response<Body> {
+        let method = req.method.clone();
+        let uri = req.uri.as_str().to_string();
 
         tracing::debug!("HTTP {} {} from {}", method, uri, peer_addr);
 
         // Enforce configured inbound credentials before serving anything
         // (CWE-306), including CONNECT tunnels.
-        if !check_proxy_authorization(req.headers(), &auth) {
+        if !check_proxy_authorization(&req.headers, auth) {
             tracing::info!("Rejecting unauthenticated HTTP request from {}", peer_addr);
-            return Ok(Response::builder()
-                .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-                .header("Proxy-Authenticate", "Basic realm=\"corduit\"")
-                .body(
-                    Full::new(Bytes::from("Proxy authentication required"))
-                        .map_err(|_| std::io::Error::other("body error"))
-                        .boxed(),
-                )
-                .unwrap());
+            let mut resp = Response::new(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+            resp.headers.insert(
+                HeaderName::from_static("proxy-authenticate"),
+                HeaderValue::from_static("Basic realm=\"corduit\""),
+            );
+            resp.body = Body::from(b"Proxy authentication required".to_vec());
+            return resp;
         }
 
-        // Handle CONNECT method for HTTPS tunneling
         if method == Method::CONNECT {
-            return Ok(Self::handle_http_connect(req, router, outbound_manager).await);
+            return Self::handle_http_connect(req, router, outbound_manager, tunnel_job).await;
         }
 
-        // Handle regular HTTP proxy request
         match Self::handle_http_proxy(req, router, outbound_manager).await {
-            Ok(response) => Ok(response),
+            Ok(resp) => resp,
             Err(e) => {
                 tracing::error!("HTTP proxy error: {}", e);
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(
-                        Full::new(Bytes::from(format!("Proxy error: {}", e)))
-                            .map_err(|_| std::io::Error::other("body error"))
-                            .boxed(),
-                    )
-                    .unwrap())
+                let mut resp = Response::new(StatusCode::BAD_GATEWAY);
+                resp.body = Body::from(format!("Proxy error: {e}"));
+                resp
             }
         }
     }
 
     async fn handle_http_connect(
-        req: Request<hyper::body::Incoming>,
-        router: Arc<Router>,
-        outbound_manager: Arc<OutboundManager>,
-    ) -> Response<BoxBody<Bytes, std::io::Error>> {
-        let uri = req.uri().clone();
-
-        let (host, port) = match Self::parse_connect_uri(&uri) {
+        req: Request<Body>,
+        router: &Router,
+        outbound_manager: &OutboundManager,
+        tunnel_job: &Mutex<Option<TunnelJob>>,
+    ) -> Response<Body> {
+        let authority = req.uri.as_str();
+        let (host, port) = match parse_connect_uri(authority) {
             Some(hp) => hp,
             None => {
-                tracing::warn!("Invalid CONNECT URI: {}", uri);
-                return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(
-                        Full::new(Bytes::from("Invalid CONNECT request"))
-                            .map_err(|_| std::io::Error::other("body error"))
-                            .boxed(),
-                    )
-                    .unwrap();
+                tracing::warn!("Invalid CONNECT URI: {}", authority);
+                let mut resp = Response::new(StatusCode::BAD_REQUEST);
+                resp.body = Body::from(b"Invalid CONNECT request".to_vec());
+                return resp;
             }
         };
 
         let outbound_tag = router
             .match_outbound(Some(&host), None, Some(port), None)
             .await;
-
         tracing::info!("CONNECT {}:{} -> {}", host, port, outbound_tag);
 
-        // Get the outbound proxy
-        let outbound = match outbound_manager.get_proxy(&outbound_tag) {
-            Some(proxy) => proxy,
+        match outbound_manager.get_proxy(&outbound_tag) {
+            Some(_proxy) => {}
             None => {
                 tracing::error!("Outbound '{}' not found", outbound_tag);
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(
-                        Full::new(Bytes::from(format!(
-                            "Outbound '{}' not found",
-                            outbound_tag
-                        )))
-                        .map_err(|_| std::io::Error::other("body error"))
-                        .boxed(),
-                    )
-                    .unwrap();
+                let mut resp = Response::new(StatusCode::BAD_GATEWAY);
+                resp.body = Body::from(format!("Outbound '{outbound_tag}' not found"));
+                return resp;
+            }
+        }
+
+        *tunnel_job.lock().unwrap() = Some(TunnelJob {
+            target: TargetAddr::new_domain(host.clone(), port),
+            host: host.clone(),
+            port,
+            outbound_tag,
+        });
+
+        // 200 OK marks the tunnel as established; the marker header makes
+        // the keep-alive loop relay the raw stream.
+        let mut resp = Response::new(StatusCode::OK);
+        resp.headers.insert(
+            HeaderName::from_static(TUNNEL_MARKER),
+            HeaderValue::from_static("1"),
+        );
+        resp
+    }
+
+    /// Relay a CONNECT tunnel: push the raw client stream through the
+    /// matched outbound with connection tracking.
+    async fn relay_connect_tunnel(
+        stream: TcpStream,
+        job: TunnelJob,
+        _router: &Router,
+        outbound_manager: &OutboundManager,
+    ) {
+        let outbound = match outbound_manager.get_proxy(&job.outbound_tag) {
+            Some(proxy) => proxy,
+            None => {
+                tracing::error!("Outbound '{}' not found", job.outbound_tag);
+                return;
             }
         };
 
-        // Spawn the relay task using the outbound proxy
-        let target = TargetAddr::new_domain(host.clone(), port);
-        let outbound_tag_clone = outbound_tag.clone();
-        tokio::spawn(async move {
-            match hyper::upgrade::on(req).await {
-                Ok(upgraded) => {
-                    let upgraded = TokioIo::new(upgraded);
+        // Resolve the destination IP for display.
+        let destination_ip = tokio::net::lookup_host(format!("{}:{}", job.host, job.port))
+            .await
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+            .map(|addr| addr.ip().to_string());
 
-                    // Try to resolve the destination IP for display
-                    let destination_ip = tokio::net::lookup_host(format!("{}:{}", host, port))
-                        .await
-                        .ok()
-                        .and_then(|mut addrs| addrs.next())
-                        .map(|addr| addr.ip().to_string());
+        let tracked_conn = TrackedConnection::new_with_ip(
+            "mixed".to_string(),
+            job.outbound_tag.clone(),
+            job.host.clone(),
+            destination_ip,
+            job.port,
+            "HTTPS".to_string(),
+            "tcp".to_string(),
+            "HTTP-CONNECT".to_string(),
+            format!("{}:{}", job.host, job.port),
+        );
+        let tracker = global_tracker();
+        let tracked = tracker.track(tracked_conn);
+        let conn_arc = Arc::clone(&tracked);
 
-                    // Track the connection with IP address
-                    let tracked_conn = TrackedConnection::new_with_ip(
-                        "mixed".to_string(),
-                        outbound_tag_clone.clone(),
-                        host.clone(),
-                        destination_ip,
-                        port,
-                        "HTTPS".to_string(),
-                        "tcp".to_string(),
-                        "HTTP-CONNECT".to_string(),
-                        format!("{}:{}", host, port),
-                    );
-                    let tracker = global_tracker();
-                    let tracked = tracker.track(tracked_conn);
-                    let conn_arc = Arc::clone(&tracked);
-
-                    // Use the outbound proxy to relay traffic with connection tracking
-                    if let Err(e) = outbound
-                        .relay_tcp_with_connection(Box::new(upgraded), target, Some(conn_arc))
-                        .await
-                    {
-                        tracing::debug!("CONNECT relay error via '{}': {}", outbound.tag(), e);
-                    }
-                    // Untrack the connection
-                    tracker.untrack(&tracked.id);
-                }
-                Err(e) => {
-                    tracing::debug!("HTTP upgrade failed: {}", e);
-                }
-            }
-        });
-
-        Response::builder()
-            .status(StatusCode::OK)
-            .body(
-                Empty::new()
-                    .map_err(|_| std::io::Error::other("empty"))
-                    .boxed(),
-            )
-            .unwrap()
+        if let Err(e) = outbound
+            .relay_tcp_with_connection(Box::new(stream), job.target, Some(conn_arc))
+            .await
+        {
+            tracing::debug!("CONNECT relay error via '{}': {}", outbound.tag(), e);
+        }
+        tracker.untrack(&tracked.id);
     }
 
     async fn handle_http_proxy(
-        req: Request<hyper::body::Incoming>,
-        router: Arc<Router>,
-        outbound_manager: Arc<OutboundManager>,
-    ) -> Result<Response<BoxBody<Bytes, std::io::Error>>> {
-        let uri = req.uri().clone();
-
-        let (host, port) = Self::parse_http_uri(&uri, req.headers())
+        req: Request<Body>,
+        router: &Router,
+        outbound_manager: &OutboundManager,
+    ) -> Result<Response<Body>> {
+        let (host, port) = parse_http_target(&req)
             .ok_or_else(|| Error::protocol("Invalid HTTP proxy request: missing host"))?;
 
         let outbound_tag = router
             .match_outbound(Some(&host), None, Some(port), None)
             .await;
 
-        tracing::info!("HTTP {} -> {}", uri, outbound_tag);
+        tracing::info!("HTTP {} -> {}", req.uri.as_str(), outbound_tag);
 
         // Get outbound instance
         let outbound = outbound_manager
             .get_proxy(&outbound_tag)
             .ok_or_else(|| Error::config(format!("Outbound '{}' not found", outbound_tag)))?;
 
-        let method = req.method().clone();
-        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let method = req.method.clone();
+        let path = req.uri.as_str().to_string();
         let is_head = method == Method::HEAD;
 
         let target = TargetAddr::new_domain(host.clone(), port);
@@ -397,18 +395,17 @@ impl MixedInbound {
         let (mut read_half, mut write_half) = tokio::io::split(client_side);
 
         // Re-serialize the request with correct HTTP/1.1 framing: hop-by-hop
-        // headers are stripped and any body is re-encoded as chunked (hyper has
-        // already decoded the client's framing, so forwarding it verbatim would
-        // desync the origin — CWE-444). The body is streamed, never buffered.
-        let forwarded_headers = req.headers().clone();
-        crate::engine::inbound::forward::send_request(
+        // headers are stripped and the materialized body is re-framed with an
+        // explicit Content-Length (CWE-444).
+        let body = req.body.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
+        forward::send_request(
             &mut write_half,
             &method,
-            path,
-            &forwarded_headers,
+            &path,
+            &req.headers,
             &host,
             port,
-            req.into_body(),
+            &body,
         )
         .await?;
 
@@ -418,62 +415,14 @@ impl MixedInbound {
             .await
             .map_err(|e| Error::network(format!("Failed to shutdown write: {}", e)))?;
 
-        // Parse the origin's raw response into a real hyper Response so it is
-        // re-framed correctly for the client (status + headers + de-chunked,
-        // size-bounded body).
-        let response =
-            crate::engine::inbound::forward::read_http_response(&mut read_half, is_head).await?;
+        // Parse the origin's raw response so it is re-framed correctly for
+        // the client (status + headers + de-chunked, size-bounded body).
+        let response = forward::read_http_response(&mut read_half, is_head).await?;
 
         // Cleanup - relay_handle should complete when remote closes connection
         let _ = relay_handle.await;
 
         Ok(response)
-    }
-
-    fn parse_connect_uri(uri: &Uri) -> Option<(String, u16)> {
-        if let Some(authority) = uri.authority() {
-            let host = authority.host().to_string();
-            let port = authority.port_u16().unwrap_or(443);
-            return Some((host, port));
-        }
-
-        // Some clients send path as host:port
-        let path = uri.path().trim_start_matches('/');
-        if let Some((host, port_str)) = path.rsplit_once(':') {
-            if let Ok(port) = port_str.parse::<u16>() {
-                return Some((host.to_string(), port));
-            }
-        }
-
-        // Try to parse as host:port directly
-        let uri_str = uri.to_string();
-        if let Some((host, port_str)) = uri_str.rsplit_once(':') {
-            if let Ok(port) = port_str.parse::<u16>() {
-                return Some((host.to_string(), port));
-            }
-        }
-
-        None
-    }
-
-    fn parse_http_uri(uri: &Uri, headers: &hyper::HeaderMap) -> Option<(String, u16)> {
-        if let Some(host) = uri.host() {
-            let port = uri.port_u16().unwrap_or(80);
-            return Some((host.to_string(), port));
-        }
-
-        if let Some(host_header) = headers.get("host") {
-            if let Ok(host_str) = host_header.to_str() {
-                if let Some((host, port_str)) = host_str.rsplit_once(':') {
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        return Some((host.to_string(), port));
-                    }
-                }
-                return Some((host_str.to_string(), 80));
-            }
-        }
-
-        None
     }
 
     // ============== SOCKS5 Handling ==============
@@ -493,7 +442,6 @@ impl MixedInbound {
         )
         .await
         .map_err(|_| Error::protocol("SOCKS5 handshake timeout"))??;
-
         // Route the connection
         let outbound_tag = router
             .match_outbound(Some(&target.host()), None, Some(target.port()), None)
@@ -777,4 +725,369 @@ impl MixedInbound {
 
         Ok(())
     }
+}
+
+/// Marker header set by the CONNECT handler; the keep-alive loop checks it
+/// and relays the raw stream (never sent to the client).
+const TUNNEL_MARKER: &str = "x-corduit-raw-upgrade";
+
+/// Read one HTTP/1.1 request from the async stream, using courierust's H/1
+/// codec (pure functions over the accumulated byte buffer). `None` on a
+/// clean close before any byte.
+async fn read_http_request(
+    stream: &mut TcpStream,
+    max_head: usize,
+    max_body: usize,
+) -> Result<Option<Request<Body>>> {
+    let mut buf: Vec<u8> = Vec::new();
+
+    // Accumulate until the head terminator (status line + headers).
+    let head_len = loop {
+        if let Some(end) = find_subsequence(&buf, b"\r\n\r\n") {
+            break end + 4;
+        }
+        if buf.len() > max_head {
+            return Err(Error::protocol("Request head too large"));
+        }
+        let mut tmp = [0u8; 2048];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
+            .await
+            .map_err(|_| Error::protocol("Timed out reading request head"))?
+            .map_err(|e| Error::network(format!("Failed to read request: {e}")))?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return Err(Error::protocol("Connection closed mid-request"));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    };
+
+    let head = &buf[..head_len];
+    let mut body_start = head_len;
+
+    // Parse the request line.
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or_else(|| Error::protocol("Malformed request line"))?;
+    let req_line = h1::parse_request_line(trim_crlf(&head[..line_end]))
+        .map_err(|e| Error::protocol(format!("Malformed request line: {e}")))?;
+
+    // Parse headers (skip the request line).
+    let mut headers = HeaderMap::new();
+    for raw in head[line_end + 1..head.len() - 4].split(|&b| b == b'\n') {
+        let raw = trim_crlf(raw);
+        if raw.is_empty() {
+            continue;
+        }
+        let colon = raw
+            .iter()
+            .position(|&b| b == b':')
+            .ok_or_else(|| Error::protocol("Malformed header line"))?;
+        let name = std::str::from_utf8(&raw[..colon])
+            .map_err(|_| Error::protocol("Malformed header name"))?
+            .trim();
+        let value = std::str::from_utf8(&raw[colon + 1..])
+            .map_err(|_| Error::protocol("Malformed header value"))?
+            .trim();
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| Error::protocol(format!("Invalid header name: {e}")))?;
+        let value = HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|e| Error::protocol(format!("Invalid header value: {e}")))?;
+        headers.append(name, value);
+    }
+
+    // Read the body per framing (bytes past the head are already buffered).
+    let framing = h1::body_length(&headers, Some(&req_line.method), None)
+        .map_err(|e| Error::protocol(format!("Bad body framing: {e}")))?;
+    let body = match framing {
+        h1::BodyLen::None => Vec::new(),
+        h1::BodyLen::Length(n) => {
+            if n > max_body {
+                return Err(Error::protocol("Request body too large"));
+            }
+            read_exact_bytes(stream, &mut buf, &mut body_start, n).await?
+        }
+        h1::BodyLen::Chunked => {
+            read_chunked_bytes(stream, &mut buf, &mut body_start, max_body).await?
+        }
+    };
+
+    Ok(Some(Request {
+        method: req_line.method,
+        uri: req_line.target,
+        version: req_line.version,
+        headers,
+        body: Body::from(body),
+    }))
+}
+
+/// Write one HTTP/1.1 response (courierust's H/1 serializer).
+async fn write_http_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    resp: &Response<Body>,
+) -> Result<()> {
+    let mut out = Vec::new();
+    let mut headers = resp.headers.clone();
+    if !headers.contains_key("content-length") && !headers.contains_key("transfer-encoding") {
+        if let Body::Bytes(b) = &resp.body {
+            headers.insert(
+                HeaderName::from_static("content-length"),
+                HeaderValue::from(b.len().to_string()),
+            );
+        }
+    }
+    h1::write_response_head(&mut out, resp.status, resp.version, &headers)
+        .map_err(|e| Error::protocol(format!("Encode response head: {e}")))?;
+    if let Body::Bytes(b) = &resp.body {
+        out.extend_from_slice(b);
+    }
+    stream
+        .write_all(&out)
+        .await
+        .map_err(|e| Error::network(format!("Failed to write response: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| Error::network(format!("Failed to flush response: {e}")))
+}
+
+/// Whether the request asks to keep the connection alive.
+fn request_keeps_alive(req: &Request<Body>) -> bool {
+    match req.headers.get("connection").and_then(|v| v.to_str().ok()) {
+        Some(v) if v.eq_ignore_ascii_case("close") => false,
+        Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
+        _ => req.version == courierust::courierust_http::Version::HTTP_11,
+    }
+}
+
+/// Whether the response asks to close the connection.
+fn response_wants_close(resp: &Response<Body>) -> bool {
+    resp.headers
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("close"))
+        .unwrap_or(false)
+}
+
+/// Parse a CONNECT authority (`host:port` or `[v6]:port`).
+fn parse_connect_uri(authority: &str) -> Option<(String, u16)> {
+    let authority = authority.trim_start_matches('/');
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, suffix)) = rest.split_once(']') {
+            let port = if let Some(p) = suffix.strip_prefix(':') {
+                p.parse::<u16>().ok()?
+            } else {
+                443
+            };
+            return Some((host.to_string(), port));
+        }
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Some((host.to_string(), port));
+            }
+        }
+        return None;
+    }
+    if !authority.is_empty() {
+        return Some((authority.to_string(), 443));
+    }
+    None
+}
+
+/// Parse an absolute-form HTTP proxy request target or a Host header.
+fn parse_http_target(req: &Request<Body>) -> Option<(String, u16)> {
+    let target = req.uri.as_str();
+    if let Some(rest) = target.strip_prefix("http://") {
+        let (authority, _) = split_authority_path(rest);
+        return split_host_port(authority, 80);
+    }
+    if let Some(rest) = target.strip_prefix("https://") {
+        let (authority, _) = split_authority_path(rest);
+        return split_host_port(authority, 443);
+    }
+    if let Some(host_header) = req.headers.get("host").and_then(|v| v.to_str().ok()) {
+        return split_host_port(host_header.trim(), 80);
+    }
+    None
+}
+
+fn split_authority_path(rest: &str) -> (&str, &str) {
+    match rest.find(['/', '?']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    }
+}
+
+fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    let authority = authority.trim();
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']')?;
+        let port = if let Some(p) = suffix.strip_prefix(':') {
+            p.parse::<u16>().ok()?
+        } else {
+            default_port
+        };
+        return Some((host.to_string(), port));
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        if !host.contains(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Some((host.to_string(), port));
+            }
+        }
+        return None;
+    }
+    if authority.is_empty() {
+        return None;
+    }
+    Some((authority.to_string(), default_port))
+}
+
+/// Read exactly `n` body bytes (using already-buffered bytes first).
+async fn read_exact_bytes(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    start: &mut usize,
+    n: usize,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        if *start < buf.len() {
+            let take = std::cmp::min(n - out.len(), buf.len() - *start);
+            out.extend_from_slice(&buf[*start..*start + take]);
+            *start += take;
+            continue;
+        }
+        let mut tmp = [0u8; 2048];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
+            .await
+            .map_err(|_| Error::protocol("Timed out reading body"))?
+            .map_err(|e| Error::network(format!("Failed to read body: {e}")))?;
+        if read == 0 {
+            return Err(Error::protocol("Connection closed mid-body"));
+        }
+        buf.clear();
+        *start = 0;
+        buf.extend_from_slice(&tmp[..read]);
+    }
+    Ok(out)
+}
+
+/// Read a chunked request body (using already-buffered bytes first).
+async fn read_chunked_bytes(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    start: &mut usize,
+    max_body: usize,
+) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        // Chunk-size line.
+        let size_line = loop {
+            if let Some(pos) = find_subsequence(&buf[*start..], b"\r\n") {
+                let pos = *start + pos;
+                let line = buf[*start..pos + 2].to_vec();
+                *start = pos + 2;
+                break line;
+            }
+            if buf.len() - *start > 1024 {
+                return Err(Error::protocol("Chunk size line too long"));
+            }
+            let mut tmp = [0u8; 2048];
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
+                    .await
+                    .map_err(|_| Error::protocol("Timed out reading chunk size"))?
+                    .map_err(|e| Error::network(format!("Failed to read chunk size: {e}")))?;
+            if read == 0 {
+                return Err(Error::protocol("Connection closed in chunk size"));
+            }
+            buf.extend_from_slice(&tmp[..read]);
+        };
+
+        let size_str = std::str::from_utf8(
+            size_line
+                .strip_suffix(b"\r\n")
+                .unwrap_or(&size_line)
+                .split(|&b| b == b';')
+                .next()
+                .unwrap_or_default(),
+        )
+        .map_err(|_| Error::protocol("Invalid chunk size"))?;
+        let size = usize::from_str_radix(size_str.trim(), 16)
+            .map_err(|_| Error::protocol("Invalid chunk size"))?;
+
+        if size == 0 {
+            // Trailer section up to the final CRLF.
+            loop {
+                if *start + 2 <= buf.len() && &buf[*start..*start + 2] == b"\r\n" {
+                    *start += 2;
+                    break;
+                }
+                if let Some(pos) = find_subsequence(&buf[*start..], b"\r\n") {
+                    *start += pos + 2;
+                    break;
+                }
+                let mut tmp = [0u8; 2048];
+                let read =
+                    tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
+                        .await
+                        .map_err(|_| Error::protocol("Timed out reading trailers"))?
+                        .map_err(|e| Error::network(format!("Failed to read trailers: {e}")))?;
+                if read == 0 {
+                    return Err(Error::protocol("Connection closed in trailers"));
+                }
+                buf.extend_from_slice(&tmp[..read]);
+            }
+            break;
+        }
+
+        if out.len().saturating_add(size) > max_body {
+            return Err(Error::protocol("Request body too large"));
+        }
+        let chunk = read_exact_bytes(stream, buf, start, size).await?;
+        out.extend_from_slice(&chunk);
+        // Trailing CRLF after the chunk data.
+        let mut crlf = [0u8; 2];
+        if *start + 2 <= buf.len() {
+            *start += 2;
+        } else {
+            let need = 2 - (buf.len() - *start);
+            if *start < buf.len() {
+                let have = buf.len() - *start;
+                crlf[..have].copy_from_slice(&buf[*start..]);
+                *start = buf.len();
+            }
+            let mut tmp = [0u8; 2];
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
+                    .await
+                    .map_err(|_| Error::protocol("Timed out reading chunk CRLF"))?
+                    .map_err(|e| Error::network(format!("Failed to read chunk CRLF: {e}")))?;
+            let _ = need;
+            let _ = crlf;
+            let _ = read;
+        }
+    }
+    Ok(out)
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Trim a trailing `\r\n` (or lone `\n`).
+fn trim_crlf(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
