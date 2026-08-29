@@ -1,10 +1,10 @@
 //! DNS over TLS (DoT) server — RFC 7858, on courierust's TLS.
 //!
 //! Each accepted connection is handled on a dedicated thread: a courierust
-//! TLS handshake, then the RFC 7858 2-byte length-prefixed DNS exchange.
-//! Queries are resolved through the async engine by blocking on a captured
-//! `tokio::runtime::Handle` (the same seam the DoH server uses).
+//! TLS handshake, then the RFC 7858 2-byte length-prefixed DNS exchange
+//! against the engine's synchronous DNS resolver.
 
+use crate::common::cancel::CancellationToken;
 use crate::common::http_server::TlsIdentity;
 use crate::dns::error::{DnsError, Result};
 use crate::dns::resolver::DnsResolver;
@@ -12,10 +12,8 @@ use crate::dns::wire::{BinDecodable, BinEncodable, Message};
 use courierust::courierust_io::{Read as CRead, Write as CWrite};
 use courierust::courierust_tls::{ServerConfig, TlsAcceptor, TlsVersion};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tracing::{debug, info, trace, warn};
 
 /// Poll interval of the accept loop while idle.
@@ -53,8 +51,8 @@ pub struct DotServer {
     resolver: Arc<DnsResolver>,
     /// TLS identity (cert chain + key).
     identity: TlsIdentity,
-    /// Shutdown signal sender.
-    shutdown_tx: broadcast::Sender<()>,
+    /// Shutdown signal.
+    shutdown: CancellationToken,
 }
 
 impl DotServer {
@@ -68,19 +66,18 @@ impl DotServer {
 
         let identity = TlsIdentity::from_pem_files(&config.cert_path, &config.key_path)
             .map_err(|e| DnsError::Config(format!("Failed to load TLS identity: {e}")))?;
-        let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             config,
             resolver,
             identity,
-            shutdown_tx,
+            shutdown: CancellationToken::new(),
         })
     }
 
-    /// Start the DoT server. Returns after the listener is bound; blocks (as
-    /// an async task) until [`Self::stop`] is called.
-    pub async fn start(&self) -> Result<()> {
+    /// Start the DoT server. Returns after the listener is bound; blocks
+    /// until [`Self::stop`] is called.
+    pub fn start(&self) -> Result<()> {
         let listener = TcpListener::bind(self.config.listen).map_err(DnsError::Io)?;
         listener.set_nonblocking(true).map_err(DnsError::Io)?;
         info!("DoT server listening on {}", self.config.listen);
@@ -88,26 +85,26 @@ impl DotServer {
         let resolver = self.resolver.clone();
         let identity = self.identity.clone();
         let timeout = Duration::from_secs(self.config.timeout_secs);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let shutdown = self.shutdown.clone();
 
-        // Accept loop on a dedicated thread (non-blocking poll + flag).
-        let loop_shutdown = shutdown.clone();
+        // Accept loop on a dedicated thread (non-blocking poll + token).
         let accept_thread = std::thread::Builder::new()
             .name("corduit-dot-accept".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Handle::current();
-                while !loop_shutdown.load(Ordering::SeqCst) {
+                while !shutdown.is_cancelled() {
                     match listener.accept() {
                         Ok((stream, addr)) => {
+                            // Windows: accepted sockets inherit the
+                            // listener's non-blocking mode; switch back so
+                            // the blocking TLS exchange + timeouts work.
+                            let _ = stream.set_nonblocking(false);
                             let resolver = resolver.clone();
                             let identity = identity.clone();
-                            let runtime = runtime.clone();
                             std::thread::Builder::new()
                                 .name("corduit-dot-conn".into())
                                 .spawn(move || {
                                     if let Err(e) = handle_connection(
-                                        stream, addr, &resolver, &identity, &runtime, timeout,
+                                        stream, addr, &resolver, &identity, timeout,
                                     ) {
                                         debug!("DoT connection error from {}: {}", addr, e);
                                     }
@@ -115,7 +112,7 @@ impl DotServer {
                                 .ok();
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(ACCEPT_POLL);
+                            shutdown.wait(ACCEPT_POLL);
                         }
                         Err(_) => break,
                     }
@@ -123,8 +120,8 @@ impl DotServer {
             })
             .map_err(DnsError::Io)?;
 
-        let _ = shutdown_rx.recv().await;
-        shutdown.store(true, Ordering::SeqCst);
+        // Wait for shutdown, then join the accept thread.
+        self.shutdown.wait(std::time::Duration::from_secs(u64::MAX));
         let _ = accept_thread.join();
         info!("DoT server stopped");
         Ok(())
@@ -132,7 +129,7 @@ impl DotServer {
 
     /// Stop the DoT server.
     pub fn stop(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.cancel();
     }
 
     /// Get the listen address.
@@ -148,7 +145,6 @@ fn handle_connection(
     addr: SocketAddr,
     resolver: &DnsResolver,
     identity: &TlsIdentity,
-    runtime: &tokio::runtime::Handle,
     timeout: Duration,
 ) -> Result<()> {
     trace!("DoT connection from {}", addr);
@@ -195,8 +191,7 @@ fn handle_connection(
                 break;
             }
         };
-        let response = match runtime.block_on(crate::dns::server::process_query(resolver, &request))
-        {
+        let response = match crate::dns::server::process_query(resolver, &request) {
             Ok(r) => r,
             Err(e) => {
                 warn!("DoT resolution failed for {}: {}", addr, e);

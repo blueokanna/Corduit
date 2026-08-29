@@ -1,12 +1,13 @@
+use crate::common::stream::BoxStream;
 use crate::crypto::uuid::Uuid;
 use crate::engine::config::OutboundConfig;
-use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
+use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::engine::tls::{ClientConfig, TlsConnector};
+use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use std::time::{Duration, Instant};
 
 const VLESS_VERSION: u8 = 0x00;
 
@@ -192,18 +193,17 @@ impl VlessOutbound {
         })
     }
 
-    async fn connect_tls(&self) -> Result<Box<dyn AsyncReadWrite>> {
+    fn connect_tls(&self) -> Result<BoxStream> {
         let addr = format!("{}:{}", self.server, self.port);
-        let stream = TcpStream::connect(&addr).await.map_err(|e| {
-            Error::network(format!("Failed to connect to VLess server {}: {}", addr, e))
-        })?;
-
-        stream.set_nodelay(true).ok();
+        let stream =
+            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
+                .map_err(|e| {
+                Error::network(format!("Failed to connect to VLess server {}: {}", addr, e))
+            })?;
 
         let connector = self.create_tls_connector()?;
         let tls_stream = connector
             .connect(stream, &self.sni)
-            .await
             .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?;
 
         tracing::debug!(
@@ -215,7 +215,7 @@ impl VlessOutbound {
         Ok(tls_stream)
     }
 
-    async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    fn handshake<S: Read + Write + ?Sized>(
         &self,
         stream: &mut S,
         target: &TargetAddr,
@@ -241,18 +241,15 @@ impl VlessOutbound {
 
         stream
             .write_all(&buf)
-            .await
             .map_err(|e| Error::network(format!("Failed to send VLess handshake: {}", e)))?;
 
         stream
             .flush()
-            .await
             .map_err(|e| Error::network(format!("Failed to flush VLess handshake: {}", e)))?;
 
         let mut response = [0u8; 2];
         stream
             .read_exact(&mut response)
-            .await
             .map_err(|e| Error::network(format!("Failed to read VLess response: {}", e)))?;
 
         if response[0] != VLESS_VERSION {
@@ -267,7 +264,6 @@ impl VlessOutbound {
             let mut addons = vec![0u8; addons_len];
             stream
                 .read_exact(&mut addons)
-                .await
                 .map_err(|e| Error::network(format!("Failed to read VLess addons: {}", e)))?;
         }
 
@@ -284,29 +280,22 @@ impl VlessOutbound {
         self.flow
     }
 
-    pub async fn relay_udp(
-        &self,
-        _local_socket: &UdpSocket,
-        target: &TargetAddr,
-        data: &[u8],
-    ) -> Result<Vec<u8>> {
+    pub fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         if !self.udp_enabled {
             return Err(Error::config(
                 "UDP relay is not enabled for this VLess proxy",
             ));
         }
 
-        let mut tls_stream = self.connect_tls().await?;
+        let mut tls_stream = self.connect_tls()?;
 
-        self.handshake(&mut tls_stream, target, VlessCommand::Udp)
-            .await?;
+        self.handshake(&mut tls_stream, target, VlessCommand::Udp)?;
 
         let udp_packet = build_udp_packet(target, data)?;
         tls_stream
             .write_all(&udp_packet)
-            .await
             .map_err(|e| Error::network(format!("Failed to send UDP packet: {}", e)))?;
-        tls_stream.flush().await.ok();
+        tls_stream.flush().ok();
 
         tracing::debug!(
             "VLess UDP: sent {} bytes to {} via {}:{}",
@@ -316,10 +305,11 @@ impl VlessOutbound {
             self.port
         );
 
-        let timeout = std::time::Duration::from_secs(30);
-        let response = tokio::time::timeout(timeout, read_udp_packet(&mut tls_stream))
-            .await
-            .map_err(|_| Error::network("UDP receive timeout"))?
+        // Bounded response read: the TLS layer reads with a short socket
+        // timeout, so retry until the 30s deadline (safe: the TLS record
+        // layer resumes from the exact byte across a transient timeout).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let response = read_udp_packet(&mut tls_stream, deadline)
             .map_err(|e| Error::network(format!("Failed to receive UDP response: {}", e)))?;
 
         tracing::debug!("VLess UDP: received {} bytes response", response.len());
@@ -328,10 +318,9 @@ impl VlessOutbound {
     }
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for VlessOutbound {
-    async fn connect(&self) -> Result<()> {
-        let _tls_stream = self.connect_tls().await?;
+    fn connect(&self) -> Result<()> {
+        let _tls_stream = self.connect_tls()?;
         tracing::info!(
             "VLess outbound '{}' can reach {}:{}",
             self.config.tag,
@@ -341,7 +330,7 @@ impl OutboundProxy for VlessOutbound {
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    fn disconnect(&self) -> Result<()> {
         Ok(())
     }
 
@@ -357,20 +346,16 @@ impl OutboundProxy for VlessOutbound {
         self.udp_enabled
     }
 
-    async fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+    fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         if !self.udp_enabled {
             return Err(Error::config(
                 "UDP relay is not enabled for this VLESS proxy",
             ));
         }
-        // Create a dummy socket for the relay_udp call
-        let dummy_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
-        self.relay_udp(&dummy_socket, target, data).await
+        self.relay_udp(target, data)
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         test_url: &str,
         timeout: std::time::Duration,
@@ -395,14 +380,10 @@ impl OutboundProxy for VlessOutbound {
 
         let start = Instant::now();
 
-        let mut tls_stream = tokio::time::timeout(timeout, self.connect_tls())
-            .await
-            .map_err(|_| Error::network("Connection timeout"))?
-            .map_err(|e| Error::network(format!("TLS connection failed: {}", e)))?;
+        let mut tls_stream = self.connect_tls()?;
 
         let target = TargetAddr::Domain(host.clone(), url_port);
-        self.handshake(&mut tls_stream, &target, VlessCommand::Tcp)
-            .await?;
+        self.handshake(&mut tls_stream, &target, VlessCommand::Tcp)?;
 
         let http_request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n",
@@ -411,60 +392,36 @@ impl OutboundProxy for VlessOutbound {
 
         tls_stream
             .write_all(http_request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send HTTP request: {}", e)))?;
 
-        let result = tokio::time::timeout(timeout, async {
-            let mut response = vec![0u8; 1024];
-            let n = tls_stream
-                .read(&mut response)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
+        // Bounded response read: retry transient timeouts up to the deadline.
+        let deadline = Instant::now() + timeout;
+        let response = read_http_response(&mut tls_stream, deadline)
+            .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
 
-            if n == 0 {
-                return Err(Error::network("Empty response"));
-            }
-
-            let response_str = String::from_utf8_lossy(&response[..n]);
-            if response_str.starts_with("HTTP/") {
-                Ok(())
-            } else {
-                Err(Error::network("Invalid HTTP response"))
-            }
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                let elapsed = start.elapsed();
-                tracing::info!("VLess latency test success: {}ms", elapsed.as_millis());
-                Ok(elapsed)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("VLess latency test failed: {}", e);
-                Err(e)
-            }
-            Err(_) => {
-                tracing::warn!("VLess latency test timeout");
-                Err(Error::network("Response timeout"))
-            }
+        if response.starts_with("HTTP/") {
+            let elapsed = start.elapsed();
+            tracing::info!("VLess latency test success: {}ms", elapsed.as_millis());
+            Ok(elapsed)
+        } else {
+            Err(Error::network("Invalid HTTP response"))
         }
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        inbound: Box<dyn AsyncReadWrite>,
+        inbound: BoxStream,
         target: TargetAddr,
         connection: Option<Arc<TrackedConnection>>,
     ) -> Result<()> {
-        let mut tls_stream = self.connect_tls().await?;
+        let tls_stream = self.connect_tls()?;
 
-        self.handshake(&mut tls_stream, &target, VlessCommand::Tcp)
-            .await?;
+        let mut tls_stream = tls_stream;
+        self.handshake(&mut tls_stream, &target, VlessCommand::Tcp)?;
 
         tracing::debug!(
             "VLess: relaying TCP to {} via {}:{}",
@@ -473,75 +430,7 @@ impl OutboundProxy for VlessOutbound {
             self.port
         );
 
-        let tracker = global_tracker();
-        let (mut ri, mut wi) = tokio::io::split(inbound);
-        let (mut ro, mut wo) = tokio::io::split(tls_stream);
-
-        let conn_upload = connection.clone();
-        let conn_download = connection.clone();
-
-        let client_to_remote = async {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                let n = ri
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read from inbound: {}", e)))?;
-                if n == 0 {
-                    break;
-                }
-                wo.write_all(&buf[..n])
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to write to VLess: {}", e)))?;
-
-                tracker.add_global_upload(n as u64);
-                if let Some(ref conn) = conn_upload {
-                    conn.add_upload(n as u64);
-                }
-            }
-            wo.shutdown().await.ok();
-            Ok::<(), Error>(())
-        };
-
-        let remote_to_client = async {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                let n = ro
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read from VLess: {}", e)))?;
-                if n == 0 {
-                    break;
-                }
-                wi.write_all(&buf[..n])
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to write to inbound: {}", e)))?;
-
-                tracker.add_global_download(n as u64);
-                if let Some(ref conn) = conn_download {
-                    conn.add_download(n as u64);
-                }
-            }
-            wi.shutdown().await.ok();
-            Ok::<(), Error>(())
-        };
-
-        let result = tokio::try_join!(client_to_remote, remote_to_client);
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("connection")
-                    || err_str.contains("reset")
-                    || err_str.contains("broken")
-                {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        relay_streams!(inbound, tls_stream, connection)
     }
 }
 
@@ -595,62 +484,120 @@ fn build_udp_packet(target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
     Ok(packet)
 }
 
-async fn read_udp_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
-    let atype = stream
-        .read_u8()
-        .await
-        .map_err(|e| Error::network(format!("Failed to read address type: {}", e)))?;
+fn read_udp_packet<S: Read>(stream: &mut S, deadline: Instant) -> std::io::Result<Vec<u8>> {
+    let read_u8 = |stream: &mut S| -> std::io::Result<u8> {
+        let mut b = [0u8; 1];
+        read_exact_deadline(stream, &mut b, deadline)?;
+        Ok(b[0])
+    };
+    let read_u16 = |stream: &mut S| -> std::io::Result<u16> {
+        let mut b = [0u8; 2];
+        read_exact_deadline(stream, &mut b, deadline)?;
+        Ok(u16::from_be_bytes(b))
+    };
+
+    let atype = read_u8(stream)?;
 
     match atype {
         0x01 => {
             let mut addr = [0u8; 4];
-            stream
-                .read_exact(&mut addr)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read IPv4 address: {}", e)))?;
+            read_exact_deadline(stream, &mut addr, deadline)?;
         }
         0x02 => {
-            let len = stream
-                .read_u8()
-                .await
-                .map_err(|e| Error::network(format!("Failed to read domain length: {}", e)))?
-                as usize;
+            let len = read_u8(stream)? as usize;
             let mut domain = vec![0u8; len];
-            stream
-                .read_exact(&mut domain)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read domain: {}", e)))?;
+            read_exact_deadline(stream, &mut domain, deadline)?;
         }
         0x03 => {
             let mut addr = [0u8; 16];
-            stream
-                .read_exact(&mut addr)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read IPv6 address: {}", e)))?;
+            read_exact_deadline(stream, &mut addr, deadline)?;
         }
         _ => {
-            return Err(Error::protocol(format!("Unknown address type: {}", atype)));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unknown address type: {}", atype),
+            ));
         }
     }
 
-    let _port = stream
-        .read_u16()
-        .await
-        .map_err(|e| Error::network(format!("Failed to read port: {}", e)))?;
+    let _port = read_u16(stream)?;
 
-    let length = stream
-        .read_u16()
-        .await
-        .map_err(|e| Error::network(format!("Failed to read length: {}", e)))?
-        as usize;
+    let length = read_u16(stream)? as usize;
 
     let mut data = vec![0u8; length];
-    stream
-        .read_exact(&mut data)
-        .await
-        .map_err(|e| Error::network(format!("Failed to read UDP data: {}", e)))?;
+    read_exact_deadline(stream, &mut data, deadline)?;
 
     Ok(data)
+}
+
+/// Read exactly `buf.len()` bytes, retrying transient read timeouts until
+/// `deadline`. Safe to retry: a `read` that returns `WouldBlock`/`TimedOut`
+/// consumes no bytes, and the courierust TLS record layer resumes from the
+/// exact byte across a mid-record timeout.
+fn read_exact_deadline(
+    stream: &mut dyn Read,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        match stream.read(&mut buf[pos..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                ))
+            }
+            Ok(n) => pos += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "read timed out",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Read the first HTTP response chunk within `deadline`, returning it as
+/// UTF-8 lossy text (used by the latency test).
+fn read_http_response(stream: &mut dyn Read, deadline: Instant) -> std::io::Result<String> {
+    let mut response = vec![0u8; 1024];
+    let mut pos = 0usize;
+    while pos < response.len() {
+        match stream.read(&mut response[pos..]) {
+            Ok(0) => break,
+            Ok(n) => pos += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if pos > 0 {
+                    // Already have data; treat a stall as end-of-chunk.
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "read timed out",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(String::from_utf8_lossy(&response[..pos]).into_owned())
 }
 
 #[cfg(test)]

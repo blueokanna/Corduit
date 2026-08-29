@@ -13,9 +13,8 @@
 //!   ([`courierust::courierust_h1`]) — TLS on top of the tunnel uses
 //!   [`courierust::courierust_tls::TlsConnector`].
 //!
-//! Because courierust's engine is synchronous, every request runs inside
-//! `tokio::task::spawn_blocking` — the engine's own thread pool keeps the
-//! async runtime responsive and applies its own backpressure.
+//! The whole client is synchronous: callers run it on the work-stealing
+//! pool (or a relay thread) and the per-request timeout bounds the call.
 
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_error::{Error as CourierError, ErrorKind as CourierErrorKind};
@@ -190,22 +189,20 @@ impl HttpClient {
     }
 
     /// Perform a GET request, following up to `MAX_REDIRECTS` redirects.
-    pub async fn get(&self, url: &str) -> Result<HttpResponse, HttpError> {
-        self.get_bytes(url).await
+    pub fn get(&self, url: &str) -> Result<HttpResponse, HttpError> {
+        self.get_bytes(url)
     }
 
     /// Perform a GET request, following up to `MAX_REDIRECTS` redirects.
-    pub async fn get_bytes(&self, url: &str) -> Result<HttpResponse, HttpError> {
+    pub fn get_bytes(&self, url: &str) -> Result<HttpResponse, HttpError> {
         let url = url.to_string();
         let proxy = self.proxy;
         let client = self.client.clone();
         let timeout = self.timeout;
-        tokio::task::spawn_blocking(move || match proxy {
+        match proxy {
             Some(proxy) => proxy_get(&client, &url, proxy, timeout),
             None => direct_get(&client, &url, timeout),
-        })
-        .await
-        .map_err(|e| HttpError::Request(format!("request worker panicked: {e}")))?
+        }
     }
 }
 

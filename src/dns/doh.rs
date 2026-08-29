@@ -1,8 +1,7 @@
 //! DNS over HTTPS (DoH) client — RFC 8484, on courierust.
 //!
 //! The transport is courierust's synchronous HTTP/1.1 + HTTP/2 client
-//! (system roots from [`crate::common::roots`]), invoked through
-//! `tokio::task::spawn_blocking` so the async engine is never blocked.
+//! (system roots from [`crate::common::roots`]).
 //! Both GET (`?dns=` base64url) and POST (binary body) query methods are
 //! supported, and every response body is capped at 128 KiB — a DNS message
 //! is at most 65535 bytes, so anything larger is a misbehaving server.
@@ -19,11 +18,11 @@ use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_http::uri::Url;
 use courierust::courierust_http::{HeaderName, HeaderValue, Method, Request};
 use courierust::courierust_tls::TlsVersion;
+use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
 /// Hard cap for a single DoH response body (a DNS message is ≤ 65535
@@ -131,12 +130,12 @@ impl DohClient {
     }
 
     /// Resolve a domain name to IP addresses.
-    pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
+    pub fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
         // Try A records first.
-        let mut ips = self.query(domain, RecordType::A).await.unwrap_or_default();
+        let mut ips = self.query(domain, RecordType::A).unwrap_or_default();
 
         // Also try AAAA records.
-        if let Ok(ipv6) = self.query(domain, RecordType::AAAA).await {
+        if let Ok(ipv6) = self.query(domain, RecordType::AAAA) {
             ips.extend(ipv6);
         }
 
@@ -151,9 +150,9 @@ impl DohClient {
     }
 
     /// Query DNS records.
-    pub async fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+    pub fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let query_bytes = self.build_query(domain, record_type.into())?;
-        let response_bytes = self.send_query(&query_bytes).await?;
+        let response_bytes = self.send_query(&query_bytes)?;
         self.parse_response(&response_bytes)
     }
 
@@ -178,72 +177,61 @@ impl DohClient {
     }
 
     /// Send a DNS query over HTTPS via courierust.
-    async fn send_query(&self, query: &[u8]) -> Result<Vec<u8>> {
-        let client = self.client.clone();
-        let base_url = self.url.clone();
-        let method = self.method;
-        let headers = self.headers.clone();
-        let query = query.to_vec();
-
-        // The per-request timeout is baked into the client config; this
-        // closure only performs the blocking round-trip.
-        tokio::task::spawn_blocking(move || {
-            let mut req = Request::<courierust::courierust_body::Body>::new(Method::POST, "/");
-            // RFC 8484 requires these regardless of method.
-            req.headers.insert(
-                HeaderName::from_static("accept"),
-                HeaderValue::from_static("application/dns-message"),
-            );
-            for (k, v) in &headers {
-                if let (Ok(name), Ok(value)) = (
-                    HeaderName::from_bytes(k.as_bytes()),
-                    HeaderValue::from_bytes(v.as_bytes()),
-                ) {
-                    req.headers.insert(name, value);
-                }
+    fn send_query(&self, query: &[u8]) -> Result<Vec<u8>> {
+        let mut req = Request::<courierust::courierust_body::Body>::new(Method::POST, "/");
+        // RFC 8484 requires these regardless of method.
+        req.headers.insert(
+            HeaderName::from_static("accept"),
+            HeaderValue::from_static("application/dns-message"),
+        );
+        for (k, v) in &self.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_bytes(v.as_bytes()),
+            ) {
+                req.headers.insert(name, value);
             }
+        }
 
-            let url = match method {
-                DohMethod::Get => {
-                    let encoded = b64_encode(&query, B64Config::URL_SAFE_NO_PAD);
-                    let mut u = base_url;
-                    u.push(if u.contains('?') { '&' } else { '?' });
-                    u.push_str("dns=");
-                    u.push_str(&encoded);
-                    u
-                }
-                DohMethod::Post => {
-                    req.headers.insert(
-                        HeaderName::from_static("content-type"),
-                        HeaderValue::from_static("application/dns-message"),
-                    );
-                    // The client's streaming body type (courierust_body), not
-                    // the no_std message body.
-                    req.body = courierust::courierust_body::Body::from(query.clone());
-                    base_url
-                }
-            };
-
-            let resp = client.execute(&url, req).map_err(|e| match e.kind {
-                courierust::courierust_error::ErrorKind::Timeout => DnsError::Timeout,
-                _ => DnsError::Http(format!("DoH request failed: {e}")),
-            })?;
-
-            let status = resp.status.as_u16();
-            if status != 200 {
-                return Err(DnsError::Http(format!(
-                    "DoH server returned status {status}"
-                )));
+        // The per-request timeout is baked into the client config.
+        let url = match self.method {
+            DohMethod::Get => {
+                let encoded = b64_encode(query, B64Config::URL_SAFE_NO_PAD);
+                let mut u = self.url.clone();
+                u.push(if u.contains('?') { '&' } else { '?' });
+                u.push_str("dns=");
+                u.push_str(&encoded);
+                u
             }
+            DohMethod::Post => {
+                req.headers.insert(
+                    HeaderName::from_static("content-type"),
+                    HeaderValue::from_static("application/dns-message"),
+                );
+                // The client's streaming body type (courierust_body), not
+                // the no_std message body.
+                req.body = courierust::courierust_body::Body::from(query.to_vec());
+                self.url.clone()
+            }
+        };
 
-            let body = resp
-                .body
-                .collect_limited(MAX_DOH_RESPONSE)
-                .map_err(|e| DnsError::Http(format!("DoH response too large: {e}")))?;
-            Ok(body.to_vec())
-        })
-        .await
-        .map_err(|e| DnsError::Http(format!("DoH worker panicked: {e}")))?
+        let resp = self.client.execute(&url, req).map_err(|e| match e.kind {
+            courierust::courierust_error::ErrorKind::Timeout => DnsError::Timeout,
+            _ => DnsError::Http(format!("DoH request failed: {e}")),
+        })?;
+
+        let status = resp.status.as_u16();
+        if status != 200 {
+            return Err(DnsError::Http(format!(
+                "DoH server returned status {status}"
+            )));
+        }
+
+        let body = resp
+            .body
+            .collect_limited(MAX_DOH_RESPONSE)
+            .map_err(|e| DnsError::Http(format!("DoH response too large: {e}")))?;
+        Ok(body.to_vec())
     }
 
     /// Parse DNS response.
@@ -352,13 +340,13 @@ impl DohResolver {
     }
 
     /// Resolve a domain name using round-robin load balancing.
-    pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
+    pub fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let mut last_error = None;
 
         // Try each client in round-robin fashion.
         for _ in 0..self.clients.len() {
             let idx = {
-                let mut current = self.current.write().await;
+                let mut current = self.current.write();
                 let idx = *current;
                 *current = (*current + 1) % self.clients.len();
                 idx
@@ -366,7 +354,7 @@ impl DohResolver {
 
             let client = &self.clients[idx];
 
-            match client.resolve(domain).await {
+            match client.resolve(domain) {
                 Ok(mut ips) if !ips.is_empty() => {
                     // Sort by preference.
                     if self.prefer_ipv4 {
@@ -403,12 +391,12 @@ impl DohResolver {
     }
 
     /// Query specific record type.
-    pub async fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+    pub fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let mut last_error = None;
 
         for _ in 0..self.clients.len() {
             let idx = {
-                let mut current = self.current.write().await;
+                let mut current = self.current.write();
                 let idx = *current;
                 *current = (*current + 1) % self.clients.len();
                 idx
@@ -416,7 +404,7 @@ impl DohResolver {
 
             let client = &self.clients[idx];
 
-            match client.query(domain, record_type).await {
+            match client.query(domain, record_type) {
                 Ok(ips) if !ips.is_empty() => {
                     return Ok(ips);
                 }

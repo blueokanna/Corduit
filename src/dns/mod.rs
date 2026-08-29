@@ -40,17 +40,16 @@
 //! ```rust,no_run
 //! use corduit::dns::{DnsManager, DnsConfig, RecordType};
 //!
-//! #[tokio::main]
-//! async fn main() -> corduit::dns::Result<()> {
+//! fn main() -> corduit::dns::Result<()> {
 //!     // Create DNS manager with default config
 //!     let manager = DnsManager::new()?;
 //!
 //!     // Resolve a domain
-//!     let ips = manager.resolve("google.com").await?;
+//!     let ips = manager.resolve("google.com")?;
 //!     println!("Resolved: {:?}", ips);
 //!
 //!     // Start DNS server
-//!     manager.start_server().await?;
+//!     manager.start_server()?;
 //!
 //!     Ok(())
 //! }

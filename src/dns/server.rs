@@ -1,16 +1,23 @@
 //! DNS server implementation (UDP/TCP/DoH/DoT)
 
+use crate::common::cancel::CancellationToken;
+use crate::common::exec;
+use crate::common::socket;
 use crate::dns::config::DnsConfig;
 use crate::dns::error::{DnsError, Result};
 use crate::dns::resolver::DnsResolver;
 use crate::dns::wire::{BinDecodable, BinEncodable, Message, RData, Record, ResponseCode};
 use crate::dns::RecordType;
-use std::net::{IpAddr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::broadcast;
+use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
+
+/// Idle poll interval for the UDP receive loop.
+const UDP_POLL: Duration = Duration::from_millis(50);
+/// Idle poll interval for the TCP accept loop.
+const ACCEPT_POLL: Duration = Duration::from_millis(20);
 
 /// DNS server
 pub struct DnsServer {
@@ -19,139 +26,142 @@ pub struct DnsServer {
     /// Configuration
     config: DnsConfig,
     /// Shutdown signal
-    shutdown_tx: broadcast::Sender<()>,
+    shutdown: CancellationToken,
 }
 
 impl DnsServer {
     /// Create a new DNS server
     pub fn new(config: DnsConfig) -> Result<Self> {
         let resolver = Arc::new(DnsResolver::new(config.clone())?);
-        let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             resolver,
             config,
-            shutdown_tx,
+            shutdown: CancellationToken::new(),
         })
     }
 
-    /// Start the DNS server
-    pub async fn start(&self) -> Result<()> {
+    /// Start the DNS server. Blocks until [`Self::stop`] is called.
+    pub fn start(&self) -> Result<()> {
         info!("Starting DNS server on {}", self.config.listen);
 
         // Start UDP server
-        let udp_handle = self.start_udp_server().await?;
+        self.start_udp_server()?;
 
         // Start TCP server if enabled
-        let tcp_handle = if self.config.tcp_enable {
-            Some(self.start_tcp_server().await?)
-        } else {
-            None
-        };
+        if self.config.tcp_enable {
+            self.start_tcp_server()?;
+        }
 
         // Wait for shutdown
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                info!("DNS server shutting down");
-            }
-            _ = udp_handle => {
-                warn!("UDP server stopped unexpectedly");
-            }
-            _ = async {
-                if let Some(handle) = tcp_handle {
-                    let _ = handle.await;
-                } else {
-                    std::future::pending::<()>().await
+        self.shutdown.wait(Duration::from_secs(u64::MAX));
+        info!("DNS server shutting down");
+        Ok(())
+    }
+
+    /// Start UDP DNS server on a dedicated receive thread.
+    fn start_udp_server(&self) -> Result<()> {
+        let udp_socket = Arc::new(socket::udp_bind(self.config.listen, UDP_POLL)?);
+        let resolver = self.resolver.clone();
+        let shutdown = self.shutdown.clone();
+
+        info!("UDP DNS server listening on {}", self.config.listen);
+
+        std::thread::Builder::new()
+            .name("corduit-dns-udp".into())
+            .spawn(move || {
+                let mut buf = vec![0u8; 4096];
+
+                loop {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+
+                    match udp_socket.recv_from(&mut buf) {
+                        Ok((len, addr)) => {
+                            let data = buf[..len].to_vec();
+                            let resolver = resolver.clone();
+                            let udp_socket = udp_socket.clone();
+
+                            exec::spawn(move || {
+                                if let Err(e) =
+                                    handle_udp_query(&udp_socket, &resolver, &data, addr)
+                                {
+                                    debug!("UDP query error from {}: {}", addr, e);
+                                }
+                            });
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            // Idle: loop re-checks cancellation.
+                        }
+                        Err(e) => {
+                            error!("UDP recv error: {}", e);
+                            // Avoid a tight error loop.
+                            shutdown.wait(Duration::from_millis(5));
+                        }
+                    }
                 }
-            } => {
-                warn!("TCP server stopped unexpectedly");
-            }
-        }
+            })
+            .map_err(DnsError::Io)?;
 
         Ok(())
     }
 
-    /// Start UDP DNS server
-    async fn start_udp_server(&self) -> Result<tokio::task::JoinHandle<()>> {
-        let socket = Arc::new(UdpSocket::bind(self.config.listen).await?);
+    /// Start TCP DNS server on a dedicated accept thread.
+    fn start_tcp_server(&self) -> Result<()> {
+        let listener = TcpListener::bind(self.config.listen).map_err(DnsError::Io)?;
+        listener.set_nonblocking(true).map_err(DnsError::Io)?;
         let resolver = self.resolver.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-
-        info!("UDP DNS server listening on {}", self.config.listen);
-
-        let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-
-            loop {
-                tokio::select! {
-                    result = socket.recv_from(&mut buf) => {
-                        match result {
-                            Ok((len, addr)) => {
-                                let data = buf[..len].to_vec();
-                                let resolver = resolver.clone();
-                                let socket = socket.clone();
-
-                                tokio::spawn(async move {
-                                    if let Err(e) = handle_udp_query(&socket, &resolver, &data, addr).await {
-                                        debug!("UDP query error from {}: {}", addr, e);
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("UDP recv error: {}", e);
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(handle)
-    }
-
-    /// Start TCP DNS server
-    async fn start_tcp_server(&self) -> Result<tokio::task::JoinHandle<()>> {
-        let listener = TcpListener::bind(self.config.listen).await?;
-        let resolver = self.resolver.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let shutdown = self.shutdown.clone();
 
         info!("TCP DNS server listening on {}", self.config.listen);
 
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = listener.accept() => {
-                        match result {
-                            Ok((stream, addr)) => {
-                                let resolver = resolver.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = handle_tcp_connection(stream, &resolver).await {
-                                        debug!("TCP connection error from {}: {}", addr, e);
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("TCP accept error: {}", e);
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
+        std::thread::Builder::new()
+            .name("corduit-dns-tcp".into())
+            .spawn(move || {
+                loop {
+                    if shutdown.is_cancelled() {
                         break;
                     }
-                }
-            }
-        });
 
-        Ok(handle)
+                    match listener.accept() {
+                        Ok((stream, addr)) => {
+                            // Windows: accepted sockets inherit the
+                            // listener's non-blocking mode; switch back so
+                            // read timeouts work on the connection.
+                            let _ = stream.set_nonblocking(false);
+                            let resolver = resolver.clone();
+
+                            exec::spawn(move || {
+                                if let Err(e) = handle_tcp_connection(stream, &resolver) {
+                                    debug!("TCP connection error from {}: {}", addr, e);
+                                }
+                            });
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // Idle — poll again shortly (also wakes on cancel).
+                            shutdown.wait(ACCEPT_POLL);
+                        }
+                        Err(e) => {
+                            error!("TCP accept error: {}", e);
+                            shutdown.wait(ACCEPT_POLL);
+                        }
+                    }
+                }
+            })
+            .map_err(DnsError::Io)?;
+
+        Ok(())
     }
 
     /// Stop the DNS server
     pub fn stop(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.cancel();
     }
 
     /// Get resolver reference
@@ -161,7 +171,7 @@ impl DnsServer {
 }
 
 /// Handle UDP DNS query
-async fn handle_udp_query(
+fn handle_udp_query(
     socket: &UdpSocket,
     resolver: &DnsResolver,
     data: &[u8],
@@ -169,24 +179,31 @@ async fn handle_udp_query(
 ) -> Result<()> {
     let request = Message::from_bytes(data).map_err(|e| DnsError::Protocol(e.to_string()))?;
 
-    let response = process_query(resolver, &request).await?;
+    let response = process_query(resolver, &request)?;
     let response_data = response
         .to_bytes()
         .map_err(|e| DnsError::Protocol(e.to_string()))?;
 
-    socket.send_to(&response_data, addr).await?;
+    socket.send_to(&response_data, addr).map_err(DnsError::Io)?;
     Ok(())
 }
 
 /// Handle TCP DNS connection
-async fn handle_tcp_connection(mut stream: TcpStream, resolver: &DnsResolver) -> Result<()> {
+fn handle_tcp_connection(mut stream: TcpStream, resolver: &DnsResolver) -> Result<()> {
     const TCP_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    stream
+        .set_read_timeout(Some(TCP_QUERY_TIMEOUT))
+        .map_err(DnsError::Io)?;
+    stream
+        .set_write_timeout(Some(TCP_QUERY_TIMEOUT))
+        .map_err(DnsError::Io)?;
 
     loop {
         let mut len_buf = [0u8; 2];
-        match tokio::time::timeout(TCP_QUERY_TIMEOUT, stream.read_exact(&mut len_buf)).await {
-            Ok(Ok(_)) => {}
-            _ => break,
+        match stream.read_exact(&mut len_buf) {
+            Ok(_) => {}
+            Err(_) => break,
         }
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 {
@@ -195,23 +212,20 @@ async fn handle_tcp_connection(mut stream: TcpStream, resolver: &DnsResolver) ->
 
         // Read query
         let mut buf = vec![0u8; len];
-        if tokio::time::timeout(TCP_QUERY_TIMEOUT, stream.read_exact(&mut buf))
-            .await
-            .is_err()
-        {
+        if stream.read_exact(&mut buf).is_err() {
             break;
         }
 
         let request = Message::from_bytes(&buf).map_err(|e| DnsError::Protocol(e.to_string()))?;
-        let response = process_query(resolver, &request).await?;
+        let response = process_query(resolver, &request)?;
         let response_data = response
             .to_bytes()
             .map_err(|e| DnsError::Protocol(e.to_string()))?;
 
         // Write response with length prefix
         let len = (response_data.len() as u16).to_be_bytes();
-        stream.write_all(&len).await?;
-        stream.write_all(&response_data).await?;
+        stream.write_all(&len).map_err(DnsError::Io)?;
+        stream.write_all(&response_data).map_err(DnsError::Io)?;
     }
 
     Ok(())
@@ -219,9 +233,8 @@ async fn handle_tcp_connection(mut stream: TcpStream, resolver: &DnsResolver) ->
 
 /// Process DNS query and generate response.
 ///
-/// Shared by the UDP/TCP servers and the DoH/DoT servers (which bridge to
-/// this async helper through `tokio::runtime::Handle::block_on`).
-pub(crate) async fn process_query(resolver: &DnsResolver, request: &Message) -> Result<Message> {
+/// Shared by the UDP/TCP servers and the DoH/DoT servers.
+pub(crate) fn process_query(resolver: &DnsResolver, request: &Message) -> Result<Message> {
     let mut response = Message::response(request.metadata.id, request.metadata.op_code);
     response.metadata.recursion_desired = request.metadata.recursion_desired;
     response.metadata.recursion_available = true;
@@ -238,7 +251,7 @@ pub(crate) async fn process_query(resolver: &DnsResolver, request: &Message) -> 
 
         trace!("DNS query: {} {:?}", name, record_type);
 
-        match resolver.resolve(&name, record_type).await {
+        match resolver.resolve(&name, record_type) {
             Ok(ips) => {
                 for ip in ips {
                     let rdata = match ip {
@@ -274,8 +287,8 @@ pub(crate) async fn process_query(resolver: &DnsResolver, request: &Message) -> 
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_dns_server_creation() {
+    #[test]
+    fn test_dns_server_creation() {
         let config = DnsConfig {
             listen: "127.0.0.1:15353".parse().unwrap(),
             nameservers: vec!["8.8.8.8".to_string()],

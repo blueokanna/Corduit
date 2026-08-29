@@ -1,3 +1,4 @@
+use crate::common::sync::Notify;
 use crate::netstack::error::{NetStackError, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -5,14 +6,16 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::task::Waker;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tracing::debug;
 
 const NAT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_NAT_ENTRIES: usize = 65535;
+/// How long a blocking UDP recv waits between queue polls.
+const RECV_POLL_TIMEOUT: Duration = Duration::from_millis(50);
+/// How long `accept()` waits between polls of the new-session queue.
+const ACCEPT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct UdpPacket {
@@ -160,7 +163,7 @@ pub struct UdpSession {
     pub src_addr: SocketAddr,
     pub dst_addr: SocketAddr,
     recv_queue: Arc<Mutex<VecDeque<UdpPacket>>>,
-    recv_waker: Arc<Mutex<Option<Waker>>>,
+    recv_notify: Arc<Notify>,
     send_tx: mpsc::Sender<UdpPacket>,
     upload_bytes: AtomicU64,
     download_bytes: AtomicU64,
@@ -179,7 +182,7 @@ impl UdpSession {
             src_addr,
             dst_addr,
             recv_queue: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
-            recv_waker: Arc::new(Mutex::new(None)),
+            recv_notify: Arc::new(Notify::new()),
             send_tx,
             upload_bytes: AtomicU64::new(0),
             download_bytes: AtomicU64::new(0),
@@ -187,7 +190,7 @@ impl UdpSession {
         }
     }
 
-    pub async fn send(&self, data: Bytes) -> Result<()> {
+    pub fn send(&self, data: Bytes) -> Result<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(NetStackError::ChannelClosed);
         }
@@ -196,9 +199,9 @@ impl UdpSession {
         self.upload_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
 
+        // Unbounded std channel: send never blocks, only fails on disconnect.
         self.send_tx
             .send(packet)
-            .await
             .map_err(|_| NetStackError::ChannelClosed)
     }
 
@@ -212,11 +215,11 @@ impl UdpSession {
             .fetch_add(data.len() as u64, Ordering::Relaxed);
 
         self.send_tx
-            .try_send(packet)
+            .send(packet)
             .map_err(|_| NetStackError::ChannelClosed)
     }
 
-    pub async fn recv(&self) -> Result<UdpPacket> {
+    pub fn recv(&self) -> Result<UdpPacket> {
         loop {
             {
                 let mut queue = self.recv_queue.lock();
@@ -229,12 +232,8 @@ impl UdpSession {
                 }
             }
 
-            let notify = tokio::sync::Notify::new();
-            {
-                let mut waker = self.recv_waker.lock();
-                *waker = Some(futures::task::noop_waker());
-            }
-            notify.notified().await;
+            // Block until a packet is pushed or the session closes.
+            self.recv_notify.wait(RECV_POLL_TIMEOUT);
         }
     }
 
@@ -248,10 +247,8 @@ impl UdpSession {
 
         let mut queue = self.recv_queue.lock();
         queue.push_back(packet);
-
-        if let Some(waker) = self.recv_waker.lock().take() {
-            waker.wake();
-        }
+        drop(queue);
+        self.recv_notify.notify_waiters();
     }
 
     pub fn upload_bytes(&self) -> u64 {
@@ -264,9 +261,7 @@ impl UdpSession {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        if let Some(waker) = self.recv_waker.lock().take() {
-            waker.wake();
-        }
+        self.recv_notify.notify_waiters();
     }
 
     pub fn is_closed(&self) -> bool {
@@ -286,8 +281,8 @@ pub struct UdpStack {
 
 impl UdpStack {
     pub fn new() -> Self {
-        let (new_session_tx, new_session_rx) = mpsc::channel(256);
-        let (send_tx, send_rx) = mpsc::channel(1024);
+        let (new_session_tx, new_session_rx) = mpsc::channel();
+        let (send_tx, send_rx) = mpsc::channel();
 
         Self {
             nat_table: Arc::new(UdpNatTable::default()),
@@ -319,7 +314,7 @@ impl UdpStack {
             self.sessions.insert(nat_port, session.clone());
             self.session_counter.fetch_add(1, Ordering::Relaxed);
 
-            let _ = self.new_session_tx.try_send(session.clone());
+            let _ = self.new_session_tx.send(session.clone());
 
             debug!(
                 "UDP session created: {} -> {} (port {})",
@@ -411,8 +406,14 @@ pub struct UdpListener {
 }
 
 impl UdpListener {
-    pub async fn accept(&mut self) -> Option<Arc<UdpSession>> {
-        self.rx.recv().await
+    pub fn accept(&mut self) -> Option<Arc<UdpSession>> {
+        loop {
+            match self.rx.recv_timeout(ACCEPT_POLL_TIMEOUT) {
+                Ok(session) => return Some(session),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
     }
 }
 
@@ -437,13 +438,13 @@ impl UdpSocket {
         self.session.dst_addr
     }
 
-    pub async fn send(&self, data: &[u8]) -> Result<usize> {
-        self.session.send(Bytes::copy_from_slice(data)).await?;
+    pub fn send(&self, data: &[u8]) -> Result<usize> {
+        self.session.send(Bytes::copy_from_slice(data))?;
         Ok(data.len())
     }
 
-    pub async fn recv(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        let packet = self.session.recv().await?;
+    pub fn recv(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let packet = self.session.recv()?;
         let len = std::cmp::min(buf.len(), packet.data.len());
         buf[..len].copy_from_slice(&packet.data[..len]);
         Ok((len, packet.src_addr))

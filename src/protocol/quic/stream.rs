@@ -1,15 +1,23 @@
-//! QUIC stream handles (`AsyncRead` / `AsyncWrite`) over a shared
+//! QUIC stream handles (`std::io::Read` / `std::io::Write`) over a shared
 //! [`QuicConn`].
+//!
+//! Reads and writes are synchronous and backpressured: when the send buffer
+//! is full or no receive data is available, the call parks on the stream's
+//! [`Notify`](crate::common::sync::Notify) for a short poll and re-checks
+//! the connection state — the transport's driver thread performs the actual
+//! socket IO.
 
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use std::time::Duration;
 
 use super::error::QuicError;
 use super::transport::{QuicConn, RecvOutcome};
+
+/// How long a stream parks between wakeups before re-checking connection
+/// state. Bounded so a connection close is noticed promptly even if a
+/// wakeup notification was consumed by another waiter.
+const STREAM_POLL: Duration = Duration::from_millis(50);
 
 /// The send half of a QUIC stream.
 pub struct QuicSendStream {
@@ -27,74 +35,62 @@ impl QuicSendStream {
         self.stream_id
     }
 
+    /// Queue the FIN for this stream (the write half closes after all
+    /// buffered data is acknowledged).
+    pub fn finish(&mut self) -> io::Result<()> {
+        let mut st = self.conn.lock();
+        if let Some(e) = &st.closed {
+            return Err(Self::io_err(e));
+        }
+        self.conn
+            .fin_stream(&mut st, self.stream_id)
+            .map_err(|e| Self::io_err(&e))?;
+        self.conn.writer.notify_one();
+        Ok(())
+    }
+
     fn io_err(e: &QuicError) -> io::Error {
         io::Error::other(e.to_string())
     }
 }
 
-impl AsyncWrite for QuicSendStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
+impl io::Write for QuicSendStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         loop {
-            let mut st = this.conn.lock();
+            let mut st = self.conn.lock();
             if let Some(e) = &st.closed {
-                return Poll::Ready(Err(Self::io_err(e)));
+                return Err(Self::io_err(e));
             }
-            match this.conn.send_data(&mut st, this.stream_id, buf) {
+            match self.conn.send_data(&mut st, self.stream_id, buf) {
                 Ok(n) => {
                     // Wake the driver so the new data hits the wire.
-                    this.conn.writer.notify_one();
-                    return Poll::Ready(Ok(n));
+                    self.conn.writer.notify_one();
+                    return Ok(n);
                 }
                 Err(QuicError::StreamLimit) => {
                     // Send buffer full: wait for ACKs / flow control.
-                    let notify = this.conn.stream_send_notify(&st, this.stream_id);
+                    let notify = self.conn.stream_send_notify(&st, self.stream_id);
                     drop(st);
-                    let mut fut = Box::pin(notify.notified());
-                    if std::future::Future::poll(fut.as_mut(), cx).is_pending() {
-                        return Poll::Pending;
-                    }
+                    notify.wait(STREAM_POLL);
                 }
-                Err(e) => return Poll::Ready(Err(Self::io_err(&e))),
+                Err(e) => return Err(Self::io_err(&e)),
             }
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
+    fn flush(&mut self) -> io::Result<()> {
         loop {
-            let st = this.conn.lock();
+            let st = self.conn.lock();
             if let Some(e) = &st.closed {
-                return Poll::Ready(Err(Self::io_err(e)));
+                return Err(Self::io_err(e));
             }
-            if this.conn.send_buffered(&st, this.stream_id) == 0 {
-                return Poll::Ready(Ok(()));
+            if self.conn.send_buffered(&st, self.stream_id) == 0 {
+                return Ok(());
             }
-            let notify = this.conn.stream_send_notify(&st, this.stream_id);
+            let notify = self.conn.stream_send_notify(&st, self.stream_id);
             drop(st);
-            let mut fut = Box::pin(notify.notified());
-            if std::future::Future::poll(fut.as_mut(), cx).is_pending() {
-                return Poll::Pending;
-            }
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let mut st = this.conn.lock();
-        if let Some(e) = &st.closed {
-            return Poll::Ready(Err(Self::io_err(e)));
-        }
-        match this.conn.fin_stream(&mut st, this.stream_id) {
-            Ok(()) => {
-                this.conn.writer.notify_one();
-                Poll::Ready(Ok(()))
-            }
-            Err(e) => Poll::Ready(Err(Self::io_err(&e))),
+            self.conn.writer.notify_one();
+            notify.wait(STREAM_POLL);
         }
     }
 }
@@ -120,38 +116,26 @@ impl QuicRecvStream {
     }
 }
 
-impl AsyncRead for QuicRecvStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
+impl io::Read for QuicRecvStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            let mut st = this.conn.lock();
+            let mut st = self.conn.lock();
             if let Some(e) = &st.closed {
-                return Poll::Ready(Err(Self::io_err(e)));
+                return Err(Self::io_err(e));
             }
-            let unfilled = buf.initialize_unfilled();
-            match this.conn.recv_into(&mut st, this.stream_id, unfilled) {
-                RecvOutcome::Data(n) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                RecvOutcome::Eof => return Poll::Ready(Ok(())),
+            match self.conn.recv_into(&mut st, self.stream_id, buf) {
+                RecvOutcome::Data(n) => return Ok(n),
+                RecvOutcome::Eof => return Ok(0),
                 RecvOutcome::Reset(code) => {
-                    return Poll::Ready(Err(io::Error::new(
+                    return Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
                         format!("QUIC stream reset by peer (code {code})"),
-                    )))
+                    ))
                 }
                 RecvOutcome::WouldBlock => {
-                    let notify = this.conn.stream_recv_notify(&st, this.stream_id);
+                    let notify = self.conn.stream_recv_notify(&st, self.stream_id);
                     drop(st);
-                    let mut fut = Box::pin(notify.notified());
-                    if std::future::Future::poll(fut.as_mut(), cx).is_pending() {
-                        return Poll::Pending;
-                    }
+                    notify.wait(STREAM_POLL);
                 }
             }
         }

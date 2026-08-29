@@ -1,7 +1,7 @@
 //! # Corduit Core
 //!
 //! The unified engine behind **Corduit** — a single, non-composite network proxy
-//! engine written in Rust. This crate owns configuration modelling & validation,
+//! engine written in Rust. This module owns configuration modelling & validation,
 //! the typed rule-routing pipeline, inbound/outbound orchestration, proxy
 //! groups, health checks, provider updates and per-connection traffic
 //! accounting.
@@ -26,8 +26,7 @@
 //!     Config, Corduit, GeneralConfig, InboundConfig, InboundType, OutboundConfig, OutboundType,
 //! };
 //!
-//! #[tokio::main]
-//! async fn main() -> corduit::engine::Result<()> {
+//! fn main() -> corduit::engine::Result<()> {
 //!     // `Config::default()` alone fails validation (no inbound), so build a
 //!     // real one: one mixed inbound + a DIRECT outbound.
 //!     let config = Config {
@@ -52,10 +51,10 @@
 //!         ..Config::default()
 //!     };
 //!
-//!     let engine = Corduit::new(config).await?;
-//!     engine.start().await?;
+//!     let engine = Corduit::new(config)?;
+//!     engine.start()?;
 //!     // ... run the proxy ...
-//!     engine.stop().await
+//!     engine.stop()
 //! }
 //! ```
 
@@ -114,7 +113,7 @@ pub struct Corduit {
 }
 
 impl Corduit {
-    pub async fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
         logging::init_logging(config.general.log_level)?;
 
@@ -122,7 +121,7 @@ impl Corduit {
         // courierust TLS layer does not need it.
         tls::install_crypto_provider();
 
-        let proxy_manager = ProxyManager::new(config.clone()).await?;
+        let proxy_manager = ProxyManager::new(config.clone())?;
         let traffic_stats = TrafficStatsManager::new();
 
         logging::log_success("Corduit instance created", None);
@@ -137,17 +136,17 @@ impl Corduit {
     }
 
     /// Start the proxy server
-    pub async fn start(&self) -> Result<()> {
+    pub fn start(&self) -> Result<()> {
         let _perf = logging::time_operation("Corduit startup");
 
         // Start inbound listeners
-        self.proxy_manager.start_inbounds().await?;
+        self.proxy_manager.start_inbounds()?;
 
         // Start outbound connections pool
-        self.proxy_manager.start_outbounds().await?;
+        self.proxy_manager.start_outbounds()?;
 
         // Start background provider refreshes (proxy/rule providers, health checks)
-        self.proxy_manager.start_providers().await?;
+        self.proxy_manager.start_providers()?;
 
         // Mark as running and record start time
         self.running
@@ -161,10 +160,10 @@ impl Corduit {
     }
 
     /// Stop the proxy server
-    pub async fn stop(&self) -> Result<()> {
+    pub fn stop(&self) -> Result<()> {
         let _perf = logging::time_operation("Corduit shutdown");
 
-        match self.proxy_manager.stop().await {
+        match self.proxy_manager.stop() {
             Ok(()) => {
                 // Mark as not running and clear start time
                 self.running
@@ -189,7 +188,7 @@ impl Corduit {
     }
 
     /// Check if the proxy server is running
-    pub async fn is_running(&self) -> Result<bool> {
+    pub fn is_running(&self) -> Result<bool> {
         Ok(self.running.load(std::sync::atomic::Ordering::Relaxed))
     }
 
@@ -204,9 +203,9 @@ impl Corduit {
     }
 
     /// Reload configuration
-    pub async fn reload(&mut self, config: Config) -> Result<()> {
+    pub fn reload(&mut self, config: Config) -> Result<()> {
         tracing::info!("Reloading Corduit configuration");
-        self.proxy_manager.reload(config.clone()).await?;
+        self.proxy_manager.reload(config.clone())?;
         self.config = config;
         tracing::info!("Corduit configuration reloaded");
         Ok(())

@@ -1,11 +1,11 @@
+use crate::common::stream::BoxStream;
 use crate::engine::config::OutboundConfig;
-use crate::engine::connection_tracker::global_tracker;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::direct::relay_bidirectional_with_connection;
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
+use std::io::{BufRead, Read, Write};
 use std::net::IpAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::net::TcpStream;
+use std::time::Duration;
 
 /// SOCKS5 outbound proxy
 pub struct Socks5Outbound {
@@ -16,21 +16,21 @@ pub struct Socks5Outbound {
     password: Option<String>,
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for Socks5Outbound {
-    async fn connect(&self) -> Result<()> {
+    fn connect(&self) -> Result<()> {
         // Test connection to SOCKS5 server (DNS resolution happens here)
-        let addr = format!("{}:{}", self.server, self.port);
-        let _stream = TcpStream::connect(&addr).await.map_err(|e| {
-            Error::network(format!(
-                "Failed to connect to SOCKS5 server {}: {}",
-                addr, e
-            ))
-        })?;
+        let _stream =
+            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
+                .map_err(|e| {
+                Error::network(format!(
+                    "Failed to connect to SOCKS5 server {}:{}: {}",
+                    self.server, self.port, e
+                ))
+            })?;
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    fn disconnect(&self) -> Result<()> {
         // SOCKS5 outbound doesn't maintain persistent connections
         Ok(())
     }
@@ -43,13 +43,12 @@ impl OutboundProxy for Socks5Outbound {
         Some((self.server.clone(), self.port))
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         test_url: &str,
         timeout: std::time::Duration,
     ) -> Result<std::time::Duration> {
         use std::time::Instant;
-        use tokio::io::{AsyncBufReadExt, BufReader};
 
         // Parse the test URL to get host and port
         let url = crate::common::url::Url::parse(test_url)
@@ -71,22 +70,24 @@ impl OutboundProxy for Socks5Outbound {
         let start = Instant::now();
 
         // Connect to SOCKS5 server
-        let server_addr = format!("{}:{}", self.server, self.port);
-        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&server_addr))
-            .await
-            .map_err(|_| Error::network("Connection timeout"))?
+        let mut stream = crate::common::socket::connect_host(&self.server, self.port, timeout)
             .map_err(|e| Error::network(format!("Failed to connect: {}", e)))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
         // Perform SOCKS5 handshake
-        self.perform_handshake(&mut stream).await?;
+        self.perform_handshake(&mut stream)?;
 
         // Send CONNECT request
         let target = TargetAddr::Domain(host.clone(), url_port);
-        self.send_connect_request_target(&mut stream, &target)
-            .await?;
+        self.send_connect_request_target(&mut stream, &target)?;
 
         // Read response
-        self.read_connect_response(&mut stream).await?;
+        self.read_connect_response(&mut stream)?;
 
         // Send HTTP request
         let http_request = format!(
@@ -95,75 +96,68 @@ impl OutboundProxy for Socks5Outbound {
         );
         stream
             .write_all(http_request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send HTTP request: {}", e)))?;
 
-        // Read HTTP response
-        let result = tokio::time::timeout(timeout, async {
-            let mut reader = BufReader::new(stream);
-            let mut response_line = String::new();
-            reader
-                .read_line(&mut response_line)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
+        // Read HTTP response (bounded by the socket read timeout)
+        let mut reader = std::io::BufReader::new(stream);
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
 
-            if response_line.starts_with("HTTP/") {
-                Ok(())
-            } else {
-                Err(Error::network("Invalid HTTP response"))
-            }
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => Ok(start.elapsed()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(Error::network("Response timeout")),
+        if response_line.starts_with("HTTP/") {
+            Ok(start.elapsed())
+        } else {
+            Err(Error::network("Invalid HTTP response"))
         }
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        mut inbound: Box<dyn AsyncReadWrite>,
+        inbound: BoxStream,
         target: TargetAddr,
         connection: Option<std::sync::Arc<crate::engine::connection_tracker::TrackedConnection>>,
     ) -> Result<()> {
         // Connect to SOCKS5 server
-        let server_addr = format!("{}:{}", self.server, self.port);
-        let mut outbound = TcpStream::connect(&server_addr).await.map_err(|e| {
-            Error::network(format!(
-                "Failed to connect to SOCKS5 server {}: {}",
-                server_addr, e
-            ))
-        })?;
+        let mut outbound =
+            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
+                .map_err(|e| {
+                Error::network(format!(
+                    "Failed to connect to SOCKS5 server {}:{}: {}",
+                    self.server, self.port, e
+                ))
+            })?;
+        outbound
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
+        outbound
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
-        tracing::debug!("SOCKS5: connected to {} for target {}", server_addr, target);
+        tracing::debug!(
+            "SOCKS5: connected to {}:{} for target {}",
+            self.server,
+            self.port,
+            target
+        );
 
         // Perform SOCKS5 handshake
-        self.perform_handshake(&mut outbound).await?;
+        self.perform_handshake(&mut outbound)?;
 
         // Send CONNECT request with domain support
-        self.send_connect_request_target(&mut outbound, &target)
-            .await?;
+        self.send_connect_request_target(&mut outbound, &target)?;
 
         // Read response
-        self.read_connect_response(&mut outbound).await?;
+        self.read_connect_response(&mut outbound)?;
 
         tracing::debug!("SOCKS5: tunnel established to {}", target);
 
         // Relay data with traffic tracking
-        let tracker = global_tracker();
-        let result =
-            relay_bidirectional_with_connection(&mut inbound, &mut outbound, tracker, connection)
-                .await;
-
-        let _ = outbound.shutdown().await;
-
-        result
+        relay_streams!(inbound, outbound, connection)
     }
 }
 
@@ -198,7 +192,7 @@ impl Socks5Outbound {
         })
     }
 
-    async fn perform_handshake(&self, stream: &mut TcpStream) -> Result<()> {
+    fn perform_handshake(&self, stream: &mut TcpStream) -> Result<()> {
         // SOCKS5 initial handshake
         let handshake = if self.username.is_some() {
             // Support username/password auth
@@ -209,12 +203,11 @@ impl Socks5Outbound {
 
         stream
             .write_all(&handshake)
-            .await
             .map_err(|e| Error::network(format!("Failed to send SOCKS5 handshake: {}", e)))?;
 
         // Read response
         let mut response = [0u8; 2];
-        stream.read_exact(&mut response).await.map_err(|e| {
+        stream.read_exact(&mut response).map_err(|e| {
             Error::network(format!("Failed to read SOCKS5 handshake response: {}", e))
         })?;
 
@@ -227,7 +220,7 @@ impl Socks5Outbound {
             0x02 => {
                 // Username/password auth required
                 if let (Some(user), Some(pass)) = (&self.username, &self.password) {
-                    self.perform_auth(stream, user, pass).await
+                    self.perform_auth(stream, user, pass)
                 } else {
                     Err(Error::protocol(
                         "SOCKS5 server requires auth but no credentials provided",
@@ -242,12 +235,7 @@ impl Socks5Outbound {
         }
     }
 
-    async fn perform_auth(
-        &self,
-        stream: &mut TcpStream,
-        username: &str,
-        password: &str,
-    ) -> Result<()> {
+    fn perform_auth(&self, stream: &mut TcpStream, username: &str, password: &str) -> Result<()> {
         // Username/password auth (RFC 1929). Each credential is a single byte
         // length-prefixed field (max 255 bytes), so oversized credentials are
         // rejected instead of silently truncated.
@@ -265,13 +253,11 @@ impl Socks5Outbound {
 
         stream
             .write_all(&auth)
-            .await
             .map_err(|e| Error::network(format!("Failed to send auth: {}", e)))?;
 
         let mut response = [0u8; 2];
         stream
             .read_exact(&mut response)
-            .await
             .map_err(|e| Error::network(format!("Failed to read auth response: {}", e)))?;
 
         if response[1] != 0x00 {
@@ -281,7 +267,7 @@ impl Socks5Outbound {
         Ok(())
     }
 
-    async fn send_connect_request_target(
+    fn send_connect_request_target(
         &self,
         stream: &mut TcpStream,
         target: &TargetAddr,
@@ -316,17 +302,15 @@ impl Socks5Outbound {
 
         stream
             .write_all(&request)
-            .await
             .map_err(|e| Error::network(format!("Failed to send SOCKS5 CONNECT: {}", e)))?;
 
         Ok(())
     }
 
-    async fn read_connect_response(&self, stream: &mut TcpStream) -> Result<()> {
+    fn read_connect_response(&self, stream: &mut TcpStream) -> Result<()> {
         let mut header = [0u8; 4];
         stream
             .read_exact(&mut header)
-            .await
             .map_err(|e| Error::network(format!("Failed to read SOCKS5 response: {}", e)))?;
 
         if header[0] != 0x05 {
@@ -357,20 +341,20 @@ impl Socks5Outbound {
             0x01 => {
                 // IPv4
                 let mut addr_port = [0u8; 6];
-                stream.read_exact(&mut addr_port).await?;
+                stream.read_exact(&mut addr_port)?;
             }
             0x04 => {
                 // IPv6
                 let mut addr_port = [0u8; 18];
-                stream.read_exact(&mut addr_port).await?;
+                stream.read_exact(&mut addr_port)?;
             }
             0x03 => {
                 // Domain
                 let mut len_buf = [0u8; 1];
-                stream.read_exact(&mut len_buf).await?;
+                stream.read_exact(&mut len_buf)?;
                 let len = len_buf[0] as usize;
                 let mut addr_port = vec![0u8; len + 2];
-                stream.read_exact(&mut addr_port).await?;
+                stream.read_exact(&mut addr_port)?;
             }
             _ => {
                 return Err(Error::protocol(

@@ -48,8 +48,7 @@ fn write_subscription(dir: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = temp_dir();
     let rule_path = write_rule_file(dir.as_path());
     let sub_path = write_subscription(dir.as_path());
@@ -77,9 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }}"#
     );
 
-    start_proxy_from_yaml(config).await?;
+    start_proxy_from_yaml(config)?;
 
-    let groups = get_proxy_groups().await?;
+    let groups = get_proxy_groups()?;
     println!("{} proxy group(s):", groups.len());
     for group in groups {
         println!(
@@ -89,10 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The `use:` expansion put sub-jp-01 / sub-us-01 into the group; select one.
-    select_proxy("PROXY".to_string(), "sub-jp-01".to_string()).await?;
+    select_proxy("PROXY".to_string(), "sub-jp-01".to_string())?;
     println!("selected sub-jp-01 in PROXY");
 
-    stop_proxy().await?;
+    stop_proxy()?;
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

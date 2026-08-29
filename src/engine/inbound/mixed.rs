@@ -1,3 +1,5 @@
+use crate::common::cancel::CancellationToken;
+use crate::common::stream::SyncStream;
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
@@ -11,11 +13,12 @@ use courierust::courierust_h1 as h1;
 use courierust::courierust_http::{
     Body, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
 };
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_util::sync::CancellationToken;
+use parking_lot::Mutex;
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Mixed HTTP/SOCKS5 proxy inbound listener
 /// Automatically detects protocol based on first byte
@@ -25,7 +28,9 @@ pub struct MixedInbound {
     outbound_manager: Arc<OutboundManager>,
     auth: Arc<InboundAuth>,
     cancel_token: CancellationToken,
-    running: Arc<std::sync::atomic::AtomicBool>,
+    running: Arc<AtomicBool>,
+    /// Handle of the dedicated accept thread; joined by `stop()`.
+    accept_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 // SOCKS5 constants
@@ -36,6 +41,15 @@ const SOCKS5_ADDR_IPV4: u8 = 0x01;
 const SOCKS5_ADDR_DOMAIN: u8 = 0x03;
 const SOCKS5_ADDR_IPV6: u8 = 0x04;
 
+/// SOCKS5 handshake read/write timeout (a silent client is dropped).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Read/write timeout applied once a connection enters the relay phase.
+const RELAY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-read timeout for the HTTP keep-alive loop / protocol peek.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Accept-loop poll interval while the listener is idle.
+const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
 /// A pending CONNECT tunnel: the destination and the outbound that will
 /// relay it.
 struct TunnelJob {
@@ -45,14 +59,13 @@ struct TunnelJob {
     outbound_tag: String,
 }
 
-#[async_trait::async_trait]
 impl InboundListener for MixedInbound {
-    async fn start(&self) -> Result<()> {
-        self.start_listener().await
+    fn start(&self) -> Result<()> {
+        self.start_listener()
     }
 
-    async fn stop(&self) -> Result<()> {
-        self.stop_listener().await
+    fn stop(&self) -> Result<()> {
+        self.stop_listener()
     }
 
     fn tag(&self) -> &str {
@@ -73,12 +86,13 @@ impl MixedInbound {
             outbound_manager,
             auth,
             cancel_token: CancellationToken::new(),
-            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
+            accept_thread: Mutex::new(None),
         }
     }
 
-    async fn start_listener(&self) -> Result<()> {
-        if self.running.load(std::sync::atomic::Ordering::Relaxed) {
+    fn start_listener(&self) -> Result<()> {
+        if self.running.load(Ordering::Relaxed) {
             tracing::warn!(
                 "Mixed inbound already running on {}:{}",
                 self.config.listen,
@@ -95,43 +109,30 @@ impl MixedInbound {
         let cancel_token = self.cancel_token.clone();
         let running = Arc::clone(&self.running);
 
-        running.store(true, std::sync::atomic::Ordering::Relaxed);
+        running.store(true, Ordering::Relaxed);
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        tracing::info!("Mixed inbound on {} shutting down", addr);
-                        break;
-                    }
-                    result = listener.accept() => {
-                        match result {
-                            Ok((stream, peer_addr)) => {
-                                let router = Arc::clone(&router);
-                                let outbound_manager = Arc::clone(&outbound_manager);
-                                let auth = Arc::clone(&auth);
-                                tokio::spawn(async move {
-                                    if let Err(err) = Self::handle_connection(stream, peer_addr, router, outbound_manager, auth).await {
-                                        tracing::debug!("Mixed connection error from {}: {}", peer_addr, err);
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("Mixed accept error: {}", e);
-                            }
-                        }
-                    }
-                }
-            }
-            running.store(false, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!("Mixed inbound on {} stopped", addr);
-        });
+        let handle = std::thread::Builder::new()
+            .name("corduit-mixed-accept".into())
+            .spawn(move || {
+                accept_loop(
+                    listener,
+                    addr,
+                    cancel_token,
+                    running,
+                    router,
+                    outbound_manager,
+                    auth,
+                );
+            })
+            .map_err(|e| Error::network(format!("Failed to spawn Mixed accept thread: {e}")))?;
+
+        *self.accept_thread.lock() = Some(handle);
 
         tracing::info!("Mixed inbound (HTTP/SOCKS5) listening on {}", addr);
         Ok(())
     }
 
-    async fn stop_listener(&self) -> Result<()> {
+    fn stop_listener(&self) -> Result<()> {
         tracing::info!(
             "Stopping Mixed inbound on {}:{}",
             self.config.listen,
@@ -139,25 +140,30 @@ impl MixedInbound {
         );
         self.cancel_token.cancel();
 
-        let mut attempts = 0;
-        while self.running.load(std::sync::atomic::Ordering::Relaxed) && attempts < 50 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            attempts += 1;
+        // The accept thread polls the token and exits promptly; joining it
+        // also drops the listener (releasing the bound port). Take the handle
+        // first so the lock is released before the (potentially blocking) join.
+        let handle = self.accept_thread.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
         }
 
+        self.running.store(false, Ordering::Relaxed);
+        tracing::info!("Mixed inbound stopped");
         Ok(())
     }
 
-    async fn handle_connection(
+    fn handle_connection(
         stream: TcpStream,
         peer_addr: SocketAddr,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
         auth: Arc<InboundAuth>,
     ) -> Result<()> {
-        // Peek at first byte to detect protocol
+        // Peek at first byte to detect protocol (bounded by the socket read
+        // timeout set in the accept loop).
         let mut peek_buf = [0u8; 1];
-        stream.peek(&mut peek_buf).await.map_err(|e| {
+        stream.peek(&mut peek_buf).map_err(|e| {
             Error::network(format!(
                 "Failed to peek connection from {}: {}",
                 peer_addr, e
@@ -169,17 +175,17 @@ impl MixedInbound {
         if first_byte == SOCKS5_VERSION {
             // SOCKS5 protocol
             tracing::debug!("Detected SOCKS5 protocol from {}", peer_addr);
-            Self::handle_socks5(stream, peer_addr, router, outbound_manager, auth).await
+            Self::handle_socks5(stream, peer_addr, router, outbound_manager, auth)
         } else {
             // Assume HTTP protocol
             tracing::debug!("Detected HTTP protocol from {}", peer_addr);
-            Self::handle_http(stream, peer_addr, router, outbound_manager, auth).await
+            Self::handle_http(stream, peer_addr, router, outbound_manager, auth)
         }
     }
 
     // ============== HTTP Handling ==============
 
-    async fn handle_http(
+    fn handle_http(
         mut stream: TcpStream,
         peer_addr: SocketAddr,
         router: Arc<Router>,
@@ -193,10 +199,9 @@ impl MixedInbound {
         let tunnel_job: Arc<Mutex<Option<TunnelJob>>> = Arc::new(Mutex::new(None));
 
         // Keep-alive loop over courierust's H/1 codec (pure functions on the
-        // accumulated buffer — the codec's blocking readers do not fit the
-        // async stream, so framing is done here).
+        // accumulated buffer; reads are bounded by the socket read timeout).
         loop {
-            let Some(req) = read_http_request(&mut stream, MAX_HEAD, MAX_BODY).await? else {
+            let Some(req) = read_http_request(&mut stream, MAX_HEAD, MAX_BODY)? else {
                 return Ok(());
             };
             let keep_alive = request_keeps_alive(&req);
@@ -207,16 +212,15 @@ impl MixedInbound {
                 &outbound_manager,
                 &auth,
                 &tunnel_job,
-            )
-            .await;
-            write_http_response(&mut stream, &resp).await?;
+            );
+            write_http_response(&mut stream, &resp)?;
 
             // CONNECT: the marker response hands the raw stream to the
             // tunnel relay (which blocks for the tunnel's lifetime).
             if resp.headers.contains_key(TUNNEL_MARKER) {
-                let job = tunnel_job.lock().unwrap().take();
+                let job = tunnel_job.lock().take();
                 if let Some(job) = job {
-                    Self::relay_connect_tunnel(stream, job, &router, &outbound_manager).await;
+                    Self::relay_connect_tunnel(stream, job, &outbound_manager);
                 }
                 return Ok(());
             }
@@ -227,7 +231,7 @@ impl MixedInbound {
         Ok(())
     }
 
-    async fn handle_http_request(
+    fn handle_http_request(
         req: Request<Body>,
         peer_addr: SocketAddr,
         router: &Router,
@@ -254,10 +258,10 @@ impl MixedInbound {
         }
 
         if method == Method::CONNECT {
-            return Self::handle_http_connect(req, router, outbound_manager, tunnel_job).await;
+            return Self::handle_http_connect(req, router, outbound_manager, tunnel_job);
         }
 
-        match Self::handle_http_proxy(req, router, outbound_manager).await {
+        match Self::handle_http_proxy(req, router, outbound_manager) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::error!("HTTP proxy error: {}", e);
@@ -268,7 +272,7 @@ impl MixedInbound {
         }
     }
 
-    async fn handle_http_connect(
+    fn handle_http_connect(
         req: Request<Body>,
         router: &Router,
         outbound_manager: &OutboundManager,
@@ -285,9 +289,7 @@ impl MixedInbound {
             }
         };
 
-        let outbound_tag = router
-            .match_outbound(Some(&host), None, Some(port), None)
-            .await;
+        let outbound_tag = router.match_outbound(Some(&host), None, Some(port), None);
         tracing::info!("CONNECT {}:{} -> {}", host, port, outbound_tag);
 
         match outbound_manager.get_proxy(&outbound_tag) {
@@ -300,7 +302,7 @@ impl MixedInbound {
             }
         }
 
-        *tunnel_job.lock().unwrap() = Some(TunnelJob {
+        *tunnel_job.lock() = Some(TunnelJob {
             target: TargetAddr::new_domain(host.clone(), port),
             host: host.clone(),
             port,
@@ -319,12 +321,7 @@ impl MixedInbound {
 
     /// Relay a CONNECT tunnel: push the raw client stream through the
     /// matched outbound with connection tracking.
-    async fn relay_connect_tunnel(
-        stream: TcpStream,
-        job: TunnelJob,
-        _router: &Router,
-        outbound_manager: &OutboundManager,
-    ) {
+    fn relay_connect_tunnel(stream: TcpStream, job: TunnelJob, outbound_manager: &OutboundManager) {
         let outbound = match outbound_manager.get_proxy(&job.outbound_tag) {
             Some(proxy) => proxy,
             None => {
@@ -334,11 +331,11 @@ impl MixedInbound {
         };
 
         // Resolve the destination IP for display.
-        let destination_ip = tokio::net::lookup_host(format!("{}:{}", job.host, job.port))
-            .await
-            .ok()
-            .and_then(|mut addrs| addrs.next())
-            .map(|addr| addr.ip().to_string());
+        let destination_ip =
+            crate::common::socket::resolve_host(&job.host, job.port, Duration::from_secs(3))
+                .ok()
+                .and_then(|addrs| addrs.into_iter().next())
+                .map(|addr| addr.ip().to_string());
 
         let tracked_conn = TrackedConnection::new_with_ip(
             "mixed".to_string(),
@@ -355,16 +352,18 @@ impl MixedInbound {
         let tracked = tracker.track(tracked_conn);
         let conn_arc = Arc::clone(&tracked);
 
-        if let Err(e) = outbound
-            .relay_tcp_with_connection(Box::new(stream), job.target, Some(conn_arc))
-            .await
+        let _ = stream.set_read_timeout(Some(RELAY_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(RELAY_TIMEOUT));
+
+        if let Err(e) =
+            outbound.relay_tcp_with_connection(Box::new(stream), job.target, Some(conn_arc))
         {
             tracing::debug!("CONNECT relay error via '{}': {}", outbound.tag(), e);
         }
         tracker.untrack(&tracked.id);
     }
 
-    async fn handle_http_proxy(
+    fn handle_http_proxy(
         req: Request<Body>,
         router: &Router,
         outbound_manager: &OutboundManager,
@@ -372,9 +371,7 @@ impl MixedInbound {
         let (host, port) = parse_http_target(&req)
             .ok_or_else(|| Error::protocol("Invalid HTTP proxy request: missing host"))?;
 
-        let outbound_tag = router
-            .match_outbound(Some(&host), None, Some(port), None)
-            .await;
+        let outbound_tag = router.match_outbound(Some(&host), None, Some(port), None);
 
         tracing::info!("HTTP {} -> {}", req.uri.as_str(), outbound_tag);
 
@@ -388,64 +385,61 @@ impl MixedInbound {
         let is_head = method == Method::HEAD;
 
         let target = TargetAddr::new_domain(host.clone(), port);
-        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-        let relay_handle =
-            tokio::spawn(async move { outbound.relay_tcp(Box::new(server_side), target).await });
+        let (mut client_side, server_side) = forward::mem_duplex(64 * 1024);
 
-        let (mut read_half, mut write_half) = tokio::io::split(client_side);
+        // Relay the server end to the origin on a dedicated thread; the
+        // client end is used below to send the request and read the response.
+        let relay_handle = std::thread::Builder::new()
+            .name("corduit-http-relay".into())
+            .spawn(move || outbound.relay_tcp(Box::new(server_side), target))
+            .map_err(|e| Error::network(format!("Failed to spawn relay thread: {e}")))?;
 
         // Re-serialize the request with correct HTTP/1.1 framing: hop-by-hop
         // headers are stripped and the materialized body is re-framed with an
         // explicit Content-Length (CWE-444).
         let body = req.body.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
         forward::send_request(
-            &mut write_half,
+            &mut client_side,
             &method,
             &path,
             &req.headers,
             &host,
             port,
             &body,
-        )
-        .await?;
+        )?;
 
         // Shutdown write side to signal EOF to relay_tcp
-        write_half
-            .shutdown()
-            .await
+        client_side
+            .shutdown(Shutdown::Write)
             .map_err(|e| Error::network(format!("Failed to shutdown write: {}", e)))?;
 
         // Parse the origin's raw response so it is re-framed correctly for
         // the client (status + headers + de-chunked, size-bounded body).
-        let response = forward::read_http_response(&mut read_half, is_head).await?;
+        let response = forward::read_http_response(&mut client_side, is_head)?;
 
         // Cleanup - relay_handle should complete when remote closes connection
-        let _ = relay_handle.await;
+        let _ = relay_handle.join();
 
         Ok(response)
     }
 
     // ============== SOCKS5 Handling ==============
 
-    async fn handle_socks5(
+    fn handle_socks5(
         mut stream: TcpStream,
         peer_addr: SocketAddr,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
         auth: Arc<InboundAuth>,
     ) -> Result<()> {
-        const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        // The handshake is bounded by the socket read timeout.
+        let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
-        let target = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            Self::read_socks5_target(&mut stream, &auth),
-        )
-        .await
-        .map_err(|_| Error::protocol("SOCKS5 handshake timeout"))??;
+        let target = Self::read_socks5_target(&mut stream, &auth)?;
         // Route the connection
-        let outbound_tag = router
-            .match_outbound(Some(&target.host()), None, Some(target.port()), None)
-            .await;
+        let outbound_tag =
+            router.match_outbound(Some(&target.host()), None, Some(target.port()), None);
 
         tracing::info!("SOCKS5 {} -> {} (from {})", target, outbound_tag, peer_addr);
 
@@ -454,7 +448,7 @@ impl MixedInbound {
             Some(proxy) => proxy,
             None => {
                 tracing::error!("Outbound '{}' not found", outbound_tag);
-                Self::send_socks5_error(&mut stream, 0x01).await; // General failure
+                Self::send_socks5_error(&mut stream, 0x01); // General failure
                 return Err(Error::config(format!(
                     "Outbound '{}' not found",
                     outbound_tag
@@ -465,16 +459,15 @@ impl MixedInbound {
         // Send success response first (with dummy bind address)
         // We don't know the actual bind address yet since we're using outbound proxy
         let dummy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
-        Self::send_socks5_success(&mut stream, dummy_addr).await?;
+        Self::send_socks5_success(&mut stream, dummy_addr)?;
 
         // Try to resolve the destination IP for display
         let destination_ip = match &target {
             TargetAddr::Ip(addr) => Some(addr.ip().to_string()),
             TargetAddr::Domain(domain, _) => {
-                tokio::net::lookup_host(format!("{}:{}", domain, target.port()))
-                    .await
+                crate::common::socket::resolve_host(domain, target.port(), Duration::from_secs(3))
                     .ok()
-                    .and_then(|mut addrs| addrs.next())
+                    .and_then(|addrs| addrs.into_iter().next())
                     .map(|addr| addr.ip().to_string())
             }
         };
@@ -495,10 +488,12 @@ impl MixedInbound {
         let tracked = tracker.track(tracked_conn);
         let conn_arc = Arc::clone(&tracked);
 
+        let _ = stream.set_read_timeout(Some(RELAY_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(RELAY_TIMEOUT));
+
         // Relay data through the outbound proxy with connection tracking
-        if let Err(e) = outbound
-            .relay_tcp_with_connection(Box::new(stream), target.clone(), Some(conn_arc))
-            .await
+        if let Err(e) =
+            outbound.relay_tcp_with_connection(Box::new(stream), target.clone(), Some(conn_arc))
         {
             tracing::debug!(
                 "SOCKS5 relay error via '{}' to {}: {}",
@@ -514,11 +509,10 @@ impl MixedInbound {
         Ok(())
     }
 
-    async fn read_socks5_target(stream: &mut TcpStream, auth: &InboundAuth) -> Result<TargetAddr> {
+    fn read_socks5_target(stream: &mut TcpStream, auth: &InboundAuth) -> Result<TargetAddr> {
         let mut header = [0u8; 2];
         stream
             .read_exact(&mut header)
-            .await
             .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 header: {}", e)))?;
 
         let version = header[0];
@@ -534,40 +528,36 @@ impl MixedInbound {
         let mut methods = vec![0u8; nmethods];
         stream
             .read_exact(&mut methods)
-            .await
             .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 methods: {}", e)))?;
 
         if auth.required() {
             // Credentials configured: only RFC 1929 user/pass is acceptable.
             if !methods.contains(&SOCKS5_AUTH_USERPASS) {
-                stream.write_all(&[SOCKS5_VERSION, 0xFF]).await.ok();
+                stream.write_all(&[SOCKS5_VERSION, 0xFF]).ok();
                 return Err(Error::protocol(
                     "SOCKS5 client did not offer username/password auth",
                 ));
             }
             stream
                 .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_USERPASS])
-                .await
                 .map_err(|e| Error::network(format!("Failed to send auth response: {}", e)))?;
-            if !socks5_userpass(stream, auth).await? {
+            if !socks5_userpass(stream, auth)? {
                 return Err(Error::protocol("SOCKS5 authentication failed"));
             }
         } else {
             // No credentials configured: NO-AUTH only.
             if !methods.contains(&SOCKS5_AUTH_NONE) {
-                stream.write_all(&[SOCKS5_VERSION, 0xFF]).await.ok();
+                stream.write_all(&[SOCKS5_VERSION, 0xFF]).ok();
                 return Err(Error::protocol("No acceptable SOCKS5 auth methods"));
             }
             stream
                 .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
-                .await
                 .map_err(|e| Error::network(format!("Failed to send auth response: {}", e)))?;
         }
 
         let mut request = [0u8; 4];
         stream
             .read_exact(&mut request)
-            .await
             .map_err(|e| Error::protocol(format!("Failed to read SOCKS5 request: {}", e)))?;
 
         let version = request[0];
@@ -579,7 +569,7 @@ impl MixedInbound {
         }
 
         if cmd != SOCKS5_CMD_CONNECT {
-            Self::send_socks5_error(stream, 0x07).await;
+            Self::send_socks5_error(stream, 0x07);
             return Err(Error::protocol(format!(
                 "Unsupported SOCKS5 command: {}",
                 cmd
@@ -591,13 +581,11 @@ impl MixedInbound {
                 let mut addr = [0u8; 4];
                 stream
                     .read_exact(&mut addr)
-                    .await
                     .map_err(|e| Error::protocol(format!("Failed to read IPv4 address: {}", e)))?;
                 let ip = Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
                 let mut port_buf = [0u8; 2];
                 stream
                     .read_exact(&mut port_buf)
-                    .await
                     .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
                 let port = u16::from_be_bytes(port_buf);
                 Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port)))
@@ -606,19 +594,16 @@ impl MixedInbound {
                 let mut len = [0u8; 1];
                 stream
                     .read_exact(&mut len)
-                    .await
                     .map_err(|e| Error::protocol(format!("Failed to read domain length: {}", e)))?;
                 let mut domain = vec![0u8; len[0] as usize];
                 stream
                     .read_exact(&mut domain)
-                    .await
                     .map_err(|e| Error::protocol(format!("Failed to read domain: {}", e)))?;
                 let domain = String::from_utf8(domain)
                     .map_err(|_| Error::protocol("Invalid domain encoding"))?;
                 let mut port_buf = [0u8; 2];
                 stream
                     .read_exact(&mut port_buf)
-                    .await
                     .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
                 let port = u16::from_be_bytes(port_buf);
                 Ok(TargetAddr::Domain(domain, port))
@@ -627,19 +612,17 @@ impl MixedInbound {
                 let mut addr = [0u8; 16];
                 stream
                     .read_exact(&mut addr)
-                    .await
                     .map_err(|e| Error::protocol(format!("Failed to read IPv6 address: {}", e)))?;
                 let ip = Ipv6Addr::from(addr);
                 let mut port_buf = [0u8; 2];
                 stream
                     .read_exact(&mut port_buf)
-                    .await
                     .map_err(|e| Error::protocol(format!("Failed to read port: {}", e)))?;
                 let port = u16::from_be_bytes(port_buf);
                 Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::V6(ip), port)))
             }
             _ => {
-                Self::send_socks5_error(stream, 0x08).await;
+                Self::send_socks5_error(stream, 0x08);
                 Err(Error::protocol(format!(
                     "Unsupported address type: {}",
                     atyp
@@ -648,7 +631,7 @@ impl MixedInbound {
         }
     }
 
-    async fn send_socks5_error(stream: &mut TcpStream, error_code: u8) {
+    fn send_socks5_error(stream: &mut TcpStream, error_code: u8) {
         let response = [
             SOCKS5_VERSION,
             error_code,
@@ -661,10 +644,10 @@ impl MixedInbound {
             0,
             0, // Bind port
         ];
-        let _ = stream.write_all(&response).await;
+        let _ = stream.write_all(&response);
     }
 
-    async fn send_socks5_success(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> {
+    fn send_socks5_success(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> {
         let mut response = vec![SOCKS5_VERSION, 0x00, 0x00]; // Success
 
         match addr.ip() {
@@ -682,59 +665,75 @@ impl MixedInbound {
 
         stream
             .write_all(&response)
-            .await
             .map_err(|e| Error::network(format!("Failed to send SOCKS5 response: {}", e)))?;
 
         Ok(())
     }
+}
 
-    // ============== Common Relay ==============
-
-    #[allow(dead_code)]
-    async fn relay<A, B>(a: &mut A, b: &mut B) -> std::io::Result<()>
-    where
-        A: AsyncRead + AsyncWrite + Unpin,
-        B: AsyncRead + AsyncWrite + Unpin,
-    {
-        let (mut ar, mut aw) = tokio::io::split(a);
-        let (mut br, mut bw) = tokio::io::split(b);
-
-        // Use tokio::select with biased to handle both directions properly
-        let result = tokio::select! {
-            biased;
-
-            result = tokio::io::copy(&mut ar, &mut bw) => {
-                let _ = bw.shutdown().await;
-                result.map(|_| ())
+/// Dedicated accept loop: polls a non-blocking listener for connections and
+/// dispatches each to the work-stealing pool. Exits on cancellation (which
+/// also drops the listener and releases the bound port).
+fn accept_loop(
+    listener: std::net::TcpListener,
+    addr: SocketAddr,
+    cancel_token: CancellationToken,
+    running: Arc<AtomicBool>,
+    router: Arc<Router>,
+    outbound_manager: Arc<OutboundManager>,
+    auth: Arc<InboundAuth>,
+) {
+    loop {
+        if cancel_token.is_cancelled() {
+            tracing::info!("Mixed inbound on {} shutting down", addr);
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
+                // Windows: accepted sockets inherit the listener's
+                // non-blocking mode; force blocking so the read/write
+                // timeouts below actually bound each operation.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(HTTP_READ_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(HTTP_READ_TIMEOUT));
+                let router = Arc::clone(&router);
+                let outbound_manager = Arc::clone(&outbound_manager);
+                let auth = Arc::clone(&auth);
+                crate::common::exec::spawn(move || {
+                    if let Err(err) = MixedInbound::handle_connection(
+                        stream,
+                        peer_addr,
+                        router,
+                        outbound_manager,
+                        auth,
+                    ) {
+                        tracing::debug!("Mixed connection error from {}: {}", peer_addr, err);
+                    }
+                });
             }
-            result = tokio::io::copy(&mut br, &mut aw) => {
-                let _ = aw.shutdown().await;
-                result.map(|_| ())
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
             }
-        };
-
-        // Log non-common errors
-        if let Err(ref e) = result {
-            if e.kind() != std::io::ErrorKind::ConnectionReset
-                && e.kind() != std::io::ErrorKind::BrokenPipe
-                && !e.to_string().contains("connection")
-            {
-                tracing::debug!("Relay error: {}", e);
+            Err(e) => {
+                if !cancel_token.is_cancelled() {
+                    tracing::error!("Mixed accept error: {}", e);
+                }
+                break;
             }
         }
-
-        Ok(())
     }
+    running.store(false, Ordering::Relaxed);
+    tracing::info!("Mixed inbound on {} stopped", addr);
 }
 
 /// Marker header set by the CONNECT handler; the keep-alive loop checks it
 /// and relays the raw stream (never sent to the client).
 const TUNNEL_MARKER: &str = "x-corduit-raw-upgrade";
 
-/// Read one HTTP/1.1 request from the async stream, using courierust's H/1
-/// codec (pure functions over the accumulated byte buffer). `None` on a
-/// clean close before any byte.
-async fn read_http_request(
+/// Read one HTTP/1.1 request from the stream, using courierust's H/1 codec
+/// (pure functions over the accumulated byte buffer). `None` on a clean
+/// close before any byte.
+fn read_http_request(
     stream: &mut TcpStream,
     max_head: usize,
     max_body: usize,
@@ -750,16 +749,24 @@ async fn read_http_request(
             return Err(Error::protocol("Request head too large"));
         }
         let mut tmp = [0u8; 2048];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
-            .await
-            .map_err(|_| Error::protocol("Timed out reading request head"))?
-            .map_err(|e| Error::network(format!("Failed to read request: {e}")))?;
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(None);
+        let n = match stream.read(&mut tmp) {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                return Err(Error::protocol("Connection closed mid-request"));
             }
-            return Err(Error::protocol("Connection closed mid-request"));
-        }
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(Error::protocol("Timed out reading request head"));
+            }
+            Err(e) => return Err(Error::network(format!("Failed to read request: {e}"))),
+        };
         buf.extend_from_slice(&tmp[..n]);
     };
 
@@ -807,11 +814,9 @@ async fn read_http_request(
             if n > max_body {
                 return Err(Error::protocol("Request body too large"));
             }
-            read_exact_bytes(stream, &mut buf, &mut body_start, n).await?
+            read_exact_bytes(stream, &mut buf, &mut body_start, n)?
         }
-        h1::BodyLen::Chunked => {
-            read_chunked_bytes(stream, &mut buf, &mut body_start, max_body).await?
-        }
+        h1::BodyLen::Chunked => read_chunked_bytes(stream, &mut buf, &mut body_start, max_body)?,
     };
 
     Ok(Some(Request {
@@ -824,10 +829,7 @@ async fn read_http_request(
 }
 
 /// Write one HTTP/1.1 response (courierust's H/1 serializer).
-async fn write_http_response<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    resp: &Response<Body>,
-) -> Result<()> {
+fn write_http_response<W: Write>(stream: &mut W, resp: &Response<Body>) -> Result<()> {
     let mut out = Vec::new();
     let mut headers = resp.headers.clone();
     if !headers.contains_key("content-length") && !headers.contains_key("transfer-encoding") {
@@ -845,11 +847,9 @@ async fn write_http_response<S: AsyncWrite + Unpin>(
     }
     stream
         .write_all(&out)
-        .await
         .map_err(|e| Error::network(format!("Failed to write response: {e}")))?;
     stream
         .flush()
-        .await
         .map_err(|e| Error::network(format!("Failed to flush response: {e}")))
 }
 
@@ -948,7 +948,7 @@ fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> 
 }
 
 /// Read exactly `n` body bytes (using already-buffered bytes first).
-async fn read_exact_bytes(
+fn read_exact_bytes(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
     start: &mut usize,
@@ -963,13 +963,19 @@ async fn read_exact_bytes(
             continue;
         }
         let mut tmp = [0u8; 2048];
-        let read = tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
-            .await
-            .map_err(|_| Error::protocol("Timed out reading body"))?
-            .map_err(|e| Error::network(format!("Failed to read body: {e}")))?;
-        if read == 0 {
-            return Err(Error::protocol("Connection closed mid-body"));
-        }
+        let read = match stream.read(&mut tmp) {
+            Ok(0) => return Err(Error::protocol("Connection closed mid-body")),
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(Error::protocol("Timed out reading body"));
+            }
+            Err(e) => return Err(Error::network(format!("Failed to read body: {e}"))),
+        };
         buf.clear();
         *start = 0;
         buf.extend_from_slice(&tmp[..read]);
@@ -978,7 +984,7 @@ async fn read_exact_bytes(
 }
 
 /// Read a chunked request body (using already-buffered bytes first).
-async fn read_chunked_bytes(
+fn read_chunked_bytes(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
     start: &mut usize,
@@ -998,14 +1004,19 @@ async fn read_chunked_bytes(
                 return Err(Error::protocol("Chunk size line too long"));
             }
             let mut tmp = [0u8; 2048];
-            let read =
-                tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
-                    .await
-                    .map_err(|_| Error::protocol("Timed out reading chunk size"))?
-                    .map_err(|e| Error::network(format!("Failed to read chunk size: {e}")))?;
-            if read == 0 {
-                return Err(Error::protocol("Connection closed in chunk size"));
-            }
+            let read = match stream.read(&mut tmp) {
+                Ok(0) => return Err(Error::protocol("Connection closed in chunk size")),
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(Error::protocol("Timed out reading chunk size"));
+                }
+                Err(e) => return Err(Error::network(format!("Failed to read chunk size: {e}"))),
+            };
             buf.extend_from_slice(&tmp[..read]);
         };
 
@@ -1033,14 +1044,19 @@ async fn read_chunked_bytes(
                     break;
                 }
                 let mut tmp = [0u8; 2048];
-                let read =
-                    tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
-                        .await
-                        .map_err(|_| Error::protocol("Timed out reading trailers"))?
-                        .map_err(|e| Error::network(format!("Failed to read trailers: {e}")))?;
-                if read == 0 {
-                    return Err(Error::protocol("Connection closed in trailers"));
-                }
+                let read = match stream.read(&mut tmp) {
+                    Ok(0) => return Err(Error::protocol("Connection closed in trailers")),
+                    Ok(n) => n,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return Err(Error::protocol("Timed out reading trailers"));
+                    }
+                    Err(e) => return Err(Error::network(format!("Failed to read trailers: {e}"))),
+                };
                 buf.extend_from_slice(&tmp[..read]);
             }
             break;
@@ -1049,27 +1065,27 @@ async fn read_chunked_bytes(
         if out.len().saturating_add(size) > max_body {
             return Err(Error::protocol("Request body too large"));
         }
-        let chunk = read_exact_bytes(stream, buf, start, size).await?;
+        let chunk = read_exact_bytes(stream, buf, start, size)?;
         out.extend_from_slice(&chunk);
         // Trailing CRLF after the chunk data.
-        let mut crlf = [0u8; 2];
         if *start + 2 <= buf.len() {
             *start += 2;
-        } else {
-            let need = 2 - (buf.len() - *start);
-            if *start < buf.len() {
-                let have = buf.len() - *start;
-                crlf[..have].copy_from_slice(&buf[*start..]);
-                *start = buf.len();
-            }
+        } else if *start < buf.len() {
+            *start = buf.len();
             let mut tmp = [0u8; 2];
-            let read =
-                tokio::time::timeout(std::time::Duration::from_secs(60), stream.read(&mut tmp))
-                    .await
-                    .map_err(|_| Error::protocol("Timed out reading chunk CRLF"))?
-                    .map_err(|e| Error::network(format!("Failed to read chunk CRLF: {e}")))?;
-            let _ = need;
-            let _ = crlf;
+            let read = match stream.read(&mut tmp) {
+                Ok(0) => return Err(Error::protocol("Connection closed in chunk CRLF")),
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(Error::protocol("Timed out reading chunk CRLF"));
+                }
+                Err(e) => return Err(Error::network(format!("Failed to read chunk CRLF: {e}"))),
+            };
             let _ = read;
         }
     }

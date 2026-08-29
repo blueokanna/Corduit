@@ -9,9 +9,9 @@ use crate::dns::fake_ip::FakeIpPool;
 use crate::dns::hosts::HostsFile;
 use crate::dns::wire::{Message, RData};
 use crate::dns::RecordType;
+use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
 /// DNS resolver with caching, Fake-IP, and routing support
@@ -76,12 +76,12 @@ impl DnsResolver {
     }
 
     /// Resolve a domain name
-    pub async fn resolve(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+    pub fn resolve(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let name = name.trim_end_matches('.');
         trace!("Resolving {} {:?}", name, record_type);
 
         // 1. Check hosts file
-        if let Some(ips) = self.hosts.read().await.lookup(name) {
+        if let Some(ips) = self.hosts.read().lookup(name) {
             debug!("Hosts hit: {} -> {:?}", name, ips);
             return Ok(ips.to_vec());
         }
@@ -107,7 +107,7 @@ impl DnsResolver {
         }
 
         // 4. Query upstream DNS
-        let result = self.query_upstream(name, record_type).await?;
+        let result = self.query_upstream(name, record_type)?;
 
         // 5. Cache the result
         if !result.is_empty() {
@@ -118,12 +118,12 @@ impl DnsResolver {
     }
 
     /// Query upstream DNS servers
-    async fn query_upstream(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+    fn query_upstream(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let wire_type = crate::dns::wire::RecordType::from(record_type);
 
         // Try primary servers first
         for client in &self.primary_clients {
-            match client.query(name, wire_type).await {
+            match client.query(name, wire_type) {
                 Ok(response) => {
                     let ips = self.extract_ips(&response, record_type);
 
@@ -145,7 +145,7 @@ impl DnsResolver {
 
         // Try fallback servers
         for client in &self.fallback_clients {
-            match client.query(name, wire_type).await {
+            match client.query(name, wire_type) {
                 Ok(response) => {
                     let ips = self.extract_ips(&response, record_type);
                     if !ips.is_empty() {
@@ -270,16 +270,16 @@ impl DnsResolver {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[test]
     #[ignore] // Requires network
-    async fn test_resolver_basic() {
+    fn test_resolver_basic() {
         let config = DnsConfig {
             nameservers: vec!["8.8.8.8".to_string()],
             ..Default::default()
         };
 
         let resolver = DnsResolver::new(config).unwrap();
-        let result = resolver.resolve("google.com", RecordType::A).await;
+        let result = resolver.resolve("google.com", RecordType::A);
 
         assert!(result.is_ok());
         assert!(!result.unwrap().is_empty());

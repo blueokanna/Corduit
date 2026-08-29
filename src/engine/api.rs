@@ -127,7 +127,7 @@ fn read_body(req: &Request<Body>) -> Result<String, String> {
 // Handlers (plain `&ApiState`, no framework extractors)
 // ---------------------------------------------------------------------------
 
-async fn get_server_info(state: &ApiState) -> Response<Body> {
+fn get_server_info(state: &ApiState) -> Response<Body> {
     let active_connections = state.traffic_stats.active_connections();
     json_response(
         StatusCode::OK,
@@ -139,7 +139,7 @@ async fn get_server_info(state: &ApiState) -> Response<Body> {
     )
 }
 
-async fn get_traffic_stats(state: &ApiState) -> Response<Body> {
+fn get_traffic_stats(state: &ApiState) -> Response<Body> {
     let stats = state.traffic_stats.global_stats();
     json_response(
         StatusCode::OK,
@@ -153,15 +153,15 @@ async fn get_traffic_stats(state: &ApiState) -> Response<Body> {
     )
 }
 
-async fn reset_traffic_stats(state: &ApiState) -> Response<Body> {
-    state.traffic_stats.reset().await;
+fn reset_traffic_stats(state: &ApiState) -> Response<Body> {
+    state.traffic_stats.reset();
     json_response(
         StatusCode::OK,
         &ApiResponse::success("Traffic statistics reset".to_string()),
     )
 }
 
-async fn get_health_status(state: &ApiState) -> Response<Body> {
+fn get_health_status(state: &ApiState) -> Response<Body> {
     let health_statuses: Vec<HealthResponse> = state
         .health_monitor
         .get_all_health()
@@ -189,8 +189,8 @@ async fn get_health_status(state: &ApiState) -> Response<Body> {
     json_response(StatusCode::OK, &ApiResponse::success(health_statuses))
 }
 
-async fn get_proxies(state: &ApiState) -> Response<Body> {
-    let config = state.proxy_manager.get_config().await;
+fn get_proxies(state: &ApiState) -> Response<Body> {
+    let config = state.proxy_manager.get_config();
     let proxies: Vec<ProxyInfo> = config
         .outbounds
         .into_iter()
@@ -214,8 +214,8 @@ async fn get_proxies(state: &ApiState) -> Response<Body> {
     json_response(StatusCode::OK, &ApiResponse::success(proxies))
 }
 
-async fn get_proxy(state: &ApiState, tag: &str) -> Response<Body> {
-    let config = state.proxy_manager.get_config().await;
+fn get_proxy(state: &ApiState, tag: &str) -> Response<Body> {
+    let config = state.proxy_manager.get_config();
 
     if let Some(outbound) = config.outbounds.into_iter().find(|o| o.tag == tag) {
         let healthy = state
@@ -242,12 +242,12 @@ async fn get_proxy(state: &ApiState, tag: &str) -> Response<Body> {
     }
 }
 
-async fn get_config(state: &ApiState) -> Response<Body> {
-    let config = state.proxy_manager.get_config().await;
+fn get_config(state: &ApiState) -> Response<Body> {
+    let config = state.proxy_manager.get_config();
     json_response(StatusCode::OK, &ApiResponse::success(config))
 }
 
-async fn update_config(state: &ApiState, body: String) -> Response<Body> {
+fn update_config(state: &ApiState, body: String) -> Response<Body> {
     let request: ConfigUpdateRequest = match nextjson::from_str(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -257,7 +257,7 @@ async fn update_config(state: &ApiState, body: String) -> Response<Body> {
             );
         }
     };
-    match state.proxy_manager.reload(request.config).await {
+    match state.proxy_manager.reload(request.config) {
         Ok(()) => json_response(
             StatusCode::OK,
             &ApiResponse::success("Configuration updated successfully".to_string()),
@@ -269,8 +269,8 @@ async fn update_config(state: &ApiState, body: String) -> Response<Body> {
     }
 }
 
-async fn get_rules(state: &ApiState) -> Response<Body> {
-    let config = state.proxy_manager.get_config().await;
+fn get_rules(state: &ApiState) -> Response<Body> {
+    let config = state.proxy_manager.get_config();
     let rules: Vec<nextjson::Value> = config
         .rules
         .into_iter()
@@ -326,7 +326,7 @@ impl ApiServer {
     /// Serve one HTTP request. Wire this into any courierust-based server
     /// (e.g. [`crate::common::http_server::HttpServer`]) by adapting the
     /// request/response pair.
-    pub async fn serve(&self, req: Request<Body>) -> Response<Body> {
+    pub fn serve(&self, req: Request<Body>) -> Response<Body> {
         let method = req.method.clone();
         let path = req.uri.path().to_owned();
         let body = match read_body(&req) {
@@ -335,11 +335,11 @@ impl ApiServer {
                 return json_response(StatusCode::BAD_REQUEST, &ApiResponse::<String>::error(e));
             }
         };
-        self.dispatch(method, &path, &body).await
+        self.dispatch(method, &path, &body)
     }
 
     /// Match `(method, path)` to a handler and run it.
-    async fn dispatch(&self, method: Method, path: &str, body: &str) -> Response<Body> {
+    fn dispatch(&self, method: Method, path: &str, body: &str) -> Response<Body> {
         // `/api/v1/proxies/:tag` (GET) — parameterized route handled first.
         let segments = path_segments(path);
         if segments.len() == 4
@@ -348,18 +348,18 @@ impl ApiServer {
             && segments[2] == "proxies"
             && method == Method::GET
         {
-            return get_proxy(&self.state, segments[3]).await;
+            return get_proxy(&self.state, segments[3]);
         }
 
         match (method.as_str(), path) {
-            ("GET", "/api/v1/info") => get_server_info(&self.state).await,
-            ("GET", "/api/v1/traffic") => get_traffic_stats(&self.state).await,
-            ("POST", "/api/v1/traffic/reset") => reset_traffic_stats(&self.state).await,
-            ("GET", "/api/v1/health") => get_health_status(&self.state).await,
-            ("GET", "/api/v1/proxies") => get_proxies(&self.state).await,
-            ("GET", "/api/v1/config") => get_config(&self.state).await,
-            ("POST", "/api/v1/config") => update_config(&self.state, body.to_owned()).await,
-            ("GET", "/api/v1/rules") => get_rules(&self.state).await,
+            ("GET", "/api/v1/info") => get_server_info(&self.state),
+            ("GET", "/api/v1/traffic") => get_traffic_stats(&self.state),
+            ("POST", "/api/v1/traffic/reset") => reset_traffic_stats(&self.state),
+            ("GET", "/api/v1/health") => get_health_status(&self.state),
+            ("GET", "/api/v1/proxies") => get_proxies(&self.state),
+            ("GET", "/api/v1/config") => get_config(&self.state),
+            ("POST", "/api/v1/config") => update_config(&self.state, body.to_owned()),
+            ("GET", "/api/v1/rules") => get_rules(&self.state),
             _ => json_response(
                 StatusCode::NOT_FOUND,
                 &ApiResponse::<()>::error("route not found".to_string()),

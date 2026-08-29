@@ -1,9 +1,8 @@
-//! HTTP proxy inbound on courierust's H/1 codec.
+//! HTTP proxy inbound on courierust's H/1 codec (synchronous engine).
 //!
 //! The listener is [`crate::common::http_server::HttpServer`]: a blocking
 //! H/1 server where each connection runs on its own thread. The synchronous
-//! handler bridges into the async engine with a captured
-//! `tokio::runtime::Handle`:
+//! handler:
 //!
 //! * plain HTTP proxy requests (absolute-form URI) are forwarded through the
 //!   matched outbound with correct re-framing ([`super::forward`]);
@@ -14,7 +13,7 @@
 //! proxying happens.
 
 use crate::common::http_server::{RawConnection, TUNNEL_MARKER};
-use crate::common::BlockingStream;
+use crate::common::stream::{BoxStream, SyncStream};
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
@@ -26,10 +25,10 @@ use crate::engine::routing::Router;
 use courierust::courierust_http::{
     Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
 };
-use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio_util::sync::CancellationToken;
+use parking_lot::Mutex;
+use std::net::Shutdown;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// HTTP proxy inbound listener.
 pub struct HttpInbound {
@@ -37,19 +36,18 @@ pub struct HttpInbound {
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
     auth: Arc<InboundAuth>,
-    cancel_token: CancellationToken,
+    cancel_token: crate::common::cancel::CancellationToken,
     running: Arc<std::sync::atomic::AtomicBool>,
-    server: AsyncMutex<Option<crate::common::http_server::HttpServer>>,
+    server: Mutex<Option<crate::common::http_server::HttpServer>>,
 }
 
-#[async_trait::async_trait]
 impl InboundListener for HttpInbound {
-    async fn start(&self) -> Result<()> {
-        self.start_listener().await
+    fn start(&self) -> Result<()> {
+        self.start_listener()
     }
 
-    async fn stop(&self) -> Result<()> {
-        self.stop_listener().await
+    fn stop(&self) -> Result<()> {
+        self.stop_listener()
     }
 
     fn tag(&self) -> &str {
@@ -69,13 +67,13 @@ impl HttpInbound {
             router,
             outbound_manager,
             auth,
-            cancel_token: CancellationToken::new(),
+            cancel_token: crate::common::cancel::CancellationToken::new(),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            server: AsyncMutex::new(None),
+            server: Mutex::new(None),
         }
     }
 
-    async fn start_listener(&self) -> Result<()> {
+    fn start_listener(&self) -> Result<()> {
         if self.running.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::warn!(
                 "HTTP inbound already running on {}:{}",
@@ -87,7 +85,6 @@ impl HttpInbound {
 
         let addr = super::parse_listen_addr(&self.config.listen, self.config.port)?;
 
-        let runtime = tokio::runtime::Handle::current();
         let router = Arc::clone(&self.router);
         let outbound_manager = Arc::clone(&self.outbound_manager);
         let auth = Arc::clone(&self.auth);
@@ -102,30 +99,20 @@ impl HttpInbound {
             let outbound_manager = outbound_manager.clone();
             let auth = auth.clone();
             let tunnel_job = tunnel_job.clone();
-            let runtime = runtime.clone();
             Arc::new(move |req: Request<Body>| {
-                handle_request(
-                    req,
-                    &router,
-                    &outbound_manager,
-                    &auth,
-                    &runtime,
-                    &tunnel_job,
-                )
+                handle_request(req, &router, &outbound_manager, &auth, &tunnel_job)
             })
         };
 
         let tunnel = {
-            let router = router.clone();
             let outbound_manager = outbound_manager.clone();
             let tunnel_job = tunnel_job.clone();
-            let runtime = runtime.clone();
             Arc::new(move |conn: RawConnection| {
-                let Some(job) = tunnel_job.lock().unwrap().take() else {
+                let Some(job) = tunnel_job.lock().take() else {
                     tracing::warn!("CONNECT tunnel handoff without a job");
                     return;
                 };
-                handle_tunnel(conn, job, &router, &outbound_manager, &runtime);
+                handle_tunnel(conn, job, &outbound_manager);
             })
         };
 
@@ -143,7 +130,7 @@ impl HttpInbound {
 
         let mut server = crate::common::http_server::HttpServer::bind(cfg)?;
         server.start()?;
-        *self.server.lock().await = Some(server);
+        *self.server.lock() = Some(server);
 
         self.running
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -151,13 +138,16 @@ impl HttpInbound {
         Ok(())
     }
 
-    async fn stop_listener(&self) -> Result<()> {
+    fn stop_listener(&self) -> Result<()> {
         tracing::info!(
             "Stopping HTTP inbound on {}:{}",
             self.config.listen,
             self.config.port
         );
-        if let Some(mut server) = self.server.lock().await.take() {
+        // Take the server out first so the lock is released before shutdown
+        // (which joins the accept loop).
+        let server = self.server.lock().take();
+        if let Some(mut server) = server {
             server.shutdown();
         }
         self.running
@@ -182,7 +172,6 @@ fn handle_request(
     router: &Router,
     outbound_manager: &OutboundManager,
     auth: &InboundAuth,
-    runtime: &tokio::runtime::Handle,
     tunnel_job: &Mutex<Option<TunnelJob>>,
 ) -> Response<Body> {
     // Enforce configured inbound credentials before serving anything
@@ -200,10 +189,10 @@ fn handle_request(
     }
 
     if req.method == Method::CONNECT {
-        return handle_connect(&req, router, outbound_manager, runtime, tunnel_job);
+        return handle_connect(&req, router, outbound_manager, tunnel_job);
     }
 
-    match handle_http_proxy(req, router, outbound_manager, runtime) {
+    match handle_http_proxy(req, router, outbound_manager) {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("HTTP proxy error: {}", e);
@@ -220,7 +209,6 @@ fn handle_connect(
     req: &Request<Body>,
     router: &Router,
     outbound_manager: &OutboundManager,
-    runtime: &tokio::runtime::Handle,
     tunnel_job: &Mutex<Option<TunnelJob>>,
 ) -> Response<Body> {
     let authority = req.uri.as_str();
@@ -232,11 +220,7 @@ fn handle_connect(
         }
     };
 
-    let outbound_tag = runtime.block_on(async {
-        router
-            .match_outbound(Some(&host), None, Some(port), None)
-            .await
-    });
+    let outbound_tag = router.match_outbound(Some(&host), None, Some(port), None);
     tracing::info!("CONNECT {}:{} -> {}", host, port, outbound_tag);
 
     let outbound = match outbound_manager.get_proxy(&outbound_tag) {
@@ -250,7 +234,7 @@ fn handle_connect(
         }
     };
 
-    *tunnel_job.lock().unwrap() = Some(TunnelJob {
+    *tunnel_job.lock() = Some(TunnelJob {
         target: TargetAddr::new_domain(host.clone(), port),
         host: host.clone(),
         port,
@@ -267,16 +251,10 @@ fn handle_connect(
     resp
 }
 
-/// Relay a CONNECT tunnel: bridge the raw client connection into the async
-/// world and push it through the matched outbound. Runs on the connection
-/// thread for the tunnel's lifetime.
-fn handle_tunnel(
-    conn: RawConnection,
-    job: TunnelJob,
-    router: &Router,
-    outbound_manager: &OutboundManager,
-    runtime: &tokio::runtime::Handle,
-) {
+/// Relay a CONNECT tunnel: push the raw client connection through the
+/// matched outbound with connection tracking. Runs on the connection thread
+/// for the tunnel's lifetime.
+fn handle_tunnel(conn: RawConnection, job: TunnelJob, outbound_manager: &OutboundManager) {
     let outbound = match outbound_manager.get_proxy(&job.outbound_tag) {
         Some(proxy) => proxy,
         None => {
@@ -285,16 +263,16 @@ fn handle_tunnel(
         }
     };
 
-    let client = BlockingStream::new(conn, 64, None);
+    // `RawConnection` implements `SyncStream` directly (plain TCP or TLS).
+    let client: BoxStream = Box::new(conn);
     let target = job.target;
     let host = job.host.clone();
     let port = job.port;
 
     // Connection tracking.
-    let destination_ip = runtime
-        .block_on(tokio::net::lookup_host(format!("{host}:{port}")))
+    let destination_ip = crate::common::socket::resolve_host(&host, port, Duration::from_secs(3))
         .ok()
-        .and_then(|mut addrs| addrs.next())
+        .and_then(|addrs| addrs.into_iter().next())
         .map(|addr| addr.ip().to_string());
     let tracked_conn = TrackedConnection::new_with_ip(
         "http".to_string(),
@@ -311,13 +289,8 @@ fn handle_tunnel(
     let tracked = tracker.track(tracked_conn);
     let conn_arc = Arc::clone(&tracked);
     let tag = job.outbound_tag.clone();
-    let _ = router;
 
-    let result = runtime.block_on(async move {
-        outbound
-            .relay_tcp_with_connection(Box::new(client), target, Some(conn_arc))
-            .await
-    });
+    let result = outbound.relay_tcp_with_connection(client, target, Some(conn_arc));
 
     tracker.untrack(&tracked.id);
     if let Err(e) = result {
@@ -333,16 +306,11 @@ fn handle_http_proxy(
     req: Request<Body>,
     router: &Router,
     outbound_manager: &OutboundManager,
-    runtime: &tokio::runtime::Handle,
 ) -> Result<Response<Body>> {
     let (host, port) = parse_http_target(&req)
         .ok_or_else(|| Error::protocol("Invalid HTTP proxy request: missing host"))?;
 
-    let outbound_tag = runtime.block_on(async {
-        router
-            .match_outbound(Some(&host), None, Some(port), None)
-            .await
-    });
+    let outbound_tag = router.match_outbound(Some(&host), None, Some(port), None);
     tracing::info!("HTTP {} -> {}", req.uri.as_str(), outbound_tag);
 
     let outbound = outbound_manager
@@ -354,38 +322,36 @@ fn handle_http_proxy(
     let is_head = method == Method::HEAD;
 
     let target = TargetAddr::new_domain(host.clone(), port);
-    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-    let relay_handle =
-        tokio::spawn(async move { outbound.relay_tcp(Box::new(server_side), target).await });
+    let (mut client_side, server_side) = forward::mem_duplex(64 * 1024);
 
-    let (mut read_half, mut write_half) = tokio::io::split(client_side);
+    // Relay the server end to the origin on a dedicated thread; the client
+    // end is used below to send the request and read the response.
+    let relay_handle = std::thread::Builder::new()
+        .name("corduit-http-relay".into())
+        .spawn(move || outbound.relay_tcp(Box::new(server_side) as BoxStream, target))
+        .map_err(|e| Error::network(format!("Failed to spawn relay thread: {e}")))?;
 
     // The request body is materialized (bounded); re-serialize it with the
     // hop-by-hop headers stripped and an explicit Content-Length (CWE-444).
     let body = req.body.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
-    let body_bytes = std::sync::Arc::new(body);
 
-    runtime.block_on(async {
-        forward::send_request(
-            &mut write_half,
-            &method,
-            &path,
-            &req.headers,
-            &host,
-            port,
-            &body_bytes,
-        )
-        .await?;
+    forward::send_request(
+        &mut client_side,
+        &method,
+        &path,
+        &req.headers,
+        &host,
+        port,
+        &body,
+    )?;
 
-        write_half
-            .shutdown()
-            .await
-            .map_err(|e| Error::network(format!("Failed to shutdown write: {e}")))?;
+    client_side
+        .shutdown(Shutdown::Write)
+        .map_err(|e| Error::network(format!("Failed to shutdown write: {e}")))?;
 
-        let response = forward::read_http_response(&mut read_half, is_head).await?;
-        let _ = relay_handle.await;
-        Ok(response)
-    })
+    let response = forward::read_http_response(&mut client_side, is_head)?;
+    let _ = relay_handle.join();
+    Ok(response)
 }
 
 /// Parse a CONNECT authority (`host:port` or `[v6]:port`).

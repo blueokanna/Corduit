@@ -17,8 +17,12 @@
 //! references a dynamic-table entry) it is rejected with an explicit error
 //! rather than silently mis-decoded. For a single-shot auth exchange that is
 //! always the case in practice, and the failure mode is loud, not wrong.
+//!
+//! This module is `no_std + alloc` — pure codec, no OS dependencies.
 
-use std::sync::OnceLock;
+use alloc::vec;
+use alloc::vec::Vec;
+use once_cell::sync::Lazy;
 
 /// QPACK / HPACK decode error.
 #[derive(Debug)]
@@ -408,47 +412,47 @@ struct HuffNode {
     symbol: i32,
 }
 
-static HUFFMAN_TREE: OnceLock<Vec<HuffNode>> = OnceLock::new();
+static HUFFMAN_TREE: Lazy<Vec<HuffNode>> = Lazy::new(|| {
+    let mut nodes = vec![HuffNode {
+        child0: -1,
+        child1: -1,
+        symbol: -1,
+    }];
+    for &(symbol, code, len) in HUFFMAN_CODES.iter() {
+        let mut node = 0usize;
+        // Transmitted bits are MSB-first; `code` is LSB-aligned, so bit
+        // `j` of the transmitted sequence is bit `(len - 1 - j)` of code.
+        for j in 0..len {
+            let bit = ((code >> (len - 1 - j)) & 1) as usize;
+            let existing = if bit == 0 {
+                nodes[node].child0
+            } else {
+                nodes[node].child1
+            };
+            node = if existing >= 0 {
+                existing as usize
+            } else {
+                let new_idx = nodes.len() as i32;
+                nodes.push(HuffNode {
+                    child0: -1,
+                    child1: -1,
+                    symbol: -1,
+                });
+                if bit == 0 {
+                    nodes[node].child0 = new_idx;
+                } else {
+                    nodes[node].child1 = new_idx;
+                }
+                new_idx as usize
+            };
+        }
+        nodes[node].symbol = symbol as i32;
+    }
+    nodes
+});
 
 fn huffman_tree() -> &'static [HuffNode] {
-    HUFFMAN_TREE.get_or_init(|| {
-        let mut nodes = vec![HuffNode {
-            child0: -1,
-            child1: -1,
-            symbol: -1,
-        }];
-        for &(symbol, code, len) in HUFFMAN_CODES.iter() {
-            let mut node = 0usize;
-            // Transmitted bits are MSB-first; `code` is LSB-aligned, so bit
-            // `j` of the transmitted sequence is bit `(len - 1 - j)` of code.
-            for j in 0..len {
-                let bit = ((code >> (len - 1 - j)) & 1) as usize;
-                let existing = if bit == 0 {
-                    nodes[node].child0
-                } else {
-                    nodes[node].child1
-                };
-                node = if existing >= 0 {
-                    existing as usize
-                } else {
-                    let new_idx = nodes.len() as i32;
-                    nodes.push(HuffNode {
-                        child0: -1,
-                        child1: -1,
-                        symbol: -1,
-                    });
-                    if bit == 0 {
-                        nodes[node].child0 = new_idx;
-                    } else {
-                        nodes[node].child1 = new_idx;
-                    }
-                    new_idx as usize
-                };
-            }
-            nodes[node].symbol = symbol as i32;
-        }
-        nodes
-    })
+    HUFFMAN_TREE.as_slice()
 }
 
 /// Decode an HPACK Huffman string (RFC 7541 §5.2 + Appendix B).

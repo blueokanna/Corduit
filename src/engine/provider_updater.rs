@@ -1,18 +1,16 @@
 use crate::engine::error::Result;
 use crate::engine::proxy_provider::ProxyProviderManager;
 use crate::engine::rule_provider::RuleProviderManager;
+use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tokio::time::interval;
 
 /// Hook invoked after proxy providers are refreshed in the background, so the
 /// component that owns the live proxy registry can re-sync provider proxies.
 /// The refresh itself is owned by `ProxyProviderManager`; this hook closes the
 /// loop back to the registry (e.g. `OutboundManager`) without coupling the two.
-#[async_trait::async_trait]
 pub trait ProviderRegistrySync: Send + Sync {
-    async fn sync_providers(&self) -> Result<()>;
+    fn sync_providers(&self) -> Result<()>;
 }
 
 pub struct ProviderUpdaterConfig {
@@ -41,7 +39,7 @@ pub struct ProviderUpdater {
     /// nodes are actually reachable without a full reload.
     proxy_registry_sync: Option<Arc<dyn ProviderRegistrySync>>,
     running: Arc<RwLock<bool>>,
-    shutdown_tx: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
+    shutdown_tx: Arc<RwLock<Option<std::sync::mpsc::Sender<()>>>>,
 }
 
 impl ProviderUpdater {
@@ -71,8 +69,8 @@ impl ProviderUpdater {
         self
     }
 
-    pub async fn start(&self) -> Result<()> {
-        let mut running = self.running.write().await;
+    pub fn start(&self) -> Result<()> {
+        let mut running = self.running.write();
         if *running {
             tracing::warn!("Provider updater is already running");
             return Ok(());
@@ -80,9 +78,9 @@ impl ProviderUpdater {
         *running = true;
         drop(running);
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
         {
-            let mut tx_guard = self.shutdown_tx.write().await;
+            let mut tx_guard = self.shutdown_tx.write();
             *tx_guard = Some(shutdown_tx);
         }
 
@@ -92,17 +90,23 @@ impl ProviderUpdater {
         let proxy_registry_sync = self.proxy_registry_sync.clone();
         let running = Arc::clone(&self.running);
 
-        tokio::spawn(async move {
-            Self::update_loop(
-                config,
-                proxy_manager,
-                rule_manager,
-                proxy_registry_sync,
-                running,
-                shutdown_rx,
-            )
-            .await;
-        });
+        std::thread::Builder::new()
+            .name("provider-updater".to_string())
+            .spawn(move || {
+                Self::update_loop(
+                    config,
+                    proxy_manager,
+                    rule_manager,
+                    proxy_registry_sync,
+                    running,
+                    shutdown_rx,
+                );
+            })
+            .map_err(|e| {
+                crate::engine::error::Error::config(format!(
+                    "Failed to spawn provider updater thread: {e}"
+                ))
+            })?;
 
         tracing::info!(
             "Provider updater started with check interval: {:?}",
@@ -112,67 +116,68 @@ impl ProviderUpdater {
         Ok(())
     }
 
-    async fn update_loop(
+    fn update_loop(
         config: ProviderUpdaterConfig,
         proxy_manager: Option<Arc<ProxyProviderManager>>,
         rule_manager: Option<Arc<RuleProviderManager>>,
         proxy_registry_sync: Option<Arc<dyn ProviderRegistrySync>>,
         running: Arc<RwLock<bool>>,
-        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        shutdown_rx: std::sync::mpsc::Receiver<()>,
     ) {
-        let mut check_interval = interval(config.check_interval);
-        check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         loop {
-            tokio::select! {
-                _ = check_interval.tick() => {
-                    let is_running = *running.read().await;
-                    if !is_running {
-                        break;
-                    }
+            // Wait for the next check tick or a shutdown signal, whichever
+            // comes first. `recv_timeout` doubles as the interval sleep.
+            match shutdown_rx.recv_timeout(config.check_interval) {
+                Ok(()) => {
+                    tracing::info!("Provider updater received shutdown signal");
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::info!("Provider updater channel closed");
+                    break;
+                }
+            }
 
-                    if config.enable_proxy_provider_update {
-                        if let Some(ref manager) = proxy_manager {
-                            Self::update_proxy_providers(manager).await;
-                            // Refreshed nodes are new proxy objects; re-sync the
-                            // shared registry so groups pick them up immediately.
-                            if let Some(ref sync) = proxy_registry_sync {
-                                if let Err(error) = sync.sync_providers().await {
-                                    tracing::warn!(
-                                        "Failed to re-sync proxy registry after provider update: {}",
-                                        error
-                                    );
-                                }
-                            }
-                        }
-                    }
+            if !*running.read() {
+                break;
+            }
 
-                    if config.enable_rule_provider_update {
-                        if let Some(ref manager) = rule_manager {
-                            Self::update_rule_providers(manager).await;
-                        }
-                    }
-
-                    if config.enable_health_check {
-                        if let Some(ref manager) = proxy_manager {
-                            Self::health_check_proxies(manager).await;
+            if config.enable_proxy_provider_update {
+                if let Some(ref manager) = proxy_manager {
+                    Self::update_proxy_providers(manager);
+                    // Refreshed nodes are new proxy objects; re-sync the
+                    // shared registry so groups pick them up immediately.
+                    if let Some(ref sync) = proxy_registry_sync {
+                        if let Err(error) = sync.sync_providers() {
+                            tracing::warn!(
+                                "Failed to re-sync proxy registry after provider update: {}",
+                                error
+                            );
                         }
                     }
                 }
-                _ = &mut shutdown_rx => {
-                    tracing::info!("Provider updater received shutdown signal");
-                    break;
+            }
+
+            if config.enable_rule_provider_update {
+                if let Some(ref manager) = rule_manager {
+                    Self::update_rule_providers(manager);
+                }
+            }
+
+            if config.enable_health_check {
+                if let Some(ref manager) = proxy_manager {
+                    Self::health_check_proxies(manager);
                 }
             }
         }
 
-        let mut is_running = running.write().await;
-        *is_running = false;
+        *running.write() = false;
         tracing::info!("Provider updater stopped");
     }
 
-    async fn update_proxy_providers(manager: &ProxyProviderManager) {
-        let results = manager.update_all().await;
+    fn update_proxy_providers(manager: &ProxyProviderManager) {
+        let results = manager.update_all();
         let mut updated_count = 0;
         let mut error_count = 0;
 
@@ -196,8 +201,8 @@ impl ProviderUpdater {
         }
     }
 
-    async fn update_rule_providers(manager: &RuleProviderManager) {
-        let results = manager.update_all().await;
+    fn update_rule_providers(manager: &RuleProviderManager) {
+        let results = manager.update_all();
         let mut updated_count = 0;
         let mut error_count = 0;
 
@@ -221,8 +226,8 @@ impl ProviderUpdater {
         }
     }
 
-    async fn health_check_proxies(manager: &ProxyProviderManager) {
-        let results = manager.health_check_all().await;
+    fn health_check_proxies(manager: &ProxyProviderManager) {
+        let results = manager.health_check_all();
         let mut checked_count = 0;
         let mut error_count = 0;
 
@@ -246,15 +251,15 @@ impl ProviderUpdater {
         }
     }
 
-    pub async fn stop(&self) -> Result<()> {
-        let mut running = self.running.write().await;
+    pub fn stop(&self) -> Result<()> {
+        let mut running = self.running.write();
         if !*running {
             return Ok(());
         }
         *running = false;
         drop(running);
 
-        let mut tx_guard = self.shutdown_tx.write().await;
+        let mut tx_guard = self.shutdown_tx.write();
         if let Some(tx) = tx_guard.take() {
             let _ = tx.send(());
         }
@@ -263,14 +268,14 @@ impl ProviderUpdater {
         Ok(())
     }
 
-    pub async fn is_running(&self) -> bool {
-        *self.running.read().await
+    pub fn is_running(&self) -> bool {
+        *self.running.read()
     }
 
-    pub async fn force_update_all(&self) -> Result<()> {
+    pub fn force_update_all(&self) -> Result<()> {
         if let Some(ref manager) = self.proxy_provider_manager {
-            for provider in manager.get_all_providers().await {
-                if let Err(e) = provider.update().await {
+            for provider in manager.get_all_providers() {
+                if let Err(e) = provider.update() {
                     tracing::warn!(
                         "Failed to force update proxy provider '{}': {}",
                         provider.name(),
@@ -281,8 +286,8 @@ impl ProviderUpdater {
         }
 
         if let Some(ref manager) = self.rule_provider_manager {
-            for provider in manager.get_all_providers().await {
-                if let Err(e) = provider.update().await {
+            for provider in manager.get_all_providers() {
+                if let Err(e) = provider.update() {
                     tracing::warn!(
                         "Failed to force update rule provider '{}': {}",
                         provider.name(),
@@ -295,10 +300,10 @@ impl ProviderUpdater {
         Ok(())
     }
 
-    pub async fn force_health_check_all(&self) -> Result<()> {
+    pub fn force_health_check_all(&self) -> Result<()> {
         if let Some(ref manager) = self.proxy_provider_manager {
-            for provider in manager.get_all_providers().await {
-                if let Err(e) = provider.health_check().await {
+            for provider in manager.get_all_providers() {
+                if let Err(e) = provider.health_check() {
                     tracing::warn!(
                         "Failed to health check proxy provider '{}': {}",
                         provider.name(),
@@ -350,15 +355,15 @@ mod tests {
         assert!(updater.rule_provider_manager.is_none());
     }
 
-    #[tokio::test]
-    async fn test_provider_updater_is_running_initial() {
+    #[test]
+    fn test_provider_updater_is_running_initial() {
         let config = ProviderUpdaterConfig::default();
         let updater = ProviderUpdater::new(config);
-        assert!(!updater.is_running().await);
+        assert!(!updater.is_running());
     }
 
-    #[tokio::test]
-    async fn test_provider_updater_start_stop() {
+    #[test]
+    fn test_provider_updater_start_stop() {
         let config = ProviderUpdaterConfig {
             check_interval: Duration::from_millis(100),
             enable_proxy_provider_update: false,
@@ -368,19 +373,19 @@ mod tests {
 
         let updater = ProviderUpdater::new(config);
 
-        updater.start().await.unwrap();
-        assert!(updater.is_running().await);
+        updater.start().unwrap();
+        assert!(updater.is_running());
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::thread::sleep(Duration::from_millis(50));
 
-        updater.stop().await.unwrap();
+        updater.stop().unwrap();
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(!updater.is_running().await);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!updater.is_running());
     }
 
-    #[tokio::test]
-    async fn test_provider_updater_with_managers() {
+    #[test]
+    fn test_provider_updater_with_managers() {
         let config = ProviderUpdaterConfig::default();
         let proxy_manager = Arc::new(ProxyProviderManager::new());
         let rule_manager = Arc::new(RuleProviderManager::new());

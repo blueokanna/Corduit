@@ -18,9 +18,10 @@
 //!   loss detection (PTO + time threshold), NewReno congestion control,
 //!   flow control (`MAX_DATA` / `MAX_STREAM_DATA` / `MAX_STREAMS`), stream
 //!   send/recv with reassembly, and RFC 9221 datagrams.
-//! * Async surface for the engine: [`QuicClient`] connects over a tokio UDP
-//!   socket and hands out [`crate::protocol::quic::ClientConnection`] /
-//!   stream handles that implement `AsyncRead` / `AsyncWrite`.
+//! * Synchronous surface for the engine: [`QuicClient`] connects over a
+//!   `std::net::UdpSocket` with a dedicated driver thread per connection,
+//!   and hands out [`ClientConnection`] / stream handles that implement
+//!   `std::io::Read` / `std::io::Write` with blocking, backpressured IO.
 //!
 //! # Honest scope notes
 //!

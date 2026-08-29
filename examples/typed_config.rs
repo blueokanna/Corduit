@@ -110,8 +110,7 @@ fn rules() -> Vec<RuleConfig> {
     ]
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = std::env::var("CORDUIT_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -129,8 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Config::default()
     };
 
-    let mut engine = Corduit::new(config).await?;
-    engine.start().await?;
+    let mut engine = Corduit::new(config)?;
+    engine.start()?;
     println!("engine started, uptime = {}s", engine.uptime_secs());
 
     // ---- hot reload: same topology, one more rule added ----
@@ -150,10 +149,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rules: new_rules,
         ..engine.config().clone()
     };
-    engine.reload(reloaded).await?;
+    engine.reload(reloaded)?;
     println!("config reloaded with {} rules", engine.config().rules.len());
 
-    engine.stop().await?;
+    engine.stop()?;
     println!("engine stopped");
     Ok(())
 }

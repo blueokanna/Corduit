@@ -78,7 +78,7 @@ pub fn ensure_wintun_available() -> Result<PathBuf> {
 
 /// Download wintun.dll from the official source
 #[cfg(windows)]
-pub async fn download_wintun_dll() -> Result<PathBuf> {
+pub fn download_wintun_dll() -> Result<PathBuf> {
     use std::io::Write;
 
     let dll_path = get_wintun_dll_path()?;
@@ -93,7 +93,6 @@ pub async fn download_wintun_dll() -> Result<PathBuf> {
 
     let response = client
         .get(WINTUN_DOWNLOAD_URL)
-        .await
         .map_err(|e| NetStackError::TunError(format!("Failed to download wintun: {e}")))?;
 
     if !response.is_success() {
@@ -142,14 +141,14 @@ pub async fn download_wintun_dll() -> Result<PathBuf> {
 
 /// Load the wintun library, downloading if necessary
 #[cfg(windows)]
-pub async fn load_wintun() -> Result<&'static wintun_bindings::Wintun> {
+pub fn load_wintun() -> Result<&'static wintun_bindings::Wintun> {
     if let Some(wintun) = WINTUN_INSTANCE.get() {
         return Ok(wintun);
     }
 
     let dll_path = match ensure_wintun_available() {
         Ok(path) => path,
-        Err(_) => download_wintun_dll().await?,
+        Err(_) => download_wintun_dll()?,
     };
 
     info!("Loading wintun.dll from {:?}", dll_path);

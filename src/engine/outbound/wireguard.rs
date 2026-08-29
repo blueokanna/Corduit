@@ -1,13 +1,14 @@
+use crate::common::stream::BoxStream;
 use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::protocol::wireguard::{public_key_from_private, WireGuardTunnel};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use parking_lot::Mutex;
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const WG_HEADER_SIZE: usize = 32;
 const IP_HEADER_SIZE: usize = 20;
@@ -121,8 +122,8 @@ impl WireguardOutbound {
         })
     }
 
-    async fn ensure_tunnel(&self) -> Result<()> {
-        let mut tunnel_guard = self.tunnel.lock().await;
+    fn ensure_tunnel(&self) -> Result<()> {
+        let mut tunnel_guard = self.tunnel.lock();
 
         if let Some(tunnel) = tunnel_guard.as_ref() {
             if tunnel.has_session() && !tunnel.is_session_expired() {
@@ -141,11 +142,15 @@ impl WireguardOutbound {
             endpoint,
         );
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
+        // Read timeout keeps the relay poll loop (and the handshake deadline
+        // loop below) from blocking forever.
+        let socket = crate::common::socket::udp_bind(
+            "0.0.0.0:0".parse().unwrap(),
+            Duration::from_millis(1000),
+        )
+        .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
 
-        socket.connect(endpoint).await.map_err(|e| {
+        socket.connect(endpoint).map_err(|e| {
             Error::network(format!("Failed to connect to WireGuard endpoint: {}", e))
         })?;
 
@@ -155,16 +160,31 @@ impl WireguardOutbound {
 
         socket
             .send(&init_packet)
-            .await
             .map_err(|e| Error::network(format!("Failed to send handshake: {}", e)))?;
 
         let mut response_buf = vec![0u8; 256];
-        let timeout = tokio::time::Duration::from_secs(10);
-
-        let n = tokio::time::timeout(timeout, socket.recv(&mut response_buf))
-            .await
-            .map_err(|_| Error::network("Handshake timeout"))?
-            .map_err(|e| Error::network(format!("Failed to receive handshake response: {}", e)))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let n = loop {
+            match socket.recv(&mut response_buf) {
+                Ok(n) => break n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(Error::network("Handshake timeout"));
+                    }
+                }
+                Err(e) => {
+                    return Err(Error::network(format!(
+                        "Failed to receive handshake response: {}",
+                        e
+                    )))
+                }
+            }
+        };
 
         tunnel
             .process_handshake_response(&response_buf[..n])
@@ -178,56 +198,50 @@ impl WireguardOutbound {
         );
 
         *tunnel_guard = Some(tunnel);
-        *self.socket.lock().await = Some(socket);
+        *self.socket.lock() = Some(socket);
 
         Ok(())
     }
 
-    async fn send_ip_packet(&self, packet: &[u8]) -> Result<()> {
-        let tunnel_guard = self.tunnel.lock().await;
+    fn send_ip_packet(&self, packet: &[u8]) -> std::io::Result<()> {
+        let tunnel_guard = self.tunnel.lock();
         let tunnel = tunnel_guard
             .as_ref()
-            .ok_or_else(|| Error::protocol("WireGuard tunnel not established"))?;
+            .ok_or_else(|| std::io::Error::other("WireGuard tunnel not established"))?;
 
         let encrypted = tunnel
             .encrypt_packet(packet)
-            .map_err(|e| Error::protocol(format!("Failed to encrypt packet: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("Failed to encrypt packet: {}", e)))?;
 
-        let socket_guard = self.socket.lock().await;
+        let socket_guard = self.socket.lock();
         let socket = socket_guard
             .as_ref()
-            .ok_or_else(|| Error::protocol("WireGuard socket not available"))?;
+            .ok_or_else(|| std::io::Error::other("WireGuard socket not available"))?;
 
-        socket
-            .send(&encrypted)
-            .await
-            .map_err(|e| Error::network(format!("Failed to send packet: {}", e)))?;
+        socket.send(&encrypted)?;
 
         Ok(())
     }
 
-    async fn recv_ip_packet(&self) -> Result<Vec<u8>> {
-        let socket_guard = self.socket.lock().await;
+    fn recv_ip_packet(&self) -> std::io::Result<Vec<u8>> {
+        let socket_guard = self.socket.lock();
         let socket = socket_guard
             .as_ref()
-            .ok_or_else(|| Error::protocol("WireGuard socket not available"))?;
+            .ok_or_else(|| std::io::Error::other("WireGuard socket not available"))?;
 
         let mut buf = vec![0u8; self.mtu as usize + WG_HEADER_SIZE];
-        let n = socket
-            .recv(&mut buf)
-            .await
-            .map_err(|e| Error::network(format!("Failed to receive packet: {}", e)))?;
+        let n = socket.recv(&mut buf)?;
 
         drop(socket_guard);
 
-        let tunnel_guard = self.tunnel.lock().await;
+        let tunnel_guard = self.tunnel.lock();
         let tunnel = tunnel_guard
             .as_ref()
-            .ok_or_else(|| Error::protocol("WireGuard tunnel not established"))?;
+            .ok_or_else(|| std::io::Error::other("WireGuard tunnel not established"))?;
 
         let decrypted = tunnel
             .decrypt_packet(&buf[..n])
-            .map_err(|e| Error::protocol(format!("Failed to decrypt packet: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("Failed to decrypt packet: {}", e)))?;
 
         Ok(decrypted)
     }
@@ -281,8 +295,8 @@ impl WireguardOutbound {
         packet
     }
 
-    pub async fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        self.ensure_tunnel().await?;
+    pub fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+        self.ensure_tunnel()?;
 
         let dst_ip = match target {
             TargetAddr::Ip(addr) => match addr.ip() {
@@ -331,27 +345,44 @@ impl WireguardOutbound {
         packet[udp_offset + 6..udp_offset + 8].copy_from_slice(&[0, 0]);
         packet[udp_offset + 8..].copy_from_slice(data);
 
-        self.send_ip_packet(&packet).await?;
+        self.send_ip_packet(&packet)?;
 
-        let timeout = tokio::time::Duration::from_secs(30);
-        let response = tokio::time::timeout(timeout, self.recv_ip_packet())
-            .await
-            .map_err(|_| Error::network("UDP response timeout"))?
-            .map_err(|e| Error::network(format!("Failed to receive UDP response: {}", e)))?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = match self.recv_ip_packet() {
+                Ok(r) => r,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(Error::network("UDP response timeout"));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::network(format!(
+                        "Failed to receive UDP response: {}",
+                        e
+                    )))
+                }
+            };
 
-        if response.len() < IP_HEADER_SIZE + UDP_HEADER_SIZE {
-            return Err(Error::protocol("Response packet too short"));
+            if response.len() < IP_HEADER_SIZE + UDP_HEADER_SIZE {
+                return Err(Error::protocol("Response packet too short"));
+            }
+
+            let payload_start = IP_HEADER_SIZE + UDP_HEADER_SIZE;
+            return Ok(response[payload_start..].to_vec());
         }
-
-        let payload_start = IP_HEADER_SIZE + UDP_HEADER_SIZE;
-        Ok(response[payload_start..].to_vec())
     }
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for WireguardOutbound {
-    async fn connect(&self) -> Result<()> {
-        self.ensure_tunnel().await?;
+    fn connect(&self) -> Result<()> {
+        self.ensure_tunnel()?;
         tracing::info!(
             "WireGuard outbound '{}' connected to {}:{}",
             self.config.tag,
@@ -361,9 +392,9 @@ impl OutboundProxy for WireguardOutbound {
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
-        *self.tunnel.lock().await = None;
-        *self.socket.lock().await = None;
+    fn disconnect(&self) -> Result<()> {
+        *self.tunnel.lock() = None;
+        *self.socket.lock() = None;
         Ok(())
     }
 
@@ -379,35 +410,31 @@ impl OutboundProxy for WireguardOutbound {
         true // WireGuard supports UDP
     }
 
-    async fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        self.relay_udp(target, data).await
+    fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+        self.relay_udp(target, data)
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         _test_url: &str,
-        timeout: std::time::Duration,
+        _timeout: std::time::Duration,
     ) -> Result<std::time::Duration> {
         use std::time::Instant;
 
         let start = Instant::now();
 
-        tokio::time::timeout(timeout, self.ensure_tunnel())
-            .await
-            .map_err(|_| Error::network("Connection timeout"))?
-            .map_err(|e| Error::network(format!("Failed to establish tunnel: {}", e)))?;
+        self.ensure_tunnel()?;
 
-        let tunnel_guard = self.tunnel.lock().await;
+        let tunnel_guard = self.tunnel.lock();
         if let Some(tunnel) = tunnel_guard.as_ref() {
             let keepalive = tunnel
                 .create_keepalive()
                 .map_err(|e| Error::protocol(format!("Failed to create keepalive: {}", e)))?;
 
-            let socket_guard = self.socket.lock().await;
+            let socket_guard = self.socket.lock();
             if let Some(socket) = socket_guard.as_ref() {
                 socket
                     .send(&keepalive)
-                    .await
                     .map_err(|e| Error::network(format!("Failed to send keepalive: {}", e)))?;
             }
         }
@@ -415,17 +442,17 @@ impl OutboundProxy for WireguardOutbound {
         Ok(start.elapsed())
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        mut inbound: Box<dyn AsyncReadWrite>,
+        mut inbound: BoxStream,
         target: TargetAddr,
         connection: Option<Arc<TrackedConnection>>,
     ) -> Result<()> {
-        self.ensure_tunnel().await?;
+        self.ensure_tunnel()?;
 
         tracing::debug!(
             "WireGuard: relaying TCP to {} via {}:{}",
@@ -439,111 +466,120 @@ impl OutboundProxy for WireguardOutbound {
         let mut seq: u32 = crate::engine::random::u32();
 
         loop {
-            tokio::select! {
-                result = inbound.read(&mut buf) => {
-                    match result {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let data = &buf[..n];
+            // Poll the inbound side (bounded by its read timeout).
+            match inbound.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = &buf[..n];
 
-                            let dst_ip = match &target {
-                                TargetAddr::Ip(addr) => match addr.ip() {
-                                    IpAddr::V4(ip) => ip,
-                                    IpAddr::V6(_) => {
-                                        return Err(Error::protocol("IPv6 not supported"));
-                                    }
-                                },
-                                TargetAddr::Domain(_, _) => {
-                                    return Err(Error::protocol("Domain targets require DNS resolution"));
-                                }
-                            };
-                            let dst_port = target.port();
-
-                            let src_ip = match self.local_address {
-                                IpAddr::V4(ip) => ip,
-                                IpAddr::V6(_) => {
-                                    return Err(Error::protocol("IPv6 local address not supported"));
-                                }
-                            };
-                            let src_port = 40000 + (seq % 20000) as u16;
-
-                            let tcp_len = TCP_HEADER_SIZE + data.len();
-                            let total_len = IP_HEADER_SIZE + tcp_len;
-                            let mut packet = vec![0u8; total_len];
-
-                            packet[0] = 0x45;
-                            packet[1] = 0x00;
-                            packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-                            packet[4..6].copy_from_slice(&(seq as u16).to_be_bytes());
-                            packet[6] = 0x40;
-                            packet[7] = 0x00;
-                            packet[8] = 64;
-                            packet[9] = 6;
-                            packet[10..12].copy_from_slice(&[0, 0]);
-                            packet[12..16].copy_from_slice(&src_ip.octets());
-                            packet[16..20].copy_from_slice(&dst_ip.octets());
-
-                            let ip_checksum = calculate_ip_checksum(&packet[..IP_HEADER_SIZE]);
-                            packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
-                            let tcp_offset = IP_HEADER_SIZE;
-                            packet[tcp_offset..tcp_offset+2].copy_from_slice(&src_port.to_be_bytes());
-                            packet[tcp_offset+2..tcp_offset+4].copy_from_slice(&dst_port.to_be_bytes());
-                            packet[tcp_offset+4..tcp_offset+8].copy_from_slice(&seq.to_be_bytes());
-                            packet[tcp_offset+8..tcp_offset+12].copy_from_slice(&0u32.to_be_bytes());
-                            packet[tcp_offset+12] = ((TCP_HEADER_SIZE / 4) as u8) << 4;
-                            packet[tcp_offset+13] = 0x18;
-                            packet[tcp_offset+14..tcp_offset+16].copy_from_slice(&65535u16.to_be_bytes());
-                            packet[tcp_offset+16..tcp_offset+18].copy_from_slice(&[0, 0]);
-                            packet[tcp_offset+18..tcp_offset+20].copy_from_slice(&[0, 0]);
-                            packet[tcp_offset+20..].copy_from_slice(data);
-
-                            self.send_ip_packet(&packet).await?;
-
-                            seq = seq.wrapping_add(data.len() as u32);
-                            tracker.add_global_upload(n as u64);
-                            if let Some(ref conn) = connection {
-                                conn.add_upload(n as u64);
+                    let dst_ip = match &target {
+                        TargetAddr::Ip(addr) => match addr.ip() {
+                            IpAddr::V4(ip) => ip,
+                            IpAddr::V6(_) => {
+                                return Err(Error::protocol("IPv6 not supported"));
                             }
+                        },
+                        TargetAddr::Domain(_, _) => {
+                            return Err(Error::protocol("Domain targets require DNS resolution"));
                         }
-                        Err(e) => {
-                            tracing::debug!("WireGuard inbound read error: {}", e);
-                            break;
+                    };
+                    let dst_port = target.port();
+
+                    let src_ip = match self.local_address {
+                        IpAddr::V4(ip) => ip,
+                        IpAddr::V6(_) => {
+                            return Err(Error::protocol("IPv6 local address not supported"));
+                        }
+                    };
+                    let src_port = 40000 + (seq % 20000) as u16;
+
+                    let tcp_len = TCP_HEADER_SIZE + data.len();
+                    let total_len = IP_HEADER_SIZE + tcp_len;
+                    let mut packet = vec![0u8; total_len];
+
+                    packet[0] = 0x45;
+                    packet[1] = 0x00;
+                    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+                    packet[4..6].copy_from_slice(&(seq as u16).to_be_bytes());
+                    packet[6] = 0x40;
+                    packet[7] = 0x00;
+                    packet[8] = 64;
+                    packet[9] = 6;
+                    packet[10..12].copy_from_slice(&[0, 0]);
+                    packet[12..16].copy_from_slice(&src_ip.octets());
+                    packet[16..20].copy_from_slice(&dst_ip.octets());
+
+                    let ip_checksum = calculate_ip_checksum(&packet[..IP_HEADER_SIZE]);
+                    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+                    let tcp_offset = IP_HEADER_SIZE;
+                    packet[tcp_offset..tcp_offset + 2].copy_from_slice(&src_port.to_be_bytes());
+                    packet[tcp_offset + 2..tcp_offset + 4].copy_from_slice(&dst_port.to_be_bytes());
+                    packet[tcp_offset + 4..tcp_offset + 8].copy_from_slice(&seq.to_be_bytes());
+                    packet[tcp_offset + 8..tcp_offset + 12].copy_from_slice(&0u32.to_be_bytes());
+                    packet[tcp_offset + 12] = ((TCP_HEADER_SIZE / 4) as u8) << 4;
+                    packet[tcp_offset + 13] = 0x18;
+                    packet[tcp_offset + 14..tcp_offset + 16]
+                        .copy_from_slice(&65535u16.to_be_bytes());
+                    packet[tcp_offset + 16..tcp_offset + 18].copy_from_slice(&[0, 0]);
+                    packet[tcp_offset + 18..tcp_offset + 20].copy_from_slice(&[0, 0]);
+                    packet[tcp_offset + 20..].copy_from_slice(data);
+
+                    self.send_ip_packet(&packet)
+                        .map_err(|e| Error::network(format!("Failed to send packet: {}", e)))?;
+
+                    seq = seq.wrapping_add(data.len() as u32);
+                    tracker.add_global_upload(n as u64);
+                    if let Some(ref conn) = connection {
+                        conn.add_upload(n as u64);
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => {
+                    tracing::debug!("WireGuard inbound read error: {}", e);
+                    break;
+                }
+            }
+
+            // Poll the tunnel receive side (bounded by the socket timeout).
+            match self.recv_ip_packet() {
+                Ok(ip_packet) => {
+                    if ip_packet.len() < IP_HEADER_SIZE + TCP_HEADER_SIZE {
+                        continue;
+                    }
+
+                    let protocol = ip_packet[9];
+                    if protocol != 6 {
+                        continue;
+                    }
+
+                    let tcp_offset = IP_HEADER_SIZE;
+                    let data_offset = tcp_offset + TCP_HEADER_SIZE;
+
+                    if ip_packet.len() > data_offset {
+                        let payload = &ip_packet[data_offset..];
+                        inbound.write_all(payload).map_err(|e| {
+                            Error::network(format!("Failed to write to inbound: {}", e))
+                        })?;
+
+                        tracker.add_global_download(payload.len() as u64);
+                        if let Some(ref conn) = connection {
+                            conn.add_download(payload.len() as u64);
                         }
                     }
                 }
-                result = self.recv_ip_packet() => {
-                    match result {
-                        Ok(ip_packet) => {
-                            if ip_packet.len() < IP_HEADER_SIZE + TCP_HEADER_SIZE {
-                                continue;
-                            }
-
-                            let protocol = ip_packet[9];
-                            if protocol != 6 {
-                                continue;
-                            }
-
-                            let tcp_offset = IP_HEADER_SIZE;
-                            let data_offset = tcp_offset + TCP_HEADER_SIZE;
-
-                            if ip_packet.len() > data_offset {
-                                let payload = &ip_packet[data_offset..];
-                                inbound.write_all(payload).await.map_err(|e| {
-                                    Error::network(format!("Failed to write to inbound: {}", e))
-                                })?;
-
-                                tracker.add_global_download(payload.len() as u64);
-                                if let Some(ref conn) = connection {
-                                    conn.add_download(payload.len() as u64);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("WireGuard recv error: {}", e);
-                            break;
-                        }
-                    }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => {
+                    tracing::debug!("WireGuard recv error: {}", e);
+                    break;
                 }
             }
         }

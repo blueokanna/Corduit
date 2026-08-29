@@ -1,16 +1,22 @@
 //! The public QUIC client facade: [`QuicClient`] establishes a connection
 //! and hands out [`ClientConnection`] / stream handles.
+//!
+//! Everything is synchronous: `connect` blocks until the TLS 1.3-over-QUIC
+//! handshake completes (bounded by the configured handshake timeout), and
+//! stream/datagram operations block with bounded waits.
 
+use parking_lot::Mutex;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 
 use super::config::ClientConfig;
 use super::error::{QuicError, Result};
 use super::stream::{QuicRecvStream, QuicSendStream};
 use super::transport::QuicConn;
+
+/// How long a connection-level wait parks before re-checking state.
+const CONN_POLL: Duration = Duration::from_millis(50);
 
 /// A QUIC client endpoint that maintains (and reuses) one connection to its
 /// configured server.
@@ -33,11 +39,11 @@ impl QuicClient {
         &self.config
     }
 
-    /// Establish (or reuse) the connection. Blocks until the TLS 1.3-over-QUIC
-    /// handshake completes.
-    pub async fn connect(&self) -> Result<Arc<ClientConnection>> {
+    /// Establish (or reuse) the connection. Blocks until the TLS
+    /// 1.3-over-QUIC handshake completes or the handshake timeout elapses.
+    pub fn connect(&self) -> Result<Arc<ClientConnection>> {
         {
-            let guard = self.conn.lock().await;
+            let guard = self.conn.lock();
             if let Some(c) = guard.as_ref() {
                 if !c.is_closed() {
                     return Ok(c.clone());
@@ -49,32 +55,30 @@ impl QuicClient {
             .config
             .local_addr
             .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-        let udp = UdpSocket::bind(local)
-            .await
+        let udp = std::net::UdpSocket::bind(local)
             .map_err(|e| QuicError::Io(format!("bind UDP: {e}")))?;
         udp.connect(self.config.server_addr)
-            .await
             .map_err(|e| QuicError::Io(format!("connect UDP: {e}")))?;
 
         let conn = QuicConn::start(udp, self.config.server_addr, self.config.clone())?;
         let client = Arc::new(ClientConnection { conn });
 
         // Wait for the handshake.
-        client.wait_handshake().await?;
+        client.wait_handshake()?;
 
-        let mut guard = self.conn.lock().await;
+        let mut guard = self.conn.lock();
         *guard = Some(client.clone());
         Ok(client)
     }
 
     /// The current connection, if any.
-    pub async fn connection(&self) -> Option<Arc<ClientConnection>> {
-        self.conn.lock().await.clone()
+    pub fn connection(&self) -> Option<Arc<ClientConnection>> {
+        self.conn.lock().clone()
     }
 
     /// Close the connection, if any.
-    pub async fn close(&self) {
-        if let Some(c) = self.conn.lock().await.take() {
+    pub fn close(&self) {
+        if let Some(c) = self.conn.lock().take() {
             c.close();
         }
     }
@@ -86,9 +90,8 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
-    pub(crate) async fn wait_handshake(&self) -> Result<()> {
+    pub(crate) fn wait_handshake(&self) -> Result<()> {
         loop {
-            let mut rx = self.conn.handshake_rx.clone();
             {
                 let st = self.conn.lock();
                 if st.handshake_complete {
@@ -98,10 +101,7 @@ impl ClientConnection {
                     return Err(e.clone());
                 }
             }
-            if *rx.borrow() {
-                continue; // an event happened; re-check state
-            }
-            let _ = rx.changed().await;
+            self.conn.handshake.wait(CONN_POLL);
         }
     }
 
@@ -112,7 +112,7 @@ impl ClientConnection {
     }
 
     /// The remote address.
-    pub fn remote_address(&self) -> std::net::SocketAddr {
+    pub fn remote_address(&self) -> SocketAddr {
         self.conn.remote_address()
     }
 
@@ -123,7 +123,7 @@ impl ClientConnection {
     }
 
     /// Open a bidirectional stream (client-initiated).
-    pub async fn open_bi(&self) -> Result<(QuicSendStream, QuicRecvStream)> {
+    pub fn open_bi(&self) -> Result<(QuicSendStream, QuicRecvStream)> {
         let id = loop {
             {
                 let mut st = self.conn.lock();
@@ -134,7 +134,7 @@ impl ClientConnection {
                     return Err(e.clone());
                 }
             }
-            self.conn.streams_notify_handle().notified().await;
+            self.conn.streams_notify_handle().wait(CONN_POLL);
         };
         Ok((
             QuicSendStream::new(self.conn.clone(), id),
@@ -143,7 +143,7 @@ impl ClientConnection {
     }
 
     /// Open a unidirectional stream (client-initiated).
-    pub async fn open_uni(&self) -> Result<QuicSendStream> {
+    pub fn open_uni(&self) -> Result<QuicSendStream> {
         let id = loop {
             {
                 let mut st = self.conn.lock();
@@ -154,14 +154,14 @@ impl ClientConnection {
                     return Err(e.clone());
                 }
             }
-            self.conn.streams_notify_handle().notified().await;
+            self.conn.streams_notify_handle().wait(CONN_POLL);
         };
         Ok(QuicSendStream::new(self.conn.clone(), id))
     }
 
     /// Wait for and return the next server-initiated unidirectional stream
     /// that has data (or a FIN) available.
-    pub async fn accept_uni(&self) -> Result<QuicRecvStream> {
+    pub fn accept_uni(&self) -> Result<QuicRecvStream> {
         loop {
             {
                 let mut st = self.conn.lock();
@@ -172,12 +172,12 @@ impl ClientConnection {
                     return Err(e.clone());
                 }
             }
-            self.conn.streams_notify_handle().notified().await;
+            self.conn.streams_notify_handle().wait(CONN_POLL);
         }
     }
 
     /// Send a datagram (RFC 9221). Bounded by the peer's UDP payload size.
-    pub async fn send_datagram(&self, data: Vec<u8>) -> Result<()> {
+    pub fn send_datagram(&self, data: Vec<u8>) -> Result<()> {
         {
             let mut st = self.conn.lock();
             self.conn.send_datagram(&mut st, data)?;
@@ -187,7 +187,7 @@ impl ClientConnection {
     }
 
     /// Receive a datagram (RFC 9221).
-    pub async fn read_datagram(&self) -> Result<Vec<u8>> {
+    pub fn read_datagram(&self) -> Result<Vec<u8>> {
         loop {
             {
                 let mut st = self.conn.lock();
@@ -198,7 +198,7 @@ impl ClientConnection {
                     return Err(e.clone());
                 }
             }
-            self.conn.datagram_notify_handle().notified().await;
+            self.conn.datagram_notify_handle().wait(CONN_POLL);
         }
     }
 

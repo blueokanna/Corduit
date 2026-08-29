@@ -16,9 +16,9 @@
 //!   handler returns a `101 Switching Protocols` carrying an internal marker
 //!   header, and the connection is handed to a blocking RFC 6455 codec
 //!   ([`WsServer`]) that speaks the protocol from scratch;
-//! * async RPC dispatch is bridged with a captured
-//!   `tokio::runtime::Handle` (`block_on`), the same pattern the DoH server
-//!   uses.
+//! * RPC dispatch is synchronous: each WebSocket message (and each `POST
+//!   /rpc` request) is handled inline on the connection thread with a direct
+//!   call to [`crate::rpc::dispatch`].
 //!
 //! # Security model
 //!
@@ -103,23 +103,20 @@ pub struct RpcServerHandle {
 impl RpcServer {
     /// Bind a TCP listener at `addr`. Use a loopback address (`127.0.0.1`,
     /// `::1`) — the server deliberately never binds to all interfaces.
-    pub async fn bind(addr: SocketAddr, token: String) -> std::io::Result<Self> {
-        let runtime = tokio::runtime::Handle::current();
+    pub fn bind(addr: SocketAddr, token: String) -> std::io::Result<Self> {
         let token: Arc<str> = Arc::from(token.as_str());
 
         // Synchronous HTTP handler: routes /health and /rpc, and converts a
         // WebSocket upgrade into a 101 + raw-connection handoff.
         let handler_token = token.clone();
-        let handler_runtime = runtime.clone();
         let handler = Arc::new(move |req: Request<Body>| -> Response<Body> {
-            handle_http_request(req, &handler_token, &handler_runtime)
+            handle_http_request(req, &handler_token)
         });
 
         // WebSocket tunnel: runs the RFC 6455 message loop on the blocking
         // raw connection after the 101 has been written.
-        let tunnel_runtime = runtime.clone();
         let tunnel_handler = Arc::new(move |conn: RawConnection| {
-            run_ws_tunnel(conn, &tunnel_runtime);
+            run_ws_tunnel(conn);
         });
 
         let config = HttpServerConfig {
@@ -145,8 +142,7 @@ impl RpcServer {
     }
 
     /// Start the accept loop on a background thread and return a controller
-    /// handle. Call this from inside a Tokio runtime: the handler bridges
-    /// into the async engine with the runtime's handle.
+    /// handle.
     pub fn spawn(mut self) -> RpcServerHandle {
         self.server.start().expect("start RPC server accept loop");
         RpcServerHandle {
@@ -194,11 +190,7 @@ impl RpcServerHandle {
 }
 
 /// Route a single HTTP request (or WebSocket upgrade).
-fn handle_http_request(
-    req: Request<Body>,
-    token: &str,
-    runtime: &tokio::runtime::Handle,
-) -> Response<Body> {
+fn handle_http_request(req: Request<Body>, token: &str) -> Response<Body> {
     // CORS preflight for browser dashboards served from another origin.
     if req.method == Method::OPTIONS {
         return cors_response(StatusCode::NO_CONTENT);
@@ -252,7 +244,7 @@ fn handle_http_request(
         None => Vec::new(),
     };
 
-    let response = runtime.block_on(process_payload(&body));
+    let response = process_payload(&body);
     json_response(StatusCode::OK, &response)
 }
 
@@ -504,13 +496,13 @@ impl WsServer {
 
 /// Run the WebSocket message loop: every message is one JSON-RPC request.
 /// The token was already validated during the upgrade handshake. Runs on
-/// the connection thread; async dispatch is bridged with `block_on`.
-fn run_ws_tunnel(conn: RawConnection, runtime: &tokio::runtime::Handle) {
+/// the connection thread; dispatch is synchronous.
+fn run_ws_tunnel(conn: RawConnection) {
     let mut ws = WsServer::new(conn, MAX_WS_MESSAGE);
     loop {
         match ws.read() {
             Ok(WsMsg::Text(data)) | Ok(WsMsg::Binary(data)) => {
-                let resp = runtime.block_on(process_payload(&data));
+                let resp = process_payload(&data);
                 if let Err(e) = ws.send_text(resp.as_bytes()) {
                     tracing::debug!("RPC WebSocket write failed: {e}");
                     break;
@@ -563,7 +555,7 @@ fn write_all<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Parse one JSON-RPC payload and produce the JSON response string.
-async fn process_payload(body: &[u8]) -> String {
+fn process_payload(body: &[u8]) -> String {
     let text = match std::str::from_utf8(body) {
         Ok(t) => t,
         Err(_) => return encode_response(Err("request body is not valid UTF-8".to_string())),
@@ -580,7 +572,7 @@ async fn process_payload(body: &[u8]) -> String {
         .get("params")
         .cloned()
         .unwrap_or(nextjson::Value::Null);
-    let result = crate::rpc::dispatch(method, &params).await;
+    let result = crate::rpc::dispatch(method, &params);
     encode_response(result)
 }
 
@@ -648,12 +640,11 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::time::Duration;
 
-    async fn spawn_test_server() -> RpcServerHandle {
+    fn spawn_test_server() -> RpcServerHandle {
         let server = RpcServer::bind(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             "test-token-123".to_string(),
         )
-        .await
         .expect("bind");
         server.spawn()
     }
@@ -792,20 +783,18 @@ mod tests {
 
     #[test]
     fn health_endpoint_is_open() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let h = rt.block_on(spawn_test_server());
+        let h = spawn_test_server();
         let (status, body) = http_request(h.addr(), "GET", "/health", None, "");
         assert_eq!(status, 200);
         assert!(body.contains("\"ok\":true"));
         h.stop();
-        rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        std::thread::sleep(Duration::from_millis(50));
         assert!(!h.is_running());
     }
 
     #[test]
     fn http_rpc_requires_token() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let h = rt.block_on(spawn_test_server());
+        let h = spawn_test_server();
         // No token -> 401
         let (status, body) = post_rpc(h.addr(), None, r#"{"method":"get_version"}"#);
         assert_eq!(status, 401);
@@ -818,8 +807,7 @@ mod tests {
 
     #[test]
     fn http_rpc_dispatch_roundtrip() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let h = rt.block_on(spawn_test_server());
+        let h = spawn_test_server();
         let (status, body) = post_rpc(
             h.addr(),
             Some("test-token-123"),
@@ -834,8 +822,7 @@ mod tests {
 
     #[test]
     fn http_rpc_unknown_method_is_error() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let h = rt.block_on(spawn_test_server());
+        let h = spawn_test_server();
         let (status, body) = post_rpc(
             h.addr(),
             Some("test-token-123"),
@@ -850,8 +837,7 @@ mod tests {
 
     #[test]
     fn oversize_body_is_rejected() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let h = rt.block_on(spawn_test_server());
+        let h = spawn_test_server();
         let big = format!(
             r#"{{"method":"x","params":{{"pad":"{}"}}}}"#,
             "a".repeat(MAX_REQUEST_BODY + 1)
@@ -863,8 +849,7 @@ mod tests {
 
     #[test]
     fn websocket_roundtrip() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let h = rt.block_on(spawn_test_server());
+        let h = spawn_test_server();
         let (mut ws, status) = ws_handshake(h.addr(), "test-token-123");
         assert_eq!(status, 101);
 
@@ -884,8 +869,7 @@ mod tests {
 
     #[test]
     fn websocket_rejects_bad_token() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let h = rt.block_on(spawn_test_server());
+        let h = spawn_test_server();
         let (_ws, status) = ws_handshake(h.addr(), "wrong");
         assert_eq!(status, 401, "connection with a bad token must be refused");
         h.stop();

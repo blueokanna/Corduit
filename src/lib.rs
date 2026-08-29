@@ -1,17 +1,35 @@
 //! # Corduit
 //!
-//! A unified network proxy engine written in Rust.
+//! A synchronous, no_std-ready unified network proxy engine written in Rust.
 //!
 //! This crate is a single package that internally groups its code into
 //! cohesive modules (each with its own `mod.rs`):
 //!
-//! * [`common`]   — shared minimal utilities (URL parsing, HTTP client).
+//! * [`common`]   — shared minimal utilities (sync scheduler, sockets,
+//!   relay, timers, URL parsing, HTTP client).
 //! * [`engine`]   — the proxy engine: config, routing, inbounds/outbounds,
 //!   proxy groups, health checks, providers and traffic accounting.
 //! * [`crypto`]   — cryptographic primitives (digests, AEAD, KDF, X25519…).
 //! * [`dns`]      — DNS resolver, cache, fake-IP and DoH/DoT servers.
 //! * [`netstack`] — userspace TCP/IP stack for TUN-based transparent proxy.
-//! * [`protocol`] — wire protocols & transports (TLS, WireGuard…).
+//! * [`protocol`] — wire protocols & transports (TLS, QUIC, WireGuard…).
+//!
+//! ## The synchronous model
+//!
+//! Corduit has **no async runtime**. Concurrency comes from courierust's
+//! work-stealing thread pool (short tasks: accept dispatch, handshakes,
+//! control plane) layered with dedicated threads for long-lived relays and
+//! per-listener accept loops. There is no tokio anywhere in the dependency
+//! tree — `cargo tree` shows zero `tokio` packages.
+//!
+//! ## `no_std`
+//!
+//! With `default-features = false` the crate compiles on `no_std + alloc`
+//! targets: the [`crypto`] primitives, [`common::url`], and the pure wire
+//! codecs in [`protocol`] (`address`, `qpack`, `error`) have zero OS
+//! dependencies. The threaded networking layer (engine, netstack, DNS
+//! servers, RPC, HTTP/TLS/QUIC transports) is gated behind the `std`
+//! feature.
 //!
 //! ## Examples
 //!
@@ -36,101 +54,119 @@
 
 // HarmonyOS uses a non-standard `target_os = "ohos"` value.
 #![allow(unexpected_cfgs)]
-
-// The merged `crypto` module uses `alloc::` paths (it was written `no_std`);
-// make the allocator crate available crate-wide.
+// The protocol core is `no_std + alloc`; make the allocator crate available
+// crate-wide (also supplies `format!`, `vec!` etc. in no_std builds).
+#![cfg_attr(not(feature = "std"), no_std)]
+#[macro_use]
 extern crate alloc;
 
+#[cfg(feature = "std")]
 mod logging;
 
+#[cfg(feature = "std")]
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-pub mod api;
-mod error;
-pub mod ffi;
-pub mod rpc;
-mod types;
-
-// --- merged internal modules (formerly separate crates) ---------------------
+// --- no_std protocol core ---------------------------------------------------
 pub mod common;
 pub mod crypto;
-pub mod dns;
-pub mod engine;
-pub mod netstack;
 pub mod protocol;
 
-#[cfg(target_os = "android")]
+// --- threaded networking layer (std) ----------------------------------------
+#[cfg(feature = "std")]
+pub mod api;
+#[cfg(feature = "std")]
+mod error;
+#[cfg(feature = "std")]
+pub mod ffi;
+#[cfg(feature = "std")]
+pub mod rpc;
+#[cfg(feature = "std")]
+mod types;
+
+#[cfg(feature = "std")]
+pub mod dns;
+#[cfg(feature = "std")]
+pub mod engine;
+#[cfg(feature = "std")]
+pub mod netstack;
+
+#[cfg(all(feature = "std", target_os = "android"))]
 pub mod android_jni;
 
+#[cfg(feature = "std")]
 pub use api::*;
+#[cfg(feature = "std")]
 pub use error::*;
+#[cfg(feature = "std")]
 pub use types::*;
 
 /// Re-export the engine entry point at the crate root for convenience.
+#[cfg(feature = "std")]
 pub use engine::Corduit;
 
-static CORDUIT_INSTANCE: once_cell::sync::Lazy<Arc<RwLock<Option<Corduit>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
+#[cfg(feature = "std")]
+static CORDUIT_INSTANCE: once_cell::sync::Lazy<Arc<parking_lot::RwLock<Option<Corduit>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(parking_lot::RwLock::new(None)));
 
-pub(crate) static TUN_LIFECYCLE_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+#[cfg(feature = "std")]
+pub(crate) static TUN_LIFECYCLE_LOCK: once_cell::sync::Lazy<parking_lot::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(()));
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "std", target_os = "android"))]
 static ANDROID_VPN_PROCESSOR: once_cell::sync::Lazy<
     Arc<parking_lot::RwLock<Option<Arc<crate::netstack::AndroidVpnProcessor>>>>,
 > = once_cell::sync::Lazy::new(|| Arc::new(parking_lot::RwLock::new(None)));
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "std", target_os = "android"))]
 static ANDROID_TUN_DEVICE: once_cell::sync::Lazy<
     parking_lot::Mutex<Option<crate::netstack::TunDevice>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "std", target_os = "android"))]
 static ANDROID_PACKET_TASK: once_cell::sync::Lazy<
-    parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
 /// Global Windows VPN processor for stats tracking
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 static WINDOWS_VPN_PROCESSOR: once_cell::sync::Lazy<
     Arc<parking_lot::RwLock<Option<Arc<crate::netstack::WindowsVpnProcessor>>>>,
 > = once_cell::sync::Lazy::new(|| Arc::new(parking_lot::RwLock::new(None)));
 
 /// Global Windows route manager
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 static WINDOWS_ROUTE_MANAGER: once_cell::sync::Lazy<
     Arc<parking_lot::RwLock<Option<crate::netstack::WindowsRouteManager>>>,
 > = once_cell::sync::Lazy::new(|| Arc::new(parking_lot::RwLock::new(None)));
 
 /// Global Windows TUN device
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 static WINDOWS_TUN_DEVICE: once_cell::sync::Lazy<
     Arc<parking_lot::RwLock<Option<crate::netstack::TunDevice>>>,
 > = once_cell::sync::Lazy::new(|| Arc::new(parking_lot::RwLock::new(None)));
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 static LINUX_VPN_PROCESSOR: once_cell::sync::Lazy<
     parking_lot::RwLock<Option<Arc<crate::netstack::TunPacketProcessor>>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(None));
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 static LINUX_TUN_DEVICE: once_cell::sync::Lazy<
     parking_lot::Mutex<Option<crate::netstack::TunDevice>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 static LINUX_ROUTE_MANAGER: once_cell::sync::Lazy<
     parking_lot::Mutex<Option<crate::netstack::RouteManager>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 static LINUX_PACKET_TASK: once_cell::sync::Lazy<
-    parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
 
 /// Set the global Android VPN processor
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "std", target_os = "android"))]
 pub fn set_android_vpn_processor(processor: Arc<crate::netstack::AndroidVpnProcessor>) {
     let mut guard = ANDROID_VPN_PROCESSOR.write();
     *guard = Some(processor);
@@ -138,7 +174,7 @@ pub fn set_android_vpn_processor(processor: Arc<crate::netstack::AndroidVpnProce
 }
 
 /// Clear the global Android VPN processor
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "std", target_os = "android"))]
 pub fn clear_android_vpn_processor() {
     let mut guard = ANDROID_VPN_PROCESSOR.write();
     *guard = None;
@@ -146,58 +182,58 @@ pub fn clear_android_vpn_processor() {
 }
 
 /// Get the global Android VPN processor
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "std", target_os = "android"))]
 pub fn get_android_vpn_processor() -> Option<Arc<crate::netstack::AndroidVpnProcessor>> {
     let guard = ANDROID_VPN_PROCESSOR.read();
     guard.clone()
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "std", target_os = "android"))]
 pub fn set_android_tun_device(device: crate::netstack::TunDevice) {
     *ANDROID_TUN_DEVICE.lock() = Some(device);
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "std", target_os = "android"))]
 pub fn take_android_tun_device() -> Option<crate::netstack::TunDevice> {
     ANDROID_TUN_DEVICE.lock().take()
 }
 
-#[cfg(target_os = "android")]
-pub fn set_android_packet_task(task: tokio::task::JoinHandle<()>) {
+#[cfg(all(feature = "std", target_os = "android"))]
+pub fn set_android_packet_task(task: std::thread::JoinHandle<()>) {
     *ANDROID_PACKET_TASK.lock() = Some(task);
 }
 
-#[cfg(target_os = "android")]
-pub fn take_android_packet_task() -> Option<tokio::task::JoinHandle<()>> {
+#[cfg(all(feature = "std", target_os = "android"))]
+pub fn take_android_packet_task() -> Option<std::thread::JoinHandle<()>> {
     ANDROID_PACKET_TASK.lock().take()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn set_linux_vpn_processor(processor: Arc<crate::netstack::TunPacketProcessor>) {
     *LINUX_VPN_PROCESSOR.write() = Some(processor);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn get_linux_vpn_processor() -> Option<Arc<crate::netstack::TunPacketProcessor>> {
     LINUX_VPN_PROCESSOR.read().clone()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn take_linux_vpn_processor() -> Option<Arc<crate::netstack::TunPacketProcessor>> {
     LINUX_VPN_PROCESSOR.write().take()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn set_linux_tun_device(device: crate::netstack::TunDevice) {
     *LINUX_TUN_DEVICE.lock() = Some(device);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn take_linux_tun_device() -> Option<crate::netstack::TunDevice> {
     LINUX_TUN_DEVICE.lock().take()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn linux_tun_device_is_running() -> bool {
     LINUX_TUN_DEVICE
         .lock()
@@ -205,27 +241,27 @@ pub fn linux_tun_device_is_running() -> bool {
         .is_some_and(crate::netstack::TunDevice::is_running)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn set_linux_route_manager(manager: crate::netstack::RouteManager) {
     *LINUX_ROUTE_MANAGER.lock() = Some(manager);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn take_linux_route_manager() -> Option<crate::netstack::RouteManager> {
     LINUX_ROUTE_MANAGER.lock().take()
 }
 
-#[cfg(target_os = "linux")]
-pub fn set_linux_packet_task(task: tokio::task::JoinHandle<()>) {
+#[cfg(all(feature = "std", target_os = "linux"))]
+pub fn set_linux_packet_task(task: std::thread::JoinHandle<()>) {
     *LINUX_PACKET_TASK.lock() = Some(task);
 }
 
-#[cfg(target_os = "linux")]
-pub fn take_linux_packet_task() -> Option<tokio::task::JoinHandle<()>> {
+#[cfg(all(feature = "std", target_os = "linux"))]
+pub fn take_linux_packet_task() -> Option<std::thread::JoinHandle<()>> {
     LINUX_PACKET_TASK.lock().take()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "std", target_os = "linux"))]
 pub fn linux_packet_task_is_running() -> bool {
     LINUX_PACKET_TASK
         .lock()
@@ -234,7 +270,7 @@ pub fn linux_packet_task_is_running() -> bool {
 }
 
 /// Set the global Windows VPN processor
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn set_windows_vpn_processor(processor: Arc<crate::netstack::WindowsVpnProcessor>) {
     let mut guard = WINDOWS_VPN_PROCESSOR.write();
     *guard = Some(processor);
@@ -242,7 +278,7 @@ pub fn set_windows_vpn_processor(processor: Arc<crate::netstack::WindowsVpnProce
 }
 
 /// Clear the global Windows VPN processor
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn clear_windows_vpn_processor() {
     let mut guard = WINDOWS_VPN_PROCESSOR.write();
     *guard = None;
@@ -250,19 +286,19 @@ pub fn clear_windows_vpn_processor() {
 }
 
 /// Get the global Windows VPN processor
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn get_windows_vpn_processor() -> Option<Arc<crate::netstack::WindowsVpnProcessor>> {
     let guard = WINDOWS_VPN_PROCESSOR.read();
     guard.clone()
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn take_windows_vpn_processor() -> Option<Arc<crate::netstack::WindowsVpnProcessor>> {
     WINDOWS_VPN_PROCESSOR.write().take()
 }
 
 /// Set the global Windows route manager
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn set_windows_route_manager(manager: crate::netstack::WindowsRouteManager) {
     let mut guard = WINDOWS_ROUTE_MANAGER.write();
     *guard = Some(manager);
@@ -270,7 +306,7 @@ pub fn set_windows_route_manager(manager: crate::netstack::WindowsRouteManager) 
 }
 
 /// Get the global Windows route manager
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn get_windows_route_manager(
 ) -> Option<parking_lot::MappedRwLockReadGuard<'static, crate::netstack::WindowsRouteManager>> {
     let guard = WINDOWS_ROUTE_MANAGER.read();
@@ -284,7 +320,7 @@ pub fn get_windows_route_manager(
 }
 
 /// Get mutable access to the global Windows route manager
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn get_windows_route_manager_mut(
 ) -> Option<parking_lot::MappedRwLockWriteGuard<'static, crate::netstack::WindowsRouteManager>> {
     let guard = WINDOWS_ROUTE_MANAGER.write();
@@ -298,20 +334,20 @@ pub fn get_windows_route_manager_mut(
 }
 
 /// Clear the global Windows route manager
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn clear_windows_route_manager() {
     let mut guard = WINDOWS_ROUTE_MANAGER.write();
     *guard = None;
     tracing::info!("Windows route manager cleared");
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn take_windows_route_manager() -> Option<crate::netstack::WindowsRouteManager> {
     WINDOWS_ROUTE_MANAGER.write().take()
 }
 
 /// Set the global Windows TUN device
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn set_windows_tun_device(device: crate::netstack::TunDevice) {
     let mut guard = WINDOWS_TUN_DEVICE.write();
     *guard = Some(device);
@@ -319,7 +355,7 @@ pub fn set_windows_tun_device(device: crate::netstack::TunDevice) {
 }
 
 /// Clear the global Windows TUN device
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn clear_windows_tun_device() {
     let mut guard = WINDOWS_TUN_DEVICE.write();
     *guard = None;
@@ -327,18 +363,19 @@ pub fn clear_windows_tun_device() {
 }
 
 /// Take the global Windows TUN device (removes it from global state)
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 pub fn take_windows_tun_device() -> Option<crate::netstack::TunDevice> {
     let mut guard = WINDOWS_TUN_DEVICE.write();
     guard.take()
 }
 
 /// Get the global Corduit instance
-async fn get_corduit_instance() -> Result<Arc<RwLock<Option<Corduit>>>> {
+#[cfg(feature = "std")]
+fn get_corduit_instance() -> Result<Arc<parking_lot::RwLock<Option<Corduit>>>> {
     Ok(Arc::clone(&CORDUIT_INSTANCE))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::types::*;
     use proptest::prelude::*;
@@ -503,9 +540,8 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
-        /// **Feature: rust-codebase-optimization, Property 7: FFI Serialization Round-Trip**
-        /// **Validates: Requirements 11.1-11.6**
-        /// For any TrafficStatsDto, serializing to JSON and deserializing back produces an equivalent value
+        /// For any TrafficStatsDto, serializing to JSON and deserializing
+        /// back produces an equivalent value.
         #[test]
         fn test_traffic_stats_dto_roundtrip(dto in arb_traffic_stats_dto()) {
             let json = nextjson::to_string(&dto).expect("Failed to serialize");
@@ -519,9 +555,8 @@ mod tests {
             prop_assert_eq!(dto.uptime_secs, deserialized.uptime_secs);
         }
 
-        /// **Feature: rust-codebase-optimization, Property 7: FFI Serialization Round-Trip**
-        /// **Validates: Requirements 11.1-11.6**
-        /// For any ConnectionDto, serializing to JSON and deserializing back produces an equivalent value
+        /// For any ConnectionDto, serializing to JSON and deserializing back
+        /// produces an equivalent value.
         #[test]
         fn test_connection_dto_roundtrip(dto in arb_connection_dto()) {
             let json = nextjson::to_string(&dto).expect("Failed to serialize");
@@ -539,9 +574,8 @@ mod tests {
             prop_assert_eq!(dto.rule, deserialized.rule);
         }
 
-        /// **Feature: rust-codebase-optimization, Property 7: FFI Serialization Round-Trip**
-        /// **Validates: Requirements 11.1-11.6**
-        /// For any ProxyInfoDto, serializing to JSON and deserializing back produces an equivalent value
+        /// For any ProxyInfoDto, serializing to JSON and deserializing back
+        /// produces an equivalent value.
         #[test]
         fn test_proxy_info_dto_roundtrip(dto in arb_proxy_info_dto()) {
             let json = nextjson::to_string(&dto).expect("Failed to serialize");
@@ -555,9 +589,8 @@ mod tests {
             prop_assert_eq!(dto.alive, deserialized.alive);
         }
 
-        /// **Feature: rust-codebase-optimization, Property 7: FFI Serialization Round-Trip**
-        /// **Validates: Requirements 11.1-11.6**
-        /// For any ProxyGroupDto, serializing to JSON and deserializing back produces an equivalent value
+        /// For any ProxyGroupDto, serializing to JSON and deserializing back
+        /// produces an equivalent value.
         #[test]
         fn test_proxy_group_dto_roundtrip(dto in arb_proxy_group_dto()) {
             let json = nextjson::to_string(&dto).expect("Failed to serialize");
@@ -569,9 +602,8 @@ mod tests {
             prop_assert_eq!(dto.selected, deserialized.selected);
         }
 
-        /// **Feature: rust-codebase-optimization, Property 7: FFI Serialization Round-Trip**
-        /// **Validates: Requirements 11.1-11.6**
-        /// For any RuleDto, serializing to JSON and deserializing back produces an equivalent value
+        /// For any RuleDto, serializing to JSON and deserializing back
+        /// produces an equivalent value.
         #[test]
         fn test_rule_dto_roundtrip(dto in arb_rule_dto()) {
             let json = nextjson::to_string(&dto).expect("Failed to serialize");
@@ -583,9 +615,8 @@ mod tests {
             prop_assert_eq!(dto.matched_count, deserialized.matched_count);
         }
 
-        /// **Feature: rust-codebase-optimization, Property 7: FFI Serialization Round-Trip**
-        /// **Validates: Requirements 11.1-11.6**
-        /// For any DnsConfigDto, serializing to JSON and deserializing back produces an equivalent value
+        /// For any DnsConfigDto, serializing to JSON and deserializing back
+        /// produces an equivalent value.
         #[test]
         fn test_dns_config_dto_roundtrip(dto in arb_dns_config_dto()) {
             let json = nextjson::to_string(&dto).expect("Failed to serialize");

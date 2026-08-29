@@ -4,9 +4,8 @@ use crate::netstack::error::{NetStackError, Result};
 use crate::netstack::solidtcp::{SolidStack, StackBuilder, StackStats};
 use bytes::BytesMut;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::{net::Ipv4Addr, net::SocketAddr};
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 /// Traffic counters exposed to platform bridges.
@@ -53,9 +52,13 @@ impl TunPacketProcessor {
 
         let stack = Arc::new(stack);
         let cleanup_stack = Arc::clone(&stack);
-        tokio::spawn(async move {
-            cleanup_stack.run_cleanup().await;
-        });
+        // Long-lived cleanup loop runs on a dedicated thread.
+        std::thread::Builder::new()
+            .name("tun-cleanup".into())
+            .spawn(move || {
+                cleanup_stack.run_cleanup();
+            })
+            .expect("failed to spawn TUN cleanup thread");
 
         info!(%proxy_addr, mtu, "TUN packet processor started");
         Self {
@@ -65,7 +68,7 @@ impl TunPacketProcessor {
         }
     }
 
-    pub async fn process_packet(&self, packet: &[u8]) -> Result<()> {
+    pub fn process_packet(&self, packet: &[u8]) -> Result<()> {
         if !self.is_running() {
             return Err(NetStackError::NotRunning);
         }
@@ -81,7 +84,6 @@ impl TunPacketProcessor {
 
         self.stack
             .process_packet(packet)
-            .await
             .map_err(|error| NetStackError::InvalidPacket(error.to_string()))
     }
 
@@ -148,30 +150,30 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv6Addr};
 
-    #[tokio::test]
-    async fn processor_rejects_packets_after_stop() {
-        let (tx, _rx) = mpsc::channel(1);
+    #[test]
+    fn processor_rejects_packets_after_stop() {
+        let (tx, _rx) = mpsc::channel::<BytesMut>();
         let processor = TunPacketProcessor::new(7890, 1500, tx);
         processor.stop();
         assert!(matches!(
-            processor.process_packet(&[0x45]).await,
+            processor.process_packet(&[0x45]),
             Err(NetStackError::NotRunning)
         ));
     }
 
-    #[tokio::test]
-    async fn processor_rejects_empty_packets() {
-        let (tx, _rx) = mpsc::channel(1);
+    #[test]
+    fn processor_rejects_empty_packets() {
+        let (tx, _rx) = mpsc::channel::<BytesMut>();
         let processor = TunPacketProcessor::new(7890, 1500, tx);
         assert!(matches!(
-            processor.process_packet(&[]).await,
+            processor.process_packet(&[]),
             Err(NetStackError::InvalidPacket(_))
         ));
     }
 
-    #[tokio::test]
-    async fn processor_preserves_ipv6_proxy_endpoint() {
-        let (tx, _rx) = mpsc::channel(1);
+    #[test]
+    fn processor_preserves_ipv6_proxy_endpoint() {
+        let (tx, _rx) = mpsc::channel::<BytesMut>();
         let proxy_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 7890);
         let processor = TunPacketProcessor::new_with_proxy_addr(proxy_addr, 1500, tx);
 

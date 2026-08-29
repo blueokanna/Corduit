@@ -17,20 +17,25 @@
 //!   line + headers + de-chunked, size-bounded body) so the inbound re-frames
 //!   it correctly for the client instead of wrapping the raw upstream bytes
 //!   as a nested HTTP response.
+//!
+//! The synchronous engine bounds every read through the stream read timeout;
+//! `WouldBlock`/`TimedOut` mean "idle" and the loops below retry until the
+//! overall deadline instead of treating a transient timeout as fatal.
 
 use crate::engine::error::{Error, Result};
 use courierust::courierust_http::{
     Body, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Version,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 /// Upper bound for a single forwarded response body (64 MiB). Prevents a
 /// hostile origin from exhausting memory with an unbounded download.
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound for a forwarded response header block.
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
-/// Per-read timeout applied while talking to the origin.
-const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Overall deadline for reading one response.
 const RESPONSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -51,7 +56,7 @@ const HOP_BY_HOP: &[&str] = &[
 /// `body` is the fully materialized request body (may be empty). The caller
 /// is responsible for `shutdown()`-ing the write half afterwards so the
 /// outbound relay knows the request is complete.
-pub(crate) async fn send_request<W>(
+pub(crate) fn send_request<W: Write>(
     write: &mut W,
     method: &Method,
     path: &str,
@@ -59,19 +64,14 @@ pub(crate) async fn send_request<W>(
     host: &str,
     port: u16,
     body: &[u8],
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<()> {
     let head = build_request_head(method, path, headers, host, port, body.len());
     write
         .write_all(&head)
-        .await
         .map_err(|e| Error::network(format!("Failed to write request head: {e}")))?;
     if !body.is_empty() {
         write
             .write_all(body)
-            .await
             .map_err(|e| Error::network(format!("Failed to write request body: {e}")))?;
     }
     Ok(())
@@ -150,17 +150,14 @@ pub(crate) fn build_request_head(
 /// [`MAX_RESPONSE_BODY_BYTES`]) and de-chunked when the origin used
 /// `Transfer-Encoding: chunked`. `is_head` must be true for HEAD requests
 /// (responses to HEAD carry no body).
-pub(crate) async fn read_http_response<R>(read: &mut R, is_head: bool) -> Result<Response<Body>>
-where
-    R: AsyncRead + Unpin,
-{
+pub(crate) fn read_http_response<R: Read>(read: &mut R, is_head: bool) -> Result<Response<Body>> {
     let mut pending: Vec<u8> = Vec::new();
     let mut eof = false;
 
-    let deadline = tokio::time::Instant::now() + RESPONSE_DEADLINE;
+    let deadline = Instant::now() + RESPONSE_DEADLINE;
 
     let (status, headers, chunked, content_length) =
-        read_head(read, &mut pending, &mut eof, deadline).await?;
+        read_head(read, &mut pending, &mut eof, deadline)?;
 
     let no_body = is_head
         || status.is_informational()
@@ -170,12 +167,12 @@ where
     let body: Vec<u8> = if no_body {
         Vec::new()
     } else if chunked {
-        read_chunked(read, &mut pending, &mut eof, deadline).await?
+        read_chunked(read, &mut pending, &mut eof, deadline)?
     } else if let Some(length) = content_length {
-        read_exact(read, &mut pending, &mut eof, deadline, length).await?
+        read_exact(read, &mut pending, &mut eof, deadline, length)?
     } else {
         // No framing: the origin is expected to close the connection.
-        read_until_eof(read, &mut pending, &mut eof, deadline).await?
+        read_until_eof(read, &mut pending, &mut eof, deadline)?
     };
 
     // Re-frame for the client: drop framing/hop-by-hop headers; the inbound
@@ -200,15 +197,12 @@ where
 
 /// Read the response head (status line + headers) and return the parsed
 /// status, header map, chunked flag and content-length.
-async fn read_head<R>(
+fn read_head<R: Read>(
     read: &mut R,
     pending: &mut Vec<u8>,
     eof: &mut bool,
-    deadline: tokio::time::Instant,
-) -> Result<(StatusCode, HeaderMap, bool, Option<u64>)>
-where
-    R: AsyncRead + Unpin,
-{
+    deadline: Instant,
+) -> Result<(StatusCode, HeaderMap, bool, Option<u64>)> {
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 2048];
 
@@ -229,22 +223,30 @@ where
             break (parsed.0, parsed.1, parsed.2, parsed.3, rest.to_vec());
         }
 
-        if tokio::time::Instant::now() > deadline {
+        if Instant::now() > deadline {
             return Err(Error::network("Timed out waiting for response headers"));
         }
-        let n = tokio::time::timeout(IO_TIMEOUT, read.read(&mut tmp))
-            .await
-            .map_err(|_| Error::network("Timed out reading response headers"))?
-            .map_err(|e| Error::network(format!("Failed to read response: {e}")))?;
-        if n == 0 {
-            *eof = true;
-            if buf.is_empty() {
-                return Err(Error::network("No response received from server"));
+        let n = match read.read(&mut tmp) {
+            Ok(0) => {
+                *eof = true;
+                if buf.is_empty() {
+                    return Err(Error::network("No response received from server"));
+                }
+                return Err(Error::network(
+                    "Malformed response: missing header terminator",
+                ));
             }
-            return Err(Error::network(
-                "Malformed response: missing header terminator",
-            ));
-        }
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(Error::network(format!("Failed to read response: {e}"))),
+        };
         buf.extend_from_slice(&tmp[..n]);
     };
 
@@ -352,15 +354,12 @@ fn parse_status(line: &[u8]) -> Result<StatusCode> {
 }
 
 /// Read a chunked response body (RFC 7230 §4.1), returning decoded bytes.
-async fn read_chunked<R>(
+fn read_chunked<R: Read>(
     read: &mut R,
     pending: &mut Vec<u8>,
     eof: &mut bool,
-    deadline: tokio::time::Instant,
-) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
+    deadline: Instant,
+) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     let mut buf = std::mem::take(pending);
 
@@ -374,19 +373,27 @@ where
             if buf.len() > 1024 {
                 return Err(Error::network("Chunk size line too long"));
             }
-            if tokio::time::Instant::now() > deadline {
+            if Instant::now() > deadline {
                 return Err(Error::network("Timed out reading chunk size"));
             }
             // Read into a growing buffer.
             let mut tmp = [0u8; 2048];
-            let n = tokio::time::timeout(IO_TIMEOUT, read.read(&mut tmp))
-                .await
-                .map_err(|_| Error::network("Timed out reading chunk size"))?
-                .map_err(|e| Error::network(format!("Failed to read chunk size: {e}")))?;
-            if n == 0 {
-                *eof = true;
-                return Err(Error::network("EOF in chunk size line"));
-            }
+            let n = match read.read(&mut tmp) {
+                Ok(0) => {
+                    *eof = true;
+                    return Err(Error::network("EOF in chunk size line"));
+                }
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(Error::network(format!("Failed to read chunk size: {e}"))),
+            };
             buf.extend_from_slice(&tmp[..n]);
         };
 
@@ -414,14 +421,22 @@ where
                     break;
                 }
                 let mut tmp = [0u8; 2048];
-                let n = tokio::time::timeout(IO_TIMEOUT, read.read(&mut tmp))
-                    .await
-                    .map_err(|_| Error::network("Timed out reading trailers"))?
-                    .map_err(|e| Error::network(format!("Failed to read trailers: {e}")))?;
-                if n == 0 {
-                    *eof = true;
-                    return Err(Error::network("EOF in trailers"));
-                }
+                let n = match read.read(&mut tmp) {
+                    Ok(0) => {
+                        *eof = true;
+                        return Err(Error::network("EOF in trailers"));
+                    }
+                    Ok(n) => n,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(e) => return Err(Error::network(format!("Failed to read trailers: {e}"))),
+                };
                 buf.extend_from_slice(&tmp[..n]);
             }
             break;
@@ -441,27 +456,44 @@ where
                 continue;
             }
             let mut tmp = [0u8; 2048];
-            let n = tokio::time::timeout(IO_TIMEOUT, read.read(&mut tmp))
-                .await
-                .map_err(|_| Error::network("Timed out reading chunk data"))?
-                .map_err(|e| Error::network(format!("Failed to read chunk data: {e}")))?;
-            if n == 0 {
-                *eof = true;
-                return Err(Error::network("EOF in chunk data"));
-            }
+            let n = match read.read(&mut tmp) {
+                Ok(0) => {
+                    *eof = true;
+                    return Err(Error::network("EOF in chunk data"));
+                }
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(Error::network(format!("Failed to read chunk data: {e}"))),
+            };
             buf.extend_from_slice(&tmp[..n]);
         }
         // Consume the trailing CRLF after the chunk data.
-        let mut crlf = [0u8; 2];
         if buf.is_empty() {
-            let n = tokio::time::timeout(IO_TIMEOUT, read.read(&mut crlf))
-                .await
-                .map_err(|_| Error::network("Timed out reading chunk CRLF"))?
-                .map_err(|e| Error::network(format!("Failed to read chunk CRLF: {e}")))?;
-            if n == 0 {
-                *eof = true;
-                return Err(Error::network("EOF in chunk CRLF"));
-            }
+            let mut crlf = [0u8; 2];
+            let n = match read.read(&mut crlf) {
+                Ok(0) => {
+                    *eof = true;
+                    return Err(Error::network("EOF in chunk CRLF"));
+                }
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(Error::network(format!("Failed to read chunk CRLF: {e}"))),
+            };
+            let _ = n;
         } else {
             buf.drain(..std::cmp::min(2, buf.len()));
         }
@@ -472,16 +504,13 @@ where
 }
 
 /// Read exactly `length` bytes (using any already-buffered bytes first).
-async fn read_exact<R>(
+fn read_exact<R: Read>(
     read: &mut R,
     pending: &mut Vec<u8>,
     eof: &mut bool,
-    deadline: tokio::time::Instant,
+    deadline: Instant,
     length: u64,
-) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
+) -> Result<Vec<u8>> {
     if length > MAX_RESPONSE_BODY_BYTES as u64 {
         return Err(Error::network("Response body exceeds limit"));
     }
@@ -489,7 +518,7 @@ where
     let mut buf = std::mem::take(pending);
 
     while (out.len() as u64) < length {
-        if tokio::time::Instant::now() > deadline {
+        if Instant::now() > deadline {
             return Err(Error::network("Timed out reading response body"));
         }
         let need = (length as usize) - out.len();
@@ -499,14 +528,22 @@ where
             continue;
         }
         let mut tmp = [0u8; 2048];
-        let n = tokio::time::timeout(IO_TIMEOUT, read.read(&mut tmp))
-            .await
-            .map_err(|_| Error::network("Timed out reading response body"))?
-            .map_err(|e| Error::network(format!("Failed to read response body: {e}")))?;
-        if n == 0 {
-            *eof = true;
-            return Err(Error::network("Connection closed before body was complete"));
-        }
+        let n = match read.read(&mut tmp) {
+            Ok(0) => {
+                *eof = true;
+                return Err(Error::network("Connection closed before body was complete"));
+            }
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(Error::network(format!("Failed to read response body: {e}"))),
+        };
         buf.extend_from_slice(&tmp[..n]);
     }
 
@@ -515,15 +552,12 @@ where
 }
 
 /// Read until EOF (close-delimited body), bounded by the size limit.
-async fn read_until_eof<R>(
+fn read_until_eof<R: Read>(
     read: &mut R,
     pending: &mut Vec<u8>,
     eof: &mut bool,
-    deadline: tokio::time::Instant,
-) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
+    deadline: Instant,
+) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     let mut buf = std::mem::take(pending);
 
@@ -531,7 +565,7 @@ where
         if out.len() > MAX_RESPONSE_BODY_BYTES {
             return Err(Error::network("Response body exceeds limit"));
         }
-        if tokio::time::Instant::now() > deadline {
+        if Instant::now() > deadline {
             return Err(Error::network("Timed out reading response body"));
         }
         if !buf.is_empty() {
@@ -540,14 +574,22 @@ where
             continue;
         }
         let mut tmp = [0u8; 2048];
-        let n = tokio::time::timeout(IO_TIMEOUT, read.read(&mut tmp))
-            .await
-            .map_err(|_| Error::network("Timed out reading response body"))?
-            .map_err(|e| Error::network(format!("Failed to read response body: {e}")))?;
-        if n == 0 {
-            *eof = true;
-            break;
-        }
+        let n = match read.read(&mut tmp) {
+            Ok(0) => {
+                *eof = true;
+                break;
+            }
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(Error::network(format!("Failed to read response body: {e}"))),
+        };
         buf.extend_from_slice(&tmp[..n]);
     }
 
@@ -563,4 +605,253 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous in-memory duplex
+// ---------------------------------------------------------------------------
+
+/// Idle wait bound for [`MemDuplex`] reads/writes. Mirrors a socket read
+/// timeout: a read that finds no data waits at most this long before
+/// reporting `WouldBlock`, releasing the caller's stream lock so the relay
+/// loop can proceed with the opposite direction.
+const DUPLEX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+/// Bound for a blocking write when the peer never drains (socket write
+/// timeout semantics).
+const DUPLEX_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Shared pipe state between the two ends of a [`MemDuplex`].
+#[derive(Default)]
+struct DuplexState {
+    /// Bytes written by end A, read by end B.
+    a_to_b: VecDeque<u8>,
+    /// Bytes written by end B, read by end A.
+    b_to_a: VecDeque<u8>,
+    /// A called `shutdown(Write)` — B observes EOF after draining.
+    a_write_closed: bool,
+    /// B called `shutdown(Write)` — A observes EOF after draining.
+    b_write_closed: bool,
+    /// A called `shutdown(Both)`.
+    a_both: bool,
+    /// B called `shutdown(Both)`.
+    b_both: bool,
+}
+
+struct DuplexInner {
+    state: Mutex<DuplexState>,
+    cond: Condvar,
+    capacity: usize,
+}
+
+/// One end of a synchronous bounded in-memory duplex pipe.
+///
+/// This is the synchronous replacement for `tokio::io::duplex` used by the
+/// HTTP proxy path: the server end is handed to the outbound relay (which
+/// runs on its own threads and locks it per operation), the client end is
+/// used by the calling thread to send the request and read the response.
+/// Reads and writes block on a condition variable with socket-style
+/// timeouts so neither direction can starve the other's stream lock.
+pub(crate) struct MemDuplex {
+    inner: Arc<DuplexInner>,
+    is_a: bool,
+}
+
+/// Create a new in-memory duplex pair with `capacity` bytes of buffering per
+/// direction.
+pub(crate) fn mem_duplex(capacity: usize) -> (MemDuplex, MemDuplex) {
+    let inner = Arc::new(DuplexInner {
+        state: Mutex::new(DuplexState::default()),
+        cond: Condvar::new(),
+        capacity: capacity.max(1),
+    });
+    (
+        MemDuplex {
+            inner: inner.clone(),
+            is_a: true,
+        },
+        MemDuplex { inner, is_a: false },
+    )
+}
+
+impl MemDuplex {
+    fn my_read_buf<'a>(&self, state: &'a mut DuplexState) -> &'a mut VecDeque<u8> {
+        if self.is_a {
+            &mut state.b_to_a
+        } else {
+            &mut state.a_to_b
+        }
+    }
+
+    fn my_write_buf<'a>(&self, state: &'a mut DuplexState) -> &'a mut VecDeque<u8> {
+        if self.is_a {
+            &mut state.a_to_b
+        } else {
+            &mut state.b_to_a
+        }
+    }
+
+    fn peer_write_closed(&self, state: &DuplexState) -> bool {
+        if self.is_a {
+            state.b_write_closed
+        } else {
+            state.a_write_closed
+        }
+    }
+
+    fn my_write_closed(&self, state: &DuplexState) -> bool {
+        if self.is_a {
+            state.a_write_closed
+        } else {
+            state.b_write_closed
+        }
+    }
+
+    fn my_both(&self, state: &DuplexState) -> bool {
+        if self.is_a {
+            state.a_both
+        } else {
+            state.b_both
+        }
+    }
+
+    fn peer_both(&self, state: &DuplexState) -> bool {
+        if self.is_a {
+            state.b_both
+        } else {
+            state.a_both
+        }
+    }
+}
+
+impl Read for MemDuplex {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let inner = &self.inner;
+        let mut state = inner.state.lock().unwrap();
+        {
+            let mine = self.my_read_buf(&mut state);
+            if !mine.is_empty() {
+                let n = mine.len().min(buf.len());
+                for (dst, src) in buf[..n].iter_mut().zip(mine.drain(..n)) {
+                    *dst = src;
+                }
+                return Ok(n);
+            }
+        }
+        if self.peer_write_closed(&state) {
+            return Ok(0); // EOF
+        }
+        if self.my_both(&state) || self.peer_both(&state) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "duplex closed",
+            ));
+        }
+        // Idle: wait one window for data (a writer notifies), then
+        // report `WouldBlock` so the relay releases its stream lock.
+        let (guard, _) = inner
+            .cond
+            .wait_timeout(state, DUPLEX_IDLE_TIMEOUT)
+            .unwrap_or_else(|e| e.into_inner());
+        state = guard;
+        {
+            let mine = self.my_read_buf(&mut state);
+            if !mine.is_empty() {
+                let n = mine.len().min(buf.len());
+                for (dst, src) in buf[..n].iter_mut().zip(mine.drain(..n)) {
+                    *dst = src;
+                }
+                return Ok(n);
+            }
+        }
+        if self.peer_write_closed(&state) {
+            return Ok(0);
+        }
+        if self.my_both(&state) || self.peer_both(&state) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "duplex closed",
+            ));
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "duplex idle",
+        ))
+    }
+}
+
+impl Write for MemDuplex {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let inner = &self.inner;
+        let mut state = inner.state.lock().unwrap();
+        if self.my_write_closed(&state) || self.my_both(&state) || self.peer_both(&state) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "duplex write closed",
+            ));
+        }
+        {
+            let mine = self.my_write_buf(&mut state);
+            let space = inner.capacity - mine.len();
+            if space > 0 {
+                let n = space.min(buf.len());
+                mine.extend(buf[..n].iter().copied());
+                let _ = mine;
+                inner.cond.notify_all();
+                return Ok(n);
+            }
+        }
+        // Full: wait for the reader to drain, bounded by a write timeout.
+        let (guard, _) = inner
+            .cond
+            .wait_timeout(state, DUPLEX_WRITE_TIMEOUT)
+            .unwrap_or_else(|e| e.into_inner());
+        state = guard;
+        {
+            let mine = self.my_write_buf(&mut state);
+            let space = inner.capacity - mine.len();
+            if space > 0 {
+                let n = space.min(buf.len());
+                mine.extend(buf[..n].iter().copied());
+                let _ = mine;
+                inner.cond.notify_all();
+                return Ok(n);
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "duplex write timed out",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl crate::common::stream::SyncStream for MemDuplex {
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        let mut state = self.inner.state.lock().unwrap();
+        if self.is_a {
+            match how {
+                std::net::Shutdown::Write | std::net::Shutdown::Both => state.a_write_closed = true,
+                std::net::Shutdown::Read => {}
+            }
+            if how == std::net::Shutdown::Both {
+                state.a_both = true;
+            }
+        } else {
+            match how {
+                std::net::Shutdown::Write | std::net::Shutdown::Both => state.b_write_closed = true,
+                std::net::Shutdown::Read => {}
+            }
+            if how == std::net::Shutdown::Both {
+                state.b_both = true;
+            }
+        }
+        self.inner.cond.notify_all();
+        Ok(())
+    }
 }

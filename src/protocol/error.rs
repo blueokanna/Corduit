@@ -1,5 +1,9 @@
+use alloc::string::String;
 use thiserror::Error;
 
+/// Protocol-level error for the wire codecs. `no_std + alloc` — the `Io`
+/// variant carries the message text so no `std::io` dependency leaks into
+/// the no_std core.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("TLS error: {0}")]
@@ -18,7 +22,7 @@ pub enum ProtocolError {
     Network(String),
 
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
@@ -45,4 +49,11 @@ pub enum ProtocolError {
     BufferTooSmall,
 }
 
-pub type Result<T> = std::result::Result<T, ProtocolError>;
+#[cfg(feature = "std")]
+impl From<std::io::Error> for ProtocolError {
+    fn from(err: std::io::Error) -> Self {
+        ProtocolError::Io(err.to_string())
+    }
+}
+
+pub type Result<T> = core::result::Result<T, ProtocolError>;

@@ -401,7 +401,6 @@ macro_rules! impl_outbound_proxy {
 #[macro_export]
 macro_rules! impl_outbound_proxy_trait {
     ($name:ident { tag: $tag:expr $(,)? }) => {
-        #[async_trait::async_trait]
         impl $crate::engine::outbound::OutboundProxy for $name {
             fn tag(&self) -> &str {
                 &$tag
@@ -411,17 +410,16 @@ macro_rules! impl_outbound_proxy_trait {
                 None
             }
 
-            async fn connect(&self) -> $crate::engine::error::Result<()> {
+            fn connect(&self) -> $crate::engine::error::Result<()> {
                 Ok(())
             }
 
-            async fn disconnect(&self) -> $crate::engine::error::Result<()> {
+            fn disconnect(&self) -> $crate::engine::error::Result<()> {
                 Ok(())
             }
         }
     };
     ($name:ident { tag: $tag:expr, server: $server:expr, port: $port:expr $(,)? }) => {
-        #[async_trait::async_trait]
         impl $crate::engine::outbound::OutboundProxy for $name {
             fn tag(&self) -> &str {
                 &$tag
@@ -431,11 +429,11 @@ macro_rules! impl_outbound_proxy_trait {
                 Some(($server.clone(), $port))
             }
 
-            async fn connect(&self) -> $crate::engine::error::Result<()> {
+            fn connect(&self) -> $crate::engine::error::Result<()> {
                 Ok(())
             }
 
-            async fn disconnect(&self) -> $crate::engine::error::Result<()> {
+            fn disconnect(&self) -> $crate::engine::error::Result<()> {
                 Ok(())
             }
         }
@@ -478,28 +476,29 @@ macro_rules! impl_transport {
 #[macro_export]
 macro_rules! impl_transport_wrap {
     ($self:expr, $stream:expr, $wrap_fn:expr, $transport_name:expr) => {
-        $wrap_fn($self, $stream)
-            .await
-            .map_err(|e| $crate::engine::error::Error::Network {
-                message: format!("{} transport error: {}", $transport_name, e),
-                source: None,
-            })
+        $wrap_fn($self, $stream).map_err(|e| $crate::engine::error::Error::Network {
+            message: format!("{} transport error: {}", $transport_name, e),
+            source: None,
+        })
     };
 }
 
 #[macro_export]
 macro_rules! connect_with_timeout {
     ($addr:expr, $timeout:expr) => {
-        tokio::time::timeout($timeout, tokio::net::TcpStream::connect($addr))
-            .await
-            .map_err(|_| $crate::engine::error::Error::Timeout {
-                message: format!("Connection to {} timed out", $addr),
-                operation: Some("connect".to_string()),
-            })?
-            .map_err(|e| $crate::engine::error::Error::Network {
-                message: format!("Failed to connect to {}: {}", $addr, e),
-                source: None,
-            })
+        $crate::common::socket::connect(&$addr, $timeout).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                $crate::engine::error::Error::Timeout {
+                    message: format!("Connection to {} timed out", $addr),
+                    operation: Some("connect".to_string()),
+                }
+            } else {
+                $crate::engine::error::Error::Network {
+                    message: format!("Failed to connect to {}: {}", $addr, e),
+                    source: None,
+                }
+            }
+        })
     };
 }
 
@@ -508,20 +507,20 @@ macro_rules! relay_streams {
     ($inbound:expr, $outbound:expr) => {
         $crate::engine::outbound::relay_bidirectional_with_connection(
             $inbound,
-            $outbound,
+            Box::new($outbound) as $crate::common::stream::BoxStream,
             $crate::engine::connection_tracker::global_tracker(),
             None,
+            $crate::common::cancel::CancellationToken::new(),
         )
-        .await
     };
     ($inbound:expr, $outbound:expr, $connection:expr) => {
         $crate::engine::outbound::relay_bidirectional_with_connection(
             $inbound,
-            $outbound,
+            Box::new($outbound) as $crate::common::stream::BoxStream,
             $crate::engine::connection_tracker::global_tracker(),
             $connection,
+            $crate::common::cancel::CancellationToken::new(),
         )
-        .await
     };
 }
 

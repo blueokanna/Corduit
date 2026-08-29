@@ -2,10 +2,9 @@ use crate::engine::config::{Config, InboundType};
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::OutboundManager;
 use crate::engine::routing::Router;
-use std::net::{IpAddr, SocketAddr};
+use parking_lot::RwLock;
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 
 mod auth;
 mod forward;
@@ -64,8 +63,7 @@ fn bind_tcp_listener(listen: &str, port: u16, name: &str) -> Result<(TcpListener
         .listen(1024)
         .map_err(|error| Error::network(format!("Failed to listen on {addr}: {error}")))?;
 
-    let listener = TcpListener::from_std(socket.into())
-        .map_err(|error| Error::network(format!("Failed to create {name} TcpListener: {error}")))?;
+    let listener: TcpListener = socket.into();
     Ok((listener, addr))
 }
 
@@ -77,15 +75,16 @@ pub struct InboundManager {
     listeners: RwLock<Vec<Box<dyn InboundListener>>>,
 }
 
-#[async_trait::async_trait]
+/// The synchronous inbound contract: `start` spawns the accept loop(s) and
+/// returns once listening; `stop` cancels and joins them.
 pub trait InboundListener: Send + Sync {
-    async fn start(&self) -> Result<()>;
-    async fn stop(&self) -> Result<()>;
+    fn start(&self) -> Result<()>;
+    fn stop(&self) -> Result<()>;
     fn tag(&self) -> &str;
 }
 
 impl InboundManager {
-    pub async fn new(
+    pub fn new(
         config: Arc<RwLock<Config>>,
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
@@ -93,7 +92,7 @@ impl InboundManager {
         let mut listeners: Vec<Box<dyn InboundListener>> = Vec::new();
 
         {
-            let config_read = config.read().await;
+            let config_read = config.read();
             // Thread the shared credential set into every listener so the
             // configured `general.authentication` is actually enforced.
             let auth = Arc::new(InboundAuth::new(
@@ -142,30 +141,30 @@ impl InboundManager {
         })
     }
 
-    pub async fn start(&self) -> Result<()> {
-        for listener in self.listeners.read().await.iter() {
-            listener.start().await?;
+    pub fn start(&self) -> Result<()> {
+        for listener in self.listeners.read().iter() {
+            listener.start()?;
         }
         Ok(())
     }
 
-    pub async fn stop(&self) -> Result<()> {
-        for listener in self.listeners.read().await.iter() {
-            listener.stop().await?;
+    pub fn stop(&self) -> Result<()> {
+        for listener in self.listeners.read().iter() {
+            listener.stop()?;
         }
         Ok(())
     }
 
     /// Rebuild listeners from the current configuration: stop the old set,
     /// construct the new set, then start it.
-    pub async fn reload(&self) -> Result<()> {
+    pub fn reload(&self) -> Result<()> {
         // Stop existing listeners before swapping so no stale sockets linger.
-        for listener in self.listeners.read().await.iter() {
-            let _ = listener.stop().await;
+        for listener in self.listeners.read().iter() {
+            let _ = listener.stop();
         }
 
         let new_listeners = {
-            let config_read = self.config.read().await;
+            let config_read = self.config.read();
             let auth = Arc::new(InboundAuth::new(
                 config_read.general.authentication.as_deref(),
             ));
@@ -203,10 +202,10 @@ impl InboundManager {
             new_listeners
         };
 
-        *self.listeners.write().await = new_listeners;
+        *self.listeners.write() = new_listeners;
 
-        for listener in self.listeners.read().await.iter() {
-            listener.start().await?;
+        for listener in self.listeners.read().iter() {
+            listener.start()?;
         }
         Ok(())
     }

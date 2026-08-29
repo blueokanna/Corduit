@@ -9,8 +9,12 @@
 //! The API mirrors the small slice of the `url` crate that the engine used, so
 //! call sites could be migrated mechanically: `parse`, `scheme`, `host_str`,
 //! `port`, `path`, `query`, `as_str` and `to_string`.
+//!
+//! This module is `no_std + alloc`.
 
-use std::fmt;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt;
 
 /// Error returned when a URL string cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +57,7 @@ impl fmt::Display for UrlError {
     }
 }
 
-impl std::error::Error for UrlError {}
+impl core::error::Error for UrlError {}
 
 /// A parsed absolute URL.
 ///
@@ -217,7 +221,7 @@ impl fmt::Display for Url {
     }
 }
 
-impl std::str::FromStr for Url {
+impl core::str::FromStr for Url {
     type Err = UrlError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {

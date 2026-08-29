@@ -1,3 +1,4 @@
+use crate::common::stream::BoxStream;
 use crate::crypto::aead::{Aead, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305};
 use crate::crypto::digest::Digest;
 use crate::crypto::encoding::{decode as b64_decode, Config as B64Config};
@@ -5,12 +6,11 @@ use crate::crypto::hash::{Blake3, Md5, Sha1};
 use crate::crypto::kdf::Hkdf;
 use crate::engine::config::OutboundConfig;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::engine::tls::yaml_value_to_string;
-use std::io::ErrorKind;
-use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
 
 /// Shadowsocks outbound proxy
 pub struct ShadowsocksOutbound {
@@ -22,26 +22,27 @@ pub struct ShadowsocksOutbound {
     udp_enabled: bool,
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for ShadowsocksOutbound {
-    async fn connect(&self) -> Result<()> {
+    fn connect(&self) -> Result<()> {
         // Test connection to Shadowsocks server (DNS resolution happens here)
-        let addr = format!("{}:{}", self.server, self.port);
-        let _stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
-            Error::network(format!(
-                "Failed to connect to Shadowsocks server {}: {}",
-                addr, e
-            ))
-        })?;
+        let _stream =
+            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
+                .map_err(|e| {
+                Error::network(format!(
+                    "Failed to connect to Shadowsocks server {}:{}: {}",
+                    self.server, self.port, e
+                ))
+            })?;
         tracing::info!(
-            "Shadowsocks outbound '{}' connected to {}",
+            "Shadowsocks outbound '{}' connected to {}:{}",
             self.config.tag,
-            addr
+            self.server,
+            self.port
         );
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    fn disconnect(&self) -> Result<()> {
         // Shadowsocks doesn't maintain persistent connections in this impl
         Ok(())
     }
@@ -58,26 +59,21 @@ impl OutboundProxy for ShadowsocksOutbound {
         self.udp_enabled
     }
 
-    async fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+    fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         if !self.udp_enabled {
             return Err(Error::config(
                 "UDP relay is not enabled for this Shadowsocks proxy",
             ));
         }
-        // Create a dummy socket for the relay_udp call
-        let dummy_socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
-        self.relay_udp(&dummy_socket, target, data).await
+        self.relay_udp(target, data)
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         test_url: &str,
         timeout: std::time::Duration,
     ) -> Result<std::time::Duration> {
         use std::time::Instant;
-        use tokio::io::AsyncWriteExt;
 
         // Parse the test URL to get host and port
         let url = crate::common::url::Url::parse(test_url)
@@ -98,31 +94,20 @@ impl OutboundProxy for ShadowsocksOutbound {
 
         let start = Instant::now();
 
-        // First resolve the SS server address
+        let cipher_spec = CipherSpec::new(&self.cipher)?;
+
         let server_addr = format!("{}:{}", self.server, self.port);
         tracing::debug!("SS latency test: resolving {}", server_addr);
 
-        // Use tokio's DNS resolution with timeout
-        let addrs = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::net::lookup_host(&server_addr),
-        )
-        .await
-        .map_err(|_| Error::network("DNS resolution timeout"))?
-        .map_err(|e| Error::network(format!("DNS resolution failed: {}", e)))?
-        .collect::<Vec<_>>();
-
-        if addrs.is_empty() {
-            return Err(Error::network("No addresses found for server"));
-        }
-
-        tracing::debug!("SS latency test: connecting to {:?}", addrs[0]);
-
         // Connect to the Shadowsocks server
-        let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addrs[0]))
-            .await
-            .map_err(|_| Error::network("Connection timeout"))?
+        let mut stream = crate::common::socket::connect_host(&self.server, self.port, timeout)
             .map_err(|e| Error::network(format!("Failed to connect: {}", e)))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
         // Disable Nagle's algorithm for lower latency
         stream.set_nodelay(true).ok();
@@ -132,9 +117,6 @@ impl OutboundProxy for ShadowsocksOutbound {
             self.cipher
         );
 
-        // Set up cipher
-        let cipher_spec = CipherSpec::new(&self.cipher)?;
-
         // Generate client salt for sending
         let mut client_salt = vec![0u8; cipher_spec.salt_len];
         getrandom::fill(&mut client_salt)
@@ -143,8 +125,6 @@ impl OutboundProxy for ShadowsocksOutbound {
         // Derive encryption key from client salt
         let enc_subkey = derive_subkey_for_cipher(&self.password, &client_salt, &cipher_spec)?;
         let mut enc = AeadCipher::new(cipher_spec, enc_subkey);
-
-        let (mut ro, mut wo) = tokio::io::split(stream);
 
         // Build address header
         let target = crate::engine::outbound::TargetAddr::Domain(host.clone(), url_port);
@@ -174,114 +154,96 @@ impl OutboundProxy for ShadowsocksOutbound {
 
         tracing::debug!("SS latency test: sending {} bytes", send_buf.len());
 
-        wo.write_all(&send_buf)
-            .await
+        stream
+            .write_all(&send_buf)
             .map_err(|e| Error::network(format!("Failed to send request: {}", e)))?;
-        wo.flush()
-            .await
+        stream
+            .flush()
             .map_err(|e| Error::network(format!("Flush failed: {}", e)))?;
 
         tracing::debug!("SS latency test: waiting for response");
 
-        // Read response with proper salt handling
-        // Some servers may close connection early or have issues, handle gracefully
-        let result = tokio::time::timeout(timeout, async {
-            // First, read the server's salt (server uses its own salt for responses)
-            let mut server_salt = vec![0u8; cipher_spec.salt_len];
+        // Read the server's salt (server uses its own salt for responses)
+        let mut server_salt = vec![0u8; cipher_spec.salt_len];
+        let salt_result = stream.read_exact(&mut server_salt);
+        match salt_result {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(Error::network(
+                    "Server closed connection (check password/cipher)",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(Error::network("Response timeout"));
+            }
+            Err(e) => {
+                return Err(Error::network(format!("Failed to read server salt: {}", e)));
+            }
+        }
 
-            // Use a more robust read with retry for salt
-            let salt_result = ro.read_exact(&mut server_salt).await;
-            match salt_result {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Server closed connection - this could mean:
-                    // 1. Server doesn't support the cipher
-                    // 2. Password is wrong
-                    // 3. Server is overloaded
-                    // For latency test, we consider TCP connection success as partial success
-                    return Err(Error::network(
-                        "Server closed connection (check password/cipher)",
-                    ));
+        tracing::debug!("SS latency test: received server salt");
+
+        // Derive decryption key from server's salt
+        let dec_subkey = derive_subkey_for_cipher(&self.password, &server_salt, &cipher_spec)?;
+        let mut dec = AeadCipher::new(cipher_spec, dec_subkey);
+
+        // Now read and decrypt the response
+        match recv_decrypted_chunk(&mut stream, &mut dec)? {
+            Some(chunk) => {
+                let response = String::from_utf8_lossy(&chunk);
+                tracing::debug!(
+                    "SS latency test: got response: {}",
+                    &response[..response.len().min(100)]
+                );
+                if response.starts_with("HTTP/") {
+                    let elapsed = start.elapsed();
+                    tracing::info!("SS latency test success: {}ms", elapsed.as_millis());
+                    Ok(elapsed)
+                } else {
+                    Err(Error::network(format!(
+                        "Invalid HTTP response: {}",
+                        &response[..response.len().min(50)]
+                    )))
                 }
-                Err(e) => {
-                    return Err(Error::network(format!("Failed to read server salt: {}", e)));
-                }
             }
-
-            tracing::debug!("SS latency test: received server salt");
-
-            // Derive decryption key from server's salt
-            let dec_subkey = derive_subkey_for_cipher(&self.password, &server_salt, &cipher_spec)?;
-            let mut dec = AeadCipher::new(cipher_spec, dec_subkey);
-
-            // Now read and decrypt the response
-            match recv_decrypted_chunk(&mut ro, &mut dec).await? {
-                Some(chunk) => {
-                    // Check if we got HTTP response
-                    let response = String::from_utf8_lossy(&chunk);
-                    tracing::debug!(
-                        "SS latency test: got response: {}",
-                        &response[..response.len().min(100)]
-                    );
-                    if response.starts_with("HTTP/") {
-                        Ok(())
-                    } else {
-                        Err(Error::network(format!(
-                            "Invalid HTTP response: {}",
-                            &response[..response.len().min(50)]
-                        )))
-                    }
-                }
-                None => Err(Error::network("No response received")),
-            }
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                let elapsed = start.elapsed();
-                tracing::info!("SS latency test success: {}ms", elapsed.as_millis());
-                Ok(elapsed)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("SS latency test failed: {}", e);
-                Err(e)
-            }
-            Err(_) => {
-                tracing::warn!("SS latency test timeout");
-                Err(Error::network("Response timeout"))
-            }
+            None => Err(Error::network("No response received")),
         }
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        inbound: Box<dyn AsyncReadWrite>,
+        inbound: BoxStream,
         target: TargetAddr,
         connection: Option<std::sync::Arc<crate::engine::connection_tracker::TrackedConnection>>,
     ) -> Result<()> {
-        use crate::engine::connection_tracker::global_tracker;
-
         let cipher_spec = CipherSpec::new(&self.cipher)?;
 
-        let server_addr = format!("{}:{}", self.server, self.port);
-        let mut outbound = TcpStream::connect(&server_addr).await.map_err(|e| {
-            Error::network(format!(
-                "Failed to connect to SS server {}: {}",
-                server_addr, e
-            ))
-        })?;
+        let mut outbound =
+            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
+                .map_err(|e| {
+                Error::network(format!(
+                    "Failed to connect to SS server {}:{}: {}",
+                    self.server, self.port, e
+                ))
+            })?;
+        outbound
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
+        outbound
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
         // Disable Nagle's algorithm for lower latency
         outbound.set_nodelay(true).ok();
 
         tracing::debug!(
-            "Shadowsocks: connected to {} for target {}",
-            server_addr,
+            "Shadowsocks: connected to {}:{} for target {}",
+            self.server,
+            self.port,
             target
         );
 
@@ -297,72 +259,16 @@ impl OutboundProxy for ShadowsocksOutbound {
         // Send client salt first
         outbound
             .write_all(&client_salt)
-            .await
             .map_err(|e| Error::network(format!("Failed to send SS salt: {}", e)))?;
 
         let addr_header = self.build_address_header(&target)?;
-        send_encrypted_chunk(&mut outbound, &mut enc, &addr_header).await?;
+        send_encrypted_chunk(&mut outbound, &mut enc, &addr_header)?;
 
-        let (mut ri, mut wi) = tokio::io::split(inbound);
-        let (mut ro, mut wo) = tokio::io::split(outbound);
+        // Wrap the socket with the Shadowsocks chunked-encryption codec and
+        // let the bidirectional relay drive both directions concurrently.
+        let ss_stream = ShadowsocksStream::new(outbound, enc, cipher_spec, self.password.clone());
 
-        // Get global tracker for traffic stats
-        let tracker = global_tracker();
-
-        // Clone values needed for the async blocks
-        let password = self.password.clone();
-        let conn_upload = connection.clone();
-        let conn_download = connection.clone();
-
-        let client_to_remote = async {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                let n = ri
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read from inbound: {}", e)))?;
-                if n == 0 {
-                    break;
-                }
-                send_encrypted_chunk(&mut wo, &mut enc, &buf[..n]).await?;
-
-                // Update upload traffic stats (global + per-connection)
-                tracker.add_global_upload(n as u64);
-                if let Some(ref conn) = conn_upload {
-                    conn.add_upload(n as u64);
-                }
-            }
-            Ok::<(), Error>(())
-        };
-
-        let remote_to_client = async {
-            // First, read the server's salt
-            let mut server_salt = vec![0u8; cipher_spec.salt_len];
-            ro.read_exact(&mut server_salt)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read server salt: {}", e)))?;
-
-            // Derive decryption key from server's salt
-            let dec_subkey = derive_subkey_for_cipher(&password, &server_salt, &cipher_spec)?;
-            let mut dec = AeadCipher::new(cipher_spec, dec_subkey);
-
-            while let Some(chunk) = recv_decrypted_chunk(&mut ro, &mut dec).await? {
-                let chunk_len = chunk.len();
-                wi.write_all(&chunk)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to write to inbound: {}", e)))?;
-
-                // Update download traffic stats (global + per-connection)
-                tracker.add_global_download(chunk_len as u64);
-                if let Some(ref conn) = conn_download {
-                    conn.add_download(chunk_len as u64);
-                }
-            }
-            Ok::<(), Error>(())
-        };
-
-        tokio::try_join!(client_to_remote, remote_to_client)?;
-        Ok(())
+        relay_streams!(inbound, ss_stream, connection)
     }
 }
 
@@ -469,16 +375,10 @@ impl ShadowsocksOutbound {
 
     /// Relay UDP packets through Shadowsocks
     ///
-    /// This method handles UDP relay by:
-    /// 1. Binding a local UDP socket
-    /// 2. Encrypting outgoing packets with address header
-    /// 3. Decrypting incoming packets and extracting the address
-    pub async fn relay_udp(
-        &self,
-        _local_socket: &UdpSocket,
-        target: &TargetAddr,
-        data: &[u8],
-    ) -> Result<Vec<u8>> {
+    /// Encrypts the outgoing packet (with address header) and decrypts the
+    /// reply, using a fresh one-shot UDP socket (immune to Windows ICMP
+    /// poisoning).
+    pub fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         if !self.udp_enabled {
             return Err(Error::config(
                 "UDP relay is not enabled for this Shadowsocks proxy",
@@ -487,46 +387,50 @@ impl ShadowsocksOutbound {
 
         let cipher_spec = CipherSpec::new(&self.cipher)?;
 
-        // Create UDP socket to SS server
-        let server_addr = format!("{}:{}", self.server, self.port);
-        let server_socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
+        let timeout = Duration::from_secs(30);
 
         // Resolve server address
-        let resolved_addr: SocketAddr = tokio::net::lookup_host(&server_addr)
-            .await
-            .map_err(|e| Error::network(format!("Failed to resolve SS server: {}", e)))?
-            .next()
-            .ok_or_else(|| Error::network("No addresses found for SS server"))?;
+        let resolved_addr: SocketAddr =
+            crate::common::socket::resolve_host(&self.server, self.port, timeout)
+                .map_err(|e| Error::network(format!("Failed to resolve SS server: {}", e)))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::network("No addresses found for SS server"))?;
+
+        // Bind a fresh UDP socket (read timeout set by udp_bind)
+        let server_socket = crate::common::socket::udp_bind("0.0.0.0:0".parse().unwrap(), timeout)
+            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
 
         // Connect to server (for send/recv convenience)
         server_socket
             .connect(resolved_addr)
-            .await
             .map_err(|e| Error::network(format!("Failed to connect UDP to SS server: {}", e)))?;
 
         // Encrypt and send UDP packet
         let encrypted = self.encrypt_udp_packet(target, data, &cipher_spec)?;
         server_socket
             .send(&encrypted)
-            .await
             .map_err(|e| Error::network(format!("Failed to send UDP packet: {}", e)))?;
 
         tracing::debug!(
-            "Shadowsocks UDP: sent {} bytes to {} via {}",
+            "Shadowsocks UDP: sent {} bytes to {} via {}:{}",
             data.len(),
             target,
-            server_addr
+            self.server,
+            self.port
         );
 
         // Receive response with timeout
         let mut recv_buf = vec![0u8; 65535];
-        let timeout = std::time::Duration::from_secs(30);
-        let recv_len = tokio::time::timeout(timeout, server_socket.recv(&mut recv_buf))
-            .await
-            .map_err(|_| Error::network("UDP receive timeout"))?
-            .map_err(|e| Error::network(format!("Failed to receive UDP packet: {}", e)))?;
+        let recv_len =
+            crate::common::socket::recv_udp_timeout(&server_socket, &mut recv_buf, timeout)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        Error::network("UDP receive timeout")
+                    } else {
+                        Error::network(format!("Failed to receive UDP packet: {}", e))
+                    }
+                })?;
 
         // Decrypt response
         let (response_data, _response_addr) =
@@ -598,6 +502,106 @@ impl ShadowsocksOutbound {
         let payload = decrypted[addr_len..].to_vec();
 
         Ok((payload, target))
+    }
+}
+
+/// A `std::io::Read + Write + SyncStream` adapter over the Shadowsocks
+/// chunked-encryption codec, so the bidirectional relay can drive the
+/// upstream socket: writes encrypt one chunk at a time, reads consume the
+/// server salt once and then decrypt chunk-by-chunk. Read/write timeouts
+/// surface as `WouldBlock`/`TimedOut` and are treated as idle by the relay.
+struct ShadowsocksStream {
+    inner: parking_lot::Mutex<TcpStream>,
+    enc: AeadCipher,
+    dec: Option<AeadCipher>,
+    password: String,
+    cipher_spec: CipherSpec,
+    read_buffer: Vec<u8>,
+    read_pos: usize,
+    eof: bool,
+}
+
+impl ShadowsocksStream {
+    fn new(inner: TcpStream, enc: AeadCipher, cipher_spec: CipherSpec, password: String) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(inner),
+            enc,
+            dec: None,
+            password,
+            cipher_spec,
+            read_buffer: Vec::new(),
+            read_pos: 0,
+            eof: false,
+        }
+    }
+}
+
+impl std::io::Read for ShadowsocksStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            // Serve buffered decrypted data first.
+            if self.read_pos < self.read_buffer.len() {
+                let n = (self.read_buffer.len() - self.read_pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.read_buffer[self.read_pos..self.read_pos + n]);
+                self.read_pos += n;
+                if self.read_pos >= self.read_buffer.len() {
+                    self.read_buffer.clear();
+                    self.read_pos = 0;
+                }
+                return Ok(n);
+            }
+            if self.eof {
+                return Ok(0);
+            }
+            let chunk = {
+                let mut inner = self.inner.lock();
+                if self.dec.is_none() {
+                    // First read: consume the server salt and derive the key.
+                    let mut server_salt = vec![0u8; self.cipher_spec.salt_len];
+                    inner.read_exact(&mut server_salt)?;
+                    let dec_subkey =
+                        derive_subkey_for_cipher(&self.password, &server_salt, &self.cipher_spec)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    self.dec = Some(AeadCipher::new(self.cipher_spec, dec_subkey));
+                }
+                recv_decrypted_chunk(&mut *inner, self.dec.as_mut().unwrap())?
+            };
+            match chunk {
+                Some(c) => {
+                    self.read_buffer = c;
+                    self.read_pos = 0;
+                }
+                None => {
+                    self.eof = true;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+impl std::io::Write for ShadowsocksStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut inner = self.inner.lock();
+        for chunk in buf.chunks(0x3fff) {
+            send_encrypted_chunk(&mut *inner, &mut self.enc, chunk)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.lock().flush()
+    }
+}
+
+impl crate::common::stream::SyncStream for ShadowsocksStream {
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        self.inner.lock().shutdown(how)
+    }
+
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.lock().peer_addr().ok()
     }
 }
 
@@ -822,12 +826,8 @@ impl AeadCipher {
     }
 }
 
-/// 发送一个加密块：加�?2-byte length) + 加密(payload)
-async fn send_encrypted_chunk<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
-    enc: &mut AeadCipher,
-    data: &[u8],
-) -> Result<()> {
+/// 发送一个加密块：加密(2-byte length) + 加密(payload)
+fn send_encrypted_chunk<W: Write>(writer: &mut W, enc: &mut AeadCipher, data: &[u8]) -> Result<()> {
     let len = data.len();
     if len > 0x3fff {
         return Err(Error::protocol("Shadowsocks chunk too large (>16KB)"));
@@ -837,38 +837,44 @@ async fn send_encrypted_chunk<W: tokio::io::AsyncWrite + Unpin>(
     let enc_len = enc.encrypt(&len_bytes)?;
     writer
         .write_all(&enc_len)
-        .await
         .map_err(|e| Error::network(format!("Failed to send SS length: {}", e)))?;
 
     if len > 0 {
         let enc_data = enc.encrypt(data)?;
         writer
             .write_all(&enc_data)
-            .await
             .map_err(|e| Error::network(format!("Failed to send SS data: {}", e)))?;
     }
 
     Ok(())
 }
 
-/// 接收并解密一个数据块；返�?None 表示 EOF
-async fn recv_decrypted_chunk<R: tokio::io::AsyncRead + Unpin>(
+/// 接收并解密一个数据块；返回 `None` 表示 EOF。
+///
+/// 以 `io::Result` 返回，保留底层 socket 的错误 kind（`WouldBlock`/
+/// `TimedOut` 表示空闲，relay 循环据此重试）。
+fn recv_decrypted_chunk<R: Read>(
     reader: &mut R,
     dec: &mut AeadCipher,
-) -> Result<Option<Vec<u8>>> {
+) -> std::io::Result<Option<Vec<u8>>> {
     let tag = dec.tag_len;
 
-    // 读取并解密长�?
+    // 读取并解密长度
     let mut enc_len_buf = vec![0u8; 2 + tag];
-    match reader.read_exact(&mut enc_len_buf).await {
+    match reader.read_exact(&mut enc_len_buf) {
         Ok(_) => {}
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(Error::network(format!("Failed to read SS length: {}", e))),
+        Err(e) => return Err(e),
     }
 
-    let len_plain = dec.decrypt(&enc_len_buf)?;
+    let len_plain = dec
+        .decrypt(&enc_len_buf)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     if len_plain.len() != 2 {
-        return Err(Error::protocol("Invalid SS length field"));
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "Invalid SS length field",
+        ));
     }
     let data_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
 
@@ -878,12 +884,11 @@ async fn recv_decrypted_chunk<R: tokio::io::AsyncRead + Unpin>(
 
     // 读取并解密数据块
     let mut enc_data = vec![0u8; data_len + tag];
-    reader
-        .read_exact(&mut enc_data)
-        .await
-        .map_err(|e| Error::network(format!("Failed to read SS data: {}", e)))?;
+    reader.read_exact(&mut enc_data)?;
 
-    let data = dec.decrypt(&enc_data)?;
+    let data = dec
+        .decrypt(&enc_data)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(Some(data))
 }
 

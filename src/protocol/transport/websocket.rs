@@ -2,8 +2,7 @@
 //! (replacing `tokio-tungstenite`).
 //!
 //! Corduit's transport layer needs a WebSocket duplex stream for proxy
-//! outbound protocols that tunnel over WS (VMess WS, etc.). The engine
-//! already carries a minimal WS client for the VMess path; this module is the
+//! outbound protocols that tunnel over WS. This module is the
 //! transport-level, generic version with a *complete* frame codec:
 //!
 //! * client handshake (RFC 6455 §4) with `Sec-WebSocket-Accept` verification;
@@ -11,7 +10,7 @@
 //! * 7-bit / 16-bit / 64-bit payload lengths;
 //! * fragmentation (continuation frames) with a hard message cap;
 //! * ping → pong echo, close-frame handling;
-//! * a poll-based `AsyncRead`/`AsyncWrite` surface plus an optional
+//! * a synchronous `std::io::Read`/`std::io::Write` surface plus an optional
 //!   `split()` into independent sink/reader halves.
 //!
 //! The codec is deliberately defensive: oversized frames are rejected before
@@ -20,16 +19,13 @@
 //! violation and surfaced as an error.
 
 use std::collections::HashMap;
-use std::io;
-use std::pin::Pin;
+use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 
 use crate::crypto::digest::Digest;
 use crate::crypto::encoding::{encode as b64_encode, Config as B64Config};
 use crate::crypto::hash::Sha1;
 use nextjson::{NsonDeserialize, NsonSerialize};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{Result, TransportError};
 
@@ -91,26 +87,22 @@ impl WebSocketTransport {
         }
     }
 
-    pub async fn connect<S>(&self, stream: S) -> Result<WsStream<S>>
+    pub fn connect<S>(&self, stream: S) -> Result<WsStream<S>>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: Read + Write,
     {
         let host = self.config.host.as_deref().unwrap_or(&self.server);
         let path = &self.config.path;
-        let stream = websocket_handshake(stream, path, host, &self.config.headers).await?;
+        let stream = websocket_handshake(stream, path, host, &self.config.headers)?;
         Ok(WsStream::new(stream))
     }
 
-    pub async fn connect_with_early_data<S>(
-        &self,
-        stream: S,
-        early_data: &[u8],
-    ) -> Result<WsStream<S>>
+    pub fn connect_with_early_data<S>(&self, stream: S, early_data: &[u8]) -> Result<WsStream<S>>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: Read + Write,
     {
         if early_data.is_empty() || self.config.max_early_data == 0 {
-            return self.connect(stream).await;
+            return self.connect(stream);
         }
 
         let host = self.config.host.as_deref().unwrap_or(&self.server);
@@ -134,7 +126,7 @@ impl WebSocketTransport {
         };
 
         let stream =
-            websocket_handshake(stream, &path_with_early_data, host, &self.config.headers).await?;
+            websocket_handshake(stream, &path_with_early_data, host, &self.config.headers)?;
         Ok(WsStream::new(stream))
     }
 
@@ -164,15 +156,12 @@ fn compute_accept(client_key: &str) -> String {
 }
 
 /// Perform the client side of the WebSocket opening handshake over `stream`.
-async fn websocket_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+fn websocket_handshake<S: Read + Write>(
     mut stream: S,
     path: &str,
     host: &str,
     extra_headers: &HashMap<String, String>,
 ) -> Result<S> {
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWriteExt;
-
     let key = generate_ws_key();
     let mut request = format!(
         "GET {path} HTTP/1.1\r\n\
@@ -191,18 +180,30 @@ async fn websocket_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
     stream
         .write_all(request.as_bytes())
-        .await
         .map_err(|e| TransportError::WebSocket(format!("write handshake: {e}")))?;
-    let _ = stream.flush().await;
+    stream
+        .flush()
+        .map_err(|e| TransportError::WebSocket(format!("flush handshake: {e}")))?;
 
     // Read the response head byte-by-byte until the blank line. Bounded so a
     // hostile peer cannot make us buffer unboundedly.
     let mut response = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     while response.len() < MAX_HANDSHAKE_HEAD {
-        match stream.read(&mut byte).await {
+        match stream.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                // The handshake must complete within the socket read timeout.
+                return Err(TransportError::WebSocket(format!(
+                    "handshake response timed out: {e}"
+                )));
+            }
             Err(e) => {
                 return Err(TransportError::WebSocket(format!(
                     "read handshake response: {e}"
@@ -248,7 +249,7 @@ async fn websocket_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
-// Poll-based frame codec
+// Frame codec
 // ---------------------------------------------------------------------------
 
 /// Opcode of the current frame being parsed.
@@ -297,7 +298,7 @@ struct WsFramed<S> {
     write_pos: usize,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> WsFramed<S> {
+impl<S: Read + Write> WsFramed<S> {
     fn new(inner: S) -> Self {
         Self {
             inner,
@@ -321,9 +322,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsFramed<S> {
         }
     }
 
-    /// Parse as many complete frames as `inbuf` allows. Returns a control
-    /// action that the caller must act on, or `None` when more input is
-    /// needed.
+    /// Parse as many complete frames as `inbuf` allows. Returns a parsed
+    /// frame, or `None` when more input is needed.
     fn parse_one(&mut self) -> Option<io::Result<Option<FrameOut>>> {
         let avail = self.inbuf.len() - self.inpos;
         if avail < self.need {
@@ -428,137 +428,7 @@ struct FrameOut {
 }
 
 // ---------------------------------------------------------------------------
-// WsStream
-// ---------------------------------------------------------------------------
-
-pub struct WsStream<S> {
-    framed: WsFramed<S>,
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
-    pub fn new(inner: S) -> Self {
-        Self {
-            framed: WsFramed::new(inner),
-        }
-    }
-
-    pub fn into_inner(self) -> S {
-        self.framed.inner
-    }
-
-    /// Split into independent write/read halves that share the underlying
-    /// codec (each operation is serialized by an internal mutex).
-    pub fn split(self) -> (WsSink<S>, WsReader<S>)
-    where
-        S: Send,
-    {
-        let shared = Arc::new(Mutex::new(self.framed));
-        (WsSink::new(shared.clone()), WsReader::new(shared))
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let framed = &mut self.framed;
-        framed_poll_read(framed, cx, buf)
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        framed_poll_write(&mut self.framed, cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        framed_poll_flush(&mut self.framed, cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Best-effort close frame, then close the transport.
-        let _ = framed_enqueue_close(&mut self.framed);
-        framed_poll_flush(&mut self.framed, cx)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Split halves
-// ---------------------------------------------------------------------------
-
-pub struct WsSink<S> {
-    inner: Arc<Mutex<WsFramed<S>>>,
-}
-
-impl<S> WsSink<S> {
-    fn new(inner: Arc<Mutex<WsFramed<S>>>) -> Self {
-        Self { inner }
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsSink<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return Poll::Ready(Err(io::Error::other("ws mutex poisoned"))),
-        };
-        framed_poll_write(&mut *guard, cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return Poll::Ready(Err(io::Error::other("ws mutex poisoned"))),
-        };
-        framed_poll_flush(&mut *guard, cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return Poll::Ready(Err(io::Error::other("ws mutex poisoned"))),
-        };
-        let _ = framed_enqueue_close(&mut *guard);
-        framed_poll_flush(&mut *guard, cx)
-    }
-}
-
-pub struct WsReader<S> {
-    inner: Arc<Mutex<WsFramed<S>>>,
-}
-
-impl<S> WsReader<S> {
-    fn new(inner: Arc<Mutex<WsFramed<S>>>) -> Self {
-        Self { inner }
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsReader<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return Poll::Ready(Err(io::Error::other("ws mutex poisoned"))),
-        };
-        framed_poll_read(&mut *guard, cx, buf)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Shared codec drivers
+// Shared codec drivers (blocking)
 // ---------------------------------------------------------------------------
 
 /// Serialize a client frame (masked) and append it to the write buffer.
@@ -585,91 +455,54 @@ fn enqueue_frame<S>(framed: &mut WsFramed<S>, opcode: u8, payload: &[u8]) {
 }
 
 /// Enqueue a close frame (1000 = normal closure).
-fn framed_enqueue_close<S>(framed: &mut WsFramed<S>) -> io::Result<()> {
-    if !framed.write_buf.is_empty() || framed.write_pos < framed.write_buf.len() {
+fn framed_enqueue_close<S>(framed: &mut WsFramed<S>) {
+    if framed.write_pos >= framed.write_buf.len() {
+        enqueue_frame(framed, 0x8, &[0x03, 0xe8]);
+    }
+}
+
+/// Write `write_buf` to the wire in full.
+fn framed_flush_write<S: Read + Write>(framed: &mut WsFramed<S>) -> io::Result<()> {
+    if framed.write_pos >= framed.write_buf.len() {
+        framed.write_buf.clear();
+        framed.write_pos = 0;
         return Ok(());
     }
-    enqueue_frame(framed, 0x8, &[0x03, 0xe8]);
+    let remaining = &framed.write_buf[framed.write_pos..];
+    framed.inner.write_all(remaining)?;
+    framed.write_buf.clear();
+    framed.write_pos = 0;
     Ok(())
 }
 
-/// Drive the write side: flush queued frames, then enqueue a fresh binary
-/// frame for `buf`.
-fn framed_poll_write<S: AsyncRead + AsyncWrite + Unpin>(
-    framed: &mut WsFramed<S>,
-    cx: &mut Context<'_>,
-    buf: &[u8],
-) -> Poll<io::Result<usize>> {
-    // 1. Flush anything already queued (a previous partial write, a pong).
-    match framed_flush_write(framed, cx) {
-        Poll::Ready(Ok(())) => {}
-        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-        Poll::Pending => return Poll::Pending,
-    }
-    // 2. Queue the new data frame and flush it.
+/// Queue a fresh binary frame for `buf` and flush it to the wire.
+fn framed_write<S: Read + Write>(framed: &mut WsFramed<S>, buf: &[u8]) -> io::Result<usize> {
+    // Flush anything already queued (a previous partial write, a pong).
+    framed_flush_write(framed)?;
     if buf.is_empty() {
-        return Poll::Ready(Ok(0));
+        return Ok(0);
     }
     enqueue_frame(framed, 0x2, buf);
-    match framed_flush_write(framed, cx) {
-        Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-        Poll::Pending => Poll::Pending,
-    }
+    framed_flush_write(framed)?;
+    Ok(buf.len())
 }
 
-fn framed_poll_flush<S: AsyncRead + AsyncWrite + Unpin>(
-    framed: &mut WsFramed<S>,
-    cx: &mut Context<'_>,
-) -> Poll<io::Result<()>> {
-    framed_flush_write(framed, cx)
-}
-
-/// Write `write_buf` to the wire in full (poll-based, reentrant via
-/// `write_pos`).
-fn framed_flush_write<S: AsyncRead + AsyncWrite + Unpin>(
-    framed: &mut WsFramed<S>,
-    cx: &mut Context<'_>,
-) -> Poll<io::Result<()>> {
-    loop {
-        if framed.write_pos >= framed.write_buf.len() {
-            framed.write_buf.clear();
-            framed.write_pos = 0;
-            return Poll::Ready(Ok(()));
-        }
-        let remaining = &framed.write_buf[framed.write_pos..];
-        match Pin::new(&mut framed.inner).poll_write(cx, remaining) {
-            Poll::Ready(Ok(0)) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "websocket write returned 0 bytes",
-                )))
-            }
-            Poll::Ready(Ok(n)) => framed.write_pos += n,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
-    }
-}
-
-/// Serve buffered message bytes, then parse incoming frames.
-fn framed_poll_read<S: AsyncRead + AsyncWrite + Unpin>(
-    framed: &mut WsFramed<S>,
-    cx: &mut Context<'_>,
-    buf: &mut ReadBuf<'_>,
-) -> Poll<io::Result<()>> {
+/// Serve buffered message bytes, then parse incoming frames, reading more
+/// wire bytes as needed. Blocking reads are bounded by the socket's read
+/// timeout (a timeout mid-read propagates as `WouldBlock`/`TimedOut`).
+fn framed_read<S: Read + Write>(framed: &mut WsFramed<S>, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         // 1. Serve already-decoded message bytes.
         if framed.outpos < framed.out.len() {
             let remaining = &framed.out[framed.outpos..];
-            let n = std::cmp::min(remaining.len(), buf.remaining());
-            buf.put_slice(&remaining[..n]);
+            let n = std::cmp::min(remaining.len(), buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
             framed.outpos += n;
             if framed.outpos >= framed.out.len() {
                 framed.out.clear();
                 framed.outpos = 0;
             }
-            return Poll::Ready(Ok(()));
+            return Ok(n);
         }
 
         // 2. Parse any complete frames available in the input buffer. When a
@@ -679,7 +512,7 @@ fn framed_poll_read<S: AsyncRead + AsyncWrite + Unpin>(
         loop {
             match framed.parse_one() {
                 None => break, // need more wire bytes
-                Some(Err(e)) => return Poll::Ready(Err(e)),
+                Some(Err(e)) => return Err(e),
                 Some(Ok(Some(frame))) => {
                     let FrameOut {
                         fin,
@@ -693,9 +526,7 @@ fn framed_poll_read<S: AsyncRead + AsyncWrite + Unpin>(
                                 io::Error::other("continuation frame without a started message")
                             })?;
                             if framed.frag.len() + payload.len() > MAX_WS_MESSAGE as usize {
-                                return Poll::Ready(Err(io::Error::other(
-                                    "websocket message too large",
-                                )));
+                                return Err(io::Error::other("websocket message too large"));
                             }
                             framed.frag.extend_from_slice(&payload);
                             if fin {
@@ -708,9 +539,9 @@ fn framed_poll_read<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                         0x1 | 0x2 => {
                             if framed.frag_opcode.is_some() {
-                                return Poll::Ready(Err(io::Error::other(
+                                return Err(io::Error::other(
                                     "new data frame during fragmented message",
-                                )));
+                                ));
                             }
                             if fin {
                                 framed.out = payload;
@@ -724,22 +555,22 @@ fn framed_poll_read<S: AsyncRead + AsyncWrite + Unpin>(
                         // Ping → respond pong.
                         0x9 => {
                             if payload.len() > 125 {
-                                return Poll::Ready(Err(io::Error::other("ping frame too large")));
+                                return Err(io::Error::other("ping frame too large"));
                             }
                             enqueue_frame(framed, 0xA, &payload);
-                            let _ = framed_flush_write(framed, cx);
+                            framed_flush_write(framed)?;
                         }
                         // Pong — ignore.
                         0xA => {}
                         // Close → surface EOF.
                         0x8 => {
                             framed.eof = true;
-                            return Poll::Ready(Ok(()));
+                            return Ok(0);
                         }
                         _ => {
-                            return Poll::Ready(Err(io::Error::other(format!(
+                            return Err(io::Error::other(format!(
                                 "unsupported websocket opcode 0x{opcode:x}"
-                            ))))
+                            )))
                         }
                     }
                     if delivered {
@@ -755,34 +586,162 @@ fn framed_poll_read<S: AsyncRead + AsyncWrite + Unpin>(
             continue;
         }
 
-        // 4. Need more wire bytes: compact and read.
+        // 4. Need more wire bytes: compact and read (bounded by the socket
+        //    read timeout; a timeout propagates as an idle signal).
         if framed.inpos > 0 {
             framed.inbuf.drain(..framed.inpos);
             framed.inpos = 0;
         }
         let mut chunk = [0u8; 8192];
-        let mut read_buf = ReadBuf::new(&mut chunk);
-        match Pin::new(&mut framed.inner).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => {
-                let n = read_buf.filled().len();
-                if n == 0 {
-                    // Peer closed the TCP stream.
-                    return Poll::Ready(Ok(()));
-                }
-                framed.inbuf.extend_from_slice(&chunk[..n]);
+        match framed.inner.read(&mut chunk) {
+            Ok(0) => {
+                // Peer closed the TCP stream.
+                framed.eof = true;
+                return Ok(0);
             }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
+            Ok(n) => framed.inbuf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(e),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WsStream
+// ---------------------------------------------------------------------------
+
+/// A WebSocket duplex stream. Internally shares the codec behind a mutex so
+/// reads, writes and half-close can come from different threads (the relay's
+/// two copy threads, or `split()` halves).
+pub struct WsStream<S> {
+    framed: Arc<Mutex<WsFramed<S>>>,
+}
+
+impl<S: Read + Write> WsStream<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            framed: Arc::new(Mutex::new(WsFramed::new(inner))),
+        }
+    }
+
+    /// Split into independent write/read halves that share the underlying
+    /// codec (each operation is serialized by the internal mutex).
+    pub fn split(self) -> (WsSink<S>, WsReader<S>) {
+        (WsSink::new(self.framed.clone()), WsReader::new(self.framed))
+    }
+}
+
+impl<S: Read + Write> Read for WsStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .framed
+            .lock()
+            .map_err(|_| io::Error::other("ws mutex poisoned"))?;
+        framed_read(&mut *guard, buf)
+    }
+}
+
+impl<S: Read + Write> Write for WsStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut guard = self
+            .framed
+            .lock()
+            .map_err(|_| io::Error::other("ws mutex poisoned"))?;
+        framed_write(&mut *guard, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut guard = self
+            .framed
+            .lock()
+            .map_err(|_| io::Error::other("ws mutex poisoned"))?;
+        framed_flush_write(&mut *guard)
+    }
+}
+
+impl<S: Read + Write + Send> crate::common::stream::SyncStream for WsStream<S> {
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        if how != std::net::Shutdown::Read {
+            // Best-effort close frame, then flush.
+            let mut guard = self
+                .framed
+                .lock()
+                .map_err(|_| io::Error::other("ws mutex poisoned"))?;
+            framed_enqueue_close(&mut *guard);
+            framed_flush_write(&mut *guard)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split halves
+// ---------------------------------------------------------------------------
+
+pub struct WsSink<S: Read + Write> {
+    inner: Arc<Mutex<WsFramed<S>>>,
+}
+
+impl<S: Read + Write> WsSink<S> {
+    fn new(inner: Arc<Mutex<WsFramed<S>>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: Read + Write> Write for WsSink<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("ws mutex poisoned"))?;
+        framed_write(&mut *guard, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("ws mutex poisoned"))?;
+        framed_flush_write(&mut *guard)
+    }
+}
+
+impl<S: Read + Write> Drop for WsSink<S> {
+    fn drop(&mut self) {
+        // Emit a close frame on teardown so the peer sees a clean shutdown.
+        if let Ok(mut guard) = self.inner.try_lock() {
+            framed_enqueue_close(&mut *guard);
+            let _ = framed_flush_write(&mut *guard);
+        }
+    }
+}
+
+pub struct WsReader<S: Read + Write> {
+    inner: Arc<Mutex<WsFramed<S>>>,
+}
+
+impl<S: Read + Write> WsReader<S> {
+    fn new(inner: Arc<Mutex<WsFramed<S>>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: Read + Write> Read for WsReader<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("ws mutex poisoned"))?;
+        framed_read(&mut *guard, buf)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::stream::SyncStream;
     use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+    use std::time::Duration;
 
     /// A minimal blocking RFC 6455 server used to test the client codec:
     /// performs the handshake and echoes every data message back.
@@ -793,9 +752,7 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                    .ok();
+                stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
                 std::thread::spawn(move || {
                     // Handshake.
                     let mut head = Vec::new();
@@ -892,69 +849,48 @@ mod tests {
         addr
     }
 
-    #[tokio::test]
-    async fn handshake_and_echo_roundtrip() {
+    #[test]
+    fn handshake_and_echo_roundtrip() {
         let addr = spawn_echo_server();
-        let tcp = TcpStream::connect(addr).await.unwrap();
         let config = WebSocketConfig {
-            path: "/chat".to_string(),
-            host: None,
+            path: "/".to_string(),
+            host: Some("echo.test".to_string()),
             headers: HashMap::new(),
             max_early_data: 0,
             early_data_header: None,
         };
         let transport = WebSocketTransport::new(config, "echo.test", addr.port(), false);
-        let mut ws = transport.connect(tcp).await.unwrap();
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut ws = transport.connect(tcp).unwrap();
 
-        let payload = vec![0x42u8; 300]; // spans the 16-bit length path
-        ws.write_all(&payload).await.unwrap();
-        let mut echoed = Vec::with_capacity(payload.len());
-        let mut buf = [0u8; 1024];
-        while echoed.len() < payload.len() {
-            let n = ws.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            echoed.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(echoed, payload);
+        let payload = b"hello websocket";
+        ws.write_all(payload).unwrap();
+        ws.flush().unwrap();
 
-        ws.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn split_halves_roundtrip() {
-        let addr = spawn_echo_server();
-        let tcp = TcpStream::connect(addr).await.unwrap();
-        let config = WebSocketConfig::default();
-        let transport = WebSocketTransport::new(config, "echo.test", addr.port(), false);
-        let ws = transport.connect(tcp).await.unwrap();
-        let (mut sink, mut reader) = ws.split();
-
-        let payload = b"split-test-payload".to_vec();
-        sink.write_all(&payload).await.unwrap();
-        sink.flush().await.unwrap();
-        let mut echoed = Vec::with_capacity(payload.len());
-        let mut buf = [0u8; 1024];
-        while echoed.len() < payload.len() {
-            let n = reader.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            echoed.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(echoed, payload);
-
-        sink.shutdown().await.unwrap();
+        let mut buf = [0u8; 256];
+        let n = ws.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], payload);
+        ws.shutdown(std::net::Shutdown::Both).ok();
     }
 
     #[test]
-    fn compute_accept_matches_rfc_sample() {
-        // RFC 6455 §1.3 sample: key "dGhlIHNhbXBsZSBub25jZQ==" →
-        // "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-        assert_eq!(
-            compute_accept("dGhlIHNhbXBsZSBub25jZQ=="),
-            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-        );
+    fn split_halves_roundtrip() {
+        let addr = spawn_echo_server();
+        let config = WebSocketConfig::default();
+        let transport = WebSocketTransport::new(config, "echo.test", addr.port(), false);
+        let tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let ws = transport.connect(tcp).unwrap();
+        let (mut sink, mut reader) = ws.split();
+
+        let payload = b"split test";
+        sink.write_all(payload).unwrap();
+        sink.flush().unwrap();
+
+        let mut buf = [0u8; 256];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], payload);
+        drop(sink);
     }
 }

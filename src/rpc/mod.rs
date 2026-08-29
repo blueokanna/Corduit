@@ -19,8 +19,6 @@
 //! only serialization technology involved (JSON for humans, `rustbinary` for
 //! the compact binary FFI channel).
 
-use std::future::Future;
-
 use nextjson::NsonSerialize;
 
 use crate::api;
@@ -137,13 +135,13 @@ impl<'a> Args<'a> {
 /// Result of a dispatch call: the encoded value or a human-readable error.
 pub type HandlerResult = Result<nextjson::Value, String>;
 
-/// Await a typed async API call and fold it into a `nextjson::Value`.
-async fn call<T, E>(fut: impl Future<Output = Result<T, E>>) -> HandlerResult
+/// Fold a typed synchronous API call into a `nextjson::Value`.
+fn call<T, E>(res: Result<T, E>) -> HandlerResult
 where
     T: NsonSerialize,
     E: std::fmt::Display,
 {
-    match fut.await {
+    match res {
         Ok(value) => nextjson::to_value(&value).map_err(|e| format!("response encode failed: {e}")),
         Err(e) => Err(format!("{e}")),
     }
@@ -167,7 +165,7 @@ fn ok_null() -> HandlerResult {
 /// This is the only entry point every transport (FFI, HTTP, WebSocket) calls.
 /// Unknown methods and malformed arguments are reported as errors, never
 /// panics.
-pub async fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
+pub fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
     let args = Args(args);
     match method {
         // ---- lifecycle ----
@@ -179,97 +177,97 @@ pub async fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
         // ---- proxy control (YAML) ----
         "start_proxy_from_yaml" => {
             let yaml = args.string("yaml_config")?;
-            call(api::start_proxy_from_yaml(yaml)).await
+            call(api::start_proxy_from_yaml(yaml))
         }
         "start_proxy_from_file" => {
             let path = args.string("config_path")?;
-            call(api::start_proxy_from_file(path)).await
+            call(api::start_proxy_from_file(path))
         }
-        "stop_proxy" => call(api::stop_proxy()).await,
-        "is_proxy_running" => call(api::is_proxy_running()).await,
+        "stop_proxy" => call(api::stop_proxy()),
+        "is_proxy_running" => call(api::is_proxy_running()),
         "reload_config_from_yaml" => {
             let yaml = args.string("yaml_config")?;
-            call(api::reload_config_from_yaml(yaml)).await
+            call(api::reload_config_from_yaml(yaml))
         }
         "reload_config_from_file" => {
             let path = args.string("config_path")?;
-            call(api::reload_config_from_file(path)).await
+            call(api::reload_config_from_file(path))
         }
 
         // ---- dashboard / DTOs ----
-        "get_traffic_stats_dto" => call(api::get_traffic_stats_dto()).await,
-        "get_connections_dto" => call(api::get_connections_dto()).await,
+        "get_traffic_stats_dto" => call(api::get_traffic_stats_dto()),
+        "get_connections_dto" => call(api::get_connections_dto()),
         "close_connection_by_id" => {
             let id = args.string("id")?;
-            call(api::close_connection_by_id(id)).await
+            call(api::close_connection_by_id(id))
         }
-        "close_all_connections_dto" => call(api::close_all_connections_dto()).await,
-        "get_proxies" => call(api::get_proxies()).await,
-        "get_proxy_groups" => call(api::get_proxy_groups()).await,
+        "close_all_connections_dto" => call(api::close_all_connections_dto()),
+        "get_proxies" => call(api::get_proxies()),
+        "get_proxy_groups" => call(api::get_proxy_groups()),
         "select_proxy" => {
             let group = args.string("group_tag")?;
             let proxy = args.string("proxy_tag")?;
-            call(api::select_proxy(group, proxy)).await
+            call(api::select_proxy(group, proxy))
         }
         "test_proxy_latency_dto" => {
             let tag = args.string("tag")?;
             let url = args.string("test_url")?;
             let timeout = args.u64("timeout_ms")?;
-            call(api::test_proxy_latency_dto(tag, url, timeout)).await
+            call(api::test_proxy_latency_dto(tag, url, timeout))
         }
         "test_all_proxies_latency" => {
             let url = args.string("test_url")?;
             let timeout = args.u64("timeout_ms")?;
-            call(api::test_all_proxies_latency(url, timeout)).await
+            call(api::test_all_proxies_latency(url, timeout))
         }
-        "get_rules" => call(api::get_rules()).await,
-        "get_dns_config" => call(api::get_dns_config()).await,
+        "get_rules" => call(api::get_rules()),
+        "get_dns_config" => call(api::get_dns_config()),
         "set_proxy_mode" => {
             let mode = args.i32("mode")?;
-            call(api::set_proxy_mode(mode)).await
+            call(api::set_proxy_mode(mode))
         }
-        "get_proxy_mode" => call(api::get_proxy_mode()).await,
+        "get_proxy_mode" => call(api::get_proxy_mode()),
 
         // ---- TUN / VPN (legacy Windows entry points) ----
         "start_tun_mode" => {
             let name = args.string("tun_name")?;
             let address = args.string("tun_address")?;
             let netmask = args.string("tun_netmask")?;
-            call(api::start_tun_mode(name, address, netmask)).await
+            call(api::start_tun_mode(name, address, netmask))
         }
-        "stop_tun_mode" => call(api::stop_tun_mode()).await,
+        "stop_tun_mode" => call(api::stop_tun_mode()),
 
         // ---- modern engine API ----
         "initialize_corduit" => {
             let config = args.string("config_json")?;
-            call(api::initialize_corduit(config)).await
+            call(api::initialize_corduit(config))
         }
-        "start_corduit" => call(api::start_corduit()).await,
-        "stop_corduit" => call(api::stop_corduit()).await,
+        "start_corduit" => call(api::start_corduit()),
+        "stop_corduit" => call(api::stop_corduit()),
         "reload_corduit" => {
             let config = args.string("config_json")?;
-            call(api::reload_corduit(config)).await
+            call(api::reload_corduit(config))
         }
-        "get_corduit_status" => call(api::get_corduit_status()).await,
-        "get_traffic_stats" => call(api::get_traffic_stats()).await,
+        "get_corduit_status" => call(api::get_corduit_status()),
+        "get_traffic_stats" => call(api::get_traffic_stats()),
         "test_config" => {
             let config = args.string("config_json")?;
-            call(api::test_config(config)).await
+            call(api::test_config(config))
         }
-        "get_connections" => call(api::get_connections()).await,
+        "get_connections" => call(api::get_connections()),
         "close_connection" => {
             let id = args.string("connection_id")?;
-            call(api::close_connection(id)).await
+            call(api::close_connection(id))
         }
         "get_logs" => {
             let lines = args.opt_u32("lines")?;
-            call(api::get_logs(lines)).await
+            call(api::get_logs(lines))
         }
         "set_log_level" => {
             let level = args.string("level")?;
-            call(api::set_log_level(level)).await
+            call(api::set_log_level(level))
         }
-        "get_system_info" => call(api::get_system_info()).await,
+        "get_system_info" => call(api::get_system_info()),
         "get_version" => value(&api::get_version()),
         "get_build_info" => value(&api::get_build_info()),
 
@@ -278,18 +276,18 @@ pub async fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
             let server = args.string("server")?;
             let port = args.u16("port")?;
             let timeout = args.u32("timeout_ms")?;
-            call(api::test_proxy_latency(server, port, timeout)).await
+            call(api::test_proxy_latency(server, port, timeout))
         }
         "test_outbound_latency" => {
             let name = args.string("outbound_name")?;
             let timeout = args.u32("timeout_ms")?;
-            call(api::test_outbound_latency(name, timeout)).await
+            call(api::test_outbound_latency(name, timeout))
         }
         "test_tcp_connectivity" => {
             let server = args.string("server")?;
             let port = args.u16("port")?;
             let timeout = args.u32("timeout_ms")?;
-            call(api::test_tcp_connectivity(server, port, timeout)).await
+            call(api::test_tcp_connectivity(server, port, timeout))
         }
         "test_shadowsocks_latency" => {
             let server = args.string("server")?;
@@ -300,53 +298,52 @@ pub async fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
             call(api::test_shadowsocks_latency(
                 server, port, password, cipher, timeout,
             ))
-            .await
         }
         "test_proxies_latency" => {
             let proxies = args.proxies("proxies")?;
             let timeout = args.u32("timeout_ms")?;
-            call(api::test_proxies_latency(proxies, timeout)).await
+            call(api::test_proxies_latency(proxies, timeout))
         }
 
         // ---- proxy group selection ----
         "select_proxy_in_group" => {
             let group = args.string("group_name")?;
             let proxy = args.string("proxy_name")?;
-            call(api::select_proxy_in_group(group, proxy)).await
+            call(api::select_proxy_in_group(group, proxy))
         }
         "get_selected_proxy_in_group" => {
             let group = args.string("group_name")?;
-            call(api::get_selected_proxy_in_group(group)).await
+            call(api::get_selected_proxy_in_group(group))
         }
 
         // ---- connection tracking ----
-        "get_active_connections" => call(api::get_active_connections()).await,
+        "get_active_connections" => call(api::get_active_connections()),
         "close_active_connection" => {
             let id = args.string("connection_id")?;
-            call(api::close_active_connection(id)).await
+            call(api::close_active_connection(id))
         }
-        "close_all_connections" => call(api::close_all_connections()).await,
-        "get_connection_stats" => call(api::get_connection_stats()).await,
+        "close_all_connections" => call(api::close_all_connections()),
+        "get_connection_stats" => call(api::get_connection_stats()),
 
         // ---- wintun / TUN status ----
         "is_wintun_available" => value(&api::is_wintun_available()),
         "get_wintun_dll_path" => value(&api::get_wintun_dll_path()),
-        "ensure_wintun_dll" => call(api::ensure_wintun_dll()).await,
-        "enable_tun_mode" => call(api::enable_tun_mode()).await,
+        "ensure_wintun_dll" => call(api::ensure_wintun_dll()),
+        "enable_tun_mode" => call(api::enable_tun_mode()),
         "enable_tun_mode_with_mode" => {
             let mode = args.string("mode")?;
-            call(api::enable_tun_mode_with_mode(mode)).await
+            call(api::enable_tun_mode_with_mode(mode))
         }
-        "disable_tun_mode" => call(api::disable_tun_mode()).await,
-        "get_tun_status" => call(api::get_tun_status()).await,
+        "disable_tun_mode" => call(api::disable_tun_mode()),
+        "get_tun_status" => call(api::get_tun_status()),
         "set_windows_proxy_mode" => {
             let mode = args.string("mode")?;
-            call(async move { api::set_windows_proxy_mode(mode) }).await
+            call(api::set_windows_proxy_mode(mode))
         }
         "get_windows_proxy_mode_str" => value(&api::get_windows_proxy_mode_str()),
-        "get_windows_tun_stats" => call(async move { api::get_windows_tun_stats() }).await,
-        "enable_uwp_loopback" => call(api::enable_uwp_loopback()).await,
-        "open_uwp_loopback_utility" => call(api::open_uwp_loopback_utility()).await,
+        "get_windows_tun_stats" => call(api::get_windows_tun_stats()),
+        "enable_uwp_loopback" => call(api::enable_uwp_loopback()),
+        "open_uwp_loopback_utility" => call(api::open_uwp_loopback_utility()),
 
         // ---- Android ----
         "set_android_vpn_fd" => {
@@ -365,8 +362,8 @@ pub async fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
             ok_null()
         }
         "get_android_proxy_mode" => value(&api::get_android_proxy_mode()),
-        "start_android_vpn" => call(api::start_android_vpn()).await,
-        "stop_android_vpn" => call(api::stop_android_vpn()).await,
+        "start_android_vpn" => call(api::start_android_vpn()),
+        "stop_android_vpn" => call(api::stop_android_vpn()),
 
         // ---- iOS ----
         "set_ios_vpn_fd" => {
@@ -400,10 +397,10 @@ pub async fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
         "start_rpc_server" => {
             let port = args.u16("port")?;
             let token = args.opt_string("token")?;
-            call(api::start_rpc_server(port, token)).await
+            call(api::start_rpc_server(port, token))
         }
-        "stop_rpc_server" => call(async move { api::stop_rpc_server() }).await,
-        "get_rpc_server_status" => call(async move { api::get_rpc_server_status() }).await,
+        "stop_rpc_server" => call(api::stop_rpc_server()),
+        "get_rpc_server_status" => call(api::get_rpc_server_status()),
 
         _ => Err(format!("unknown method '{method}'")),
     }
@@ -512,21 +509,10 @@ pub const CORDUIT_METHODS: &[&str] = &[
 mod tests {
     use super::*;
 
-    fn runtime() -> &'static tokio::runtime::Runtime {
-        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-        RT.get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_name("corduit-rpc-test")
-                .build()
-                .expect("failed to build test runtime")
-        })
-    }
-
     #[test]
     fn dispatch_rejects_unknown_method() {
         let value = nextjson::Value::Null;
-        let result = runtime().block_on(dispatch("no_such_method", &value));
+        let result = dispatch("no_such_method", &value);
         assert!(result.is_err());
     }
 
@@ -578,7 +564,7 @@ mod tests {
 
         let value = nextjson::Value::Null;
         for method in CORDUIT_METHODS {
-            let result = runtime().block_on(dispatch(method, &value));
+            let result = dispatch(method, &value);
             if let Err(e) = result {
                 assert!(
                     !e.starts_with("unknown method"),

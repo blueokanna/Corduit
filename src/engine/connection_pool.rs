@@ -1,8 +1,8 @@
 use crate::engine::error::{Error, Result};
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
 /// Connection pool entry
 #[derive(Debug)]
@@ -65,15 +65,15 @@ impl ConnectionPool {
     }
 
     /// Get a connection from the pool
-    pub async fn get_connection(&self, target: &str) -> Result<Arc<Mutex<PooledConnection>>> {
+    pub fn get_connection(&self, target: &str) -> Result<Arc<Mutex<PooledConnection>>> {
         let mut pool = self.pools.entry(target.to_string()).or_default();
 
         // Clean up expired connections
-        self.cleanup_expired_connections(&mut pool).await;
+        self.cleanup_expired_connections(&mut pool);
 
         // Find an available connection
         for conn_mutex in pool.iter() {
-            let mut conn = conn_mutex.lock().await;
+            let mut conn = conn_mutex.lock();
             if conn.state == ConnectionState::Available {
                 conn.state = ConnectionState::InUse;
                 conn.last_used = Instant::now();
@@ -101,8 +101,8 @@ impl ConnectionPool {
     }
 
     /// Return a connection to the pool
-    pub async fn return_connection(&self, connection: Arc<Mutex<PooledConnection>>) -> Result<()> {
-        let mut conn = connection.lock().await;
+    pub fn return_connection(&self, connection: Arc<Mutex<PooledConnection>>) -> Result<()> {
+        let mut conn = connection.lock();
         if conn.state == ConnectionState::InUse {
             conn.state = ConnectionState::Available;
             conn.last_used = Instant::now();
@@ -111,8 +111,8 @@ impl ConnectionPool {
     }
 
     /// Remove a connection from the pool
-    pub async fn remove_connection(&self, connection: Arc<Mutex<PooledConnection>>) -> Result<()> {
-        let conn = connection.lock().await;
+    pub fn remove_connection(&self, connection: Arc<Mutex<PooledConnection>>) -> Result<()> {
+        let conn = connection.lock();
         let target = conn.target.clone();
         drop(conn);
 
@@ -123,11 +123,10 @@ impl ConnectionPool {
     }
 
     /// Clean up expired connections
-    async fn cleanup_expired_connections(&self, pool: &mut Vec<Arc<Mutex<PooledConnection>>>) {
+    fn cleanup_expired_connections(&self, pool: &mut Vec<Arc<Mutex<PooledConnection>>>) {
         let now = Instant::now();
         pool.retain(|conn| {
-            let conn_guard = conn.try_lock();
-            if let Ok(conn) = conn_guard {
+            if let Some(conn) = conn.try_lock() {
                 let age = now.duration_since(conn.last_used);
                 age < self.config.max_idle_time && conn.state != ConnectionState::Closing
             } else {
@@ -145,7 +144,7 @@ impl ConnectionPool {
         for pool in self.pools.iter() {
             for conn in pool.value() {
                 total_connections += 1;
-                if let Ok(conn) = conn.try_lock() {
+                if let Some(conn) = conn.try_lock() {
                     match conn.state {
                         ConnectionState::Available => available_connections += 1,
                         ConnectionState::InUse => in_use_connections += 1,
@@ -164,10 +163,10 @@ impl ConnectionPool {
     }
 
     /// Shutdown the connection pool
-    pub async fn shutdown(&self) -> Result<()> {
+    pub fn shutdown(&self) -> Result<()> {
         for pool in self.pools.iter() {
             for conn in pool.value() {
-                let mut conn = conn.lock().await;
+                let mut conn = conn.lock();
                 conn.state = ConnectionState::Closing;
             }
         }
@@ -189,27 +188,27 @@ pub struct PoolStats {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_connection_pool() {
+    #[test]
+    fn test_connection_pool() {
         let pool = ConnectionPool::new(PoolConfig::default());
 
         // Get a connection
-        let conn1 = pool.get_connection("example.com:80").await.unwrap();
+        let conn1 = pool.get_connection("example.com:80").unwrap();
         {
-            let conn = conn1.lock().await;
+            let conn = conn1.lock();
             assert_eq!(conn.target, "example.com:80");
             assert_eq!(conn.state, ConnectionState::InUse);
         }
 
         // Return the connection
-        pool.return_connection(conn1.clone()).await.unwrap();
+        pool.return_connection(conn1.clone()).unwrap();
         {
-            let conn = conn1.lock().await;
+            let conn = conn1.lock();
             assert_eq!(conn.state, ConnectionState::Available);
         }
 
         // Get another connection
-        let conn2 = pool.get_connection("example.com:80").await.unwrap();
+        let conn2 = pool.get_connection("example.com:80").unwrap();
         assert!(Arc::ptr_eq(&conn1, &conn2));
 
         // Check stats

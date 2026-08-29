@@ -12,8 +12,8 @@
 
 use crate::engine::config::AuthenticationConfig;
 use crate::engine::error::{Error, Result};
+use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// SOCKS5 authentication method: username/password (RFC 1929).
 pub const SOCKS5_AUTH_USERPASS: u8 = 0x02;
@@ -114,14 +114,13 @@ impl HeaderLookup for courierust::courierust_http::HeaderMap {
 /// `auth`, and writes the `[VER, STATUS]` reply. Returns `Ok(true)` only when
 /// the credentials are valid; the caller must close the connection otherwise.
 /// All lengths are single bytes (≤ 255), so reads are inherently bounded.
-pub async fn socks5_userpass<S>(stream: &mut S, auth: &InboundAuth) -> Result<bool>
+pub fn socks5_userpass<S>(stream: &mut S, auth: &InboundAuth) -> Result<bool>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Read + Write,
 {
     let mut header = [0u8; 2];
     stream
         .read_exact(&mut header)
-        .await
         .map_err(|e| Error::network(format!("Failed to read SOCKS5 auth header: {e}")))?;
     if header[0] != 0x01 {
         return Err(Error::protocol("Invalid SOCKS5 auth version"));
@@ -131,19 +130,16 @@ where
     let mut username = vec![0u8; username_len];
     stream
         .read_exact(&mut username)
-        .await
         .map_err(|e| Error::network(format!("Failed to read SOCKS5 username: {e}")))?;
 
     let mut password_len_buf = [0u8; 1];
     stream
         .read_exact(&mut password_len_buf)
-        .await
         .map_err(|e| Error::network(format!("Failed to read SOCKS5 password length: {e}")))?;
     let password_len = password_len_buf[0] as usize;
     let mut password = vec![0u8; password_len];
     stream
         .read_exact(&mut password)
-        .await
         .map_err(|e| Error::network(format!("Failed to read SOCKS5 password: {e}")))?;
 
     let username = String::from_utf8(username)
@@ -155,7 +151,6 @@ where
     let status = if ok { 0x00 } else { 0x01 };
     stream
         .write_all(&[0x01, status])
-        .await
         .map_err(|e| Error::network(format!("Failed to write SOCKS5 auth reply: {e}")))?;
     Ok(ok)
 }

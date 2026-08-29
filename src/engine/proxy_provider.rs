@@ -2,12 +2,12 @@ use crate::engine::config::{OutboundConfig, OutboundType};
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{build_outbound_proxy, OutboundProxy};
 use nextjson::{NsonDeserialize, NsonSerialize};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 /// Runtime proxy provider configuration, injected by the API layer before an
 /// engine instance is created or reloaded. Mirrors `RUNTIME_RULE_PROVIDERS`
@@ -149,22 +149,22 @@ impl ProxyProvider {
         self.config.provider_type
     }
 
-    pub async fn load(&self) -> Result<()> {
+    pub fn load(&self) -> Result<()> {
         let content = match self.config.provider_type {
-            ProxyProviderType::File => self.load_from_file().await?,
-            ProxyProviderType::Http => self.load_from_http().await?,
+            ProxyProviderType::File => self.load_from_file()?,
+            ProxyProviderType::Http => self.load_from_http()?,
         };
 
         let proxy_configs = self.parse_proxies(&content)?;
         let proxies = self.create_proxies(&proxy_configs)?;
 
-        let mut configs_guard = self.proxy_configs.write().await;
+        let mut configs_guard = self.proxy_configs.write();
         *configs_guard = proxy_configs;
 
-        let mut proxies_guard = self.proxies.write().await;
+        let mut proxies_guard = self.proxies.write();
         *proxies_guard = proxies;
 
-        let mut last_update = self.last_update.write().await;
+        let mut last_update = self.last_update.write();
         *last_update = Some(Instant::now());
 
         tracing::info!(
@@ -176,19 +176,18 @@ impl ProxyProvider {
         Ok(())
     }
 
-    async fn load_from_file(&self) -> Result<String> {
+    fn load_from_file(&self) -> Result<String> {
         let path = self
             .config
             .path
             .as_ref()
             .ok_or_else(|| Error::config("File proxy provider requires 'path' field"))?;
 
-        tokio::fs::read_to_string(path)
-            .await
+        std::fs::read_to_string(path)
             .map_err(|e| Error::config(format!("Failed to read proxy file '{}': {}", path, e)))
     }
 
-    async fn load_from_http(&self) -> Result<String> {
+    fn load_from_http(&self) -> Result<String> {
         let url = self
             .config
             .url
@@ -197,7 +196,7 @@ impl ProxyProvider {
 
         if let Some(path) = &self.config.path {
             if Path::new(path).exists() {
-                if let Ok(content) = tokio::fs::read_to_string(path).await {
+                if let Ok(content) = std::fs::read_to_string(path) {
                     return Ok(content);
                 }
             }
@@ -207,7 +206,6 @@ impl ProxyProvider {
 
         let response = client
             .get(url)
-            .await
             .map_err(|e| Error::network(format!("Failed to fetch proxies from '{url}': {e}")))?;
 
         if !response.is_success() {
@@ -223,9 +221,9 @@ impl ProxyProvider {
 
         if let Some(path) = &self.config.path {
             if let Some(parent) = Path::new(path).parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = std::fs::create_dir_all(parent);
             }
-            let _ = tokio::fs::write(path, &content).await;
+            let _ = std::fs::write(path, &content);
         }
 
         Ok(content)
@@ -274,33 +272,33 @@ impl ProxyProvider {
         Ok(proxies)
     }
 
-    pub async fn update(&self) -> Result<()> {
-        self.load().await
+    pub fn update(&self) -> Result<()> {
+        self.load()
     }
 
-    pub async fn needs_update(&self) -> bool {
-        let last_update = self.last_update.read().await;
+    pub fn needs_update(&self) -> bool {
+        let last_update = self.last_update.read();
         match *last_update {
             Some(time) => time.elapsed() > Duration::from_secs(self.config.interval),
             None => true,
         }
     }
 
-    pub async fn update_if_needed(&self) -> Result<bool> {
-        if self.needs_update().await {
-            self.update().await?;
+    pub fn update_if_needed(&self) -> Result<bool> {
+        if self.needs_update() {
+            self.update()?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
-    pub async fn health_check(&self) -> Result<()> {
+    pub fn health_check(&self) -> Result<()> {
         if !self.config.health_check.enable {
             return Ok(());
         }
 
-        let proxies = self.proxies.read().await;
+        let proxies = self.proxies.read();
         let url = &self.config.health_check.url;
         let timeout = Duration::from_millis(self.config.health_check.timeout);
 
@@ -308,7 +306,7 @@ impl ProxyProvider {
 
         for proxy in proxies.iter() {
             let tag = proxy.tag().to_string();
-            let result = match proxy.test_http_latency(url, timeout).await {
+            let result = match proxy.test_http_latency(url, timeout) {
                 Ok(latency) => ProxyHealthResult {
                     alive: true,
                     latency_ms: Some(latency.as_millis() as u64),
@@ -333,49 +331,49 @@ impl ProxyProvider {
             results.insert(tag, result);
         }
 
-        let mut health_results = self.health_results.write().await;
+        let mut health_results = self.health_results.write();
         *health_results = results;
 
-        let mut last_health_check = self.last_health_check.write().await;
+        let mut last_health_check = self.last_health_check.write();
         *last_health_check = Some(Instant::now());
 
         Ok(())
     }
 
-    pub async fn needs_health_check(&self) -> bool {
+    pub fn needs_health_check(&self) -> bool {
         if !self.config.health_check.enable {
             return false;
         }
 
-        let last_check = self.last_health_check.read().await;
+        let last_check = self.last_health_check.read();
         match *last_check {
             Some(time) => time.elapsed() > Duration::from_secs(self.config.health_check.interval),
             None => !self.config.health_check.lazy,
         }
     }
 
-    pub async fn health_check_if_needed(&self) -> Result<bool> {
-        if self.needs_health_check().await {
-            self.health_check().await?;
+    pub fn health_check_if_needed(&self) -> Result<bool> {
+        if self.needs_health_check() {
+            self.health_check()?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
-    pub async fn get_proxies(&self) -> Vec<Arc<dyn OutboundProxy>> {
-        self.proxies.read().await.clone()
+    pub fn get_proxies(&self) -> Vec<Arc<dyn OutboundProxy>> {
+        self.proxies.read().clone()
     }
 
-    pub async fn get_proxy(&self, tag: &str) -> Option<Arc<dyn OutboundProxy>> {
-        let proxies = self.proxies.read().await;
+    pub fn get_proxy(&self, tag: &str) -> Option<Arc<dyn OutboundProxy>> {
+        let proxies = self.proxies.read();
         proxies.iter().find(|p| p.tag() == tag).cloned()
     }
 
-    pub async fn get_proxy_info(&self) -> Vec<ProxyInfo> {
-        let proxies = self.proxies.read().await;
-        let configs = self.proxy_configs.read().await;
-        let health_results = self.health_results.read().await;
+    pub fn get_proxy_info(&self) -> Vec<ProxyInfo> {
+        let proxies = self.proxies.read();
+        let configs = self.proxy_configs.read();
+        let health_results = self.health_results.read();
 
         let mut info_list = Vec::new();
 
@@ -399,9 +397,9 @@ impl ProxyProvider {
         info_list
     }
 
-    pub async fn get_alive_proxies(&self) -> Vec<Arc<dyn OutboundProxy>> {
-        let proxies = self.proxies.read().await;
-        let health_results = self.health_results.read().await;
+    pub fn get_alive_proxies(&self) -> Vec<Arc<dyn OutboundProxy>> {
+        let proxies = self.proxies.read();
+        let health_results = self.health_results.read();
 
         proxies
             .iter()
@@ -410,8 +408,8 @@ impl ProxyProvider {
             .collect()
     }
 
-    pub async fn proxy_count(&self) -> usize {
-        self.proxies.read().await.len()
+    pub fn proxy_count(&self) -> usize {
+        self.proxies.read().len()
     }
 }
 
@@ -426,83 +424,83 @@ impl ProxyProviderManager {
         }
     }
 
-    pub async fn add_provider(&self, config: ProxyProviderConfig) -> Result<()> {
+    pub fn add_provider(&self, config: ProxyProviderConfig) -> Result<()> {
         let name = config.name.clone();
         let provider = Arc::new(ProxyProvider::new(config));
-        provider.load().await?;
+        provider.load()?;
 
-        let mut providers = self.providers.write().await;
+        let mut providers = self.providers.write();
         providers.insert(name, provider);
 
         Ok(())
     }
 
-    pub async fn remove_provider(&self, name: &str) {
-        let mut providers = self.providers.write().await;
+    pub fn remove_provider(&self, name: &str) {
+        let mut providers = self.providers.write();
         providers.remove(name);
     }
 
-    pub async fn get_provider(&self, name: &str) -> Option<Arc<ProxyProvider>> {
-        let providers = self.providers.read().await;
+    pub fn get_provider(&self, name: &str) -> Option<Arc<ProxyProvider>> {
+        let providers = self.providers.read();
         providers.get(name).cloned()
     }
 
-    pub async fn get_all_providers(&self) -> Vec<Arc<ProxyProvider>> {
-        let providers = self.providers.read().await;
+    pub fn get_all_providers(&self) -> Vec<Arc<ProxyProvider>> {
+        let providers = self.providers.read();
         providers.values().cloned().collect()
     }
 
-    pub async fn get_proxy(
+    pub fn get_proxy(
         &self,
         provider_name: &str,
         proxy_tag: &str,
     ) -> Option<Arc<dyn OutboundProxy>> {
-        let providers = self.providers.read().await;
+        let providers = self.providers.read();
         if let Some(provider) = providers.get(provider_name) {
-            provider.get_proxy(proxy_tag).await
+            provider.get_proxy(proxy_tag)
         } else {
             None
         }
     }
 
-    pub async fn get_all_proxies(&self) -> Vec<Arc<dyn OutboundProxy>> {
-        let providers = self.providers.read().await;
+    pub fn get_all_proxies(&self) -> Vec<Arc<dyn OutboundProxy>> {
+        let providers = self.providers.read();
         let mut all_proxies = Vec::new();
 
         for provider in providers.values() {
-            let proxies = provider.get_proxies().await;
+            let proxies = provider.get_proxies();
             all_proxies.extend(proxies);
         }
 
         all_proxies
     }
 
-    pub async fn update_all(&self) -> Vec<Result<bool>> {
-        let providers = self.providers.read().await;
+    pub fn update_all(&self) -> Vec<Result<bool>> {
+        let providers = self.providers.read();
         let mut results = Vec::new();
 
         for provider in providers.values() {
-            results.push(provider.update_if_needed().await);
+            results.push(provider.update_if_needed());
         }
 
         results
     }
 
-    pub async fn health_check_all(&self) -> Vec<Result<bool>> {
-        let providers = self.providers.read().await;
+    pub fn health_check_all(&self) -> Vec<Result<bool>> {
+        let providers = self.providers.read();
         let mut results = Vec::new();
 
         for provider in providers.values() {
-            results.push(provider.health_check_if_needed().await);
+            results.push(provider.health_check_if_needed());
         }
 
         results
     }
 
-    pub async fn reload_provider(&self, name: &str) -> Result<()> {
-        let providers = self.providers.read().await;
+    pub fn reload_provider(&self, name: &str) -> Result<()> {
+        let providers = self.providers.read();
         if let Some(provider) = providers.get(name) {
-            provider.load().await
+            provider.load()
         } else {
             Err(Error::config(format!(
                 "Proxy provider '{}' not found",
@@ -513,12 +511,12 @@ impl ProxyProviderManager {
 
     /// Remove every provider. Used on reload so outbound rebuilds start from a
     /// clean slate instead of accumulating stale providers.
-    pub async fn clear(&self) {
-        self.providers.write().await.clear();
+    pub fn clear(&self) {
+        self.providers.write().clear();
     }
 
-    pub async fn provider_count(&self) -> usize {
-        self.providers.read().await.len()
+    pub fn provider_count(&self) -> usize {
+        self.providers.read().len()
     }
 }
 
@@ -637,14 +635,14 @@ mod tests {
         assert_eq!(proxies.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_proxy_provider_manager_new() {
+    #[test]
+    fn test_proxy_provider_manager_new() {
         let manager = ProxyProviderManager::new();
-        assert_eq!(manager.provider_count().await, 0);
+        assert_eq!(manager.provider_count(), 0);
     }
 
-    #[tokio::test]
-    async fn test_needs_update_initial() {
+    #[test]
+    fn test_needs_update_initial() {
         let config = ProxyProviderConfig {
             name: "test".to_string(),
             provider_type: ProxyProviderType::File,
@@ -655,6 +653,6 @@ mod tests {
         };
 
         let provider = ProxyProvider::new(config);
-        assert!(provider.needs_update().await);
+        assert!(provider.needs_update());
     }
 }

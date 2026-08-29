@@ -3,9 +3,7 @@
 //! Each query is a short request/response exchange: connect a TCP socket,
 //! perform a TLS 1.2/1.3 handshake with courierust (system roots from
 //! [`crate::common::roots`]), write the 2-byte length-prefixed DNS message,
-//! read the length-prefixed reply. Because the whole exchange is
-//! synchronous, it runs inside `tokio::task::spawn_blocking` — the async
-//! engine is never blocked.
+//! read the length-prefixed reply. The whole exchange is synchronous.
 
 use crate::common::roots::system_root_store;
 use crate::dns::error::{DnsError, Result};
@@ -15,11 +13,11 @@ use crate::dns::wire::{
 use crate::dns::RecordType;
 use courierust::courierust_io::{Read as CRead, Write as CWrite};
 use courierust::courierust_tls::{ClientConfig, TlsConnector, TlsVersion};
+use parking_lot::RwLock;
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
 /// DNS over TLS uses a 2-byte big-endian length prefix (RFC 7858 §3.3).
@@ -107,12 +105,12 @@ impl DotClient {
     }
 
     /// Resolve a domain name to IP addresses.
-    pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
+    pub fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
         // Try A records first.
-        let mut ips = self.query(domain, RecordType::A).await.unwrap_or_default();
+        let mut ips = self.query(domain, RecordType::A).unwrap_or_default();
 
         // Also try AAAA records.
-        if let Ok(ipv6) = self.query(domain, RecordType::AAAA).await {
+        if let Ok(ipv6) = self.query(domain, RecordType::AAAA) {
             ips.extend(ipv6);
         }
 
@@ -127,9 +125,9 @@ impl DotClient {
     }
 
     /// Query DNS records.
-    pub async fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+    pub fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let query_bytes = self.build_query(domain, record_type.into())?;
-        let response_bytes = self.send_query(&query_bytes).await?;
+        let response_bytes = self.send_query(&query_bytes)?;
         self.parse_response(&response_bytes)
     }
 
@@ -157,62 +155,50 @@ impl DotClient {
             .map_err(|e| DnsError::Protocol(format!("Failed to serialize query: {}", e)))
     }
 
-    /// Send a DNS query over TLS via courierust (blocking exchange on a
-    /// worker thread).
-    async fn send_query(&self, query: &[u8]) -> Result<Vec<u8>> {
-        let server = self.server.clone();
-        let port = self.port;
-        let tls_name = self.tls_name.clone();
-        let timeout = self.timeout;
-        let connector = self.tls_connector.clone();
-        let query = query.to_vec();
+    /// Send a DNS query over TLS via courierust (blocking exchange).
+    fn send_query(&self, query: &[u8]) -> Result<Vec<u8>> {
+        // Resolve the host (courierust's transport is synchronous).
+        let addrs: Vec<SocketAddr> = (self.server.as_str(), self.port)
+            .to_socket_addrs()
+            .map_err(DnsError::Io)?
+            .collect();
+        let addr = addrs.first().copied().ok_or_else(|| {
+            DnsError::Config(format!("no address for {}:{}", self.server, self.port))
+        })?;
 
-        tokio::task::spawn_blocking(move || {
-            // Resolve the host (courierust's transport is synchronous).
-            let addrs: Vec<SocketAddr> = (server.as_str(), port)
-                .to_socket_addrs()
-                .map_err(DnsError::Io)?
-                .collect();
-            let addr = addrs
-                .first()
-                .copied()
-                .ok_or_else(|| DnsError::Config(format!("no address for {server}:{port}")))?;
+        let tcp = TcpStream::connect_timeout(&addr, self.timeout).map_err(DnsError::Io)?;
+        let _ = tcp.set_read_timeout(Some(self.timeout));
+        let _ = tcp.set_write_timeout(Some(self.timeout));
 
-            let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(DnsError::Io)?;
-            let _ = tcp.set_read_timeout(Some(timeout));
-            let _ = tcp.set_write_timeout(Some(timeout));
+        // TLS handshake over the socket.
+        let mut tls = self
+            .tls_connector
+            .connect(&self.tls_name, &tcp, &tcp)
+            .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {e}")))?;
 
-            // TLS handshake over the socket.
-            let mut tls = connector
-                .connect(&tls_name, &tcp, &tcp)
-                .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {e}")))?;
+        // Write the 2-byte length prefix + query.
+        let mut request = Vec::with_capacity(LEN_PREFIX + query.len());
+        request.extend_from_slice(&(query.len() as u16).to_be_bytes());
+        request.extend_from_slice(query);
+        write_all(&mut tls, &request)
+            .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
 
-            // Write the 2-byte length prefix + query.
-            let mut request = Vec::with_capacity(LEN_PREFIX + query.len());
-            request.extend_from_slice(&(query.len() as u16).to_be_bytes());
-            request.extend_from_slice(&query);
-            write_all(&mut tls, &request)
-                .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
+        // Read the response length prefix.
+        let mut len_buf = [0u8; 2];
+        read_exact(&mut tls, &mut len_buf)
+            .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
+        let response_len = u16::from_be_bytes(len_buf) as usize;
+        if response_len > 65535 {
+            return Err(DnsError::Protocol("Response too large".to_string()));
+        }
 
-            // Read the response length prefix.
-            let mut len_buf = [0u8; 2];
-            read_exact(&mut tls, &mut len_buf)
-                .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
-            let response_len = u16::from_be_bytes(len_buf) as usize;
-            if response_len > 65535 {
-                return Err(DnsError::Protocol("Response too large".to_string()));
-            }
+        // Read the response body.
+        let mut response = vec![0u8; response_len];
+        read_exact(&mut tls, &mut response)
+            .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
 
-            // Read the response body.
-            let mut response = vec![0u8; response_len];
-            read_exact(&mut tls, &mut response)
-                .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
-
-            trace!("DoT received {} bytes response", response.len());
-            Ok(response)
-        })
-        .await
-        .map_err(|e| DnsError::Io(std::io::Error::other(format!("DoT worker panicked: {e}"))))?
+        trace!("DoT received {} bytes response", response.len());
+        Ok(response)
     }
 
     /// Parse DNS response.
@@ -356,12 +342,12 @@ impl DotResolver {
     }
 
     /// Resolve a domain name using round-robin load balancing.
-    pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
+    pub fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let mut last_error = None;
 
         for _ in 0..self.clients.len() {
             let idx = {
-                let mut current = self.current.write().await;
+                let mut current = self.current.write();
                 let idx = *current;
                 *current = (*current + 1) % self.clients.len();
                 idx
@@ -369,7 +355,7 @@ impl DotResolver {
 
             let client = &self.clients[idx];
 
-            match client.resolve(domain).await {
+            match client.resolve(domain) {
                 Ok(mut ips) if !ips.is_empty() => {
                     if self.prefer_ipv4 {
                         ips.sort_by_key(|ip| match ip {
@@ -410,12 +396,12 @@ impl DotResolver {
     }
 
     /// Query a specific record type.
-    pub async fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+    pub fn query(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let mut last_error = None;
 
         for _ in 0..self.clients.len() {
             let idx = {
-                let mut current = self.current.write().await;
+                let mut current = self.current.write();
                 let idx = *current;
                 *current = (*current + 1) % self.clients.len();
                 idx
@@ -423,7 +409,7 @@ impl DotResolver {
 
             let client = &self.clients[idx];
 
-            match client.query(domain, record_type).await {
+            match client.query(domain, record_type) {
                 Ok(ips) if !ips.is_empty() => return Ok(ips),
                 Ok(_) => continue,
                 Err(e) => {

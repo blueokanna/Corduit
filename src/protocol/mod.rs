@@ -79,13 +79,15 @@ macro_rules! impl_protocol_enum {
 pub mod address;
 pub mod error;
 pub mod qpack;
+
+#[cfg(feature = "std")]
 pub mod quic;
+#[cfg(all(feature = "std", feature = "tls"))]
+pub mod tls;
+#[cfg(feature = "std")]
 pub mod transport;
 
-#[cfg(feature = "tls")]
-pub mod tls;
-
-#[cfg(feature = "wireguard")]
+#[cfg(all(feature = "std", feature = "wireguard"))]
 pub mod wireguard;
 
 pub use address::{Address, AddressType};
@@ -95,14 +97,15 @@ pub mod prelude {
     pub use crate::protocol::address::{Address, AddressType};
     pub use crate::protocol::error::{ProtocolError, Result};
 
+    #[cfg(feature = "std")]
     pub use crate::protocol::transport::{
         TlsConfig, TlsFingerprint, TlsStream, TlsTransport, TransportError, WebSocketConfig,
         WebSocketTransport, WsStream,
     };
 
-    #[cfg(feature = "tls")]
+    #[cfg(all(feature = "std", feature = "tls"))]
     pub use crate::protocol::tls::{TlsAcceptor, TlsConnector, TlsStream as TlsModuleStream};
 
-    #[cfg(feature = "wireguard")]
+    #[cfg(all(feature = "std", feature = "wireguard"))]
     pub use crate::protocol::wireguard::{WireGuardError, WireGuardTunnel};
 }

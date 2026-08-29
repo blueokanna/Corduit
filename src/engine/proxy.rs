@@ -6,8 +6,8 @@ use crate::engine::provider_updater::{
     ProviderRegistrySync, ProviderUpdater, ProviderUpdaterConfig,
 };
 use crate::engine::routing::Router;
+use parking_lot::RwLock;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Proxy manager that coordinates inbound and outbound connections
 pub struct ProxyManager {
@@ -22,16 +22,16 @@ pub struct ProxyManager {
 
 impl ProxyManager {
     /// Create a new proxy manager
-    pub async fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config) -> Result<Self> {
         let config_arc = Arc::new(RwLock::new(config));
 
         // Router first: it loads rule providers and validates that every
         // RULE-SET rule references a configured provider.
-        let router = Arc::new(Router::new(config_arc.clone()).await?);
+        let router = Arc::new(Router::new(config_arc.clone())?);
 
         // Outbound manager next: it loads proxy providers into the shared
         // registry so proxy groups can reference provider proxies.
-        let outbound_manager = Arc::new(OutboundManager::new(config_arc.clone()).await?);
+        let outbound_manager = Arc::new(OutboundManager::new(config_arc.clone())?);
 
         // Provider updater shares the live managers so interval refreshes
         // affect the same proxies/rules traffic is using; the registry sync
@@ -48,8 +48,7 @@ impl ProxyManager {
             config_arc.clone(),
             router.clone(),
             Arc::clone(&outbound_manager),
-        )
-        .await?;
+        )?;
 
         Ok(Self {
             config: config_arc,
@@ -61,55 +60,55 @@ impl ProxyManager {
     }
 
     /// Start all inbound listeners
-    pub async fn start_inbounds(&self) -> Result<()> {
-        self.inbound_manager.start().await
+    pub fn start_inbounds(&self) -> Result<()> {
+        self.inbound_manager.start()
     }
 
     /// Start outbound connection pools
-    pub async fn start_outbounds(&self) -> Result<()> {
-        self.outbound_manager.start().await
+    pub fn start_outbounds(&self) -> Result<()> {
+        self.outbound_manager.start()
     }
 
     /// Start the background provider updater (interval refresh + health check).
-    pub async fn start_providers(&self) -> Result<()> {
-        self.provider_updater.start().await
+    pub fn start_providers(&self) -> Result<()> {
+        self.provider_updater.start()
     }
 
     /// Stop the background provider updater.
-    pub async fn stop_providers(&self) -> Result<()> {
-        self.provider_updater.stop().await
+    pub fn stop_providers(&self) -> Result<()> {
+        self.provider_updater.stop()
     }
 
     /// Stop all proxy services
-    pub async fn stop(&self) -> Result<()> {
-        self.stop_providers().await?;
-        self.inbound_manager.stop().await?;
-        self.outbound_manager.stop().await?;
+    pub fn stop(&self) -> Result<()> {
+        self.stop_providers()?;
+        self.inbound_manager.stop()?;
+        self.outbound_manager.stop()?;
         Ok(())
     }
 
     /// Reload configuration.
     ///
-    /// The config lock is released before the router/inbound/outbound reloads
-    /// run, because each of those takes a read lock on the *same* `RwLock`
-    /// (a tokio `RwLock` is not re-entrant — holding the write lock here would
-    /// deadlock).
-    pub async fn reload(&self, new_config: Config) -> Result<()> {
+    /// The config write lock is released before the router/inbound/outbound
+    /// reloads run, because each of those takes a read lock on the *same*
+    /// `RwLock` (parking_lot's `RwLock` is not re-entrant — holding the
+    /// write lock here would deadlock).
+    pub fn reload(&self, new_config: Config) -> Result<()> {
         {
-            let mut config = self.config.write().await;
+            let mut config = self.config.write();
             *config = new_config;
         }
 
-        self.router.reload().await?;
-        self.inbound_manager.reload().await?;
-        self.outbound_manager.reload().await?;
+        self.router.reload()?;
+        self.inbound_manager.reload()?;
+        self.outbound_manager.reload()?;
 
         Ok(())
     }
 
     /// Get current configuration
-    pub async fn get_config(&self) -> Config {
-        self.config.read().await.clone()
+    pub fn get_config(&self) -> Config {
+        self.config.read().clone()
     }
 
     /// Get router reference

@@ -20,23 +20,25 @@
 //! NewReno-style AIMD controller; 0-RTT is not offered (an explicit warning
 //! is logged when `reduce-rtt` / `zero-rtt-handshake` is requested).
 
+use crate::common::stream::BoxStream;
 use crate::crypto::digest::Digest;
 use crate::crypto::hash::Sha256;
 use crate::crypto::uuid::Uuid;
 use crate::engine::config::OutboundConfig;
-use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
+use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::engine::tls::yaml_value_to_string;
-use crate::protocol::quic::{ClientConfig as QuicClientConfig, ClientConnection, QuicClient};
+use crate::protocol::quic::{
+    ClientConfig as QuicClientConfig, ClientConnection, QuicClient, QuicRecvStream, QuicSendStream,
+};
 use bytes::{Buf, BufMut, BytesMut};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 const TUIC_VERSION: u8 = 0x05;
@@ -146,7 +148,7 @@ impl TuicConnection {
         }
     }
 
-    pub async fn authenticate(&self) -> Result<()> {
+    pub fn authenticate(&self) -> Result<()> {
         if *self.authenticated.read() {
             return Ok(());
         }
@@ -154,7 +156,6 @@ impl TuicConnection {
         let mut stream = self
             .connection
             .open_uni()
-            .await
             .map_err(|e| Error::network(format!("Failed to open auth stream: {e}")))?;
 
         let mut buf = BytesMut::with_capacity(64);
@@ -167,11 +168,9 @@ impl TuicConnection {
 
         stream
             .write_all(&buf)
-            .await
             .map_err(|e| Error::network(format!("Failed to send auth: {e}")))?;
         stream
-            .shutdown()
-            .await
+            .finish()
             .map_err(|e| Error::network(format!("Failed to finish auth stream: {e}")))?;
 
         *self.authenticated.write() = true;
@@ -179,19 +178,12 @@ impl TuicConnection {
         Ok(())
     }
 
-    pub async fn open_tcp_stream(
-        &self,
-        target: &TargetAddr,
-    ) -> Result<(
-        crate::protocol::quic::QuicSendStream,
-        crate::protocol::quic::QuicRecvStream,
-    )> {
-        self.authenticate().await?;
+    pub fn open_tcp_stream(&self, target: &TargetAddr) -> Result<(QuicSendStream, QuicRecvStream)> {
+        self.authenticate()?;
 
         let (mut send, recv) = self
             .connection
             .open_bi()
-            .await
             .map_err(|e| Error::network(format!("Failed to open bi stream: {e}")))?;
 
         let mut buf = BytesMut::with_capacity(128);
@@ -200,14 +192,13 @@ impl TuicConnection {
         encode_address(&mut buf, target)?;
 
         send.write_all(&buf)
-            .await
             .map_err(|e| Error::network(format!("Failed to send connect: {e}")))?;
 
         debug!("TUIC TCP stream opened for target: {target}");
         Ok((send, recv))
     }
 
-    pub async fn send_udp_packet(
+    pub fn send_udp_packet(
         &self,
         assoc_id: u16,
         target: &TargetAddr,
@@ -215,7 +206,7 @@ impl TuicConnection {
         frag_id: u8,
         frag_total: u8,
     ) -> Result<()> {
-        self.authenticate().await?;
+        self.authenticate()?;
 
         match self.udp_relay_mode {
             UdpRelayMode::Native => {
@@ -234,7 +225,6 @@ impl TuicConnection {
                     let msg = build_udp_message(assoc_id, 1, 0, &addr, data)?;
                     self.connection
                         .send_datagram(msg)
-                        .await
                         .map_err(|e| Error::network(format!("Failed to send UDP datagram: {e}")))?;
                 } else {
                     let frag_count = data.len().div_ceil(max_chunk);
@@ -247,7 +237,7 @@ impl TuicConnection {
                     for (i, chunk) in data.chunks(max_chunk).enumerate() {
                         let msg =
                             build_udp_message(assoc_id, frag_count as u8, i as u8, &addr, chunk)?;
-                        self.connection.send_datagram(msg).await.map_err(|e| {
+                        self.connection.send_datagram(msg).map_err(|e| {
                             Error::network(format!("Failed to send UDP fragment: {e}"))
                         })?;
                     }
@@ -259,15 +249,12 @@ impl TuicConnection {
                 let mut stream = self
                     .connection
                     .open_uni()
-                    .await
                     .map_err(|e| Error::network(format!("Failed to open UDP stream: {e}")))?;
                 stream
                     .write_all(&msg)
-                    .await
                     .map_err(|e| Error::network(format!("Failed to send UDP packet: {e}")))?;
                 stream
-                    .shutdown()
-                    .await
+                    .finish()
                     .map_err(|e| Error::network(format!("Failed to finish UDP stream: {e}")))?;
             }
         }
@@ -276,22 +263,21 @@ impl TuicConnection {
         Ok(())
     }
 
-    pub async fn recv_udp_packet(&self) -> Result<(u16, TargetAddr, Vec<u8>)> {
+    pub fn recv_udp_packet(&self) -> Result<(u16, TargetAddr, Vec<u8>)> {
         loop {
             let data = match self.udp_relay_mode {
                 UdpRelayMode::Native => {
-                    let datagram = self.connection.read_datagram().await.map_err(|e| {
+                    let datagram = self.connection.read_datagram().map_err(|e| {
                         Error::network(format!("Failed to receive UDP datagram: {e}"))
                     })?;
                     datagram
                 }
                 UdpRelayMode::Quic => {
-                    let mut stream =
-                        self.connection.accept_uni().await.map_err(|e| {
-                            Error::network(format!("Failed to accept UDP stream: {e}"))
-                        })?;
+                    let mut stream = self
+                        .connection
+                        .accept_uni()
+                        .map_err(|e| Error::network(format!("Failed to accept UDP stream: {e}")))?;
                     read_all_limited(&mut stream, 65536)
-                        .await
                         .map_err(|e| Error::network(format!("Failed to read UDP stream: {e}")))?
                 }
             };
@@ -300,18 +286,17 @@ impl TuicConnection {
             if frag_total <= 1 {
                 return Ok((assoc_id, target, payload));
             }
-            let mut assembler = self.assembler.lock().await;
+            let mut assembler = self.assembler.lock();
             if let Some(full) = assembler.add(assoc_id, frag_id, frag_total, target, payload) {
                 return Ok((assoc_id, full.0, full.1));
             }
         }
     }
 
-    pub async fn dissociate(&self, assoc_id: u16) -> Result<()> {
+    pub fn dissociate(&self, assoc_id: u16) -> Result<()> {
         let mut stream = self
             .connection
             .open_uni()
-            .await
             .map_err(|e| Error::network(format!("Failed to open dissociate stream: {e}")))?;
 
         let mut buf = BytesMut::with_capacity(4);
@@ -321,18 +306,16 @@ impl TuicConnection {
 
         stream
             .write_all(&buf)
-            .await
             .map_err(|e| Error::network(format!("Failed to send dissociate: {e}")))?;
-        stream.shutdown().await.ok();
+        stream.finish().ok();
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub async fn heartbeat(&self) -> Result<()> {
+    pub fn heartbeat(&self) -> Result<()> {
         let mut stream = self
             .connection
             .open_uni()
-            .await
             .map_err(|e| Error::network(format!("Failed to open heartbeat stream: {e}")))?;
 
         let mut buf = BytesMut::with_capacity(2);
@@ -341,9 +324,8 @@ impl TuicConnection {
 
         stream
             .write_all(&buf)
-            .await
             .map_err(|e| Error::network(format!("Failed to send heartbeat: {e}")))?;
-        stream.shutdown().await.ok();
+        stream.finish().ok();
         Ok(())
     }
 
@@ -726,8 +708,8 @@ impl TuicOutbound {
         Ok(cfg)
     }
 
-    async fn get_or_create_connection(&self) -> Result<Arc<TuicConnection>> {
-        let mut conn_guard = self.connection.lock().await;
+    fn get_or_create_connection(&self) -> Result<Arc<TuicConnection>> {
+        let mut conn_guard = self.connection.lock();
 
         if let Some(ref conn) = *conn_guard {
             if !conn.is_closed() {
@@ -735,18 +717,30 @@ impl TuicOutbound {
             }
         }
 
-        let addr = format!("{}:{}", self.tuic_config.server, self.tuic_config.port);
-        let socket_addr: SocketAddr = tokio::net::lookup_host(&addr)
-            .await
-            .map_err(|e| Error::network(format!("Failed to resolve TUIC server {addr}: {e}")))?
-            .next()
-            .ok_or_else(|| Error::network(format!("No addresses found for TUIC server {addr}")))?;
+        let socket_addr: SocketAddr = crate::common::socket::resolve_host(
+            &self.tuic_config.server,
+            self.tuic_config.port,
+            Duration::from_secs(30),
+        )
+        .map_err(|e| {
+            Error::network(format!(
+                "Failed to resolve TUIC server {}:{}: {e}",
+                self.tuic_config.server, self.tuic_config.port
+            ))
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Error::network(format!(
+                "No addresses found for TUIC server {}:{}",
+                self.tuic_config.server, self.tuic_config.port
+            ))
+        })?;
 
         let quic_config = self.build_quic_config(socket_addr)?;
         let client = QuicClient::new(quic_config);
         let connection = client
             .connect()
-            .await
             .map_err(|e| Error::network(format!("QUIC connection failed: {e}")))?;
 
         debug!("TUIC QUIC connection established to {socket_addr}");
@@ -758,35 +752,42 @@ impl TuicOutbound {
             self.tuic_config.udp_relay_mode,
         ));
 
-        tuic_conn.authenticate().await?;
+        tuic_conn.authenticate()?;
 
         *conn_guard = Some(tuic_conn.clone());
 
         Ok(tuic_conn)
     }
 
-    pub async fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        let conn = self.get_or_create_connection().await?;
+    pub fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+        let conn = self.get_or_create_connection()?;
         let assoc_id: u16 = crate::engine::random::u16();
 
-        conn.send_udp_packet(assoc_id, target, data, 0, 1).await?;
+        conn.send_udp_packet(assoc_id, target, data, 0, 1)?;
 
+        // The QUIC datagram receive blocks until data (or close), so bound
+        // it with a dedicated thread + channel receive timeout.
         let timeout = Duration::from_secs(30);
-        let result = tokio::time::timeout(timeout, conn.recv_udp_packet())
-            .await
-            .map_err(|_| Error::network("UDP receive timeout"))?;
+        let conn2 = conn.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(conn2.recv_udp_packet());
+        });
 
-        let (_recv_assoc_id, _recv_target, payload) = result?;
-        conn.dissociate(assoc_id).await.ok();
+        let (_recv_assoc_id, _recv_target, payload) = match rx.recv_timeout(timeout) {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(Error::network(format!("UDP receive failed: {e}"))),
+            Err(_) => return Err(Error::network("UDP receive timeout")),
+        };
+        conn.dissociate(assoc_id).ok();
 
         Ok(payload)
     }
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for TuicOutbound {
-    async fn connect(&self) -> Result<()> {
-        let _conn = self.get_or_create_connection().await?;
+    fn connect(&self) -> Result<()> {
+        let _conn = self.get_or_create_connection()?;
         info!(
             "TUIC outbound '{}' connected to {}:{}",
             self.config.tag, self.tuic_config.server, self.tuic_config.port
@@ -794,8 +795,8 @@ impl OutboundProxy for TuicOutbound {
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
-        let mut conn_guard = self.connection.lock().await;
+    fn disconnect(&self) -> Result<()> {
+        let mut conn_guard = self.connection.lock();
         if let Some(conn) = conn_guard.take() {
             conn.close();
         }
@@ -814,11 +815,11 @@ impl OutboundProxy for TuicOutbound {
         true // TUIC always supports UDP
     }
 
-    async fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        self.relay_udp(target, data).await
+    fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+        self.relay_udp(target, data)
     }
 
-    async fn test_http_latency(&self, test_url: &str, timeout: Duration) -> Result<Duration> {
+    fn test_http_latency(&self, test_url: &str, timeout: Duration) -> Result<Duration> {
         use std::time::Instant;
 
         let url = crate::common::url::Url::parse(test_url)
@@ -839,160 +840,115 @@ impl OutboundProxy for TuicOutbound {
 
         let start = Instant::now();
 
-        let conn = tokio::time::timeout(timeout, self.get_or_create_connection())
-            .await
-            .map_err(|_| Error::network("Connection timeout"))??;
+        let conn = self.get_or_create_connection()?;
 
         let target = TargetAddr::Domain(host.clone(), url_port);
-        let (mut send, mut recv) = conn.open_tcp_stream(&target).await?;
+        let (mut send, mut recv) = conn.open_tcp_stream(&target)?;
 
         let http_request = format!(
             "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n"
         );
 
         send.write_all(http_request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send HTTP request: {e}")))?;
 
-        let result = tokio::time::timeout(timeout, async {
+        // QUIC stream reads block until data; bound them via a thread + channel.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut response = vec![0u8; 1024];
-            let n = recv
-                .read(&mut response)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read response: {e}")))?;
-            if n == 0 {
-                return Err(Error::network("Empty response"));
-            }
-            let response_str = String::from_utf8_lossy(&response[..n]);
-            if response_str.starts_with("HTTP/") {
-                Ok(())
-            } else {
-                Err(Error::network("Invalid HTTP response"))
-            }
-        })
-        .await;
+            let r = recv.read(&mut response).map(|n| response[..n].to_vec());
+            let _ = tx.send(r);
+        });
 
-        match result {
-            Ok(Ok(())) => {
-                let elapsed = start.elapsed();
-                info!("TUIC latency test success: {}ms", elapsed.as_millis());
-                Ok(elapsed)
-            }
-            Ok(Err(e)) => {
-                warn!("TUIC latency test failed: {e}");
-                Err(e)
-            }
-            Err(_) => {
-                warn!("TUIC latency test timeout");
-                Err(Error::network("Response timeout"))
-            }
+        let response = match rx.recv_timeout(timeout) {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(Error::network(format!("Failed to read response: {e}"))),
+            Err(_) => return Err(Error::network("Response timeout")),
+        };
+
+        let response_str = String::from_utf8_lossy(&response);
+        if response_str.starts_with("HTTP/") {
+            let elapsed = start.elapsed();
+            info!("TUIC latency test success: {}ms", elapsed.as_millis());
+            Ok(elapsed)
+        } else {
+            Err(Error::network("Invalid HTTP response"))
         }
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        inbound: Box<dyn AsyncReadWrite>,
+        inbound: BoxStream,
         target: TargetAddr,
         connection: Option<Arc<TrackedConnection>>,
     ) -> Result<()> {
-        let conn = self.get_or_create_connection().await?;
-        let (mut send, mut recv) = conn.open_tcp_stream(&target).await?;
+        let conn = self.get_or_create_connection()?;
+        let (send, recv) = conn.open_tcp_stream(&target)?;
 
         debug!(
             "TUIC: relaying TCP to {target} via {}:{}",
             self.tuic_config.server, self.tuic_config.port
         );
 
-        let tracker = global_tracker();
-        let (mut ri, mut wi) = tokio::io::split(inbound);
+        let pair = QuicStreamPair::new(send, recv);
+        relay_streams!(inbound, pair, connection)
+    }
+}
 
-        let conn_upload = connection.clone();
-        let conn_download = connection.clone();
+/// Combines a QUIC stream's send/recv halves into one duplex `SyncStream` so
+/// the bidirectional relay can drive both directions concurrently (each half
+/// is an independent handle to the same QUIC stream).
+struct QuicStreamPair {
+    send: Mutex<QuicSendStream>,
+    recv: Mutex<QuicRecvStream>,
+}
 
-        let client_to_remote = async {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                let n = ri
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read from inbound: {e}")))?;
-                if n == 0 {
-                    break;
-                }
-                send.write_all(&buf[..n])
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to write to TUIC: {e}")))?;
-
-                tracker.add_global_upload(n as u64);
-                if let Some(ref conn) = conn_upload {
-                    conn.add_upload(n as u64);
-                }
-            }
-            send.shutdown().await.ok();
-            Ok::<(), Error>(())
-        };
-
-        let remote_to_client = async {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match recv.read(&mut buf).await {
-                    Ok(n) if n > 0 => {
-                        wi.write_all(&buf[..n]).await.map_err(|e| {
-                            Error::network(format!("Failed to write to inbound: {e}"))
-                        })?;
-
-                        tracker.add_global_download(n as u64);
-                        if let Some(ref conn) = conn_download {
-                            conn.add_download(n as u64);
-                        }
-                    }
-                    Ok(_) => break,
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("reset") || err_str.contains("closed") {
-                            break;
-                        }
-                        return Err(Error::network(format!("Failed to read from TUIC: {e}")));
-                    }
-                }
-            }
-            wi.shutdown().await.ok();
-            Ok::<(), Error>(())
-        };
-
-        let result = tokio::try_join!(client_to_remote, remote_to_client);
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("connection")
-                    || err_str.contains("reset")
-                    || err_str.contains("broken")
-                {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }
+impl QuicStreamPair {
+    fn new(send: QuicSendStream, recv: QuicRecvStream) -> Self {
+        Self {
+            send: Mutex::new(send),
+            recv: Mutex::new(recv),
         }
+    }
+}
+
+impl Read for QuicStreamPair {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.recv.lock().read(buf)
+    }
+}
+
+impl Write for QuicStreamPair {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.send.lock().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send.lock().flush()
+    }
+}
+
+impl crate::common::stream::SyncStream for QuicStreamPair {
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        if matches!(how, std::net::Shutdown::Write | std::net::Shutdown::Both) {
+            // Half-close: queue the QUIC stream FIN after buffered data.
+            self.send.lock().finish()?;
+        }
+        Ok(())
     }
 }
 
 /// Read the whole stream, capping at `limit` bytes (defends against a
 /// malicious peer that never sends FIN).
-async fn read_all_limited<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-    limit: usize,
-) -> std::io::Result<Vec<u8>> {
+fn read_all_limited<R: Read>(reader: &mut R, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
-        let n = reader.read(&mut buf).await?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }

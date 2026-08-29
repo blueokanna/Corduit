@@ -1,12 +1,18 @@
 //! QUIC v1 client transport (RFC 9000 + RFC 9002) built on courierust's
 //! public packet/frame/protection codecs.
 //!
-//! A single background task owns the connected UDP socket and drives the
+//! A single driver thread owns the connected UDP socket and drives the
 //! transport. All outbound datagrams are built under the state lock by
-//! [`QuicConn::build_outbound`] and sent *after* the lock is released
-//! (`send_to` is async). Inbound packets are un-protected, parsed, and fed
-//! into the shared [`ConnState`]; waiters wake on per-stream / per-connection
-//! [`tokio::sync::Notify`] handles.
+//! [`QuicConn::build_outbound`] and sent *after* the lock is released.
+//! Inbound packets are un-protected, parsed, and fed into the shared
+//! [`ConnState`]; waiters wake on per-stream / per-connection
+//! [`Notify`](crate::common::sync::Notify) handles.
+//!
+//! The driver is fully synchronous: it blocks on `recv_from` with a short
+//! socket read timeout (`DRIVER_POLL`), so it wakes on inbound traffic
+//! immediately and otherwise re-checks timers and the writer latch every
+//! poll interval. The timeout also bounds how long a stream write waits
+//! before its queued bytes hit the wire.
 //!
 //! Loss recovery follows RFC 9002: per-space sent-packet tracking,
 //! time-threshold loss detection, PTO probes with exponential backoff, and a
@@ -15,7 +21,8 @@
 //! directions, and RFC 9221 datagrams are supported.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::io;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -24,14 +31,19 @@ use courierust::courierust_quic::frame::Frame;
 use courierust::courierust_quic::packet::{self, LongType, Packet as ParsedPacket};
 use courierust::courierust_quic::protection::PacketKey;
 use courierust::courierust_tls::crypto::rng::{self, ChaChaRng};
-use tokio::net::UdpSocket;
-use tokio::sync::Notify;
 
 use super::config::ClientConfig;
 use super::error::{QuicError, Result};
 use super::obfs::Salamander;
 use super::tls13::{Tls13Client, TransportParameters};
+use crate::common::sync::Notify;
 use crate::protocol::quic::{INITIAL_CWND, MAX_PACKET, MAX_UDP_PAYLOAD, MIN_CWND};
+
+/// Driver poll interval: bounds both idle wakeup latency and how quickly a
+/// queued write reaches the wire. 10 ms is comfortably below QUIC's own
+/// timing granularity (PTO / ack delay are tens of ms) while keeping idle
+/// syscalls at ~100/s per connection.
+const DRIVER_POLL: Duration = Duration::from_millis(10);
 
 /// Maximum in-memory per-stream send buffer before `poll_write` backpressures.
 const MAX_SEND_BUFFER: usize = 4 * 1024 * 1024;
@@ -267,10 +279,9 @@ pub(crate) struct QuicConn {
     pub(crate) writer: Notify,
     /// Optional packet obfuscation wrapping every datagram on the wire.
     pub(crate) obfs: Option<Arc<Salamander>>,
-    /// Watch channel: the driver sends `true` whenever the handshake
-    /// completes or the connection closes (so waiters wake and re-check).
-    handshake_tx: tokio::sync::watch::Sender<bool>,
-    pub(crate) handshake_rx: tokio::sync::watch::Receiver<bool>,
+    /// Woken whenever the handshake completes or the connection closes (so
+    /// waiters wake and re-check the connection state under the lock).
+    pub(crate) handshake: Notify,
     pub(crate) shutdown: AtomicBool,
 }
 
@@ -280,12 +291,17 @@ impl QuicConn {
     }
 
     /// Build a connection over an already-connected UDP socket and start the
-    /// driver task. The initial ClientHello flight is queued immediately.
+    /// driver thread. The initial ClientHello flight is queued immediately.
     pub(crate) fn start(
         udp: UdpSocket,
         peer: SocketAddr,
         config: ClientConfig,
     ) -> Result<Arc<QuicConn>> {
+        // The driver blocks on recv; a short read timeout turns a quiet
+        // socket into a periodic wakeup so timers and queued writes get
+        // serviced promptly.
+        udp.set_read_timeout(Some(DRIVER_POLL))
+            .map_err(|e| QuicError::Io(e.to_string()))?;
         let udp = Arc::new(udp);
         let mut rng_seed = [0u8; 44];
         rng::fill_random(&mut rng_seed);
@@ -379,22 +395,21 @@ impl QuicConn {
         state.spaces[0].crypto_send = state.tls.client_hello.clone();
         state.spaces[0].crypto_written = state.tls.client_hello.len() as u64;
 
-        let (handshake_tx, handshake_rx) = tokio::sync::watch::channel(false);
         let conn = Arc::new(QuicConn {
             udp,
             peer,
             state: Mutex::new(state),
             writer: Notify::new(),
             obfs: config_obfs,
-            handshake_tx,
-            handshake_rx,
+            handshake: Notify::new(),
             shutdown: AtomicBool::new(false),
         });
 
         let driver = conn.clone();
-        tokio::spawn(async move {
-            let _ = driver.run().await;
-        });
+        std::thread::Builder::new()
+            .name("corduit-quic-driver".into())
+            .spawn(move || driver.run())
+            .map_err(|e| QuicError::Io(e.to_string()))?;
         conn.writer.notify_one();
         Ok(conn)
     }
@@ -403,78 +418,89 @@ impl QuicConn {
     // Driver
     // -------------------------------------------------------------------
 
-    async fn run(self: Arc<Self>) {
+    /// The connection's driver loop: receive (bounded by the socket read
+    /// timeout), process inbound, run timers, flush outbound, repeat.
+    /// Exits when the connection is closed or [`QuicConn::close`] is called.
+    fn run(self: Arc<Self>) {
         let mut buf = [0u8; MAX_PACKET];
         loop {
-            let deadline = {
-                let st = self.lock();
-                next_deadline(&st)
-            };
-            let out;
-            tokio::select! {
-                r = self.udp.recv_from(&mut buf) => {
-                    match r {
-                        Ok((n, _)) => {
-                            let mut st = self.lock();
-                            st.last_recv = Instant::now();
-                            match &self.obfs {
-                                // Salamander: strip the 8-byte salt and XOR
-                                // the keystream back out. Packets too short to
-                                // carry a salt are invalid and discarded.
-                                Some(obfs) => match obfs.deobfuscate_packet(&buf[..n]) {
-                                    Some(plain) => {
-                                        if let Err(e) = self.process_inbound(&mut st, &plain) {
-                                            self.process_fatal(&mut st, e);
-                                            out = Vec::new();
-                                        } else {
-                                            out = self.build_outbound(&mut st);
-                                        }
-                                    }
-                                    None => out = self.build_outbound(&mut st),
-                                },
-                                None => {
-                                    if let Err(e) = self.process_inbound(&mut st, &buf[..n]) {
+            // 1. Receive one datagram. A quiet socket times out after
+            //    DRIVER_POLL and falls through to timer / writer servicing.
+            match self.udp.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    let out = {
+                        let mut st = self.lock();
+                        st.last_recv = Instant::now();
+                        match &self.obfs {
+                            // Salamander: strip the 8-byte salt and XOR the
+                            // keystream back out. Packets too short to carry
+                            // a salt are invalid and discarded.
+                            Some(obfs) => match obfs.deobfuscate_packet(&buf[..n]) {
+                                Some(plain) => {
+                                    if let Err(e) = self.process_inbound(&mut st, &plain) {
                                         self.process_fatal(&mut st, e);
-                                        out = Vec::new();
+                                        Vec::new()
                                     } else {
-                                        out = self.build_outbound(&mut st);
+                                        self.build_outbound(&mut st)
                                     }
+                                }
+                                None => self.build_outbound(&mut st),
+                            },
+                            None => {
+                                if let Err(e) = self.process_inbound(&mut st, &buf[..n]) {
+                                    self.process_fatal(&mut st, e);
+                                    Vec::new()
+                                } else {
+                                    self.build_outbound(&mut st)
                                 }
                             }
                         }
-                        Err(e) => {
-                            let mut st = self.lock();
-                            self.process_fatal(&mut st, QuicError::Io(e.to_string()));
-                            out = Vec::new();
-                        }
-                    }
+                    };
+                    self.send_all(&out);
                 }
-                _ = self.writer.notified() => {
-                    let mut st = self.lock();
-                    out = self.build_outbound(&mut st);
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    // Transient: idle socket, or (on Windows) an ICMP error
+                    // surfacing on a connected UDP socket. Both are normal
+                    // for QUIC — loss recovery is the activity authority,
+                    // not per-recv errors.
+                    let _ = self.writer.notified();
+                    let out = {
+                        let mut st = self.lock();
+                        self.on_timer(&mut st);
+                        self.build_outbound(&mut st)
+                    };
+                    self.send_all(&out);
                 }
-                _ = tokio::time::sleep_until(deadline.into()) => {
+                Err(e) => {
                     let mut st = self.lock();
-                    self.on_timer(&mut st);
-                    out = self.build_outbound(&mut st);
+                    self.process_fatal(&mut st, QuicError::Io(e.to_string()));
                 }
             }
-            self.send_all(&out).await;
-            if out.len() >= 32 {
-                self.writer.notify_one();
-            }
-            if self.lock().closed.is_some() || self.shutdown.load(Ordering::Acquire) {
+
+            // 2. Exit once the connection is closed or shutdown is requested.
+            let closed = {
+                let st = self.lock();
+                st.closed.is_some() || self.shutdown.load(Ordering::Acquire)
+            };
+            if closed {
                 return;
             }
         }
     }
 
-    async fn send_all(&self, datagrams: &[Vec<u8>]) {
+    fn send_all(&self, datagrams: &[Vec<u8>]) {
         for d in datagrams {
             if let Some(obfs) = &self.obfs {
-                let _ = self.udp.send_to(&obfs.obfuscate_packet(d), self.peer).await;
+                let _ = self.udp.send_to(&obfs.obfuscate_packet(d), self.peer);
             } else {
-                let _ = self.udp.send_to(d, self.peer).await;
+                let _ = self.udp.send_to(d, self.peer);
             }
         }
     }
@@ -482,7 +508,7 @@ impl QuicConn {
     fn on_timer(&self, st: &mut ConnState) {
         if !st.handshake_complete && st.last_recv.elapsed() > st.config.handshake_timeout {
             st.closed = Some(QuicError::Timeout);
-            let _ = self.handshake_tx.send(true);
+            self.handshake.notify_waiters();
             return;
         }
         if st.handshake_complete
@@ -490,7 +516,7 @@ impl QuicConn {
             && st.last_recv.elapsed() > st.config.idle_timeout
         {
             st.closed = Some(QuicError::IdleTimeout);
-            let _ = self.handshake_tx.send(true);
+            self.handshake.notify_waiters();
             return;
         }
         if st.handshake_complete {
@@ -792,7 +818,7 @@ impl QuicConn {
                     error_code,
                     reason: String::from_utf8_lossy(&reason).into_owned(),
                 });
-                let _ = self.handshake_tx.send(true);
+                self.handshake.notify_waiters();
                 wake_all(st);
                 st.datagram_notify.notify_waiters();
                 Ok(())
@@ -866,7 +892,7 @@ impl QuicConn {
         install_keys(st);
         if st.tls.is_complete() && !st.handshake_complete {
             st.handshake_complete = true;
-            let _ = self.handshake_tx.send(true);
+            self.handshake.notify_waiters();
         }
         Ok(())
     }
@@ -1436,7 +1462,7 @@ impl QuicConn {
         if st.closed.is_none() {
             st.closed = Some(err);
         }
-        let _ = self.handshake_tx.send(true);
+        self.handshake.notify_waiters();
         wake_all(st);
         st.datagram_notify.notify_waiters();
         st.streams_notify.notify_waiters();
@@ -1619,7 +1645,7 @@ impl QuicConn {
         if st.closed.is_none() {
             st.closed = Some(err.unwrap_or(QuicError::Closed));
         }
-        let _ = self.handshake_tx.send(true);
+        self.handshake.notify_waiters();
         wake_all(st);
         st.datagram_notify.notify_waiters();
         st.streams_notify.notify_waiters();
@@ -1834,21 +1860,6 @@ fn build_ack_ranges(acked: &BTreeSet<u64>) -> Vec<(u64, u64)> {
         gap_base = q;
     }
     ranges
-}
-
-fn next_deadline(st: &ConnState) -> Instant {
-    let mut d = Instant::now() + Duration::from_secs(60);
-    if !st.handshake_complete {
-        d = d.min(st.last_recv + st.config.handshake_timeout);
-    }
-    if let Some(ka) = st.config.keep_alive_interval {
-        d = d.min(st.keep_alive_next);
-        let _ = ka;
-    }
-    if let Some(p) = st.pto_due {
-        d = d.min(p);
-    }
-    d
 }
 
 /// Compute the packet-number offset for a long-header packet.

@@ -9,9 +9,12 @@
 //! - UDP session management with NAT support
 //! - DNS interception with Fake-IP support
 //! - Zero-copy packet processing where possible
-//! - Async/await support with Tokio
 //! - Connection pooling and reuse
 //! - Traffic statistics and monitoring
+//!
+//! The stack is fully synchronous: packet processing runs inline on the
+//! caller thread and long-lived relays run on dedicated OS threads. There is
+//! no async runtime dependency.
 //!
 //! # Architecture
 //!

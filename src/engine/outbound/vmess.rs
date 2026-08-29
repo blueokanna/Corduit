@@ -1,18 +1,18 @@
+use crate::common::stream::BoxStream;
 use crate::crypto::aead::{Aead, Aes128Gcm, ChaCha20Poly1305};
 use crate::crypto::digest::Digest;
 use crate::crypto::encoding::{encode as b64_encode, Config as B64Config};
 use crate::crypto::hash::{Md5, Sha1, Sha256};
 use crate::crypto::uuid::Uuid;
 use crate::engine::config::OutboundConfig;
-use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
+use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const VMESS_VERSION: u8 = 1;
 const VMESS_AEAD_AUTH_LEN: usize = 16;
@@ -127,7 +127,7 @@ impl Default for VmessWsOptions {
 
 /// UDP session state for VMess
 struct VmessUdpSession {
-    stream: tokio::sync::Mutex<Box<dyn AsyncReadWrite>>,
+    stream: parking_lot::Mutex<BoxStream>,
     request_key: [u8; 16],
     request_iv: [u8; 16],
     response_key: [u8; 16],
@@ -138,14 +138,14 @@ struct VmessUdpSession {
 
 impl VmessUdpSession {
     fn new(
-        stream: Box<dyn AsyncReadWrite>,
+        stream: BoxStream,
         request_key: [u8; 16],
         request_iv: [u8; 16],
         response_key: [u8; 16],
         response_iv: [u8; 16],
     ) -> Self {
         Self {
-            stream: tokio::sync::Mutex::new(stream),
+            stream: parking_lot::Mutex::new(stream),
             request_key,
             request_iv,
             response_key,
@@ -174,8 +174,8 @@ impl VmessUdpSession {
     }
 }
 
-pub struct WebSocketStream<S> {
-    inner: S,
+pub struct WebSocketStream<S: crate::common::stream::SyncStream> {
+    inner: parking_lot::Mutex<S>,
     read_buffer: Vec<u8>,
     read_pos: usize,
 }
@@ -185,25 +185,25 @@ pub struct WebSocketStream<S> {
 /// could request a multi-gigabyte allocation and abort the process.
 const MAX_WS_FRAME_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
 
-impl<S> WebSocketStream<S> {
+impl<S: crate::common::stream::SyncStream> WebSocketStream<S> {
     pub fn new(inner: S) -> Self {
         Self {
-            inner,
+            inner: parking_lot::Mutex::new(inner),
             read_buffer: Vec::new(),
             read_pos: 0,
         }
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
+impl<S: crate::common::stream::SyncStream> WebSocketStream<S> {
     /// Perform WebSocket handshake
-    pub async fn handshake(
+    pub fn handshake(
         stream: S,
         host: &str,
         path: &str,
         extra_headers: &std::collections::HashMap<String, String>,
     ) -> Result<Self> {
-        let mut ws = Self::new(stream);
+        let ws = Self::new(stream);
 
         let mut key_bytes = [0u8; 16];
         getrandom::fill(&mut key_bytes)
@@ -227,10 +227,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
         }
         request.push_str("\r\n");
         ws.inner
+            .lock()
             .write_all(request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send WebSocket handshake: {}", e)))?;
-        ws.inner.flush().await.ok();
+        ws.inner.lock().flush().ok();
 
         let mut response = Vec::with_capacity(1024);
         let mut buf = [0u8; 1];
@@ -238,8 +238,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
 
         while response.len() < 4096 {
             ws.inner
+                .lock()
                 .read_exact(&mut buf)
-                .await
                 .map_err(|e| Error::network(format!("Failed to read WebSocket response: {}", e)))?;
             response.push(buf[0]);
 
@@ -289,7 +289,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
     }
 
     #[allow(dead_code)]
-    pub async fn write_frame(&mut self, data: &[u8]) -> Result<()> {
+    pub fn write_frame(&self, data: &[u8]) -> std::io::Result<()> {
         let mut frame = Vec::with_capacity(14 + data.len());
 
         frame.push(0x82);
@@ -306,7 +306,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
 
         let mut mask = [0u8; 4];
         getrandom::fill(&mut mask)
-            .map_err(|e| Error::protocol(format!("Failed to generate mask: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("Failed to generate mask: {}", e)))?;
         frame.extend_from_slice(&mask);
 
         // Masked payload
@@ -315,22 +315,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
         }
 
         self.inner
+            .lock()
             .write_all(&frame)
-            .await
-            .map_err(|e| Error::network(format!("Failed to write WebSocket frame: {}", e)))?;
-
-        Ok(())
+            .map_err(|e| Error::network(format!("Failed to write WebSocket frame: {}", e)))
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// Read a WebSocket frame, returns the payload data
     #[allow(dead_code)]
-    pub async fn read_frame(&mut self) -> Result<Vec<u8>> {
+    pub fn read_frame(&self) -> std::io::Result<Vec<u8>> {
+        let mut inner = self.inner.lock();
+
         // Read first 2 bytes
         let mut header = [0u8; 2];
-        self.inner
-            .read_exact(&mut header)
-            .await
-            .map_err(|e| Error::network(format!("Failed to read WebSocket frame header: {}", e)))?;
+        inner.read_exact(&mut header)?;
 
         let _fin = (header[0] & 0x80) != 0;
         let opcode = header[0] & 0x0F;
@@ -338,17 +336,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
         let mut payload_len = (header[1] & 0x7F) as u64;
 
         if opcode == 0x08 {
-            return Err(Error::network("WebSocket connection closed by server"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "WebSocket connection closed by server",
+            ));
         }
 
         // Handle ping frame - read payload and continue (non-recursive)
         if opcode == 0x09 {
             if payload_len > MAX_WS_FRAME_SIZE {
-                return Err(Error::protocol("WebSocket ping frame too large"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WebSocket ping frame too large",
+                ));
             }
             if payload_len > 0 {
                 let mut ping_data = vec![0u8; payload_len as usize];
-                self.inner.read_exact(&mut ping_data).await.ok();
+                inner.read_exact(&mut ping_data).ok();
             }
             // Return empty to signal caller should retry
             return Ok(Vec::new());
@@ -357,34 +361,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
         // Extended payload length
         if payload_len == 126 {
             let mut ext = [0u8; 2];
-            self.inner
-                .read_exact(&mut ext)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read extended length: {}", e)))?;
+            inner.read_exact(&mut ext)?;
             payload_len = u16::from_be_bytes(ext) as u64;
         } else if payload_len == 127 {
             let mut ext = [0u8; 8];
-            self.inner
-                .read_exact(&mut ext)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read extended length: {}", e)))?;
+            inner.read_exact(&mut ext)?;
             payload_len = u64::from_be_bytes(ext);
         }
 
         // Reject oversized frames before allocating any buffer.
         if payload_len > MAX_WS_FRAME_SIZE {
-            return Err(Error::protocol(format!(
-                "WebSocket frame too large: {} bytes",
-                payload_len
-            )));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WebSocket frame too large: {} bytes", payload_len),
+            ));
         }
 
         let mask = if masked {
             let mut m = [0u8; 4];
-            self.inner
-                .read_exact(&mut m)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read mask: {}", e)))?;
+            inner.read_exact(&mut m)?;
             Some(m)
         } else {
             None
@@ -392,10 +387,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
 
         // Read payload
         let mut payload = vec![0u8; payload_len as usize];
-        self.inner
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| Error::network(format!("Failed to read WebSocket payload: {}", e)))?;
+        inner.read_exact(&mut payload)?;
 
         // Unmask if needed
         if let Some(m) = mask {
@@ -409,9 +401,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
 
     /// Read frame with retry for control frames
     #[allow(dead_code)]
-    pub async fn read_frame_data(&mut self) -> Result<Vec<u8>> {
+    pub fn read_frame_data(&self) -> std::io::Result<Vec<u8>> {
         loop {
-            let data = self.read_frame().await?;
+            let data = self.read_frame()?;
             if !data.is_empty() {
                 return Ok(data);
             }
@@ -427,133 +419,35 @@ fn compute_websocket_accept(key: &str) -> String {
     b64_encode(&result, B64Config::STANDARD)
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for WebSocketStream<S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use std::task::Poll;
-
-        // If we have buffered data, return it first
-        if self.read_pos < self.read_buffer.len() {
-            let remaining = &self.read_buffer[self.read_pos..];
-            let to_copy = std::cmp::min(remaining.len(), buf.remaining());
-            buf.put_slice(&remaining[..to_copy]);
-            self.read_pos += to_copy;
-
-            // Clear buffer if fully consumed
-            if self.read_pos >= self.read_buffer.len() {
-                self.read_buffer.clear();
+impl<S: crate::common::stream::SyncStream> Read for WebSocketStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            // Serve buffered frame payload first.
+            if self.read_pos < self.read_buffer.len() {
+                let n = (self.read_buffer.len() - self.read_pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.read_buffer[self.read_pos..self.read_pos + n]);
+                self.read_pos += n;
+                if self.read_pos >= self.read_buffer.len() {
+                    self.read_buffer.clear();
+                    self.read_pos = 0;
+                }
+                return Ok(n);
+            }
+            // Pull the next non-empty frame (pings yield empty payloads and
+            // are skipped). Errors (including read timeouts) propagate with
+            // their io kind so the relay treats idle as "nothing happened".
+            let data = self.read_frame()?;
+            if !data.is_empty() {
+                self.read_buffer = data;
                 self.read_pos = 0;
             }
-
-            return Poll::Ready(Ok(()));
         }
-
-        // We need to read a new WebSocket frame
-        // For simplicity, we'll read the frame synchronously using a future
-        // This is not ideal but works for now
-
-        // Read 2-byte header
-        let mut header = [0u8; 2];
-        let inner = &mut self.inner;
-
-        // Try to read header
-        let mut header_buf = tokio::io::ReadBuf::new(&mut header);
-        match std::pin::Pin::new(&mut *inner).poll_read(cx, &mut header_buf) {
-            Poll::Ready(Ok(())) => {
-                if header_buf.filled().len() < 2 {
-                    // EOF or incomplete read
-                    return Poll::Ready(Ok(()));
-                }
-            }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
-
-        let opcode = header[0] & 0x0F;
-        let masked = (header[1] & 0x80) != 0;
-        let payload_len_byte = header[1] & 0x7F;
-
-        // Handle close frame
-        if opcode == 0x08 {
-            return Poll::Ready(Ok(()));
-        }
-
-        // For now, we only handle small frames (< 126 bytes) in the poll
-        // Larger frames would need more complex state management
-        if payload_len_byte >= 126 {
-            // For larger frames, we need to buffer and handle asynchronously
-            // This is a simplified implementation
-            return Poll::Ready(Err(std::io::Error::other(
-                "Large WebSocket frames not yet supported in poll_read",
-            )));
-        }
-
-        let payload_len = payload_len_byte as usize;
-        let mask_len = if masked { 4 } else { 0 };
-        let total_len = payload_len + mask_len;
-
-        if total_len == 0 {
-            // Empty frame (like ping response)
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        // Read mask and payload
-        let mut frame_data = vec![0u8; total_len];
-        let mut frame_buf = tokio::io::ReadBuf::new(&mut frame_data);
-
-        match std::pin::Pin::new(&mut *inner).poll_read(cx, &mut frame_buf) {
-            Poll::Ready(Ok(())) => {
-                if frame_buf.filled().len() < total_len {
-                    // Incomplete read, need to buffer
-                    self.read_buffer = frame_buf.filled().to_vec();
-                    self.read_pos = 0;
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-            }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
-
-        // Extract mask and unmask payload
-        let payload = if masked {
-            let mask: [u8; 4] = [frame_data[0], frame_data[1], frame_data[2], frame_data[3]];
-            let mut payload = frame_data[4..].to_vec();
-            for (i, byte) in payload.iter_mut().enumerate() {
-                *byte ^= mask[i % 4];
-            }
-            payload
-        } else {
-            frame_data
-        };
-
-        // Copy to output buffer
-        let to_copy = std::cmp::min(payload.len(), buf.remaining());
-        buf.put_slice(&payload[..to_copy]);
-
-        // Buffer remaining data
-        if to_copy < payload.len() {
-            self.read_buffer = payload[to_copy..].to_vec();
-            self.read_pos = 0;
-        }
-
-        Poll::Ready(Ok(()))
     }
 }
 
-// Implement AsyncWrite for WebSocketStream
-impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for WebSocketStream<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        use std::task::Poll;
-
+impl<S: crate::common::stream::SyncStream> Write for WebSocketStream<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Build and send one masked binary frame.
         let mut frame = Vec::with_capacity(14 + buf.len());
         frame.push(0x82);
 
@@ -575,31 +469,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for WebSocketStream<S>
             frame.push(byte ^ mask[i % 4]);
         }
 
-        // Write the frame
-        let inner = &mut self.inner;
-        let pinned = std::pin::Pin::new(inner);
-
-        match pinned.poll_write(cx, &frame) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
+        self.inner.lock().write_all(&frame)?;
+        Ok(buf.len())
     }
 
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let inner = &mut self.inner;
-        std::pin::Pin::new(inner).poll_flush(cx)
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.lock().flush()
+    }
+}
+
+impl<S: crate::common::stream::SyncStream> crate::common::stream::SyncStream
+    for WebSocketStream<S>
+{
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        self.inner.lock().shutdown(how)
     }
 
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let inner = &mut self.inner;
-        std::pin::Pin::new(inner).poll_shutdown(cx)
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.lock().peer_addr()
     }
 }
 
@@ -944,24 +831,25 @@ impl VmessOutbound {
         })
     }
 
-    async fn connect_tcp(&self) -> Result<TcpStream> {
+    fn connect_tcp(&self) -> Result<std::net::TcpStream> {
         let addr = format!("{}:{}", self.server, self.port);
-        let stream = TcpStream::connect(&addr).await.map_err(|e| {
-            Error::network(format!("Failed to connect to VMess server {}: {}", addr, e))
-        })?;
+        let stream =
+            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
+                .map_err(|e| {
+                Error::network(format!("Failed to connect to VMess server {}: {}", addr, e))
+            })?;
         stream.set_nodelay(true).ok();
         Ok(stream)
     }
 
-    /// Connect with TLS if enabled (courierust TLS, boxed async stream).
-    async fn connect_tls(&self) -> Result<Box<dyn AsyncReadWrite>> {
-        let tcp_stream = self.connect_tcp().await?;
+    /// Connect with TLS if enabled (courierust TLS, boxed sync stream).
+    fn connect_tls(&self) -> Result<BoxStream> {
+        let tcp_stream = self.connect_tcp()?;
 
         let sni = self.sni.as_deref().unwrap_or(&self.server).to_string();
         let connector = self.create_tls_connector()?;
         connector
             .connect(tcp_stream, &sni)
-            .await
             .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))
     }
 
@@ -985,7 +873,7 @@ impl VmessOutbound {
     }
 
     /// Connect and return a boxed stream (TCP, TLS, or WebSocket)
-    async fn connect_stream(&self) -> Result<Box<dyn AsyncReadWrite>> {
+    fn connect_stream(&self) -> Result<BoxStream> {
         match self.transport {
             VmessTransport::Ws => {
                 let default_ws_opts = VmessWsOptions::default();
@@ -994,32 +882,30 @@ impl VmessOutbound {
                 let path = &ws_opts.path;
 
                 if self.tls_enabled {
-                    let tls_stream = self.connect_tls().await?;
+                    let tls_stream = self.connect_tls()?;
                     let ws_stream =
-                        WebSocketStream::handshake(tls_stream, host, path, &ws_opts.headers)
-                            .await?;
-                    Ok(Box::new(ws_stream) as Box<dyn AsyncReadWrite>)
+                        WebSocketStream::handshake(tls_stream, host, path, &ws_opts.headers)?;
+                    Ok(Box::new(ws_stream) as BoxStream)
                 } else {
-                    let tcp_stream = self.connect_tcp().await?;
+                    let tcp_stream = self.connect_tcp()?;
                     let ws_stream =
-                        WebSocketStream::handshake(tcp_stream, host, path, &ws_opts.headers)
-                            .await?;
-                    Ok(Box::new(ws_stream) as Box<dyn AsyncReadWrite>)
+                        WebSocketStream::handshake(tcp_stream, host, path, &ws_opts.headers)?;
+                    Ok(Box::new(ws_stream) as BoxStream)
                 }
             }
             _ => {
                 if self.tls_enabled {
-                    let tls_stream = self.connect_tls().await?;
-                    Ok(Box::new(tls_stream) as Box<dyn AsyncReadWrite>)
+                    let tls_stream = self.connect_tls()?;
+                    Ok(Box::new(tls_stream) as BoxStream)
                 } else {
-                    let tcp_stream = self.connect_tcp().await?;
-                    Ok(Box::new(tcp_stream) as Box<dyn AsyncReadWrite>)
+                    let tcp_stream = self.connect_tcp()?;
+                    Ok(Box::new(tcp_stream) as BoxStream)
                 }
             }
         }
     }
 
-    async fn handshake<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+    fn handshake<S: Read + Write + ?Sized>(
         &self,
         stream: &mut S,
         target: &TargetAddr,
@@ -1068,9 +954,8 @@ impl VmessOutbound {
 
         stream
             .write_all(&sealed_header)
-            .await
             .map_err(|e| Error::network(format!("Failed to send VMess header: {}", e)))?;
-        stream.flush().await.ok();
+        stream.flush().ok();
 
         tracing::debug!("VMess handshake sent for target: {}", target);
 
@@ -1082,7 +967,7 @@ impl VmessOutbound {
     }
 
     /// Get or create a UDP session for the given target
-    async fn get_or_create_udp_session(&self, target: &TargetAddr) -> Result<Arc<VmessUdpSession>> {
+    fn get_or_create_udp_session(&self, target: &TargetAddr) -> Result<Arc<VmessUdpSession>> {
         let session_key = target.to_string();
 
         // Check for existing session
@@ -1097,10 +982,9 @@ impl VmessOutbound {
         }
 
         // Create new session
-        let mut stream = self.connect_stream().await?;
-        let (request_key, request_iv, _response_header) = self
-            .handshake(&mut *stream, target, VmessCommand::Udp)
-            .await?;
+        let mut stream = self.connect_stream()?;
+        let (request_key, request_iv, _response_header) =
+            self.handshake(&mut *stream, target, VmessCommand::Udp)?;
 
         let response_key = self.generate_response_key(&request_key);
         let response_iv = self.generate_response_iv(&request_iv);
@@ -1135,7 +1019,7 @@ impl VmessOutbound {
         }
     }
 
-    pub async fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         if !self.udp_enabled {
             return Err(Error::config(
                 "UDP relay is not enabled for this VMess proxy",
@@ -1143,7 +1027,7 @@ impl VmessOutbound {
         }
 
         // Get or create a session for this target
-        let session = self.get_or_create_udp_session(target).await?;
+        let session = self.get_or_create_udp_session(target)?;
 
         // Get chunk count and keys
         let chunk_count = session.next_chunk_count();
@@ -1154,47 +1038,41 @@ impl VmessOutbound {
         let target_str = target.to_string();
 
         // Lock stream for write
-        let mut stream_guard = session.stream.lock().await;
+        let mut stream_guard = session.stream.lock();
 
         // Encrypt and send data
         let encrypted_data = self.encrypt_chunk(data, &request_key, &request_iv, chunk_count)?;
-        if let Err(e) = stream_guard.write_all(&encrypted_data).await {
+        if let Err(e) = stream_guard.write_all(&encrypted_data) {
             // Session might be broken, remove it
             drop(stream_guard);
             self.udp_sessions.remove(&target_str);
             return Err(Error::network(format!("Failed to send UDP data: {}", e)));
         }
-        stream_guard.flush().await.ok();
+        stream_guard.flush().ok();
         session.touch();
 
-        // Read response with timeout
-        let timeout = Duration::from_secs(10);
-        let response = tokio::time::timeout(
-            timeout,
-            self.read_response_chunk(&mut **stream_guard, &response_key, &response_iv),
-        )
-        .await
-        .map_err(|_| {
-            // Timeout, session might be stale
-            Error::network("UDP receive timeout")
-        })?
-        .map_err(|e| {
-            // Read error, remove session
-            Error::network(format!("Failed to receive UDP response: {}", e))
-        })?;
+        // Read response with deadline. The stream read timeout may fire
+        // while no data has arrived; retry until the 10s deadline.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let response = self
+            .read_response_chunk(&mut **stream_guard, &response_key, &response_iv, deadline)
+            .map_err(|e| {
+                // Read error, remove session
+                Error::network(format!("Failed to receive UDP response: {}", e))
+            })?;
 
         Ok(response)
     }
 
     /// Relay UDP packet without waiting for response (fire and forget for some protocols)
-    pub async fn send_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<()> {
+    pub fn send_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<()> {
         if !self.udp_enabled {
             return Err(Error::config(
                 "UDP relay is not enabled for this VMess proxy",
             ));
         }
 
-        let session = self.get_or_create_udp_session(target).await?;
+        let session = self.get_or_create_udp_session(target)?;
 
         let chunk_count = session.next_chunk_count();
         let request_key = session.request_key;
@@ -1202,12 +1080,11 @@ impl VmessOutbound {
 
         let encrypted_data = self.encrypt_chunk(data, &request_key, &request_iv, chunk_count)?;
 
-        let mut stream_guard = session.stream.lock().await;
+        let mut stream_guard = session.stream.lock();
         stream_guard
             .write_all(&encrypted_data)
-            .await
             .map_err(|e| Error::network(format!("Failed to send UDP data: {}", e)))?;
-        stream_guard.flush().await.ok();
+        stream_guard.flush().ok();
         session.touch();
 
         Ok(())
@@ -1350,17 +1227,15 @@ impl VmessOutbound {
         Ok(decrypted)
     }
 
-    async fn read_response_chunk<S: AsyncRead + Unpin + ?Sized>(
+    fn read_response_chunk<S: Read + ?Sized>(
         &self,
         stream: &mut S,
         key: &[u8; 16],
         iv: &[u8; 16],
-    ) -> Result<Vec<u8>> {
+        deadline: Instant,
+    ) -> std::io::Result<Vec<u8>> {
         let mut length_buf = [0u8; 2];
-        stream
-            .read_exact(&mut length_buf)
-            .await
-            .map_err(|e| Error::network(format!("Failed to read chunk length: {}", e)))?;
+        read_exact_deadline(stream, &mut length_buf, deadline)?;
 
         let length = u16::from_be_bytes(length_buf) as usize;
         if length == 0 {
@@ -1368,19 +1243,54 @@ impl VmessOutbound {
         }
 
         let mut data = vec![0u8; length];
-        stream
-            .read_exact(&mut data)
-            .await
-            .map_err(|e| Error::network(format!("Failed to read chunk data: {}", e)))?;
+        read_exact_deadline(stream, &mut data, deadline)?;
 
         self.decrypt_chunk(&data, key, iv, 0)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
-#[async_trait::async_trait]
+/// Read exactly `buf.len()` bytes, retrying transient read timeouts until
+/// `deadline`. Safe to retry: a `read` that returns `WouldBlock`/`TimedOut`
+/// consumes no bytes, and the courierust TLS record layer resumes from the
+/// exact byte across a mid-record timeout.
+fn read_exact_deadline<R: Read + ?Sized>(
+    stream: &mut R,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        match stream.read(&mut buf[pos..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                ))
+            }
+            Ok(n) => pos += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "read timed out",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 impl OutboundProxy for VmessOutbound {
-    async fn connect(&self) -> Result<()> {
-        let _stream = self.connect_tcp().await?;
+    fn connect(&self) -> Result<()> {
+        let _stream = self.connect_tcp()?;
         tracing::info!(
             "VMess outbound '{}' can reach {}:{}",
             self.config.tag,
@@ -1390,7 +1300,7 @@ impl OutboundProxy for VmessOutbound {
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    fn disconnect(&self) -> Result<()> {
         Ok(())
     }
 
@@ -1406,16 +1316,16 @@ impl OutboundProxy for VmessOutbound {
         self.udp_enabled
     }
 
-    async fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+    fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         if !self.udp_enabled {
             return Err(Error::config(
                 "UDP relay is not enabled for this VMess proxy",
             ));
         }
-        self.relay_udp(target, data).await
+        self.relay_udp(target, data)
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         test_url: &str,
         timeout: std::time::Duration,
@@ -1441,15 +1351,11 @@ impl OutboundProxy for VmessOutbound {
         let start = Instant::now();
 
         // Use connect_stream to support TLS
-        let mut stream = tokio::time::timeout(timeout, self.connect_stream())
-            .await
-            .map_err(|_| Error::network("Connection timeout"))?
-            .map_err(|e| Error::network(format!("Connection failed: {}", e)))?;
+        let mut stream = self.connect_stream()?;
 
         let target = TargetAddr::Domain(host.clone(), url_port);
-        let (request_key, request_iv, _) = self
-            .handshake(&mut *stream, &target, VmessCommand::Tcp)
-            .await?;
+        let (request_key, request_iv, _) =
+            self.handshake(&mut *stream, &target, VmessCommand::Tcp)?;
 
         let http_request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n",
@@ -1460,57 +1366,41 @@ impl OutboundProxy for VmessOutbound {
             self.encrypt_chunk(http_request.as_bytes(), &request_key, &request_iv, 0)?;
         stream
             .write_all(&encrypted_request)
-            .await
             .map_err(|e| Error::network(format!("Failed to send HTTP request: {}", e)))?;
 
         let response_key = self.generate_response_key(&request_key);
         let response_iv = self.generate_response_iv(&request_iv);
 
-        let result = tokio::time::timeout(timeout, async {
-            let response = self
-                .read_response_chunk(&mut *stream, &response_key, &response_iv)
-                .await?;
-            let response_str = String::from_utf8_lossy(&response);
-            if response_str.starts_with("HTTP/") {
-                Ok(())
-            } else {
-                Err(Error::network("Invalid HTTP response"))
-            }
-        })
-        .await;
+        // Bounded response read: retry transient timeouts up to the deadline.
+        let deadline = Instant::now() + timeout;
+        let response = self
+            .read_response_chunk(&mut *stream, &response_key, &response_iv, deadline)
+            .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
 
-        match result {
-            Ok(Ok(())) => {
-                let elapsed = start.elapsed();
-                tracing::info!("VMess latency test success: {}ms", elapsed.as_millis());
-                Ok(elapsed)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("VMess latency test failed: {}", e);
-                Err(e)
-            }
-            Err(_) => {
-                tracing::warn!("VMess latency test timeout");
-                Err(Error::network("Response timeout"))
-            }
+        let response_str = String::from_utf8_lossy(&response);
+        if response_str.starts_with("HTTP/") {
+            let elapsed = start.elapsed();
+            tracing::info!("VMess latency test success: {}ms", elapsed.as_millis());
+            Ok(elapsed)
+        } else {
+            Err(Error::network("Invalid HTTP response"))
         }
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        inbound: Box<dyn AsyncReadWrite>,
+        inbound: BoxStream,
         target: TargetAddr,
         connection: Option<Arc<TrackedConnection>>,
     ) -> Result<()> {
-        // Use connect_stream to support TLS
-        let mut stream = self.connect_stream().await?;
-        let (request_key, request_iv, _response_header) = self
-            .handshake(&mut *stream, &target, VmessCommand::Tcp)
-            .await?;
+        // Use connect_stream to support TLS / WebSocket
+        let mut stream = self.connect_stream()?;
+        let (request_key, request_iv, _response_header) =
+            self.handshake(&mut *stream, &target, VmessCommand::Tcp)?;
 
         let response_key = self.generate_response_key(&request_key);
         let response_iv = self.generate_response_iv(&request_iv);
@@ -1523,96 +1413,156 @@ impl OutboundProxy for VmessOutbound {
             self.tls_enabled
         );
 
-        let tracker = global_tracker();
-        let (mut ri, mut wi) = tokio::io::split(inbound);
-        let (mut ro, mut wo) = tokio::io::split(stream);
+        // Wrap the stream with the VMess chunked-encryption codec and let the
+        // bidirectional relay drive both directions concurrently.
+        let vmess_stream = VmessStream::new(
+            stream,
+            self.cipher,
+            request_key,
+            request_iv,
+            response_key,
+            response_iv,
+        );
 
-        let cipher = self.cipher;
-        let conn_upload = connection.clone();
-        let conn_download = connection.clone();
+        relay_streams!(inbound, vmess_stream, connection)
+    }
+}
 
-        let client_to_remote = async {
-            let mut buf = vec![0u8; 16 * 1024];
-            let mut count: u16 = 0;
-            loop {
-                let n = ri
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read from inbound: {}", e)))?;
-                if n == 0 {
-                    let end_chunk = [0u8; 2];
-                    wo.write_all(&end_chunk).await.ok();
-                    break;
+/// A `std::io::Read + Write + SyncStream` adapter over the VMess
+/// chunked-encryption codec, so the bidirectional relay can drive the
+/// upstream stream: writes encrypt each chunk (incrementing the request
+/// count), reads decrypt each chunk (incrementing the response count). On
+/// write-shutdown the `[0,0]` end-of-stream chunk is emitted once before
+/// the underlying transport is half-closed, matching the VMess wire format.
+struct VmessStream {
+    inner: parking_lot::Mutex<BoxStream>,
+    cipher: VmessCipher,
+    enc_key: [u8; 16],
+    enc_iv: [u8; 16],
+    dec_key: [u8; 16],
+    dec_iv: [u8; 16],
+    enc_count: u16,
+    dec_count: u16,
+    read_buffer: Vec<u8>,
+    read_pos: usize,
+    eof: bool,
+    end_chunk_sent: AtomicBool,
+}
+
+/// Maximum plaintext bytes per VMess chunk (u16 length field on the wire;
+/// ciphertext adds a 16-byte tag, so 16 KiB always fits).
+const VMESS_CHUNK_MAX: usize = 16 * 1024;
+
+impl VmessStream {
+    fn new(
+        inner: BoxStream,
+        cipher: VmessCipher,
+        enc_key: [u8; 16],
+        enc_iv: [u8; 16],
+        dec_key: [u8; 16],
+        dec_iv: [u8; 16],
+    ) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(inner),
+            cipher,
+            enc_key,
+            enc_iv,
+            dec_key,
+            dec_iv,
+            enc_count: 0,
+            dec_count: 0,
+            read_buffer: Vec::new(),
+            read_pos: 0,
+            eof: false,
+            end_chunk_sent: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Read for VmessStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            // Serve buffered decrypted data first.
+            if self.read_pos < self.read_buffer.len() {
+                let n = (self.read_buffer.len() - self.read_pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.read_buffer[self.read_pos..self.read_pos + n]);
+                self.read_pos += n;
+                if self.read_pos >= self.read_buffer.len() {
+                    self.read_buffer.clear();
+                    self.read_pos = 0;
                 }
-
-                let encrypted =
-                    encrypt_chunk_static(cipher, &buf[..n], &request_key, &request_iv, count)?;
-                wo.write_all(&encrypted)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to write to VMess: {}", e)))?;
-
-                tracker.add_global_upload(n as u64);
-                if let Some(ref conn) = conn_upload {
-                    conn.add_upload(n as u64);
-                }
-                count = count.wrapping_add(1);
+                return Ok(n);
             }
-            wo.shutdown().await.ok();
-            Ok::<(), Error>(())
-        };
-
-        let remote_to_client = async {
-            let mut count: u16 = 0;
-            loop {
-                let mut length_buf = [0u8; 2];
-                match ro.read_exact(&mut length_buf).await {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(Error::network(format!("Failed to read length: {}", e))),
-                }
-
-                let length = u16::from_be_bytes(length_buf) as usize;
-                if length == 0 {
-                    break;
-                }
-
-                let mut data = vec![0u8; length];
-                ro.read_exact(&mut data)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read chunk: {}", e)))?;
-
-                let decrypted =
-                    decrypt_chunk_static(cipher, &data, &response_key, &response_iv, count)?;
-                wi.write_all(&decrypted)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to write to inbound: {}", e)))?;
-
-                tracker.add_global_download(decrypted.len() as u64);
-                if let Some(ref conn) = conn_download {
-                    conn.add_download(decrypted.len() as u64);
-                }
-                count = count.wrapping_add(1);
+            if self.eof {
+                return Ok(0);
             }
-            wi.shutdown().await.ok();
-            Ok::<(), Error>(())
-        };
-
-        let result = tokio::try_join!(client_to_remote, remote_to_client);
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("connection")
-                    || err_str.contains("reset")
-                    || err_str.contains("broken")
-                {
-                    Ok(())
-                } else {
-                    Err(e)
+            // Read the next chunk: [2-byte length][payload].
+            let mut inner = self.inner.lock();
+            let mut length_buf = [0u8; 2];
+            match inner.read_exact(&mut length_buf) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    self.eof = true;
+                    return Ok(0);
                 }
+                Err(e) => return Err(e),
+            }
+            let length = u16::from_be_bytes(length_buf) as usize;
+            if length == 0 {
+                self.eof = true;
+                return Ok(0);
+            }
+            let mut data = vec![0u8; length];
+            inner.read_exact(&mut data)?;
+            drop(inner);
+
+            let count = self.dec_count;
+            let decrypted =
+                decrypt_chunk_static(self.cipher, &data, &self.dec_key, &self.dec_iv, count)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            self.dec_count = self.dec_count.wrapping_add(1);
+
+            self.read_buffer = decrypted;
+            self.read_pos = 0;
+        }
+    }
+}
+
+impl Write for VmessStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut inner = self.inner.lock();
+        let mut count = self.enc_count;
+        for chunk in buf.chunks(VMESS_CHUNK_MAX) {
+            let encrypted =
+                encrypt_chunk_static(self.cipher, chunk, &self.enc_key, &self.enc_iv, count)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            inner.write_all(&encrypted)?;
+            count = count.wrapping_add(1);
+        }
+        self.enc_count = count;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.lock().flush()
+    }
+}
+
+impl crate::common::stream::SyncStream for VmessStream {
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        let mut inner = self.inner.lock();
+        if matches!(how, std::net::Shutdown::Write | std::net::Shutdown::Both) {
+            // Emit the [0,0] end-of-stream chunk exactly once, then FIN.
+            if !self.end_chunk_sent.swap(true, Ordering::SeqCst) {
+                let end_chunk = [0u8; 2];
+                let _ = inner.write_all(&end_chunk);
             }
         }
+        inner.shutdown(how)
+    }
+
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.lock().peer_addr()
     }
 }
 

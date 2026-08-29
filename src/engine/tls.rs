@@ -99,19 +99,18 @@ pub mod shadow_tls {
             self.obfuscation_enabled = enabled;
         }
 
-        pub async fn connect(
+        pub fn connect(
             &self,
-            stream: tokio::net::TcpStream,
+            stream: std::net::TcpStream,
             server_name: &str,
         ) -> Result<ShadowTlsStream> {
-            let tls_stream =
-                self.inner
-                    .connect(stream, server_name)
-                    .await
-                    .map_err(|e| Error::Tls {
-                        message: format!("Shadow TLS connection failed: {}", e),
-                        source: None,
-                    })?;
+            let tls_stream = self
+                .inner
+                .connect(stream, server_name)
+                .map_err(|e| Error::Tls {
+                    message: format!("Shadow TLS connection failed: {}", e),
+                    source: None,
+                })?;
             Ok(ShadowTlsStream {
                 inner: tls_stream,
                 obfuscation_enabled: self.obfuscation_enabled,

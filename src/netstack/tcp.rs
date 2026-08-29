@@ -1,22 +1,25 @@
 //! TCP stack implementation for corduit-netstack
 //!
 //! Handles TCP connections from the TUN device and provides
-//! AsyncRead/AsyncWrite streams for proxying.
+//! synchronous Read/Write streams for proxying.
 
+use crate::common::stream::SyncStream;
+use crate::common::sync::Notify;
 use crate::netstack::error::{NetStackError, Result};
 use bytes::{Bytes, BytesMut};
-use futures::Stream;
 use parking_lot::Mutex;
-use pin_project_lite::pin_project;
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::pin::Pin;
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use tracing::debug;
+
+/// How long a blocking read waits for data before re-checking connection state.
+const READ_POLL_TIMEOUT: Duration = Duration::from_millis(50);
+/// How long `accept()` waits between polls of the new-connection queue.
+const ACCEPT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// TCP connection identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,10 +55,8 @@ struct TcpConnectionInner {
     recv_buffer: BytesMut,
     /// Data to be sent to remote
     send_buffer: BytesMut,
-    /// Waker for read operations
-    read_waker: Option<Waker>,
-    /// Waker for write operations
-    write_waker: Option<Waker>,
+    /// Wakeup signal for blocking readers (data available / state changed)
+    notify: Notify,
     /// Connection closed flag
     closed: bool,
     /// Bytes uploaded
@@ -80,8 +81,7 @@ impl TcpConnection {
                 state: TcpState::SynReceived,
                 recv_buffer: BytesMut::with_capacity(64 * 1024),
                 send_buffer: BytesMut::with_capacity(64 * 1024),
-                read_waker: None,
-                write_waker: None,
+                notify: Notify::new(),
                 closed: false,
                 upload_bytes: 0,
                 download_bytes: 0,
@@ -134,9 +134,8 @@ impl TcpConnection {
         }
         inner.recv_buffer.extend_from_slice(data);
         inner.download_bytes += data.len() as u64;
-        if let Some(waker) = inner.read_waker.take() {
-            waker.wake();
-        }
+        drop(inner);
+        self.inner.lock().notify.notify_waiters();
     }
 
     /// Take data to be sent to the network
@@ -157,12 +156,8 @@ impl TcpConnection {
         inner.state = state;
         if state == TcpState::Closed {
             inner.closed = true;
-            if let Some(waker) = inner.read_waker.take() {
-                waker.wake();
-            }
-            if let Some(waker) = inner.write_waker.take() {
-                waker.wake();
-            }
+            drop(inner);
+            self.inner.lock().notify.notify_waiters();
         }
     }
 
@@ -171,70 +166,77 @@ impl TcpConnection {
         let mut inner = self.inner.lock();
         inner.closed = true;
         inner.state = TcpState::Closed;
-        if let Some(waker) = inner.read_waker.take() {
-            waker.wake();
+        drop(inner);
+        self.inner.lock().notify.notify_waiters();
+    }
+}
+
+impl Read for TcpConnection {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
         }
-        if let Some(waker) = inner.write_waker.take() {
-            waker.wake();
+        loop {
+            let notify = {
+                let mut inner = self.inner.lock();
+                if !inner.recv_buffer.is_empty() {
+                    let len = std::cmp::min(buf.len(), inner.recv_buffer.len());
+                    buf[..len].copy_from_slice(&inner.recv_buffer.split_to(len));
+                    return Ok(len);
+                }
+                if inner.closed {
+                    return Ok(0); // EOF
+                }
+                inner.notify.clone()
+            };
+            // Block until data arrives or the connection is closed.
+            notify.wait(READ_POLL_TIMEOUT);
+            if self.inner.lock().closed {
+                return Ok(0);
+            }
         }
     }
 }
 
-impl AsyncRead for TcpConnection {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut inner = self.inner.lock();
-
-        if !inner.recv_buffer.is_empty() {
-            let len = std::cmp::min(buf.remaining(), inner.recv_buffer.len());
-            buf.put_slice(&inner.recv_buffer.split_to(len));
-            return Poll::Ready(Ok(()));
-        }
-
-        if inner.closed {
-            return Poll::Ready(Ok(())); // EOF
-        }
-
-        inner.read_waker = Some(cx.waker().clone());
-        Poll::Pending
-    }
-}
-
-impl AsyncWrite for TcpConnection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+impl Write for TcpConnection {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut inner = self.inner.lock();
 
         if inner.closed {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
                 "Connection closed",
-            )));
+            ));
         }
 
         inner.send_buffer.extend_from_slice(buf);
         inner.upload_bytes += buf.len() as u64;
 
         // Notify the stack that there's data to send
-        let _ = self.stack_tx.try_send(TcpStackEvent::DataReady(self.id));
+        let _ = self.stack_tx.send(TcpStackEvent::DataReady(self.id));
 
-        Poll::Ready(Ok(buf.len()))
+        Ok(buf.len())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl SyncStream for TcpConnection {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match how {
+            Shutdown::Write | Shutdown::Both => {
+                self.close();
+                let _ = self.stack_tx.send(TcpStackEvent::Close(self.id));
+            }
+            Shutdown::Read => {}
+        }
+        Ok(())
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.close();
-        let _ = self.stack_tx.try_send(TcpStackEvent::Close(self.id));
-        Poll::Ready(Ok(()))
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        Some(self.id.src_addr)
     }
 }
 
@@ -263,8 +265,8 @@ pub struct TcpStack {
 
 impl TcpStack {
     pub fn new() -> Self {
-        let (new_conn_tx, new_conn_rx) = mpsc::channel(256);
-        let (event_tx, event_rx) = mpsc::channel(1024);
+        let (new_conn_tx, new_conn_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
 
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
@@ -300,7 +302,7 @@ impl TcpStack {
         debug!("TCP connection created: {}", id);
 
         // Notify listener about new connection
-        let _ = self.new_conn_tx.try_send(conn.clone());
+        let _ = self.new_conn_tx.send(conn.clone());
 
         Ok(conn)
     }
@@ -370,25 +372,21 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    /// Accept a new connection
-    pub async fn accept(&mut self) -> Option<Arc<TcpConnection>> {
-        self.rx.recv().await
+    /// Accept a new connection (blocks until one is available)
+    pub fn accept(&mut self) -> Option<Arc<TcpConnection>> {
+        loop {
+            match self.rx.recv_timeout(ACCEPT_POLL_TIMEOUT) {
+                Ok(conn) => return Some(conn),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
     }
 }
 
-impl Stream for TcpListener {
-    type Item = Arc<TcpConnection>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.rx).poll_recv(cx)
-    }
-}
-
-pin_project! {
-    /// A TCP stream wrapper that implements AsyncRead + AsyncWrite
-    pub struct TcpStream {
-        conn: Arc<TcpConnection>,
-    }
+/// A TCP stream wrapper that implements synchronous Read + Write
+pub struct TcpStream {
+    conn: Arc<TcpConnection>,
 }
 
 impl TcpStream {
@@ -409,68 +407,72 @@ impl TcpStream {
     }
 }
 
-impl AsyncRead for TcpStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.project();
-        let mut inner = this.conn.inner.lock();
-
-        if !inner.recv_buffer.is_empty() {
-            let len = std::cmp::min(buf.remaining(), inner.recv_buffer.len());
-            buf.put_slice(&inner.recv_buffer.split_to(len));
-            return Poll::Ready(Ok(()));
+impl Read for TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
         }
-
-        if inner.closed {
-            return Poll::Ready(Ok(()));
+        loop {
+            let notify = {
+                let mut inner = self.conn.inner.lock();
+                if !inner.recv_buffer.is_empty() {
+                    let len = std::cmp::min(buf.len(), inner.recv_buffer.len());
+                    buf[..len].copy_from_slice(&inner.recv_buffer.split_to(len));
+                    return Ok(len);
+                }
+                if inner.closed {
+                    return Ok(0);
+                }
+                inner.notify.clone()
+            };
+            notify.wait(READ_POLL_TIMEOUT);
+            if self.conn.inner.lock().closed {
+                return Ok(0);
+            }
         }
-
-        inner.read_waker = Some(cx.waker().clone());
-        Poll::Pending
     }
 }
 
-impl AsyncWrite for TcpStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.project();
-        let mut inner = this.conn.inner.lock();
+impl Write for TcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut inner = self.conn.inner.lock();
 
         if inner.closed {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
                 "Connection closed",
-            )));
+            ));
         }
 
         inner.send_buffer.extend_from_slice(buf);
         inner.upload_bytes += buf.len() as u64;
 
-        let _ = this
+        let _ = self
             .conn
             .stack_tx
-            .try_send(TcpStackEvent::DataReady(this.conn.id));
+            .send(TcpStackEvent::DataReady(self.conn.id));
 
-        Poll::Ready(Ok(buf.len()))
+        Ok(buf.len())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl SyncStream for TcpStream {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match how {
+            Shutdown::Write | Shutdown::Both => {
+                self.conn.close();
+                let _ = self.conn.stack_tx.send(TcpStackEvent::Close(self.conn.id));
+            }
+            Shutdown::Read => {}
+        }
+        Ok(())
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.project();
-        this.conn.close();
-        let _ = this
-            .conn
-            .stack_tx
-            .try_send(TcpStackEvent::Close(this.conn.id));
-        Poll::Ready(Ok(()))
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        Some(self.conn.src_addr())
     }
 }

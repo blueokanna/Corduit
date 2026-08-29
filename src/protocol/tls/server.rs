@@ -1,14 +1,15 @@
 //! TLS server acceptor on courierust's TLS 1.2/1.3 (replacing `rustls` +
 //! `tokio-rustls`).
 //!
-//! Same model as the client: the handshake runs on a `spawn_blocking`
-//! worker over a `std::net::TcpStream`, and the resulting blocking TLS
-//! stream is bridged back to tokio.
+//! Synchronous model: [`TlsAcceptor::accept`] performs the handshake over a
+//! `std::net::TcpStream` and returns a boxed
+//! [`SyncStream`](crate::common::stream::SyncStream).
 
 use super::config::ServerConfig;
 use super::error::{Result, TlsError};
 use super::{BoxStream, TlsStream};
 use crate::common::http_server::TlsIdentity;
+use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Socket write timeout.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Read timeout used for the relay loop after the handshake.
-const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(20);
+const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// TLS server acceptor (courierust).
 #[derive(Clone)]
@@ -47,35 +48,23 @@ impl TlsAcceptor {
         Ok(Self { inner, config })
     }
 
-    /// Accept a TLS handshake on `stream`. Returns a boxed async stream.
-    pub async fn accept(&self, stream: tokio::net::TcpStream) -> Result<BoxStream> {
+    /// Accept a TLS handshake on `stream`. Returns a boxed synchronous
+    /// stream.
+    pub fn accept(&self, stream: TcpStream) -> Result<BoxStream> {
         let acceptor = self.inner.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let std_stream = stream.into_std().map_err(TlsError::Io)?;
-            let _ = std_stream.set_nodelay(true);
-            let _ = std_stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
-            let _ = std_stream.set_write_timeout(Some(WRITE_TIMEOUT));
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
 
-            let arc = Arc::new(std_stream);
-            let tls = acceptor
-                .accept(arc.clone(), arc.clone())
-                .map_err(|e| TlsError::Handshake(e.to_string()))?;
+        let arc = Arc::new(stream);
+        let tls = acceptor
+            .accept(arc.clone(), arc.clone())
+            .map_err(|e| TlsError::Handshake(e.to_string()))?;
 
-            let _ = arc.set_read_timeout(Some(RELAY_READ_TIMEOUT));
+        let _ = arc.set_read_timeout(Some(RELAY_READ_TIMEOUT));
 
-            type Stream = courierust::courierust_tls::TlsStream<
-                Arc<std::net::TcpStream>,
-                Arc<std::net::TcpStream>,
-            >;
-            let hook: crate::common::ShutdownHook<Stream> = Box::new(|s| {
-                let _ = s.close_notify();
-            });
-
-            Ok(Box::new(TlsStream::new(tls, 64, Some(hook))) as BoxStream)
-        })
-        .await
-        .map_err(|e| TlsError::Io(std::io::Error::other(format!("TLS worker panicked: {e}"))))?
+        Ok(Box::new(TlsStream::new(tls, arc)) as BoxStream)
     }
 
     /// The underlying configuration.

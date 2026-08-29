@@ -1,0 +1,56 @@
+    Blocking waiting for file lock on build directory
+    Checking corduit v0.2.0 (D:\RustProject\Corduit)
+warning: function `copy_one_way` is never used
+  --> src\common\stream.rs:84:4
+   |
+84 | fn copy_one_way(
+   |    ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `thread` is never read
+  --> src\common\timer.rs:65:5
+   |
+63 | pub struct Timer {
+   |            ----- field in this struct
+64 |     core: Arc<Core>,
+65 |     thread: Option<std::thread::JoinHandle<()>>,
+   |     ^^^^^^
+
+warning: constant `PROXY_READ_TIMEOUT` is never used
+  --> src\netstack\solidtcp\stack.rs:26:7
+   |
+26 | const PROXY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+   --> src\engine\inbound\forward.rs:804:21
+    |
+804 |                     drop(mine);
+    |                     ^^^^^----^
+    |                          |
+    |                          argument has type `&mut VecDeque<u8>`
+    |
+    = note: `#[warn(dropping_references)]` on by default
+help: use `let _ = ...` to ignore the expression or result
+    |
+804 -                     drop(mine);
+804 +                     let _ = mine;
+    |
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+   --> src\engine\inbound\forward.rs:821:21
+    |
+821 |                     drop(mine);
+    |                     ^^^^^----^
+    |                          |
+    |                          argument has type `&mut VecDeque<u8>`
+    |
+help: use `let _ = ...` to ignore the expression or result
+    |
+821 -                     drop(mine);
+821 +                     let _ = mine;
+    |
+
+warning: `corduit` (lib) generated 5 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.43s

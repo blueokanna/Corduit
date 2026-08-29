@@ -32,7 +32,7 @@
 //! ```rust,no_run
 //! use corduit::netstack::{NetStack, NetStackBuilder};
 //!
-//! async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! fn run() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create network stack
 //!     let mut stack = NetStackBuilder::new()
 //!         .tun_name("Corduit")
@@ -40,18 +40,17 @@
 //!         .tun_netmask("255.255.0.0".parse()?)
 //!         .enable_tcp(true)
 //!         .enable_udp(true)
-//!         .build()
-//!         .await?;
+//!         .build()?;
 //!
 //!     // Create TUN device
-//!     stack.create_tun("Corduit", "198.18.0.1", "255.255.0.0").await?;
+//!     stack.create_tun("Corduit", "198.18.0.1", "255.255.0.0")?;
 //!
 //!     // Start the stack
-//!     stack.start().await?;
+//!     stack.start()?;
 //!
 //!     // Get TCP listener
 //!     if let Some(mut tcp_listener) = stack.tcp_listener() {
-//!         while let Some(conn) = tcp_listener.accept().await {
+//!         while let Some(conn) = tcp_listener.accept() {
 //!             // Handle TCP connection
 //!             println!("New TCP connection: {} -> {}", conn.src_addr(), conn.dst_addr());
 //!         }
@@ -174,19 +173,19 @@ pub fn get_wintun_path() -> Option<std::path::PathBuf> {
 
 /// Ensure wintun.dll is available, downloading if necessary (Windows only)
 #[cfg(windows)]
-pub async fn ensure_wintun() -> Result<std::path::PathBuf> {
+pub fn ensure_wintun() -> Result<std::path::PathBuf> {
     // First try to use existing or embedded
     if let Ok(path) = wintun_embed::ensure_wintun_available() {
         return Ok(path);
     }
 
     // Try to download
-    wintun_embed::download_wintun_dll().await
+    wintun_embed::download_wintun_dll()
 }
 
 /// Ensure wintun.dll is available (non-Windows - always succeeds)
 #[cfg(not(windows))]
-pub async fn ensure_wintun() -> Result<std::path::PathBuf> {
+pub fn ensure_wintun() -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::new())
 }
 

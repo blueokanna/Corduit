@@ -12,32 +12,15 @@
 //!   payloads.
 //!
 //! Callers must free returned buffers with [`corduit_string_free`] /
-//! [`corduit_binary_free`]. Thread-safe: a shared multi-threaded Tokio runtime
-//! drives every async API internally, and no panic ever unwinds across the
-//! `extern "C"` boundary.
+//! [`corduit_binary_free`]. Thread-safe: every exported function runs the
+//! engine synchronously on the calling thread, and no panic ever unwinds
+//! across the `extern "C"` boundary.
 
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
-use std::sync::OnceLock;
 
 use crate::api;
 use crate::rpc::{dispatch, CORDUIT_API_VERSION, CORDUIT_METHODS};
-
-// ---------------------------------------------------------------------------
-// Shared async runtime
-// ---------------------------------------------------------------------------
-
-/// Lazily-initialized multi-threaded runtime used by every async FFI method.
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("corduit-ffi")
-            .build()
-            .expect("failed to build the Corduit FFI tokio runtime")
-    })
-}
 
 // ---------------------------------------------------------------------------
 // C-compatible response types
@@ -194,7 +177,7 @@ pub unsafe extern "C" fn corduit_call(
             nextjson::from_str(raw).unwrap_or(nextjson::Value::Null)
         };
 
-        runtime().block_on(dispatch(&method, &value))
+        dispatch(&method, &value)
     })) {
         Ok(Ok(v)) => match nextjson::to_string(&v) {
             Ok(s) => FfiResponse::ok(s),
@@ -237,7 +220,7 @@ pub unsafe extern "C" fn corduit_call_binary(
             rustbinary::deserialize(bytes).unwrap_or(nextjson::Value::Null)
         };
 
-        runtime().block_on(dispatch(&method, &value))
+        dispatch(&method, &value)
     })) {
         Ok(Ok(v)) => match rustbinary::serialize(&v) {
             Ok(bytes) => FfiBinaryResponse::ok(bytes),
@@ -289,7 +272,7 @@ mod tests {
             let s = CStr::from_ptr(resp.data).to_str().unwrap().to_string();
             drop(CString::from_raw(resp.data));
             assert!(
-                s.contains("version") || s.contains("0.1"),
+                s.contains("Corduit") || s.contains("v0.2"),
                 "unexpected: {s}"
             );
         }

@@ -1,8 +1,16 @@
+//! SOCKS-style address encoding/decoding (`Address`, `AddressType`).
+//!
+//! The wire codec is `no_std + alloc`: IP types come from `core::net`, byte
+//! buffers from `bytes` (itself `no_std`), and parsing is purely slice-based
+//! — no OS, no heap beyond the owned `Address` form.
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::fmt;
-use std::io::Cursor;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use core::fmt;
+use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::protocol::error::{ProtocolError, Result};
 
@@ -180,7 +188,8 @@ impl Address {
         Ok((addr.to_owned(), consumed))
     }
 
-    pub fn read_from_cursor(buf: &mut Cursor<&[u8]>) -> Result<Self> {
+    /// Read an address from a byte slice, advancing a `&[u8]` cursor.
+    fn parse_from_buf(buf: &mut &[u8]) -> Result<Self> {
         if !buf.has_remaining() {
             return Err(ProtocolError::BufferTooSmall);
         }
@@ -224,47 +233,52 @@ impl Address {
         }
     }
 
-    pub async fn read_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
-        let addr_type_byte = reader.read_u8().await.map_err(ProtocolError::Io)?;
-        let addr_type = AddressType::try_from(addr_type_byte)?;
+    /// Read an address from a `std::io::Read` stream (the engine's socket
+    /// path). The read is bounded by the socket's read timeout.
+    #[cfg(feature = "std")]
+    pub fn read_from_reader<R: std::io::Read>(reader: &mut R) -> Result<Self> {
+        let mut get = |buf: &mut [u8]| -> Result<()> {
+            reader
+                .read_exact(buf)
+                .map_err(|e| ProtocolError::Io(e.to_string()))
+        };
+        let mut one = [0u8; 1];
+        get(&mut one)?;
+        let addr_type = AddressType::try_from(one[0])?;
 
         match addr_type {
             AddressType::IPv4 => {
                 let mut ip = [0u8; 4];
-                reader
-                    .read_exact(&mut ip)
-                    .await
-                    .map_err(ProtocolError::Io)?;
-                let port = reader.read_u16().await.map_err(ProtocolError::Io)?;
-                Ok(Self::Ipv4(Ipv4Addr::from(ip), port))
+                get(&mut ip)?;
+                let mut port = [0u8; 2];
+                get(&mut port)?;
+                Ok(Self::Ipv4(Ipv4Addr::from(ip), u16::from_be_bytes(port)))
             }
             AddressType::IPv6 => {
                 let mut ip = [0u8; 16];
-                reader
-                    .read_exact(&mut ip)
-                    .await
-                    .map_err(ProtocolError::Io)?;
-                let port = reader.read_u16().await.map_err(ProtocolError::Io)?;
-                Ok(Self::Ipv6(Ipv6Addr::from(ip), port))
+                get(&mut ip)?;
+                let mut port = [0u8; 2];
+                get(&mut port)?;
+                Ok(Self::Ipv6(Ipv6Addr::from(ip), u16::from_be_bytes(port)))
             }
             AddressType::Domain => {
-                let len = reader.read_u8().await.map_err(ProtocolError::Io)? as usize;
+                get(&mut one)?;
+                let len = one[0] as usize;
                 let mut domain = vec![0u8; len];
-                reader
-                    .read_exact(&mut domain)
-                    .await
-                    .map_err(ProtocolError::Io)?;
+                get(&mut domain)?;
                 let domain = String::from_utf8(domain)
                     .map_err(|_| ProtocolError::AddressParse("Invalid UTF-8 domain".into()))?;
-                let port = reader.read_u16().await.map_err(ProtocolError::Io)?;
-                Ok(Self::Domain(domain, port))
+                let mut port = [0u8; 2];
+                get(&mut port)?;
+                Ok(Self::Domain(domain, u16::from_be_bytes(port)))
             }
         }
     }
 
     #[inline]
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        Self::read_from_cursor(&mut Cursor::new(data))
+        let mut buf: &[u8] = data;
+        Self::parse_from_buf(&mut buf)
     }
 
     pub fn to_socket_addr(&self) -> Option<SocketAddr> {
@@ -291,12 +305,12 @@ pub enum AddressRef<'a> {
 
 impl<'a> AddressRef<'a> {
     pub fn parse(buf: &'a [u8]) -> Result<(Self, usize)> {
-        let mut cursor = Cursor::new(buf);
-        let addr = Self::parse_cursor(&mut cursor)?;
-        Ok((addr, cursor.position() as usize))
+        let mut rest: &[u8] = buf;
+        let addr = Self::parse_buf(&mut rest)?;
+        Ok((addr, buf.len() - rest.len()))
     }
 
-    pub fn parse_cursor(buf: &mut Cursor<&'a [u8]>) -> Result<Self> {
+    fn parse_buf(buf: &mut &'a [u8]) -> Result<Self> {
         if !buf.has_remaining() {
             return Err(ProtocolError::BufferTooSmall);
         }
@@ -328,8 +342,7 @@ impl<'a> AddressRef<'a> {
                 if buf.remaining() < len + 2 {
                     return Err(ProtocolError::BufferTooSmall);
                 }
-                let pos = buf.position() as usize;
-                let domain = std::str::from_utf8(&buf.get_ref()[pos..pos + len])
+                let domain = core::str::from_utf8(&buf[..len])
                     .map_err(|_| ProtocolError::AddressParse("Invalid UTF-8 domain".into()))?;
                 buf.advance(len);
                 let port = buf.get_u16();
@@ -502,13 +515,27 @@ mod tests {
         assert_eq!(addr.host(), "1.2.3.4");
     }
 
-    #[tokio::test]
-    async fn test_address_async_read() {
-        let addr = Address::Domain("async.test".to_string(), 12345);
+    #[test]
+    fn test_address_reader_roundtrip() {
+        let addr = Address::Domain("sync.test".to_string(), 12345);
         let bytes = addr.to_bytes().unwrap();
         let mut cursor = std::io::Cursor::new(bytes.to_vec());
-        let parsed = Address::read_from_async(&mut cursor).await.unwrap();
+        let parsed = Address::read_from_reader(&mut cursor).unwrap();
         assert_eq!(addr, parsed);
+
+        // Reader path must also reject truncated wire data.
+        let mut cursor = std::io::Cursor::new(vec![AddressType::IPv4 as u8, 1, 2]);
+        assert!(Address::read_from_reader(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn test_address_parse_from_slice_cursor() {
+        let addr = Address::Ipv4(Ipv4Addr::new(10, 0, 0, 2), 53);
+        let bytes = addr.to_bytes().unwrap();
+        let mut buf: &[u8] = &bytes;
+        let parsed = Address::parse_from_buf(&mut buf).unwrap();
+        assert_eq!(addr, parsed);
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -527,8 +554,8 @@ mod tests {
         // The borrowed domain must point into the input buffer, not a copy.
         let domain = parsed.domain().expect("domain address");
         assert_eq!(domain, "example.com");
-        let in_wire = unsafe { std::slice::from_raw_parts(domain.as_ptr(), domain.len()) };
-        assert_eq!(in_wire, &wire[2..13]);
+        // Provenance check: the borrow aliases the wire region, not a heap copy.
+        assert_eq!(domain.as_ptr(), wire[2..13].as_ptr());
     }
 
     #[test]

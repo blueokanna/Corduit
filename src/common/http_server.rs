@@ -134,9 +134,8 @@ fn contains_oid(der: &[u8], oid: &[u8]) -> bool {
 }
 
 /// A transport that is either a plain TCP socket or a TLS stream, shared
-/// between the reader and writer via `Arc` (the same shape the blocking-IO
-/// bridge and the client use). Public so a CONNECT-tunnel handler can wrap
-/// it in a [`crate::common::BlockingStream`].
+/// between the reader and writer via `Arc`. Public so a CONNECT-tunnel
+/// handler can box it into the engine's [`BoxStream`](crate::common::stream::BoxStream).
 #[allow(clippy::large_enum_variant)] // the TLS variant legitimately owns a handshake object
 pub enum RawConnection {
     /// A plain TCP socket.
@@ -170,6 +169,53 @@ impl CWrite for RawConnection {
     }
 }
 
+impl std::io::Read for RawConnection {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use courierust::courierust_error::ErrorKind as CourierKind;
+        match CRead::read(self, buf) {
+            Ok(n) => Ok(n),
+            Err(e) if matches!(e.kind, CourierKind::Timeout) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read timed out",
+            )),
+            Err(e) if matches!(e.kind, CourierKind::WouldBlock) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "would block",
+            )),
+            Err(e) if matches!(e.kind, CourierKind::UnexpectedEof) => Ok(0),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
+        }
+    }
+}
+
+impl std::io::Write for RawConnection {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CWrite::write(self, buf).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        CWrite::flush(self).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
+
+impl crate::common::stream::SyncStream for RawConnection {
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        match self {
+            RawConnection::Plain(s) => s.shutdown(how),
+            // TLS half-close is driven by close_notify on drop; the raw
+            // socket is not reachable through courierust's public API.
+            RawConnection::Tls(_) => Ok(()),
+        }
+    }
+
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            RawConnection::Plain(s) => s.peer_addr().ok(),
+            RawConnection::Tls(_) => None,
+        }
+    }
+}
+
 /// A synchronous HTTP request handler.
 pub trait Handler: Send + Sync + 'static {
     /// Handle one request and produce a response.
@@ -191,8 +237,8 @@ where
 pub(crate) const TUNNEL_MARKER: &str = "x-corduit-raw-upgrade";
 
 /// Handles a raw connection handed off after an HTTP response (used for
-/// proxy CONNECT tunnels). The connection is blocking; wrap it in a
-/// [`crate::common::BlockingStream`] to relay it through the async engine.
+/// proxy CONNECT tunnels). The connection is synchronous; the handler can
+/// relay it with [`relay`](crate::common::stream::relay).
 pub trait TunnelHandler: Send + Sync + 'static {
     /// Take ownership of the raw connection and relay it.
     fn handle_tunnel(&self, conn: RawConnection);

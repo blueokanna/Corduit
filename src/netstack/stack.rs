@@ -5,9 +5,12 @@ use crate::netstack::udp::{UdpListener, UdpStack};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket as SmolUdpPacket};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use tracing::{info, trace};
+
+/// How long the packet processing loop waits between queue polls.
+const PACKET_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Network stack configuration
 #[derive(Debug, Clone)]
@@ -104,12 +107,12 @@ pub struct NetStack {
 
 impl NetStack {
     /// Create a new network stack with default configuration
-    pub async fn new() -> Result<Self> {
-        Self::with_config(StackConfig::default()).await
+    pub fn new() -> Result<Self> {
+        Self::with_config(StackConfig::default())
     }
 
     /// Create a new network stack with custom configuration
-    pub async fn with_config(config: StackConfig) -> Result<Self> {
+    pub fn with_config(config: StackConfig) -> Result<Self> {
         let tcp_stack = TcpStack::new();
         let udp_stack = UdpStack::new();
 
@@ -125,7 +128,7 @@ impl NetStack {
     }
 
     /// Create and setup TUN device
-    pub async fn create_tun(&mut self, name: &str, addr: &str, netmask: &str) -> Result<()> {
+    pub fn create_tun(&mut self, name: &str, addr: &str, netmask: &str) -> Result<()> {
         let mut config = self.config.tun.clone();
         config.name = name.to_string();
         config.address = addr
@@ -135,20 +138,20 @@ impl NetStack {
             .parse()
             .map_err(|e| NetStackError::Parse(format!("{}", e)))?;
 
-        let tun = TunDevice::with_config(config).await?;
+        let tun = TunDevice::with_config(config)?;
         self.tun_device = Some(tun);
         Ok(())
     }
 
     /// Create TUN device with full configuration
-    pub async fn create_tun_with_config(&mut self, config: TunConfig) -> Result<()> {
-        let tun = TunDevice::with_config(config).await?;
+    pub fn create_tun_with_config(&mut self, config: TunConfig) -> Result<()> {
+        let tun = TunDevice::with_config(config)?;
         self.tun_device = Some(tun);
         Ok(())
     }
 
     /// Start the network stack
-    pub async fn start(&mut self) -> Result<()> {
+    pub fn start(&mut self) -> Result<()> {
         if self.running.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -157,14 +160,14 @@ impl NetStack {
 
         // Start TUN device
         if let Some(tun) = &mut self.tun_device {
-            tun.start().await?;
+            tun.start()?;
         } else {
             return Err(NetStackError::TunError(
                 "TUN device not created".to_string(),
             ));
         }
 
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         self.shutdown_tx = Some(shutdown_tx);
 
         // Get TUN packet channels
@@ -186,45 +189,48 @@ impl NetStack {
         let enable_tcp = self.config.enable_tcp;
         let enable_udp = self.config.enable_udp;
 
-        // Clone stacks for the processing task
-        // Note: In a real implementation, we'd use Arc<Mutex<>> or similar
-        // For now, we'll process packets inline
-
         running.store(true, Ordering::Relaxed);
 
-        // Spawn packet processing task
-        tokio::spawn(async move {
-            info!("Packet processing task started");
+        // Long-lived packet processing loop runs on a dedicated thread.
+        std::thread::Builder::new()
+            .name("netstack-packet".into())
+            .spawn(move || {
+                info!("Packet processing task started");
 
-            loop {
-                tokio::select! {
-                    // Receive packet from TUN
-                    Some(packet) = tun_receiver.recv() => {
-                        stats.packets_received.fetch_add(1, Ordering::Relaxed);
-
-                        if let Err(e) = process_ip_packet(&packet, &stats, enable_tcp, enable_udp) {
-                            trace!("Failed to process packet: {}", e);
-                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    // Shutdown signal
-                    _ = shutdown_rx.recv() => {
+                loop {
+                    if !running.load(Ordering::Relaxed) || shutdown_rx.try_recv().is_ok() {
                         info!("Packet processing task shutting down");
                         break;
                     }
-                }
-            }
 
-            running.store(false, Ordering::Relaxed);
-            info!("Packet processing task stopped");
-        });
+                    // Receive packet from TUN
+                    match tun_receiver.recv_timeout(PACKET_POLL_TIMEOUT) {
+                        Ok(packet) => {
+                            stats.packets_received.fetch_add(1, Ordering::Relaxed);
+
+                            if let Err(e) =
+                                process_ip_packet(&packet, &stats, enable_tcp, enable_udp)
+                            {
+                                trace!("Failed to process packet: {}", e);
+                                stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+
+                running.store(false, Ordering::Relaxed);
+                info!("Packet processing task stopped");
+            })
+            .map_err(NetStackError::Io)?;
 
         info!("Network stack started");
         Ok(())
     }
 
     /// Stop the network stack
-    pub async fn stop(&mut self) -> Result<()> {
+    pub fn stop(&mut self) -> Result<()> {
         if !self.running.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -233,12 +239,12 @@ impl NetStack {
 
         // Send shutdown signal
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(()).await;
+            let _ = shutdown_tx.send(());
         }
 
         // Stop TUN device
         if let Some(tun) = &mut self.tun_device {
-            tun.stop().await?;
+            tun.stop()?;
         }
 
         // Close all connections
@@ -526,8 +532,8 @@ impl NetStackBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<NetStack> {
-        NetStack::with_config(self.config).await
+    pub fn build(self) -> Result<NetStack> {
+        NetStack::with_config(self.config)
     }
 }
 

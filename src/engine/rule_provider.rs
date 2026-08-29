@@ -1,13 +1,13 @@
 use crate::engine::error::{Error, Result};
 use ipnet::IpNet;
 use nextjson::{NsonDeserialize, NsonSerialize};
+use parking_lot::RwLock;
 use regex::Regex;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleProviderType {
@@ -102,10 +102,10 @@ impl RuleProvider {
         self.config.behavior
     }
 
-    pub async fn load(&self) -> Result<()> {
+    pub fn load(&self) -> Result<()> {
         let content = match self.config.provider_type {
-            RuleProviderType::File => self.load_from_file().await?,
-            RuleProviderType::Http => self.load_from_http().await?,
+            RuleProviderType::File => self.load_from_file()?,
+            RuleProviderType::Http => self.load_from_http()?,
         };
 
         let rules = self.parse_rules(&content)?;
@@ -116,10 +116,10 @@ impl RuleProvider {
             )));
         }
 
-        let mut rules_guard = self.rules.write().await;
+        let mut rules_guard = self.rules.write();
         *rules_guard = rules;
 
-        let mut last_update = self.last_update.write().await;
+        let mut last_update = self.last_update.write();
         *last_update = Some(Instant::now());
 
         tracing::info!(
@@ -131,19 +131,18 @@ impl RuleProvider {
         Ok(())
     }
 
-    async fn load_from_file(&self) -> Result<String> {
+    fn load_from_file(&self) -> Result<String> {
         let path = self
             .config
             .path
             .as_ref()
             .ok_or_else(|| Error::config("File rule provider requires 'path' field"))?;
 
-        tokio::fs::read_to_string(path)
-            .await
+        std::fs::read_to_string(path)
             .map_err(|e| Error::config(format!("Failed to read rule file '{}': {}", path, e)))
     }
 
-    async fn load_from_http(&self) -> Result<String> {
+    fn load_from_http(&self) -> Result<String> {
         let url = self
             .config
             .url
@@ -154,25 +153,21 @@ impl RuleProvider {
 
         let client = crate::common::HttpClient::new().with_timeout(Duration::from_secs(30));
 
-        let result = client.get(url).await;
+        let result = client.get(url);
 
         let response = match result {
             Ok(response) if response.is_success() => response,
             Ok(response) => {
-                return self
-                    .read_cached_or_error(
-                        &cache_path,
-                        format!("HTTP request failed with status: {}", response.status()),
-                    )
-                    .await;
+                return self.read_cached_or_error(
+                    &cache_path,
+                    format!("HTTP request failed with status: {}", response.status()),
+                );
             }
             Err(error) => {
-                return self
-                    .read_cached_or_error(
-                        &cache_path,
-                        format!("Failed to fetch rules from '{url}': {error}"),
-                    )
-                    .await;
+                return self.read_cached_or_error(
+                    &cache_path,
+                    format!("Failed to fetch rules from '{url}': {error}"),
+                );
             }
         };
 
@@ -182,9 +177,9 @@ impl RuleProvider {
 
         if let Some(path) = &cache_path {
             if let Some(parent) = path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = std::fs::create_dir_all(parent);
             }
-            let _ = tokio::fs::write(path, &content).await;
+            let _ = std::fs::write(path, &content);
         }
 
         Ok(content)
@@ -211,13 +206,13 @@ impl RuleProvider {
         )
     }
 
-    async fn read_cached_or_error(
+    fn read_cached_or_error(
         &self,
         cache_path: &Option<PathBuf>,
         message: String,
     ) -> Result<String> {
         if let Some(path) = cache_path {
-            if let Ok(content) = tokio::fs::read_to_string(path).await {
+            if let Ok(content) = std::fs::read_to_string(path) {
                 tracing::warn!(
                     "Using cached rule provider '{}' after refresh failed: {}",
                     self.config.name,
@@ -395,13 +390,13 @@ impl RuleProvider {
         }
     }
 
-    pub async fn matches(
+    pub fn matches(
         &self,
         domain: Option<&str>,
         ip: Option<IpAddr>,
         process_name: Option<&str>,
     ) -> bool {
-        let rules = self.rules.read().await;
+        let rules = self.rules.read();
 
         for rule in rules.iter() {
             if self.matches_entry_with_process(rule, domain, ip, process_name) {
@@ -507,21 +502,21 @@ impl RuleProvider {
         pattern_stem.eq_ignore_ascii_case(process_stem)
     }
 
-    pub async fn update(&self) -> Result<()> {
-        self.load().await
+    pub fn update(&self) -> Result<()> {
+        self.load()
     }
 
-    pub async fn needs_update(&self) -> bool {
-        let last_update = self.last_update.read().await;
+    pub fn needs_update(&self) -> bool {
+        let last_update = self.last_update.read();
         match *last_update {
             Some(time) => time.elapsed() > Duration::from_secs(self.config.interval),
             None => true,
         }
     }
 
-    pub async fn update_if_needed(&self) -> Result<bool> {
-        if self.needs_update().await {
-            self.update().await?;
+    pub fn update_if_needed(&self) -> Result<bool> {
+        if self.needs_update() {
+            self.update()?;
             Ok(true)
         } else {
             Ok(false)
@@ -536,12 +531,12 @@ impl RuleProvider {
         self.config.interval
     }
 
-    pub async fn rule_count(&self) -> usize {
-        self.rules.read().await.len()
+    pub fn rule_count(&self) -> usize {
+        self.rules.read().len()
     }
 
-    pub async fn last_update_time(&self) -> Option<Instant> {
-        *self.last_update.read().await
+    pub fn last_update_time(&self) -> Option<Instant> {
+        *self.last_update.read()
     }
 }
 
@@ -556,73 +551,73 @@ impl RuleProviderManager {
         }
     }
 
-    pub async fn add_provider(&self, config: RuleProviderConfig) -> Result<()> {
+    pub fn add_provider(&self, config: RuleProviderConfig) -> Result<()> {
         let name = config.name.clone();
         let provider = Arc::new(RuleProvider::new(config));
-        provider.load().await?;
+        provider.load()?;
 
-        let mut providers = self.providers.write().await;
+        let mut providers = self.providers.write();
         providers.insert(name, provider);
 
         Ok(())
     }
 
-    pub async fn remove_provider(&self, name: &str) {
-        let mut providers = self.providers.write().await;
+    pub fn remove_provider(&self, name: &str) {
+        let mut providers = self.providers.write();
         providers.remove(name);
     }
 
-    pub async fn get_provider(&self, name: &str) -> Option<Arc<RuleProvider>> {
-        let providers = self.providers.read().await;
+    pub fn get_provider(&self, name: &str) -> Option<Arc<RuleProvider>> {
+        let providers = self.providers.read();
         providers.get(name).cloned()
     }
 
-    pub async fn matches(
+    pub fn matches(
         &self,
         provider_name: &str,
         domain: Option<&str>,
         ip: Option<IpAddr>,
         process_name: Option<&str>,
     ) -> bool {
-        let providers = self.providers.read().await;
+        let providers = self.providers.read();
         if let Some(provider) = providers.get(provider_name) {
-            provider.matches(domain, ip, process_name).await
+            provider.matches(domain, ip, process_name)
         } else {
             false
         }
     }
 
-    pub async fn update_all(&self) -> Vec<Result<bool>> {
-        let providers = self.providers.read().await;
+    pub fn update_all(&self) -> Vec<Result<bool>> {
+        let providers = self.providers.read();
         let mut results = Vec::new();
 
         for provider in providers.values() {
-            results.push(provider.update_if_needed().await);
+            results.push(provider.update_if_needed());
         }
 
         results
     }
 
-    pub async fn reload_provider(&self, name: &str) -> Result<()> {
-        let providers = self.providers.read().await;
+    pub fn reload_provider(&self, name: &str) -> Result<()> {
+        let providers = self.providers.read();
         if let Some(provider) = providers.get(name) {
-            provider.load().await
+            provider.load()
         } else {
             Err(Error::config(format!("Rule provider '{}' not found", name)))
         }
     }
 
-    pub async fn get_all_providers(&self) -> Vec<Arc<RuleProvider>> {
-        let providers = self.providers.read().await;
+    pub fn get_all_providers(&self) -> Vec<Arc<RuleProvider>> {
+        let providers = self.providers.read();
         providers.values().cloned().collect()
     }
 
-    pub async fn provider_count(&self) -> usize {
-        self.providers.read().await.len()
+    pub fn provider_count(&self) -> usize {
+        self.providers.read().len()
     }
 
-    pub async fn get_provider_names(&self) -> Vec<String> {
-        let providers = self.providers.read().await;
+    pub fn get_provider_names(&self) -> Vec<String> {
+        let providers = self.providers.read();
         providers.keys().cloned().collect()
     }
 }

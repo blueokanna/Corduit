@@ -1,11 +1,11 @@
 //! DNS over HTTPS (DoH) server — RFC 8484, on courierust.
 //!
 //! The HTTP/1.1 server is [`crate::common::http_server::HttpServer`]
-//! (courierust's H/1 codec + TLS). The synchronous handler bridges into the
-//! async resolver with a captured `tokio::runtime::Handle`, so the engine's
-//! DNS resolver stays fully async while each DoH request is answered on a
+//! (courierust's H/1 codec + TLS). The synchronous handler answers each DoH
+//! request directly against the engine's synchronous DNS resolver on a
 //! dedicated server thread.
 
+use crate::common::cancel::CancellationToken;
 use crate::common::http_server::{error_response, HttpServer, HttpServerConfig, TlsIdentity};
 use crate::crypto::encoding::{decode as b64_decode, Config as B64Config};
 use crate::dns::error::{DnsError, Result};
@@ -15,9 +15,9 @@ use courierust::courierust_http::{
     Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
 };
 use courierust::courierust_tls::TlsVersion;
+use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
 use tracing::{info, warn};
 
 /// Cap for a POSTed DNS message (a DNS message is at most 65535 bytes).
@@ -58,25 +58,24 @@ pub struct DohServer {
     resolver: Arc<DnsResolver>,
     /// The underlying blocking HTTP server (bound lazily in `start`).
     server: Mutex<Option<HttpServer>>,
-    /// Shutdown signal sender.
-    shutdown_tx: broadcast::Sender<()>,
+    /// Shutdown signal.
+    shutdown: CancellationToken,
 }
 
 impl DohServer {
     /// Create a new DoH server.
     pub fn new(config: DohServerConfig, resolver: Arc<DnsResolver>) -> Result<Self> {
-        let (shutdown_tx, _) = broadcast::channel(1);
         Ok(Self {
             config,
             resolver,
             server: Mutex::new(None),
-            shutdown_tx,
+            shutdown: CancellationToken::new(),
         })
     }
 
     /// Start the DoH server. Returns after the server is bound and
-    /// listening; blocks (as an async task) until [`Self::stop`] is called.
-    pub async fn start(&self) -> Result<()> {
+    /// listening; blocks until [`Self::stop`] is called.
+    pub fn start(&self) -> Result<()> {
         let tls = if !self.config.cert_path.is_empty() && !self.config.key_path.is_empty() {
             Some(TlsIdentity::from_pem_files(
                 &self.config.cert_path,
@@ -88,10 +87,8 @@ impl DohServer {
 
         let resolver = self.resolver.clone();
         let path = self.config.path.clone();
-        let runtime = tokio::runtime::Handle::current();
 
-        let handler =
-            Arc::new(move |req: Request<Body>| handle_request(req, &resolver, &path, &runtime));
+        let handler = Arc::new(move |req: Request<Body>| handle_request(req, &resolver, &path));
 
         let cfg = HttpServerConfig {
             listen: self.config.listen,
@@ -108,12 +105,12 @@ impl DohServer {
         let mut server = HttpServer::bind(cfg)?;
         server.start()?;
         info!("DoH server listening on {}", server.local_addr()?);
-        *self.server.lock().await = Some(server);
+        *self.server.lock() = Some(server);
 
         // Wait for shutdown, then tear the listener down.
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let _ = shutdown_rx.recv().await;
-        if let Some(mut s) = self.server.lock().await.take() {
+        self.shutdown.wait(std::time::Duration::from_secs(u64::MAX));
+        let server = self.server.lock().take();
+        if let Some(mut s) = server {
             s.shutdown();
         }
         info!("DoH server stopped");
@@ -122,7 +119,7 @@ impl DohServer {
 
     /// Stop the DoH server.
     pub fn stop(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.cancel();
     }
 
     /// Get the listen address.
@@ -132,20 +129,20 @@ impl DohServer {
 }
 
 /// The HTTP handler: validates the path and method, decodes the DNS query,
-/// resolves it through the (async) engine and returns the DNS response.
+/// resolves it through the engine's synchronous resolver and returns the DNS
+/// response.
 fn handle_request(
     req: Request<Body>,
     resolver: &DnsResolver,
     expected_path: &str,
-    runtime: &tokio::runtime::Handle,
 ) -> Response<Body> {
     if req.uri.as_str() != expected_path {
         return error_response(StatusCode::NOT_FOUND, "Not Found");
     }
 
     let result = match req.method {
-        Method::GET => handle_get_request(&req, resolver, runtime),
-        Method::POST => handle_post_request(&req, resolver, runtime),
+        Method::GET => handle_get_request(&req, resolver),
+        Method::POST => handle_post_request(&req, resolver),
         _ => {
             return error_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
         }
@@ -177,11 +174,7 @@ fn handle_request(
 }
 
 /// GET handler: base64url-encoded query in `?dns=`.
-fn handle_get_request(
-    req: &Request<Body>,
-    resolver: &DnsResolver,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Message> {
+fn handle_get_request(req: &Request<Body>, resolver: &DnsResolver) -> Result<Message> {
     let query_string = req.uri.query().unwrap_or_default();
 
     let dns_param = query_string
@@ -195,15 +188,11 @@ fn handle_get_request(
     let query_bytes = b64_decode(dns_param.as_bytes(), B64Config::URL_SAFE_NO_PAD)
         .map_err(|e| DnsError::Protocol(format!("Invalid base64: {:?}", e)))?;
 
-    process_dns_query(&query_bytes, resolver, runtime)
+    process_dns_query(&query_bytes, resolver)
 }
 
 /// POST handler: binary DNS message in the body.
-fn handle_post_request(
-    req: &Request<Body>,
-    resolver: &DnsResolver,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Message> {
+fn handle_post_request(req: &Request<Body>, resolver: &DnsResolver) -> Result<Message> {
     let content_type = req
         .headers
         .get("content-type")
@@ -224,19 +213,15 @@ fn handle_post_request(
         .as_bytes()
         .ok_or_else(|| DnsError::Http("Empty request body".to_string()))?;
 
-    process_dns_query(body, resolver, runtime)
+    process_dns_query(body, resolver)
 }
 
-/// Process a DNS query and generate the response, blocking on the async
-/// resolver from the server thread.
-fn process_dns_query(
-    query_bytes: &[u8],
-    resolver: &DnsResolver,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Message> {
+/// Process a DNS query and generate the response against the synchronous
+/// resolver.
+fn process_dns_query(query_bytes: &[u8], resolver: &DnsResolver) -> Result<Message> {
     let request = Message::from_bytes(query_bytes)
         .map_err(|e| DnsError::Protocol(format!("Invalid DNS message: {}", e)))?;
-    runtime.block_on(crate::dns::server::process_query(resolver, &request))
+    crate::dns::server::process_query(resolver, &request)
 }
 
 #[cfg(test)]
@@ -251,8 +236,8 @@ mod tests {
         assert!(config.http2);
     }
 
-    #[tokio::test]
-    async fn test_doh_server_creation_without_tls() {
+    #[test]
+    fn test_doh_server_creation_without_tls() {
         let dns_config = DnsConfig {
             nameservers: vec!["8.8.8.8".to_string()],
             ..Default::default()

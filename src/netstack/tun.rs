@@ -1,13 +1,60 @@
+use crate::common::cancel::CancellationToken;
 use crate::netstack::error::{NetStackError, Result};
 use bytes::BytesMut;
 use std::net::Ipv4Addr;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+/// How long TUN worker threads wait between polls when idle.
+const TUN_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// A `std::sync::mpsc::Receiver` that can cross thread boundaries.
+///
+/// `std::sync::mpsc::Receiver` is deliberately `!Send`/`!Sync`. Here the
+/// receiver is created on the thread that starts the TUN device, stored in
+/// `TunDevice`, and moved out exactly once (via `take_receiver` / `recv`)
+/// before being used on a single consumer thread. It is never shared — this
+/// wrapper only exposes `&mut self` accessors, so two threads can never race
+/// on the underlying channel.
+///
+/// # Safety
+/// - `Send`: the inner receiver is transferred between threads by ownership
+///   only; no other thread retains a reference to it.
+/// - `Sync`: a shared reference cannot reach the inner receiver (all
+///   accessors require `&mut self`), so concurrent access is impossible.
+#[repr(transparent)]
+pub struct SendReceiver<T> {
+    inner: mpsc::Receiver<T>,
+}
+
+unsafe impl<T> Send for SendReceiver<T> {}
+unsafe impl<T> Sync for SendReceiver<T> {}
+
+impl<T> SendReceiver<T> {
+    fn new(rx: mpsc::Receiver<T>) -> Self {
+        Self { inner: rx }
+    }
+
+    /// Block until a value is available, checking at most every `timeout`.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> std::result::Result<T, RecvTimeoutError> {
+        self.inner.recv_timeout(timeout)
+    }
+
+    /// Block until a value is available or the channel disconnects.
+    pub fn recv(&mut self) -> std::result::Result<T, mpsc::RecvError> {
+        self.inner.recv()
+    }
+
+    /// Attempt to receive without blocking.
+    pub fn try_recv(&mut self) -> std::result::Result<T, mpsc::TryRecvError> {
+        self.inner.try_recv()
+    }
+}
 
 /// Global Android VPN file descriptor
 /// Set by the Android layer when VPN service starts
@@ -106,15 +153,25 @@ impl Default for TunConfig {
 pub struct TunDevice {
     config: TunConfig,
     tx: Option<mpsc::Sender<BytesMut>>,
-    rx: Option<mpsc::Receiver<BytesMut>>,
+    rx: Option<SendReceiver<BytesMut>>,
     running: Arc<AtomicBool>,
     shutdown: Option<CancellationToken>,
     #[cfg(windows)]
     windows_session: Option<Arc<wintun_bindings::Session>>,
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    ))]
+    unix_device: Option<tun_rs::SyncDevice>,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    vpn_file: Option<std::fs::File>,
 }
 
 impl TunDevice {
-    pub async fn new(name: &str, addr: &str, netmask: &str) -> Result<Self> {
+    pub fn new(name: &str, addr: &str, netmask: &str) -> Result<Self> {
         let address: Ipv4Addr = addr
             .parse()
             .map_err(|e| NetStackError::Parse(format!("Invalid address: {}", e)))?;
@@ -135,10 +192,20 @@ impl TunDevice {
             shutdown: None,
             #[cfg(windows)]
             windows_session: None,
+            #[cfg(any(
+                all(target_os = "linux", not(target_env = "ohos")),
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+            ))]
+            unix_device: None,
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            vpn_file: None,
         })
     }
 
-    pub async fn with_config(config: TunConfig) -> Result<Self> {
+    pub fn with_config(config: TunConfig) -> Result<Self> {
         Ok(Self {
             config,
             tx: None,
@@ -147,6 +214,16 @@ impl TunDevice {
             shutdown: None,
             #[cfg(windows)]
             windows_session: None,
+            #[cfg(any(
+                all(target_os = "linux", not(target_env = "ohos")),
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+            ))]
+            unix_device: None,
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            vpn_file: None,
         })
     }
 
@@ -157,7 +234,7 @@ impl TunDevice {
         self.running.load(Ordering::Relaxed)
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    pub fn start(&mut self) -> Result<()> {
         if self.is_running() {
             return Ok(());
         }
@@ -165,7 +242,7 @@ impl TunDevice {
         self.running.store(true, Ordering::Release);
 
         #[cfg(windows)]
-        if let Err(error) = self.start_windows().await {
+        if let Err(error) = self.start_windows() {
             self.running.store(false, Ordering::Release);
             return Err(error);
         }
@@ -177,19 +254,19 @@ impl TunDevice {
             target_os = "openbsd",
             target_os = "netbsd",
         ))]
-        if let Err(error) = self.start_unix().await {
+        if let Err(error) = self.start_unix() {
             self.running.store(false, Ordering::Release);
             return Err(error);
         }
 
         #[cfg(target_os = "android")]
-        if let Err(error) = self.start_android().await {
+        if let Err(error) = self.start_android() {
             self.running.store(false, Ordering::Release);
             return Err(error);
         }
 
         #[cfg(target_os = "ios")]
-        if let Err(error) = self.start_ios().await {
+        if let Err(error) = self.start_ios() {
             self.running.store(false, Ordering::Release);
             return Err(error);
         }
@@ -199,14 +276,14 @@ impl TunDevice {
     }
 
     #[cfg(windows)]
-    async fn start_windows(&mut self) -> Result<()> {
+    fn start_windows(&mut self) -> Result<()> {
         use crate::netstack::wintun_embed;
         use wintun_bindings::{Adapter, MAX_RING_CAPACITY};
 
         // Ensure wintun.dll is available and load it
         let dll_path = match wintun_embed::ensure_wintun_available() {
             Ok(path) => path,
-            Err(_) => wintun_embed::download_wintun_dll().await?,
+            Err(_) => wintun_embed::download_wintun_dll()?,
         };
 
         info!("Loading wintun.dll from {:?}", dll_path);
@@ -245,12 +322,12 @@ impl TunDevice {
         );
 
         // Create channels
-        let (tx_to_tun, mut rx_from_stack) = mpsc::channel::<BytesMut>(4096);
-        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>(4096);
+        let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
+        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>();
         let shutdown = CancellationToken::new();
 
         self.tx = Some(tx_to_tun);
-        self.rx = Some(rx_from_tun);
+        self.rx = Some(SendReceiver::new(rx_from_tun));
         self.shutdown = Some(shutdown.clone());
         self.windows_session = Some(session.clone());
 
@@ -258,80 +335,80 @@ impl TunDevice {
         let session_read = session.clone();
         let session_write = session.clone();
 
-        // Read task using blocking operations in spawn_blocking
+        // Read task: dedicated thread doing blocking wintun reads.
         let running_read = running.clone();
-        tokio::spawn(async move {
-            info!("TUN read task started");
+        let shutdown_read = shutdown.clone();
+        std::thread::Builder::new()
+            .name("tun-read".into())
+            .spawn(move || {
+                info!("TUN read task started");
 
-            loop {
-                if !running_read.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let session_clone = session_read.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || session_clone.receive_blocking()).await;
-
-                match result {
-                    Ok(Ok(packet)) => {
-                        let data = BytesMut::from(packet.bytes());
-                        if tx_to_stack.send(data).await.is_err() {
-                            debug!("Stack receiver dropped");
-                            break;
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("shutdown") || err_str.contains("EOF") {
-                            info!("TUN adapter terminating");
-                            break;
-                        } else {
-                            warn!("TUN read error: {}", e);
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        }
-                    }
-                    Err(e) => {
-                        error!("spawn_blocking error: {}", e);
+                loop {
+                    if !running_read.load(Ordering::Relaxed) || shutdown_read.is_cancelled() {
                         break;
                     }
-                }
-            }
-            info!("TUN read task stopped");
-        });
 
-        // Write task
-        let running_write = running.clone();
-        tokio::spawn(async move {
-            info!("TUN write task started");
-
-            loop {
-                tokio::select! {
-                    Some(packet) = rx_from_stack.recv() => {
-                        let session_clone = session_write.clone();
-                        let packet_data = packet.to_vec();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            match session_clone.allocate_send_packet(packet_data.len() as u16) {
-                                Ok(mut send_packet) => {
-                                    send_packet.bytes_mut().copy_from_slice(&packet_data);
-                                    session_clone.send_packet(send_packet);
-                                }
-                                Err(e) => {
-                                    if !e.to_string().contains("ERROR_BUFFER_OVERFLOW") {
-                                        tracing::error!("Failed to allocate send packet: {}", e);
-                                    }
-                                }
+                    match session_read.receive_blocking() {
+                        Ok(packet) => {
+                            let data = BytesMut::from(packet.bytes());
+                            if tx_to_stack.send(data).is_err() {
+                                debug!("Stack receiver dropped");
+                                break;
                             }
-                        }).await;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("shutdown") || err_str.contains("EOF") {
+                                info!("TUN adapter terminating");
+                                break;
+                            } else {
+                                warn!("TUN read error: {}", e);
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
                     }
-                    _ = shutdown.cancelled() => {
+                }
+                info!("TUN read task stopped");
+            })
+            .map_err(NetStackError::Io)?;
+
+        // Write task: dedicated thread pulling packets from the stack.
+        let running_write = running.clone();
+        let shutdown_write = shutdown.clone();
+        let rx_from_stack = rx_from_stack;
+        std::thread::Builder::new()
+            .name("tun-write".into())
+            .spawn(move || {
+                info!("TUN write task started");
+
+                loop {
+                    if shutdown_write.is_cancelled() {
                         debug!("TUN shutdown requested");
                         break;
                     }
+
+                    match rx_from_stack.recv_timeout(TUN_POLL_TIMEOUT) {
+                        Ok(packet) => {
+                            match session_write.allocate_send_packet(packet.len() as u16) {
+                                Ok(mut send_packet) => {
+                                    send_packet.bytes_mut().copy_from_slice(&packet);
+                                    session_write.send_packet(send_packet);
+                                }
+                                Err(e) => {
+                                    if !e.to_string().contains("ERROR_BUFFER_OVERFLOW") {
+                                        error!("Failed to allocate send packet: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
-            }
-            running_write.store(false, Ordering::Relaxed);
-            info!("TUN write task stopped");
-        });
+                running_write.store(false, Ordering::Relaxed);
+                info!("TUN write task stopped");
+            })
+            .map_err(NetStackError::Io)?;
 
         Ok(())
     }
@@ -427,7 +504,8 @@ impl TunDevice {
         target_os = "openbsd",
         target_os = "netbsd",
     ))]
-    async fn start_unix(&mut self) -> Result<()> {
+    fn start_unix(&mut self) -> Result<()> {
+        use std::os::fd::AsRawFd;
         use tun_rs::DeviceBuilder;
 
         let prefix_len = netmask_to_prefix(self.config.netmask);
@@ -436,7 +514,7 @@ impl TunDevice {
             .name(&self.config.name)
             .ipv4(self.config.address, prefix_len, None::<Ipv4Addr>)
             .mtu(self.config.mtu)
-            .build_async()
+            .build_sync()
             .map_err(|e| NetStackError::TunError(format!("Failed to create TUN: {}", e)))?;
 
         info!(
@@ -444,52 +522,134 @@ impl TunDevice {
             self.config.name, self.config.address, prefix_len
         );
 
-        let (tx_to_tun, mut rx_from_stack) = mpsc::channel::<BytesMut>(4096);
-        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>(4096);
+        let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
+        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>();
         let shutdown = CancellationToken::new();
 
         self.tx = Some(tx_to_tun);
-        self.rx = Some(rx_from_tun);
+        self.rx = Some(SendReceiver::new(rx_from_tun));
         self.shutdown = Some(shutdown.clone());
+        self.unix_device = Some(device);
 
         let running = self.running.clone();
+        // The device is kept alive by `self.unix_device`; worker threads
+        // operate on the underlying fd with poll()-based timeouts so they
+        // can observe shutdown while a packet is not yet available.
+        let fd = self.unix_device.as_ref().unwrap().as_raw_fd();
 
-        tokio::spawn(async move {
-            let mut read_buf = vec![0u8; 65535];
+        // Read task: poll fd, then read packets into the stack channel.
+        let running_read = running.clone();
+        let shutdown_read = shutdown.clone();
+        let read_fd = fd;
+        std::thread::Builder::new()
+            .name("tun-read".into())
+            .spawn(move || {
+                let mut read_buf = vec![0u8; 65535];
 
-            loop {
-                tokio::select! {
-                    result = device.recv(&mut read_buf) => {
-                        match result {
-                            Ok(n) => {
-                                let packet = BytesMut::from(&read_buf[..n]);
-                                if tx_to_stack.send(packet).await.is_err() {
-                                    debug!("Stack receiver dropped");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!("TUN read error: {}", e);
-                                break;
-                            }
-                        }
+                loop {
+                    if !running_read.load(Ordering::Relaxed) || shutdown_read.is_cancelled() {
+                        break;
                     }
-                    Some(packet) = rx_from_stack.recv() => {
-                        if let Err(e) = device.send(&packet).await {
-                            error!("TUN write error: {}", e);
+
+                    let mut pfd = libc::pollfd {
+                        fd: read_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+                    if ret < 0 {
+                        let e = std::io::Error::last_os_error();
+                        if e.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        error!("TUN poll error: {}", e);
+                        break;
+                    }
+                    if ret == 0 {
+                        // Timeout: poll again.
+                        continue;
+                    }
+                    if pfd.revents & libc::POLLIN != 0 {
+                        let n = unsafe {
+                            libc::read(read_fd, read_buf.as_mut_ptr().cast(), read_buf.len())
+                        };
+                        if n < 0 {
+                            let e = std::io::Error::last_os_error();
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            error!("TUN read error: {}", e);
+                            break;
+                        }
+                        if n == 0 {
+                            info!("TUN read EOF");
+                            break;
+                        }
+                        let packet = BytesMut::from(&read_buf[..n as usize]);
+                        if tx_to_stack.send(packet).is_err() {
+                            debug!("Stack receiver dropped");
                             break;
                         }
                     }
-                    _ = shutdown.cancelled() => {
+                }
+
+                running_read.store(false, Ordering::Relaxed);
+                info!("TUN read task stopped");
+            })
+            .map_err(|e| NetStackError::Io(e))?;
+
+        // Write task: pull packets from the stack and write them to the fd.
+        let running_write = running.clone();
+        let shutdown_write = shutdown.clone();
+        let write_fd = fd;
+        let mut rx_from_stack = rx_from_stack;
+        std::thread::Builder::new()
+            .name("tun-write".into())
+            .spawn(move || {
+                loop {
+                    if shutdown_write.is_cancelled() {
                         debug!("TUN shutdown requested");
                         break;
                     }
-                }
-            }
 
-            running.store(false, Ordering::Relaxed);
-            info!("TUN I/O task stopped");
-        });
+                    match rx_from_stack.recv_timeout(TUN_POLL_TIMEOUT) {
+                        Ok(packet) => {
+                            let mut written = 0usize;
+                            while written < packet.len() {
+                                let n = unsafe {
+                                    libc::write(
+                                        write_fd,
+                                        packet[written..].as_ptr().cast(),
+                                        packet.len() - written,
+                                    )
+                                };
+                                if n < 0 {
+                                    let e = std::io::Error::last_os_error();
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::Interrupted
+                                    {
+                                        continue;
+                                    }
+                                    error!("TUN write error: {}", e);
+                                    break;
+                                }
+                                if n == 0 {
+                                    break;
+                                }
+                                written += n as usize;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+
+                running_write.store(false, Ordering::Relaxed);
+                info!("TUN write task stopped");
+            })
+            .map_err(|e| NetStackError::Io(e))?;
 
         Ok(())
     }
@@ -499,7 +659,7 @@ impl TunDevice {
     /// iOS `NetworkExtension`/`PacketTunnelProvider`). The descriptor is
     /// duplicated so we never take ownership of the caller's fd.
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    async fn start_from_fd(&mut self, fd: i32) -> Result<()> {
+    fn start_from_fd(&mut self, fd: i32) -> Result<()> {
         use std::os::unix::io::FromRawFd;
 
         if fd < 0 {
@@ -522,131 +682,138 @@ impl TunDevice {
 
         info!("Duplicated VPN fd: {} -> {}", fd, dup_fd);
 
-        // Create async file from the duplicated VPN file descriptor
-        // SAFETY: dup_fd is a valid duplicated fd that we own
+        // Own the duplicated fd with a File so it is closed when the device
+        // is dropped. The worker threads operate on the raw fd below.
+        // SAFETY: dup_fd is a valid duplicated fd that we own.
         let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
-        let async_fd = tokio::io::unix::AsyncFd::new(file)
-            .map_err(|e| NetStackError::TunError(format!("Failed to create AsyncFd: {}", e)))?;
+        self.vpn_file = Some(file);
 
         // Create channels for packet communication
-        let (tx_to_tun, mut rx_from_stack) = mpsc::channel::<BytesMut>(4096);
-        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>(4096);
+        let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
+        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>();
         let shutdown = CancellationToken::new();
 
         self.tx = Some(tx_to_tun);
-        self.rx = Some(rx_from_tun);
+        self.rx = Some(SendReceiver::new(rx_from_tun));
         self.shutdown = Some(shutdown.clone());
 
         let running = self.running.clone();
-        let async_fd = Arc::new(async_fd);
-        let async_fd_read = async_fd.clone();
-        let async_fd_write = async_fd.clone();
         let read_shutdown = shutdown.clone();
         let write_shutdown = shutdown;
 
         // Read task - read packets from TUN and send to stack
         let running_read = running.clone();
-        tokio::spawn(async move {
-            info!("Android TUN read task started");
-            let mut read_buf = vec![0u8; 65535];
+        let read_fd = dup_fd;
+        std::thread::Builder::new()
+            .name("tun-fd-read".into())
+            .spawn(move || {
+                info!("Android TUN read task started");
+                let mut read_buf = vec![0u8; 65535];
 
-            loop {
-                if !running_read.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let readiness = tokio::select! {
-                    _ = read_shutdown.cancelled() => break,
-                    readiness = async_fd_read.readable() => readiness,
-                };
-                let mut guard = match readiness {
-                    Ok(g) => g,
-                    Err(e) => {
-                        error!("AsyncFd readable error: {}", e);
+                loop {
+                    if !running_read.load(Ordering::Relaxed) || read_shutdown.is_cancelled() {
                         break;
                     }
-                };
 
-                // Try to read from the TUN device
-                match guard.try_io(|inner| {
-                    use std::io::Read;
-                    inner.get_ref().read(&mut read_buf)
-                }) {
-                    Ok(Ok(n)) if n > 0 => {
-                        let packet = BytesMut::from(&read_buf[..n]);
-                        if tx_to_stack.send(packet).await.is_err() {
+                    let mut pfd = libc::pollfd {
+                        fd: read_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+                    if ret < 0 {
+                        let e = std::io::Error::last_os_error();
+                        if e.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        error!("TUN fd poll error: {}", e);
+                        break;
+                    }
+                    if ret == 0 {
+                        continue;
+                    }
+                    if pfd.revents & libc::POLLIN != 0 {
+                        let n = unsafe {
+                            libc::read(read_fd, read_buf.as_mut_ptr().cast(), read_buf.len())
+                        };
+                        if n < 0 {
+                            let e = std::io::Error::last_os_error();
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            error!("TUN fd read error: {}", e);
+                            break;
+                        }
+                        if n == 0 {
+                            info!("TUN fd read EOF");
+                            break;
+                        }
+                        let packet = BytesMut::from(&read_buf[..n as usize]);
+                        if tx_to_stack.send(packet).is_err() {
                             debug!("Stack receiver dropped");
                             break;
                         }
                     }
-                    Ok(Ok(_)) => {
-                        // EOF
-                        info!("TUN read EOF");
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        if e.kind() != std::io::ErrorKind::WouldBlock {
-                            error!("TUN read error: {}", e);
-                            break;
-                        }
-                    }
-                    Err(_would_block) => {
-                        // WouldBlock, continue waiting
-                        continue;
-                    }
                 }
-            }
 
-            running_read.store(false, Ordering::Relaxed);
-            info!("Android TUN read task stopped");
-        });
+                running_read.store(false, Ordering::Relaxed);
+                info!("Android TUN read task stopped");
+            })
+            .map_err(|e| NetStackError::Io(e))?;
 
         // Write task - write packets from stack to TUN
         let running_write = running.clone();
-        tokio::spawn(async move {
-            info!("Android TUN write task started");
+        let write_fd = dup_fd;
+        let mut rx_from_stack = rx_from_stack;
+        std::thread::Builder::new()
+            .name("tun-fd-write".into())
+            .spawn(move || {
+                info!("Android TUN write task started");
 
-            loop {
-                tokio::select! {
-                    Some(packet) = rx_from_stack.recv() => {
-                        let mut written = 0;
-                        while written < packet.len() {
-                            let readiness = tokio::select! {
-                                _ = write_shutdown.cancelled() => break,
-                                readiness = async_fd_write.writable() => readiness,
-                            };
-                            let mut guard = match readiness {
-                                Ok(guard) => guard,
-                                Err(error) => {
-                                    error!("AsyncFd writable error: {}", error);
-                                    break;
-                                }
-                            };
-                            match guard.try_io(|inner| {
-                                use std::io::Write;
-                                inner.get_ref().write(&packet[written..])
-                            }) {
-                                Ok(Ok(0)) => break,
-                                Ok(Ok(count)) => written += count,
-                                Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                                Ok(Err(error)) => {
-                                    error!("TUN write error: {}", error);
-                                    break;
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                    _ = write_shutdown.cancelled() => {
+                loop {
+                    if write_shutdown.is_cancelled() {
                         debug!("TUN shutdown requested");
                         break;
                     }
-                }
-            }
 
-            running_write.store(false, Ordering::Relaxed);
-            info!("Android TUN write task stopped");
-        });
+                    match rx_from_stack.recv_timeout(TUN_POLL_TIMEOUT) {
+                        Ok(packet) => {
+                            let mut written = 0usize;
+                            while written < packet.len() {
+                                let n = unsafe {
+                                    libc::write(
+                                        write_fd,
+                                        packet[written..].as_ptr().cast(),
+                                        packet.len() - written,
+                                    )
+                                };
+                                if n < 0 {
+                                    let e = std::io::Error::last_os_error();
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::Interrupted
+                                    {
+                                        continue;
+                                    }
+                                    error!("TUN fd write error: {}", e);
+                                    break;
+                                }
+                                if n == 0 {
+                                    break;
+                                }
+                                written += n as usize;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+
+                running_write.store(false, Ordering::Relaxed);
+                info!("Android TUN write task stopped");
+            })
+            .map_err(|e| NetStackError::Io(e))?;
 
         info!("TUN initialized with fd={}", fd);
         Ok(())
@@ -655,21 +822,21 @@ impl TunDevice {
     /// Android TUN implementation: the device is created by `VpnService` and
     /// we receive the file descriptor through `set_android_vpn_fd`.
     #[cfg(target_os = "android")]
-    async fn start_android(&mut self) -> Result<()> {
+    fn start_android(&mut self) -> Result<()> {
         let fd = ANDROID_VPN_FD.load(Ordering::Relaxed);
-        self.start_from_fd(fd).await
+        self.start_from_fd(fd)
     }
 
     /// iOS TUN implementation: the device is created by `NetworkExtension`
     /// (`PacketTunnelProvider`) and we receive the file descriptor through
     /// `set_ios_vpn_fd`.
     #[cfg(target_os = "ios")]
-    async fn start_ios(&mut self) -> Result<()> {
+    fn start_ios(&mut self) -> Result<()> {
         let fd = IOS_VPN_FD.load(Ordering::Relaxed);
-        self.start_from_fd(fd).await
+        self.start_from_fd(fd)
     }
 
-    pub async fn stop(&mut self) -> Result<()> {
+    pub fn stop(&mut self) -> Result<()> {
         if !self.is_running() {
             return Ok(());
         }
@@ -691,20 +858,32 @@ impl TunDevice {
         Ok(())
     }
 
-    pub async fn send(&self, packet: BytesMut) -> Result<()> {
+    pub fn send(&self, packet: BytesMut) -> Result<()> {
         if let Some(tx) = &self.tx {
-            tx.send(packet)
-                .await
-                .map_err(|_| NetStackError::ChannelClosed)?;
+            tx.send(packet).map_err(|_| NetStackError::ChannelClosed)?;
             Ok(())
         } else {
             Err(NetStackError::NotRunning)
         }
     }
 
-    pub async fn recv(&mut self) -> Result<BytesMut> {
+    pub fn recv(&mut self) -> Result<BytesMut> {
         if let Some(rx) = &mut self.rx {
-            rx.recv().await.ok_or(NetStackError::ChannelClosed)
+            loop {
+                match rx.recv_timeout(TUN_POLL_TIMEOUT) {
+                    Ok(packet) => return Ok(packet),
+                    Err(RecvTimeoutError::Timeout) => {
+                        // Disjoint field access: `self.rx` is mutably borrowed
+                        // above, but the running flag is a separate field.
+                        if !self.running.load(Ordering::Relaxed) {
+                            return Err(NetStackError::NotRunning);
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(NetStackError::ChannelClosed);
+                    }
+                }
+            }
         } else {
             Err(NetStackError::NotRunning)
         }
@@ -713,7 +892,7 @@ impl TunDevice {
     pub fn get_sender(&self) -> Option<mpsc::Sender<BytesMut>> {
         self.tx.clone()
     }
-    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<BytesMut>> {
+    pub fn take_receiver(&mut self) -> Option<SendReceiver<BytesMut>> {
         self.rx.take()
     }
 }
@@ -731,6 +910,23 @@ impl Drop for TunDevice {
         #[cfg(windows)]
         if let Some(session) = self.windows_session.take() {
             let _ = session.shutdown();
+        }
+
+        // Dropping `unix_device` / `vpn_file` closes the underlying fds,
+        // which also unblocks any worker thread still polling on them.
+        #[cfg(any(
+            all(target_os = "linux", not(target_env = "ohos")),
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+        ))]
+        {
+            self.unix_device.take();
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            self.vpn_file.take();
         }
 
         self.tx = None;
@@ -765,11 +961,11 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
+    #[test]
     #[ignore = "requires Linux CAP_NET_ADMIN and /dev/net/tun"]
-    async fn linux_tun_lifecycle() {
+    fn linux_tun_lifecycle() {
         use std::path::Path;
-        use tokio::time::{sleep, Duration, Instant};
+        use std::time::{Duration, Instant};
 
         let name = format!("vgtest{}", std::process::id() % 100_000);
         let mut device = TunDevice::with_config(TunConfig {
@@ -779,20 +975,19 @@ mod tests {
             mtu: 1_400,
             ..TunConfig::default()
         })
-        .await
         .expect("TUN configuration should be valid");
 
-        device.start().await.expect("Linux TUN should start");
+        device.start().expect("Linux TUN should start");
         assert!(device.is_running());
         assert!(Path::new(&format!("/sys/class/net/{name}")).exists());
 
-        device.stop().await.expect("Linux TUN should stop");
+        device.stop().expect("Linux TUN should stop");
         assert!(!device.is_running());
 
         let interface_path = format!("/sys/class/net/{name}");
         let deadline = Instant::now() + Duration::from_secs(2);
         while Path::new(&interface_path).exists() && Instant::now() < deadline {
-            sleep(Duration::from_millis(20)).await;
+            std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
             !Path::new(&interface_path).exists(),

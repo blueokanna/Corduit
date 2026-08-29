@@ -18,7 +18,21 @@ where
         let level = metadata.level();
         let target = metadata.target();
 
-        if target.starts_with("tokio") {
+        // Drop noisy third-party targets (frameworks no longer include
+        // tokio, but hyper/mio/courierust-style crates are still chatty);
+        // everything else — including the engine's `corduit::*` targets —
+        // flows into the UI log buffer.
+        if target.is_empty()
+            || target.starts_with("tokio")
+            || target.starts_with("hyper")
+            || target.starts_with("mio")
+            || target.starts_with("h2")
+            || target.starts_with("want")
+            || target.starts_with("tower")
+            || target.starts_with("rustls")
+            || target.starts_with("courierust")
+            || target.starts_with("reqwest")
+        {
             return;
         }
 

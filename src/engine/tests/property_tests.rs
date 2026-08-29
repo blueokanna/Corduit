@@ -483,8 +483,8 @@ mod unit_tests {
         assert_eq!(configs.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_rule_provider_needs_update() {
+    #[test]
+    fn test_rule_provider_needs_update() {
         let config = RuleProviderConfig {
             name: "test".to_string(),
             provider_type: RuleProviderType::File,
@@ -496,11 +496,11 @@ mod unit_tests {
 
         let provider = RuleProvider::new(config);
 
-        assert!(provider.needs_update().await);
+        assert!(provider.needs_update());
     }
 
-    #[tokio::test]
-    async fn test_proxy_provider_needs_update() {
+    #[test]
+    fn test_proxy_provider_needs_update() {
         let config = ProxyProviderConfig {
             name: "test".to_string(),
             provider_type: ProxyProviderType::File,
@@ -512,6 +512,6 @@ mod unit_tests {
 
         let provider = ProxyProvider::new(config);
 
-        assert!(provider.needs_update().await);
+        assert!(provider.needs_update());
     }
 }

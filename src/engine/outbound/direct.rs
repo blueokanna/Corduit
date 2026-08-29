@@ -1,21 +1,34 @@
+//! DIRECT outbound: connect straight to the target.
+//!
+//! No upstream proxy — this is the baseline every other outbound is compared
+//! against. TCP relays run two dedicated copy threads (see
+//! [`relay_bidirectional_with_connection`]); UDP is a one-shot request/reply
+//! on a fresh socket (immune to Windows ICMP poisoning).
+
+use crate::common::cancel::CancellationToken;
+use crate::common::stream::SyncStream;
 use crate::engine::config::OutboundConfig;
+use crate::engine::connection_tracker::ConnectionTracker;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
+use std::io::{BufRead, Read, Write};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Copy buffer size for the relay threads.
+const RELAY_CHUNK: usize = 32 * 1024;
 
 pub struct DirectOutbound {
     config: OutboundConfig,
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for DirectOutbound {
-    async fn connect(&self) -> Result<()> {
+    fn connect(&self) -> Result<()> {
         // Direct outbound doesn't need to maintain persistent connections
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    fn disconnect(&self) -> Result<()> {
         // Nothing to disconnect
         Ok(())
     }
@@ -33,57 +46,34 @@ impl OutboundProxy for DirectOutbound {
         true
     }
 
-    async fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        use std::time::Duration;
-        use tokio::net::UdpSocket;
+    fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+        let timeout = Duration::from_secs(30);
 
-        // Resolve target address
         let target_addr = match target {
             TargetAddr::Ip(addr) => *addr,
             TargetAddr::Domain(domain, port) => {
-                let addr_str = format!("{}:{}", domain, port);
-                let resolved = tokio::net::lookup_host(&addr_str)
-                    .await
+                crate::common::socket::resolve_host(domain, *port, timeout)
                     .map_err(|e| Error::network(format!("Failed to resolve {}: {}", domain, e)))?
+                    .into_iter()
                     .next()
-                    .ok_or_else(|| Error::network(format!("No address found for {}", domain)))?;
-                resolved
+                    .ok_or_else(|| Error::network(format!("No address found for {}", domain)))?
             }
         };
 
-        // Create UDP socket
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
-
-        // Send data
-        socket
-            .send_to(data, target_addr)
-            .await
-            .map_err(|e| Error::network(format!("Failed to send UDP packet: {}", e)))?;
-
-        // Receive response with timeout
-        let mut buf = vec![0u8; 65535];
-        let timeout = Duration::from_secs(30);
-
-        match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => Ok(buf[..n].to_vec()),
-            Ok(Err(e)) => Err(Error::network(format!(
-                "Failed to receive UDP response: {}",
-                e
-            ))),
-            Err(_) => Err(Error::network("UDP response timeout")),
-        }
+        crate::common::socket::udp_exchange(&target_addr, data, timeout, None).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                Error::network("UDP response timeout")
+            } else {
+                Error::network(format!("Failed to exchange UDP packet: {}", e))
+            }
+        })
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         test_url: &str,
         timeout: std::time::Duration,
     ) -> Result<std::time::Duration> {
-        use std::time::Instant;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-
         // Parse the test URL
         let url = crate::common::url::Url::parse(test_url)
             .map_err(|e| Error::config(format!("Invalid test URL: {}", e)))?;
@@ -105,10 +95,14 @@ impl OutboundProxy for DirectOutbound {
 
         // Direct connection to target
         let addr = format!("{}:{}", host, url_port);
-        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| Error::network("Connection timeout"))?
-            .map_err(|e| Error::network(format!("Failed to connect: {}", e)))?;
+        let mut stream = crate::common::socket::connect_host(&host, url_port, timeout)
+            .map_err(|e| Error::network(format!("Failed to connect to {}: {}", addr, e)))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
         // Send HTTP request
         let http_request = format!(
@@ -117,66 +111,68 @@ impl OutboundProxy for DirectOutbound {
         );
         stream
             .write_all(http_request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send HTTP request: {}", e)))?;
 
-        // Read HTTP response
-        let result = tokio::time::timeout(timeout, async {
-            let mut reader = BufReader::new(stream);
-            let mut response_line = String::new();
-            reader
-                .read_line(&mut response_line)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
+        // Read the response status line
+        let mut reader = std::io::BufReader::new(stream);
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
 
-            if response_line.starts_with("HTTP/") {
-                Ok(())
-            } else {
-                Err(Error::network("Invalid HTTP response"))
-            }
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => Ok(start.elapsed()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(Error::network("Response timeout")),
+        if response_line.starts_with("HTTP/") {
+            Ok(start.elapsed())
+        } else {
+            Err(Error::network("Invalid HTTP response"))
         }
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(
+        &self,
+        inbound: crate::common::stream::BoxStream,
+        target: TargetAddr,
+    ) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        mut inbound: Box<dyn AsyncReadWrite>,
+        inbound: crate::common::stream::BoxStream,
         target: TargetAddr,
-        connection: Option<std::sync::Arc<crate::engine::connection_tracker::TrackedConnection>>,
+        connection: Option<Arc<crate::engine::connection_tracker::TrackedConnection>>,
     ) -> Result<()> {
         use crate::engine::connection_tracker::global_tracker;
 
         // Connect directly to target
         let target_str = target.to_string();
-        let mut outbound = TcpStream::connect(&target_str).await.map_err(|e| {
-            Error::network(format!("Direct connect to {} failed: {}", target_str, e))
-        })?;
+        let outbound = match target {
+            TargetAddr::Ip(addr) => crate::common::socket::connect(&addr, Duration::from_secs(30)),
+            TargetAddr::Domain(domain, port) => {
+                crate::common::socket::connect_host(&domain, port, Duration::from_secs(30))
+            }
+        }
+        .map_err(|e| Error::network(format!("Direct connect to {} failed: {}", target_str, e)))?;
 
         // Disable Nagle's algorithm
         outbound.set_nodelay(true).ok();
+        outbound
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .ok();
+        outbound
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .ok();
 
         tracing::debug!("Direct connection to {} established", target_str);
 
         // Relay data bidirectionally with traffic tracking
         let tracker = global_tracker();
-        let result =
-            relay_bidirectional_with_connection(&mut inbound, &mut outbound, tracker, connection)
-                .await;
-
-        // Cleanup
-        let _ = outbound.shutdown().await;
-
-        result
+        relay_bidirectional_with_connection(
+            inbound,
+            Box::new(outbound) as crate::common::stream::BoxStream,
+            tracker,
+            connection,
+            CancellationToken::new(),
+        )
     }
 }
 
@@ -186,78 +182,148 @@ impl DirectOutbound {
     }
 }
 
-/// Bidirectional relay between two streams with traffic statistics and optional connection tracking
-pub async fn relay_bidirectional_with_connection<A, B>(
-    a: &mut A,
-    b: &mut B,
-    tracker: std::sync::Arc<crate::engine::connection_tracker::ConnectionTracker>,
-    connection: Option<std::sync::Arc<crate::engine::connection_tracker::TrackedConnection>>,
-) -> Result<()>
-where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// Bidirectional relay between two owned streams with traffic statistics and
+/// optional connection tracking.
+///
+/// Two dedicated threads, one per direction; EOF half-closes the opposite
+/// peer. `a` is the client side (upload), `b` the upstream side (download).
+/// Threads need `'static` streams, so both transports are owned (boxed) and
+/// shared behind mutexes; each operation locks exactly one stream, which
+/// keeps the two-thread relay deadlock-free by construction.
+pub fn relay_bidirectional_with_connection(
+    a: crate::common::stream::BoxStream,
+    b: crate::common::stream::BoxStream,
+    tracker: Arc<ConnectionTracker>,
+    connection: Option<Arc<crate::engine::connection_tracker::TrackedConnection>>,
+    token: CancellationToken,
+) -> Result<()> {
+    let a = Arc::new(std::sync::Mutex::new(a));
+    let b = Arc::new(std::sync::Mutex::new(b));
 
-    let (mut ar, mut aw) = tokio::io::split(a);
-    let (mut br, mut bw) = tokio::io::split(b);
-
-    let tracker_upload = tracker.clone();
-    let tracker_download = tracker.clone();
-    let conn_upload = connection.clone();
-    let conn_download = connection.clone();
-
-    let a_to_b = async {
-        let mut buf = vec![0u8; 32 * 1024];
-        loop {
-            let n = ar.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            bw.write_all(&buf[..n]).await?;
-            tracker_upload.add_global_upload(n as u64);
-            if let Some(ref conn) = conn_upload {
-                conn.add_upload(n as u64);
-            }
-        }
-        let _ = bw.shutdown().await;
-        Ok::<(), std::io::Error>(())
+    // Every shared handle is cloned into each thread's closure so the two
+    // relay threads own their own copies (no move-after-move).
+    let t1 = {
+        let a1 = a.clone();
+        let b1 = b.clone();
+        let tracker1 = tracker.clone();
+        let connection1 = connection.clone();
+        let token1 = token.clone();
+        std::thread::Builder::new()
+            .name("corduit-relay-up".into())
+            .spawn(move || {
+                let mut buf = vec![0u8; RELAY_CHUNK];
+                loop {
+                    if token1.is_cancelled() {
+                        let _ = a1.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                        let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                        return Err(Error::network("relay cancelled"));
+                    }
+                    let n = match a1.lock().unwrap().read(&mut buf) {
+                        Ok(0) => {
+                            let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Write);
+                            return Ok(());
+                        }
+                        Ok(n) => n,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = a1.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                            let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                            return Err(Error::network(format!("relay read failed: {e}")));
+                        }
+                    };
+                    if let Err(e) = b1.lock().unwrap().write_all(&buf[..n]) {
+                        let _ = a1.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                        let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                        return Err(Error::network(format!("relay write failed: {e}")));
+                    }
+                    tracker1.add_global_upload(n as u64);
+                    if let Some(ref c) = connection1 {
+                        c.add_upload(n as u64);
+                    }
+                }
+            })
+            .map_err(|e| Error::network(format!("spawn relay thread: {e}")))?
     };
 
-    let b_to_a = async {
-        let mut buf = vec![0u8; 32 * 1024];
-        loop {
-            let n = br.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            aw.write_all(&buf[..n]).await?;
-            tracker_download.add_global_download(n as u64);
-            if let Some(ref conn) = conn_download {
-                conn.add_download(n as u64);
-            }
-        }
-        let _ = aw.shutdown().await;
-        Ok::<(), std::io::Error>(())
+    let t2 = {
+        let a2 = a.clone();
+        let b2 = b.clone();
+        let tracker2 = tracker.clone();
+        let connection2 = connection.clone();
+        let token2 = token.clone();
+        std::thread::Builder::new()
+            .name("corduit-relay-down".into())
+            .spawn(move || {
+                let mut buf = vec![0u8; RELAY_CHUNK];
+                loop {
+                    if token2.is_cancelled() {
+                        let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                        let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                        return Err(Error::network("relay cancelled"));
+                    }
+                    let n = match b2.lock().unwrap().read(&mut buf) {
+                        Ok(0) => {
+                            let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Write);
+                            return Ok(());
+                        }
+                        Ok(n) => n,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                            let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                            return Err(Error::network(format!("relay read failed: {e}")));
+                        }
+                    };
+                    if let Err(e) = a2.lock().unwrap().write_all(&buf[..n]) {
+                        let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                        let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                        return Err(Error::network(format!("relay write failed: {e}")));
+                    }
+                    tracker2.add_global_download(n as u64);
+                    if let Some(ref c) = connection2 {
+                        c.add_download(n as u64);
+                    }
+                }
+            })
+            .map_err(|e| Error::network(format!("spawn relay thread: {e}")))?
     };
 
-    // Run both directions concurrently and wait for both to complete
-    let (result_a, result_b) = tokio::join!(a_to_b, b_to_a);
+    let r1 = t1
+        .join()
+        .map_err(|_| Error::network("relay thread panicked"))?;
+    let r2 = t2
+        .join()
+        .map_err(|_| Error::network("relay thread panicked"))?;
 
-    // Return error only if both failed with non-connection errors
-    match (result_a, result_b) {
-        (Ok(_), Ok(_)) => Ok(()),
-        (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
-            // One direction completed successfully, consider it a success
-            Ok(())
-        }
+    if token.is_cancelled() {
+        return Err(Error::network("relay cancelled"));
+    }
+
+    // One clean direction (EOF) is success; both failing with connection
+    // teardown errors is also a normal close.
+    match (r1, r2) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(_)) | (Err(_), Ok(())) => Ok(()),
         (Err(e1), Err(e2)) => {
-            // Both failed - check if it's a normal connection close
-            if (e1.kind() == std::io::ErrorKind::ConnectionReset
-                || e1.kind() == std::io::ErrorKind::BrokenPipe)
-                && (e2.kind() == std::io::ErrorKind::ConnectionReset
-                    || e2.kind() == std::io::ErrorKind::BrokenPipe)
-            {
+            let normal = |e: &Error| {
+                let msg = e.to_string().to_lowercase();
+                msg.contains("reset") || msg.contains("broken pipe") || msg.contains("connection")
+            };
+            if normal(&e1) && normal(&e2) {
                 Ok(())
             } else {
                 Err(Error::network(format!("Relay error: {} / {}", e1, e2)))
@@ -266,40 +332,28 @@ where
     }
 }
 
-/// Bidirectional relay between two streams (without stats)
+/// Bidirectional relay between two streams (without stats).
 #[allow(dead_code)]
-pub async fn relay_bidirectional<A, B>(a: &mut A, b: &mut B) -> Result<()>
-where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
-{
-    let (mut ar, mut aw) = tokio::io::split(a);
-    let (mut br, mut bw) = tokio::io::split(b);
-
-    let result = tokio::select! {
-        biased;
-
-        result = tokio::io::copy(&mut ar, &mut bw) => {
-            let _ = bw.shutdown().await;
-            result.map(|bytes| {
-                tracing::trace!("Relay A->B completed: {} bytes", bytes);
-
-            })
-        }
-        result = tokio::io::copy(&mut br, &mut aw) => {
-            let _ = aw.shutdown().await;
-            result.map(|bytes| {
-                tracing::trace!("Relay B->A completed: {} bytes", bytes);
-
-            })
-        }
-    };
-
+pub fn relay_bidirectional(
+    a: crate::common::stream::BoxStream,
+    b: crate::common::stream::BoxStream,
+) -> Result<()> {
+    let result = relay_bidirectional_with_connection(
+        a,
+        b,
+        crate::engine::connection_tracker::global_tracker(),
+        None,
+        CancellationToken::new(),
+    );
     match result {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        Err(e) if e.to_string().contains("connection") => Ok(()),
-        Err(e) => Err(Error::network(format!("Relay error: {}", e))),
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("reset") || msg.contains("broken pipe") || msg.contains("connection") {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
     }
 }

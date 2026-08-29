@@ -7,6 +7,7 @@
 //! - DNS server functionality
 //! - Hot-reload configuration
 
+use crate::common::exec;
 use crate::dns::config::DnsConfig;
 use crate::dns::doh::DohResolver;
 use crate::dns::dot::DotResolver;
@@ -14,9 +15,9 @@ use crate::dns::error::Result;
 use crate::dns::resolver::DnsResolver;
 use crate::dns::server::DnsServer;
 use crate::dns::RecordType;
+use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// DNS Manager state
@@ -43,7 +44,7 @@ pub struct DnsManager {
     /// DNS resolver
     resolver: Arc<RwLock<DnsResolver>>,
     /// DNS server (optional)
-    server: Arc<RwLock<Option<DnsServer>>>,
+    server: Arc<RwLock<Option<Arc<DnsServer>>>>,
     /// DoH resolver (optional)
     doh_resolver: Option<Arc<DohResolver>>,
     /// DoT resolver (optional)
@@ -143,21 +144,17 @@ impl DnsManager {
     /// 1. DoH (if available and preferred)
     /// 2. DoT (if available)
     /// 3. Standard resolver (UDP/TCP with caching, Fake-IP, etc.)
-    pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        self.resolve_with_type(domain, RecordType::A).await
+    pub fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        self.resolve_with_type(domain, RecordType::A)
     }
 
     /// Resolve with specific record type
-    pub async fn resolve_with_type(
-        &self,
-        domain: &str,
-        record_type: RecordType,
-    ) -> Result<Vec<IpAddr>> {
+    pub fn resolve_with_type(&self, domain: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let domain = domain.trim_end_matches('.');
 
         // Try DoH first if available
         if let Some(doh) = &self.doh_resolver {
-            match doh.query(domain, record_type).await {
+            match doh.query(domain, record_type) {
                 Ok(ips) if !ips.is_empty() => {
                     debug!("DoH resolved {} to {:?}", domain, ips);
                     return Ok(ips);
@@ -169,7 +166,7 @@ impl DnsManager {
 
         // Try DoT if available
         if let Some(dot) = &self.dot_resolver {
-            match dot.query(domain, record_type).await {
+            match dot.query(domain, record_type) {
                 Ok(ips) if !ips.is_empty() => {
                     debug!("DoT resolved {} to {:?}", domain, ips);
                     return Ok(ips);
@@ -180,13 +177,13 @@ impl DnsManager {
         }
 
         // Fall back to standard resolver
-        let resolver = self.resolver.read().await;
-        resolver.resolve(domain, record_type).await
+        let resolver = self.resolver.read();
+        resolver.resolve(domain, record_type)
     }
 
     /// Resolve IPv4 addresses only
-    pub async fn resolve_a(&self, domain: &str) -> Result<Vec<std::net::Ipv4Addr>> {
-        let ips = self.resolve_with_type(domain, RecordType::A).await?;
+    pub fn resolve_a(&self, domain: &str) -> Result<Vec<std::net::Ipv4Addr>> {
+        let ips = self.resolve_with_type(domain, RecordType::A)?;
         Ok(ips
             .into_iter()
             .filter_map(|ip| match ip {
@@ -197,8 +194,8 @@ impl DnsManager {
     }
 
     /// Resolve IPv6 addresses only
-    pub async fn resolve_aaaa(&self, domain: &str) -> Result<Vec<std::net::Ipv6Addr>> {
-        let ips = self.resolve_with_type(domain, RecordType::AAAA).await?;
+    pub fn resolve_aaaa(&self, domain: &str) -> Result<Vec<std::net::Ipv6Addr>> {
+        let ips = self.resolve_with_type(domain, RecordType::AAAA)?;
         Ok(ips
             .into_iter()
             .filter_map(|ip| match ip {
@@ -209,55 +206,49 @@ impl DnsManager {
     }
 
     /// Start DNS server
-    pub async fn start_server(&self) -> Result<()> {
-        let config = self.config.read().await;
+    pub fn start_server(&self) -> Result<()> {
+        let config = self.config.read();
 
         if !config.enable {
             return Ok(());
         }
 
-        let server = DnsServer::new(config.clone())?;
+        let server = Arc::new(DnsServer::new(config.clone())?);
 
         // Store server reference
-        {
-            let mut server_lock = self.server.write().await;
-            *server_lock = Some(server);
-        }
+        *self.server.write() = Some(server.clone());
 
-        // Start server in background
-        let server_lock = self.server.clone();
-        tokio::spawn(async move {
-            if let Some(server) = server_lock.read().await.as_ref() {
-                if let Err(e) = server.start().await {
-                    warn!("DNS server error: {}", e);
-                }
+        // Start server in background (runs until `stop_server`).
+        exec::spawn(move || {
+            if let Err(e) = server.start() {
+                warn!("DNS server error: {}", e);
             }
         });
 
-        *self.state.write().await = DnsManagerState::Running;
+        *self.state.write() = DnsManagerState::Running;
         info!("DNS server started on {}", config.listen);
         Ok(())
     }
 
     /// Stop DNS server
-    pub async fn stop_server(&self) -> Result<()> {
-        let mut server_lock = self.server.write().await;
+    pub fn stop_server(&self) -> Result<()> {
+        let mut server_lock = self.server.write();
         if let Some(server) = server_lock.take() {
             server.stop();
             info!("DNS server stopped");
         }
-        *self.state.write().await = DnsManagerState::Stopped;
+        *self.state.write() = DnsManagerState::Stopped;
         Ok(())
     }
 
     /// Check if DNS server is running
-    pub async fn is_server_running(&self) -> bool {
-        self.server.read().await.is_some()
+    pub fn is_server_running(&self) -> bool {
+        self.server.read().is_some()
     }
 
     /// Get current state
-    pub async fn state(&self) -> DnsManagerState {
-        *self.state.read().await
+    pub fn state(&self) -> DnsManagerState {
+        *self.state.read()
     }
 
     /// Check if DoH is enabled
@@ -271,20 +262,20 @@ impl DnsManager {
     }
 
     /// Lookup domain from Fake-IP
-    pub async fn lookup_fake_ip(&self, ip: std::net::Ipv4Addr) -> Option<String> {
-        let resolver = self.resolver.read().await;
+    pub fn lookup_fake_ip(&self, ip: std::net::Ipv4Addr) -> Option<String> {
+        let resolver = self.resolver.read();
         resolver.lookup_fake_ip(ip)
     }
 
     /// Check if IP is a Fake-IP
-    pub async fn is_fake_ip(&self, ip: std::net::Ipv4Addr) -> bool {
-        let resolver = self.resolver.read().await;
+    pub fn is_fake_ip(&self, ip: std::net::Ipv4Addr) -> bool {
+        let resolver = self.resolver.read();
         resolver.is_fake_ip(ip)
     }
 
     /// Get cache statistics
-    pub async fn cache_stats(&self) -> CacheStatistics {
-        let resolver = self.resolver.read().await;
+    pub fn cache_stats(&self) -> CacheStatistics {
+        let resolver = self.resolver.read();
         let cache = resolver.cache();
         let stats = cache.stats();
 
@@ -297,25 +288,25 @@ impl DnsManager {
     }
 
     /// Clear DNS cache
-    pub async fn clear_cache(&self) {
-        let resolver = self.resolver.read().await;
+    pub fn clear_cache(&self) {
+        let resolver = self.resolver.read();
         resolver.clear_cache();
         info!("DNS cache cleared");
     }
 
     /// Reset DNS manager (clear cache, stop server, reinitialize)
-    pub async fn reset(&self) -> Result<()> {
+    pub fn reset(&self) -> Result<()> {
         info!("Resetting DNS manager...");
 
         // Stop server if running
-        self.stop_server().await?;
+        self.stop_server()?;
 
         // Clear cache
-        self.clear_cache().await;
+        self.clear_cache();
 
         // Cleanup resolver
         {
-            let resolver = self.resolver.read().await;
+            let resolver = self.resolver.read();
             resolver.cleanup();
         }
 
@@ -324,13 +315,13 @@ impl DnsManager {
     }
 
     /// Reload configuration
-    pub async fn reload_config(&self, new_config: DnsConfig) -> Result<()> {
+    pub fn reload_config(&self, new_config: DnsConfig) -> Result<()> {
         info!("Reloading DNS configuration...");
 
         // Stop server if running
-        let was_running = self.is_server_running().await;
+        let was_running = self.is_server_running();
         if was_running {
-            self.stop_server().await?;
+            self.stop_server()?;
         }
 
         // Create new resolver
@@ -338,19 +329,19 @@ impl DnsManager {
 
         // Update resolver
         {
-            let mut resolver = self.resolver.write().await;
+            let mut resolver = self.resolver.write();
             *resolver = new_resolver;
         }
 
         // Update config
         {
-            let mut config = self.config.write().await;
+            let mut config = self.config.write();
             *config = new_config;
         }
 
         // Restart server if it was running
         if was_running {
-            self.start_server().await?;
+            self.start_server()?;
         }
 
         info!("DNS configuration reloaded");
@@ -358,8 +349,8 @@ impl DnsManager {
     }
 
     /// Get current configuration
-    pub async fn config(&self) -> DnsConfig {
-        self.config.read().await.clone()
+    pub fn config(&self) -> DnsConfig {
+        self.config.read().clone()
     }
 
     /// Get resolver reference (for advanced usage)
@@ -391,14 +382,14 @@ impl Default for DnsManager {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_dns_manager_creation() {
+    #[test]
+    fn test_dns_manager_creation() {
         let manager = DnsManager::new();
         assert!(manager.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_dns_manager_with_config() {
+    #[test]
+    fn test_dns_manager_with_config() {
         let config = DnsConfig {
             nameservers: vec![
                 "8.8.8.8".to_string(),
@@ -414,17 +405,17 @@ mod tests {
         assert!(manager.has_doh());
     }
 
-    #[tokio::test]
-    async fn test_dns_manager_state() {
+    #[test]
+    fn test_dns_manager_state() {
         let manager = DnsManager::new().unwrap();
-        assert_eq!(manager.state().await, DnsManagerState::Stopped);
+        assert_eq!(manager.state(), DnsManagerState::Stopped);
     }
 
-    #[tokio::test]
+    #[test]
     #[ignore] // Requires network
-    async fn test_dns_manager_resolve() {
+    fn test_dns_manager_resolve() {
         let manager = DnsManager::new().unwrap();
-        let result = manager.resolve("google.com").await;
+        let result = manager.resolve("google.com");
         assert!(result.is_ok());
         assert!(!result.unwrap().is_empty());
     }

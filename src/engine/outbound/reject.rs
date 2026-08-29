@@ -1,20 +1,20 @@
+use crate::common::stream::BoxStream;
 use crate::engine::config::OutboundConfig;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
 
 /// Reject outbound - drops all connections
 pub struct RejectOutbound {
     config: OutboundConfig,
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for RejectOutbound {
-    async fn connect(&self) -> Result<()> {
+    fn connect(&self) -> Result<()> {
         // Reject outbound doesn't need to connect
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    fn disconnect(&self) -> Result<()> {
         // Nothing to disconnect
         Ok(())
     }
@@ -28,7 +28,7 @@ impl OutboundProxy for RejectOutbound {
         None
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         _test_url: &str,
         _timeout: std::time::Duration,
@@ -37,7 +37,7 @@ impl OutboundProxy for RejectOutbound {
         Err(Error::network("Connection rejected by policy"))
     }
 
-    async fn relay_tcp(&self, _inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
+    fn relay_tcp(&self, _inbound: BoxStream, target: TargetAddr) -> Result<()> {
         tracing::debug!("Rejecting connection to {}", target);
         // Simply drop the connection by returning an error
         Err(Error::network("Connection rejected by policy"))

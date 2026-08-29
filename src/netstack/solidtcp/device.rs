@@ -5,8 +5,7 @@
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use bytes::BytesMut;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 /// Device configuration
 #[derive(Debug, Clone)]
@@ -121,7 +120,7 @@ pub struct VirtualDevice {
 impl VirtualDevice {
     /// Create a new virtual device
     pub fn new(config: DeviceConfig) -> Self {
-        let (write_tx, write_rx) = mpsc::channel(config.write_queue_size);
+        let (write_tx, write_rx) = mpsc::channel();
 
         Self {
             config,
@@ -163,17 +162,16 @@ impl VirtualDevice {
     }
 
     /// Queue a packet for writing
-    pub async fn queue_write(&self, packet: BytesMut) -> Result<()> {
+    pub fn queue_write(&self, packet: BytesMut) -> Result<()> {
         self.write_tx
             .send(packet)
-            .await
             .map_err(|_| SolidTcpError::ChannelClosed)
     }
 
     /// Try to queue a packet for writing (non-blocking)
     pub fn try_queue_write(&self, packet: BytesMut) -> Result<()> {
         self.write_tx
-            .try_send(packet)
+            .send(packet)
             .map_err(|_| SolidTcpError::ChannelClosed)
     }
 }

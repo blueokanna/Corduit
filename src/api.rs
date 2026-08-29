@@ -36,8 +36,8 @@ pub fn init_app() {
 fn init_tracing_safe() -> std::result::Result<(), ()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("debug,corduit=debug,tokio=warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug,corduit=debug"));
 
     let bridge_log_layer = BridgeLogLayer;
     #[cfg(target_os = "android")]
@@ -90,7 +90,7 @@ fn init_tracing_safe() -> std::result::Result<(), ()> {
 }
 
 // ============== Proxy Control API (Design Document Compliant) ==============
-pub async fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
+pub fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
     tracing::info!("Starting proxy from config JSON...");
 
     // This public entry point must honor `rule_providers` / `proxy_providers`
@@ -101,56 +101,52 @@ pub async fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(
     let config: Config =
         nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {}", e))?;
     {
-        let mut instance = CORDUIT_INSTANCE.write().await;
+        let mut instance = CORDUIT_INSTANCE.write();
         if let Some(ref corduit) = *instance {
             tracing::info!("Stopping existing Corduit instance before re-initialization");
-            if let Err(e) = corduit.stop().await {
+            if let Err(e) = corduit.stop() {
                 tracing::warn!("Error stopping existing instance: {}", e);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
         *instance = None;
     }
 
     let corduit = crate::engine::Corduit::new(config)
-        .await
         .map_err(|e| format!("Failed to create Corduit: {}", e))?;
 
     corduit
         .start()
-        .await
         .map_err(|e| format!("Failed to start proxy: {}", e))?;
 
-    let mut instance = CORDUIT_INSTANCE.write().await;
+    let mut instance = CORDUIT_INSTANCE.write();
     *instance = Some(corduit);
 
     tracing::info!("Proxy started successfully from config JSON");
     Ok(())
 }
 
-pub async fn start_proxy_from_file(config_path: String) -> std::result::Result<(), String> {
+pub fn start_proxy_from_file(config_path: String) -> std::result::Result<(), String> {
     tracing::info!("Starting proxy from file: {}", config_path);
 
     let yaml_content = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("Failed to read config file '{}': {}", config_path, e))?;
-    start_proxy_from_yaml(yaml_content).await
+    start_proxy_from_yaml(yaml_content)
 }
 
-pub async fn stop_proxy() -> std::result::Result<(), String> {
+pub fn stop_proxy() -> std::result::Result<(), String> {
     tracing::info!("Stopping proxy...");
 
     let tracker = crate::engine::connection_tracker::global_tracker();
     tracker.reset();
     {
-        let instance = get_corduit_instance()
-            .await
-            .map_err(|e| format!("Failed to get instance: {}", e))?;
-        let corduit_guard = instance.read().await;
+        let instance =
+            get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+        let corduit_guard = instance.read();
 
         if let Some(corduit) = corduit_guard.as_ref() {
             corduit
                 .stop()
-                .await
                 .map_err(|e| format!("Failed to stop proxy: {}", e))?;
         } else {
             tracing::warn!("Proxy was not running");
@@ -158,9 +154,9 @@ pub async fn stop_proxy() -> std::result::Result<(), String> {
         }
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    std::thread::sleep(std::time::Duration::from_millis(500));
     {
-        let mut instance = CORDUIT_INSTANCE.write().await;
+        let mut instance = CORDUIT_INSTANCE.write();
         *instance = None;
     }
 
@@ -168,36 +164,30 @@ pub async fn stop_proxy() -> std::result::Result<(), String> {
     Ok(())
 }
 
-pub async fn is_proxy_running() -> std::result::Result<bool, String> {
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let corduit_guard = instance.read().await;
+pub fn is_proxy_running() -> std::result::Result<bool, String> {
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let corduit_guard = instance.read();
 
     if let Some(corduit) = corduit_guard.as_ref() {
         corduit
             .is_running()
-            .await
             .map_err(|e| format!("Failed to check running status: {}", e))
     } else {
         Ok(false)
     }
 }
 
-pub async fn reload_config_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
+pub fn reload_config_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
     tracing::info!("Reloading config from JSON...");
     let config: Config =
         nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {}", e))?;
 
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let mut corduit_guard = instance.write().await;
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let mut corduit_guard = instance.write();
 
     if let Some(corduit) = corduit_guard.as_mut() {
         corduit
             .reload(config)
-            .await
             .map_err(|e| format!("Failed to reload config: {}", e))?;
         tracing::info!("Config reloaded successfully");
         Ok(())
@@ -206,16 +196,16 @@ pub async fn reload_config_from_yaml(yaml_config: String) -> std::result::Result
     }
 }
 
-pub async fn reload_config_from_file(config_path: String) -> std::result::Result<(), String> {
+pub fn reload_config_from_file(config_path: String) -> std::result::Result<(), String> {
     tracing::info!("Reloading config from file: {}", config_path);
     let yaml_content = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("Failed to read config file '{}': {}", config_path, e))?;
 
-    reload_config_from_yaml(yaml_content).await
+    reload_config_from_yaml(yaml_content)
 }
 
 // ============== Traffic Statistics API (Design Document Compliant) ==============
-pub async fn get_traffic_stats_dto() -> std::result::Result<TrafficStatsDto, String> {
+pub fn get_traffic_stats_dto() -> std::result::Result<TrafficStatsDto, String> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     tracker.update_speed();
 
@@ -234,10 +224,9 @@ pub async fn get_traffic_stats_dto() -> std::result::Result<TrafficStatsDto, Str
         }
     }
     let uptime_secs = {
-        let instance = get_corduit_instance()
-            .await
-            .map_err(|e| format!("Failed to get instance: {}", e))?;
-        let guard = instance.read().await;
+        let instance =
+            get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+        let guard = instance.read();
         guard.as_ref().map(|v| v.uptime_secs()).unwrap_or(0)
     };
 
@@ -251,7 +240,7 @@ pub async fn get_traffic_stats_dto() -> std::result::Result<TrafficStatsDto, Str
     })
 }
 
-pub async fn get_connections_dto() -> std::result::Result<Vec<ConnectionDto>, String> {
+pub fn get_connections_dto() -> std::result::Result<Vec<ConnectionDto>, String> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     let connections = tracker.get_all();
 
@@ -274,7 +263,7 @@ pub async fn get_connections_dto() -> std::result::Result<Vec<ConnectionDto>, St
     Ok(result)
 }
 
-pub async fn close_connection_by_id(id: String) -> std::result::Result<(), String> {
+pub fn close_connection_by_id(id: String) -> std::result::Result<(), String> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     if tracker.close_connection(&id) {
         tracing::info!("Connection {} closed", id);
@@ -284,7 +273,7 @@ pub async fn close_connection_by_id(id: String) -> std::result::Result<(), Strin
     }
 }
 
-pub async fn close_all_connections_dto() -> std::result::Result<(), String> {
+pub fn close_all_connections_dto() -> std::result::Result<(), String> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     tracker.close_all();
     tracing::info!("All connections closed");
@@ -292,11 +281,9 @@ pub async fn close_all_connections_dto() -> std::result::Result<(), String> {
 }
 
 // ============== Proxy Management API (Design Document Compliant) ==============
-pub async fn get_proxies() -> std::result::Result<Vec<ProxyInfoDto>, String> {
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read().await;
+pub fn get_proxies() -> std::result::Result<Vec<ProxyInfoDto>, String> {
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let guard = instance.read();
 
     if let Some(corduit) = guard.as_ref() {
         let config = corduit.config();
@@ -332,11 +319,9 @@ pub async fn get_proxies() -> std::result::Result<Vec<ProxyInfoDto>, String> {
     }
 }
 
-pub async fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, String> {
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read().await;
+pub fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, String> {
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let guard = instance.read();
 
     if let Some(corduit) = guard.as_ref() {
         let config = corduit.config();
@@ -383,8 +368,8 @@ pub async fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, Strin
                 };
                 let providers = outbound_manager.proxy_provider_manager();
                 for name in use_names {
-                    if let Some(provider) = providers.get_provider(&name).await {
-                        for proxy in provider.get_proxies().await {
+                    if let Some(provider) = providers.get_provider(&name) {
+                        for proxy in provider.get_proxies() {
                             let tag = proxy.tag().to_string();
                             if !proxies.contains(&tag) {
                                 proxies.push(tag);
@@ -413,17 +398,15 @@ pub async fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, Strin
     }
 }
 
-pub async fn select_proxy(group_tag: String, proxy_tag: String) -> std::result::Result<(), String> {
+pub fn select_proxy(group_tag: String, proxy_tag: String) -> std::result::Result<(), String> {
     tracing::info!(
         "Selecting proxy: group='{}', proxy='{}'",
         group_tag,
         proxy_tag
     );
 
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read().await;
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let guard = instance.read();
 
     if let Some(corduit) = guard.as_ref() {
         let proxy_manager = corduit.proxy_manager();
@@ -434,7 +417,6 @@ pub async fn select_proxy(group_tag: String, proxy_tag: String) -> std::result::
 
         outbound_manager
             .set_selector_proxy(&group_tag, &proxy_tag)
-            .await
             .map_err(|e| format!("Failed to set proxy selection: {}", e))?;
 
         tracing::info!("Proxy selection updated: {} -> {}", group_tag, proxy_tag);
@@ -444,23 +426,21 @@ pub async fn select_proxy(group_tag: String, proxy_tag: String) -> std::result::
     }
 }
 
-pub async fn test_proxy_latency_dto(
+pub fn test_proxy_latency_dto(
     tag: String,
     test_url: String,
     timeout_ms: u64,
 ) -> std::result::Result<u64, String> {
-    use tokio::time::Duration;
+    use std::time::Duration;
 
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read().await;
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let guard = instance.read();
     if let Some(corduit) = guard.as_ref() {
         let proxy_manager = corduit.proxy_manager();
 
         if let Some(proxy) = proxy_manager.outbound_manager().get_proxy(&tag) {
             let timeout = Duration::from_millis(timeout_ms);
-            match proxy.test_http_latency(&test_url, timeout).await {
+            match proxy.test_http_latency(&test_url, timeout) {
                 Ok(duration) => Ok(duration.as_millis() as u64),
                 Err(e) => Err(format!("Latency test failed: {}", e)),
             }
@@ -472,17 +452,14 @@ pub async fn test_proxy_latency_dto(
     }
 }
 
-pub async fn test_all_proxies_latency(
+pub fn test_all_proxies_latency(
     test_url: String,
     timeout_ms: u64,
 ) -> std::result::Result<Vec<ProxyLatencyDto>, String> {
-    use futures::future::join_all;
-    use tokio::time::Duration;
+    use std::time::Duration;
 
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read().await;
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let guard = instance.read();
 
     if let Some(corduit) = guard.as_ref() {
         let proxy_manager = corduit.proxy_manager();
@@ -490,28 +467,24 @@ pub async fn test_all_proxies_latency(
         let tags = outbound_manager.get_all_tags();
         let timeout = Duration::from_millis(timeout_ms);
 
-        let mut futures = Vec::new();
+        let mut results = Vec::new();
         for tag in tags {
             if let Some(proxy) = outbound_manager.get_proxy(&tag) {
-                let url = test_url.clone();
-                futures.push(async move {
-                    match proxy.test_http_latency(&url, timeout).await {
-                        Ok(duration) => ProxyLatencyDto {
-                            tag,
-                            latency_ms: Some(duration.as_millis() as u64),
-                            error: None,
-                        },
-                        Err(e) => ProxyLatencyDto {
-                            tag,
-                            latency_ms: None,
-                            error: Some(e.to_string()),
-                        },
-                    }
-                });
+                match proxy.test_http_latency(&test_url, timeout) {
+                    Ok(duration) => results.push(ProxyLatencyDto {
+                        tag,
+                        latency_ms: Some(duration.as_millis() as u64),
+                        error: None,
+                    }),
+                    Err(e) => results.push(ProxyLatencyDto {
+                        tag,
+                        latency_ms: None,
+                        error: Some(e.to_string()),
+                    }),
+                }
             }
         }
 
-        let results = join_all(futures).await;
         Ok(results)
     } else {
         Err("Proxy not initialized".to_string())
@@ -519,11 +492,9 @@ pub async fn test_all_proxies_latency(
 }
 
 // ============== Configuration Query API (Design Document Compliant) ==============
-pub async fn get_rules() -> std::result::Result<Vec<RuleDto>, String> {
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read().await;
+pub fn get_rules() -> std::result::Result<Vec<RuleDto>, String> {
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let guard = instance.read();
 
     if let Some(corduit) = guard.as_ref() {
         let config = corduit.config();
@@ -545,11 +516,9 @@ pub async fn get_rules() -> std::result::Result<Vec<RuleDto>, String> {
     }
 }
 
-pub async fn get_dns_config() -> std::result::Result<DnsConfigDto, String> {
-    let instance = get_corduit_instance()
-        .await
-        .map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read().await;
+pub fn get_dns_config() -> std::result::Result<DnsConfigDto, String> {
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
+    let guard = instance.read();
 
     if let Some(corduit) = guard.as_ref() {
         let config = corduit.config();
@@ -565,7 +534,7 @@ pub async fn get_dns_config() -> std::result::Result<DnsConfigDto, String> {
     }
 }
 
-pub async fn set_proxy_mode(mode: i32) -> std::result::Result<(), String> {
+pub fn set_proxy_mode(mode: i32) -> std::result::Result<(), String> {
     crate::engine::set_runtime_proxy_mode(mode);
 
     #[cfg(target_os = "android")]
@@ -588,7 +557,7 @@ pub async fn set_proxy_mode(mode: i32) -> std::result::Result<(), String> {
     Ok(())
 }
 
-pub async fn get_proxy_mode() -> std::result::Result<i32, String> {
+pub fn get_proxy_mode() -> std::result::Result<i32, String> {
     Ok(crate::engine::get_runtime_proxy_mode())
 }
 
@@ -642,7 +611,7 @@ pub fn set_protect_socket_callback_enabled(enabled: bool) {
     }
 }
 
-pub async fn start_tun_mode(
+pub fn start_tun_mode(
     tun_name: String,
     tun_address: String,
     tun_netmask: String,
@@ -665,7 +634,6 @@ pub async fn start_tun_mode(
             .map_err(|e| format!("Invalid TUN netmask: {}", e))?;
 
         crate::netstack::ensure_wintun()
-            .await
             .map_err(|e| format!("Failed to load wintun.dll: {}", e))?;
         let config = TunConfig {
             name: tun_name,
@@ -677,11 +645,9 @@ pub async fn start_tun_mode(
         };
 
         let mut tun = TunDevice::with_config(config)
-            .await
             .map_err(|e| format!("Failed to create TUN device: {}", e))?;
 
         tun.start()
-            .await
             .map_err(|e| format!("Failed to start TUN device: {}", e))?;
 
         crate::set_windows_tun_device(tun);
@@ -696,7 +662,7 @@ pub async fn start_tun_mode(
     }
 }
 
-pub async fn stop_tun_mode() -> std::result::Result<(), String> {
+pub fn stop_tun_mode() -> std::result::Result<(), String> {
     #[cfg(windows)]
     {
         tracing::info!("Stopping TUN mode...");
@@ -713,7 +679,6 @@ pub async fn stop_tun_mode() -> std::result::Result<(), String> {
         if let Some(mut tun_device) = crate::take_windows_tun_device() {
             tun_device
                 .stop()
-                .await
                 .map_err(|e| format!("Failed to stop TUN device: {}", e))?;
         }
 
@@ -730,7 +695,7 @@ pub async fn stop_tun_mode() -> std::result::Result<(), String> {
     }
 }
 
-pub async fn initialize_corduit(config_json: String) -> Result<()> {
+pub fn initialize_corduit(config_json: String) -> Result<()> {
     tracing::info!("Initializing corduit...");
 
     configure_rule_providers(&config_json)?;
@@ -740,36 +705,34 @@ pub async fn initialize_corduit(config_json: String) -> Result<()> {
     let core_config = convert_ffi_config_to_core(config)?;
 
     {
-        let mut instance = CORDUIT_INSTANCE.write().await;
+        let mut instance = CORDUIT_INSTANCE.write();
         if let Some(ref corduit) = *instance {
             tracing::info!("Stopping existing Corduit instance before re-initialization");
-            if let Err(e) = corduit.stop().await {
+            if let Err(e) = corduit.stop() {
                 tracing::warn!("Error stopping existing instance: {}", e);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
         *instance = None;
     }
 
-    let corduit = crate::engine::Corduit::new(core_config)
-        .await
-        .map_err(CorduitError::from)?;
+    let corduit = crate::engine::Corduit::new(core_config).map_err(CorduitError::from)?;
 
-    let mut instance = CORDUIT_INSTANCE.write().await;
+    let mut instance = CORDUIT_INSTANCE.write();
     *instance = Some(corduit);
 
     tracing::info!("Corduit initialized successfully");
     Ok(())
 }
 
-pub async fn start_corduit() -> Result<()> {
+pub fn start_corduit() -> Result<()> {
     tracing::info!("Starting Corduit proxy server...");
 
-    let instance = get_corduit_instance().await?;
-    let corduit_guard = instance.read().await;
+    let instance = get_corduit_instance()?;
+    let corduit_guard = instance.read();
 
     if let Some(corduit) = corduit_guard.as_ref() {
-        corduit.start().await.map_err(CorduitError::from)?;
+        corduit.start().map_err(CorduitError::from)?;
         tracing::info!("Corduit proxy server started successfully");
     } else {
         return Err(CorduitError::Internal(
@@ -780,27 +743,27 @@ pub async fn start_corduit() -> Result<()> {
     Ok(())
 }
 
-pub async fn stop_corduit() -> Result<()> {
+pub fn stop_corduit() -> Result<()> {
     tracing::info!("Stopping Corduit proxy server...");
 
     let tracker = crate::engine::connection_tracker::global_tracker();
     tracker.reset();
     tracing::info!("Connection tracker reset");
     {
-        let instance = get_corduit_instance().await?;
-        let corduit_guard = instance.read().await;
+        let instance = get_corduit_instance()?;
+        let corduit_guard = instance.read();
 
         if let Some(corduit) = corduit_guard.as_ref() {
-            corduit.stop().await.map_err(CorduitError::from)?;
+            corduit.stop().map_err(CorduitError::from)?;
         } else {
             tracing::warn!("Corduit was not initialized, nothing to stop");
             return Ok(());
         }
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    std::thread::sleep(std::time::Duration::from_millis(500));
     {
-        let mut instance = CORDUIT_INSTANCE.write().await;
+        let mut instance = CORDUIT_INSTANCE.write();
         *instance = None;
     }
 
@@ -808,7 +771,7 @@ pub async fn stop_corduit() -> Result<()> {
     Ok(())
 }
 
-pub async fn reload_corduit(config_json: String) -> Result<()> {
+pub fn reload_corduit(config_json: String) -> Result<()> {
     configure_rule_providers(&config_json)?;
     configure_proxy_providers(&config_json)?;
     let config: CorduitConfig = nextjson::from_str(&config_json)
@@ -816,14 +779,11 @@ pub async fn reload_corduit(config_json: String) -> Result<()> {
 
     let core_config = convert_ffi_config_to_core(config)?;
 
-    let instance = get_corduit_instance().await?;
-    let mut corduit_guard = instance.write().await;
+    let instance = get_corduit_instance()?;
+    let mut corduit_guard = instance.write();
 
     if let Some(corduit) = corduit_guard.as_mut() {
-        corduit
-            .reload(core_config)
-            .await
-            .map_err(CorduitError::from)?;
+        corduit.reload(core_config).map_err(CorduitError::from)?;
     } else {
         return Err(CorduitError::Internal(
             "Corduit not initialized".to_string(),
@@ -833,11 +793,11 @@ pub async fn reload_corduit(config_json: String) -> Result<()> {
     Ok(())
 }
 
-pub async fn get_corduit_status() -> Result<ProxyStatus> {
+pub fn get_corduit_status() -> Result<ProxyStatus> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
-    let instance = get_corduit_instance().await?;
-    let corduit_guard = instance.read().await;
+    let instance = get_corduit_instance()?;
+    let corduit_guard = instance.read();
 
     if let Some(corduit) = corduit_guard.as_ref() {
         let tracker = crate::engine::connection_tracker::global_tracker();
@@ -873,7 +833,7 @@ pub async fn get_corduit_status() -> Result<ProxyStatus> {
         };
 
         Ok(ProxyStatus {
-            running: corduit.is_running().await.unwrap_or(false),
+            running: corduit.is_running().unwrap_or(false),
             inbound_count: config.inbounds.len() as u32,
             outbound_count: config.outbounds.len() as u32,
             connection_count,
@@ -892,7 +852,7 @@ pub async fn get_corduit_status() -> Result<ProxyStatus> {
     }
 }
 
-pub async fn get_traffic_stats() -> Result<TrafficStats> {
+pub fn get_traffic_stats() -> Result<TrafficStats> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     tracker.update_speed();
     #[cfg(target_os = "android")]
@@ -916,22 +876,22 @@ pub async fn get_traffic_stats() -> Result<TrafficStats> {
     })
 }
 
-pub async fn test_config(config_json: String) -> Result<bool> {
+pub fn test_config(config_json: String) -> Result<bool> {
     configure_rule_providers(&config_json)?;
     configure_proxy_providers(&config_json)?;
     let config: CorduitConfig = nextjson::from_str(&config_json)
         .map_err(|e| CorduitError::Parse(format!("Invalid config JSON: {}", e)))?;
 
     let core_config = convert_ffi_config_to_core(config)?;
-    match crate::engine::Corduit::new(core_config).await {
+    match crate::engine::Corduit::new(core_config) {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
 }
 
-pub async fn get_connections() -> Result<Vec<ConnectionInfo>> {
-    let instance = get_corduit_instance().await?;
-    let corduit_guard = instance.read().await;
+pub fn get_connections() -> Result<Vec<ConnectionInfo>> {
+    let instance = get_corduit_instance()?;
+    let corduit_guard = instance.read();
 
     if let Some(corduit) = corduit_guard.as_ref() {
         corduit.traffic_stats().active_connections();
@@ -941,11 +901,11 @@ pub async fn get_connections() -> Result<Vec<ConnectionInfo>> {
     }
 }
 
-pub async fn close_connection(_connection_id: String) -> Result<()> {
+pub fn close_connection(_connection_id: String) -> Result<()> {
     Ok(())
 }
 
-pub async fn get_logs(lines: Option<u32>) -> Result<Vec<String>> {
+pub fn get_logs(lines: Option<u32>) -> Result<Vec<String>> {
     let max_lines = lines.unwrap_or(100) as usize;
     let logs = crate::engine::logging::get_recent_logs(max_lines);
     if logs.is_empty() {
@@ -957,7 +917,7 @@ pub async fn get_logs(lines: Option<u32>) -> Result<Vec<String>> {
     }
 }
 
-pub async fn set_log_level(level: String) -> Result<()> {
+pub fn set_log_level(level: String) -> Result<()> {
     match level.to_lowercase().as_str() {
         "error" => tracing::Level::ERROR,
         "warn" | "warning" => tracing::Level::WARN,
@@ -971,7 +931,7 @@ pub async fn set_log_level(level: String) -> Result<()> {
     Ok(())
 }
 
-pub async fn get_system_info() -> Result<SystemInfo> {
+pub fn get_system_info() -> Result<SystemInfo> {
     use sysinfo::System;
 
     let platform = if cfg!(target_os = "windows") {
@@ -1117,8 +1077,8 @@ fn generate_rpc_token() -> String {
 ///
 /// Binds to `127.0.0.1` only. When `token` is omitted a fresh random token is
 /// generated; the caller is responsible for delivering it to the frontend.
-pub async fn start_rpc_server(port: u16, token: Option<String>) -> std::result::Result<(), String> {
-    // Never hold the (non-`Send`) parking_lot guard across an `.await`.
+pub fn start_rpc_server(port: u16, token: Option<String>) -> std::result::Result<(), String> {
+    // Never hold the (non-`Send`) parking_lot guard across a blocking call.
     {
         let guard = RPC_SERVER.lock();
         if let Some(handle) = guard.as_ref() {
@@ -1131,7 +1091,6 @@ pub async fn start_rpc_server(port: u16, token: Option<String>) -> std::result::
     let token = token.unwrap_or_else(generate_rpc_token);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let server = crate::rpc::server::RpcServer::bind(addr, token)
-        .await
         .map_err(|e| format!("Failed to bind RPC server on {addr}: {e}"))?;
     let bound = server.addr();
     let handle = server.spawn();
@@ -1525,22 +1484,17 @@ fn decode_options(kind: &str, tag: &str, raw: &str) -> Result<HashMap<String, ne
 }
 
 // ============== Latency Testing ==============
-pub async fn test_proxy_latency(
-    server: String,
-    port: u16,
-    timeout_ms: u32,
-) -> Result<LatencyTestResult> {
-    use std::time::Instant;
-    use tokio::time::Duration;
+pub fn test_proxy_latency(server: String, port: u16, timeout_ms: u32) -> Result<LatencyTestResult> {
+    use std::time::{Duration, Instant};
 
     let proxy_name = format!("{}:{}", server, port);
     let timeout_duration = Duration::from_millis(timeout_ms as u64);
 
     let proxy_addr = {
-        let instance = get_corduit_instance().await;
+        let instance = get_corduit_instance();
         match instance {
             Ok(inst) => {
-                let guard = inst.read().await;
+                let guard = inst.read();
                 if let Some(corduit) = guard.as_ref() {
                     let config = corduit.config();
                     let mut port = 7890u16;
@@ -1564,7 +1518,7 @@ pub async fn test_proxy_latency(
 
     let test_url = "http://www.gstatic.com/generate_204";
     let start = Instant::now();
-    let result = test_via_http_proxy(test_url, proxy_addr, timeout_duration).await;
+    let result = test_via_http_proxy(test_url, proxy_addr, timeout_duration);
 
     match result {
         Ok(()) => {
@@ -1585,18 +1539,15 @@ pub async fn test_proxy_latency(
     }
 }
 
-pub async fn test_outbound_latency(
-    outbound_name: String,
-    timeout_ms: u32,
-) -> Result<LatencyTestResult> {
-    use tokio::time::Duration;
+pub fn test_outbound_latency(outbound_name: String, timeout_ms: u32) -> Result<LatencyTestResult> {
+    use std::time::Duration;
 
     let timeout_duration = Duration::from_millis(timeout_ms as u64);
     let test_url = "http://www.gstatic.com/generate_204";
 
     let proxy = {
-        let instance = get_corduit_instance().await?;
-        let guard = instance.read().await;
+        let instance = get_corduit_instance()?;
+        let guard = instance.read();
 
         if let Some(corduit) = guard.as_ref() {
             let proxy_manager = corduit.proxy_manager();
@@ -1618,7 +1569,7 @@ pub async fn test_outbound_latency(
         }
     };
 
-    match proxy.test_http_latency(test_url, timeout_duration).await {
+    match proxy.test_http_latency(test_url, timeout_duration) {
         Ok(duration) => {
             let latency = duration.as_millis() as u32;
             Ok(LatencyTestResult {
@@ -1637,14 +1588,13 @@ pub async fn test_outbound_latency(
     }
 }
 
-pub async fn test_tcp_connectivity(
+pub fn test_tcp_connectivity(
     server: String,
     port: u16,
     timeout_ms: u32,
 ) -> Result<LatencyTestResult> {
-    use std::time::Instant;
-    use tokio::net::TcpStream;
-    use tokio::time::{timeout, Duration};
+    use std::net::ToSocketAddrs;
+    use std::time::{Duration, Instant};
 
     let proxy_name = format!("{}:{}", server, port);
     let addr = format!("{}:{}", server, port);
@@ -1652,41 +1602,51 @@ pub async fn test_tcp_connectivity(
 
     let start = Instant::now();
 
-    match timeout(timeout_duration, TcpStream::connect(&addr)).await {
-        Ok(Ok(_stream)) => {
-            let latency = start.elapsed().as_millis() as u32;
-            Ok(LatencyTestResult {
+    match addr.to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(sa) => match std::net::TcpStream::connect_timeout(&sa, timeout_duration) {
+                Ok(_stream) => {
+                    let latency = start.elapsed().as_millis() as u32;
+                    Ok(LatencyTestResult {
+                        proxy_name,
+                        latency_ms: Some(latency),
+                        success: true,
+                        error: None,
+                    })
+                }
+                Err(e) => Ok(LatencyTestResult {
+                    proxy_name,
+                    latency_ms: None,
+                    success: false,
+                    error: Some(format!("Connection failed: {}", e)),
+                }),
+            },
+            None => Ok(LatencyTestResult {
                 proxy_name,
-                latency_ms: Some(latency),
-                success: true,
-                error: None,
-            })
-        }
-        Ok(Err(e)) => Ok(LatencyTestResult {
+                latency_ms: None,
+                success: false,
+                error: Some("Address resolution returned no addresses".to_string()),
+            }),
+        },
+        Err(e) => Ok(LatencyTestResult {
             proxy_name,
             latency_ms: None,
             success: false,
-            error: Some(format!("Connection failed: {}", e)),
-        }),
-        Err(_) => Ok(LatencyTestResult {
-            proxy_name,
-            latency_ms: None,
-            success: false,
-            error: Some("Timeout".to_string()),
+            error: Some(format!("Address resolution failed: {}", e)),
         }),
     }
 }
 
-pub async fn test_shadowsocks_latency(
+pub fn test_shadowsocks_latency(
     server: String,
     port: u16,
     password: String,
     cipher: String,
     timeout_ms: u32,
 ) -> Result<LatencyTestResult> {
-    use std::time::Instant;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::Duration;
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    use std::time::{Duration, Instant};
 
     let proxy_name = format!("{}:{}", server, port);
     let timeout_duration = Duration::from_millis(timeout_ms as u64);
@@ -1723,14 +1683,25 @@ pub async fn test_shadowsocks_latency(
 
     let start = Instant::now();
     let server_addr = format!("{}:{}", server, port);
-    let stream = match tokio::time::timeout(
-        timeout_duration,
-        tokio::net::TcpStream::connect(&server_addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    let socket_addr = match server_addr.to_socket_addrs().and_then(|mut it| {
+        it.next().ok_or(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no addresses",
+        ))
+    }) {
+        Ok(sa) => sa,
+        Err(e) => {
+            return Ok(LatencyTestResult {
+                proxy_name,
+                latency_ms: None,
+                success: false,
+                error: Some(format!("Address resolution failed: {}", e)),
+            });
+        }
+    };
+    let mut stream = match std::net::TcpStream::connect_timeout(&socket_addr, timeout_duration) {
+        Ok(s) => s,
+        Err(e) => {
             return Ok(LatencyTestResult {
                 proxy_name,
                 latency_ms: None,
@@ -1738,17 +1709,13 @@ pub async fn test_shadowsocks_latency(
                 error: Some(format!("Connection failed: {}", e)),
             });
         }
-        Err(_) => {
-            return Ok(LatencyTestResult {
-                proxy_name,
-                latency_ms: None,
-                success: false,
-                error: Some("Connection timeout".to_string()),
-            });
-        }
     };
 
-    stream.set_nodelay(true).ok();
+    let _ = stream.set_nodelay(true);
+    // Bound every blocking read/write below by the caller's timeout.
+    let _ = stream.set_read_timeout(Some(timeout_duration));
+    let _ = stream.set_write_timeout(Some(timeout_duration));
+
     let cipher_spec = match ss_cipher_spec(&cipher) {
         Ok(c) => c,
         Err(e) => {
@@ -1795,7 +1762,6 @@ pub async fn test_shadowsocks_latency(
         }
     };
 
-    let (mut ro, mut wo) = tokio::io::split(stream);
     let addr_header = ss_build_address_header(&host, url_port);
     let http_request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n",
@@ -1835,7 +1801,7 @@ pub async fn test_shadowsocks_latency(
     send_buf.extend_from_slice(&enc_len);
     send_buf.extend_from_slice(&enc_data);
 
-    if let Err(e) = wo.write_all(&send_buf).await {
+    if let Err(e) = stream.write_all(&send_buf) {
         return Ok(LatencyTestResult {
             proxy_name,
             latency_ms: None,
@@ -1844,7 +1810,7 @@ pub async fn test_shadowsocks_latency(
         });
     }
 
-    if let Err(e) = wo.flush().await {
+    if let Err(e) = stream.flush() {
         return Ok(LatencyTestResult {
             proxy_name,
             latency_ms: None,
@@ -1853,15 +1819,13 @@ pub async fn test_shadowsocks_latency(
         });
     }
 
-    let password_clone = password.clone();
-    let result = tokio::time::timeout(timeout_duration, async move {
+    let result = (|| {
         let mut server_salt = vec![0u8; cipher_spec.salt_len];
-        if let Err(e) = ro.read_exact(&mut server_salt).await {
+        if let Err(e) = stream.read_exact(&mut server_salt) {
             return Err(format!("Failed to read server salt: {}", e));
         }
 
-        let dec_subkey = match ss_derive_subkey(&password_clone, &server_salt, cipher_spec.key_len)
-        {
+        let dec_subkey = match ss_derive_subkey(&password, &server_salt, cipher_spec.key_len) {
             Ok(k) => k,
             Err(e) => return Err(e),
         };
@@ -1870,7 +1834,7 @@ pub async fn test_shadowsocks_latency(
             Err(e) => return Err(e),
         };
 
-        match ss_recv_decrypted_chunk(&mut ro, &mut dec).await {
+        match ss_recv_decrypted_chunk(&mut stream, &mut dec) {
             Ok(Some(chunk)) => {
                 let response = String::from_utf8_lossy(&chunk);
                 if response.starts_with("HTTP/") {
@@ -1885,11 +1849,10 @@ pub async fn test_shadowsocks_latency(
             Ok(None) => Err("No response received".to_string()),
             Err(e) => Err(e),
         }
-    })
-    .await;
+    })();
 
     match result {
-        Ok(Ok(())) => {
+        Ok(()) => {
             let latency = start.elapsed().as_millis() as u32;
             Ok(LatencyTestResult {
                 proxy_name,
@@ -1898,17 +1861,11 @@ pub async fn test_shadowsocks_latency(
                 error: None,
             })
         }
-        Ok(Err(e)) => Ok(LatencyTestResult {
+        Err(e) => Ok(LatencyTestResult {
             proxy_name,
             latency_ms: None,
             success: false,
             error: Some(e),
-        }),
-        Err(_) => Ok(LatencyTestResult {
-            proxy_name,
-            latency_ms: None,
-            success: false,
-            error: Some("Response timeout".to_string()),
         }),
     }
 }
@@ -2043,12 +2000,12 @@ impl SsAeadCipher {
     }
 }
 
-async fn ss_recv_decrypted_chunk<R: tokio::io::AsyncReadExt + Unpin>(
+fn ss_recv_decrypted_chunk<R: std::io::Read>(
     reader: &mut R,
     cipher: &mut SsAeadCipher,
 ) -> std::result::Result<Option<Vec<u8>>, String> {
     let mut encrypted_len = vec![0u8; 2 + 16];
-    match reader.read_exact(&mut encrypted_len).await {
+    match reader.read_exact(&mut encrypted_len) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(format!("Read length failed: {}", e)),
@@ -2064,65 +2021,56 @@ async fn ss_recv_decrypted_chunk<R: tokio::io::AsyncReadExt + Unpin>(
     let mut encrypted_data = vec![0u8; data_len + 16];
     reader
         .read_exact(&mut encrypted_data)
-        .await
         .map_err(|e| format!("Read data failed: {}", e))?;
 
     let data = cipher.decrypt(&encrypted_data)?;
     Ok(Some(data))
 }
 
-async fn test_via_http_proxy(
+fn test_via_http_proxy(
     url: &str,
     proxy_addr: std::net::SocketAddr,
-    timeout: tokio::time::Duration,
+    timeout: std::time::Duration,
 ) -> std::result::Result<(), String> {
-    use tokio::time::timeout as tokio_timeout;
-
     let client = crate::common::HttpClient::new()
         .with_proxy(proxy_addr)
         .with_timeout(timeout);
 
-    let result = tokio_timeout(timeout, client.get(url)).await;
-
-    match result {
-        Ok(Ok(response)) => {
+    match client.get(url) {
+        Ok(response) => {
             if response.is_success() || response.status() == 204 {
                 Ok(())
             } else {
                 Err(format!("HTTP {}", response.status()))
             }
         }
-        Ok(Err(e)) => Err(format!("{}", e)),
-        Err(_) => Err("Timeout".to_string()),
+        Err(e) => Err(format!("{}", e)),
     }
 }
 
-pub async fn test_proxies_latency(
+pub fn test_proxies_latency(
     proxies: Vec<(String, u16)>,
     timeout_ms: u32,
 ) -> Result<Vec<LatencyTestResult>> {
-    use futures::future::join_all;
-
-    let futures: Vec<_> = proxies
-        .into_iter()
-        .map(|(server, port)| test_proxy_latency(server, port, timeout_ms))
-        .collect();
-
-    let results = join_all(futures).await;
-
-    Ok(results.into_iter().filter_map(|r| r.ok()).collect())
+    let mut results = Vec::new();
+    for (server, port) in proxies {
+        if let Ok(r) = test_proxy_latency(server, port, timeout_ms) {
+            results.push(r);
+        }
+    }
+    Ok(results)
 }
 
 // ============== Proxy Group Selection ==============
-pub async fn select_proxy_in_group(group_name: String, proxy_name: String) -> Result<bool> {
+pub fn select_proxy_in_group(group_name: String, proxy_name: String) -> Result<bool> {
     tracing::info!(
         "Selecting proxy in group: group='{}', proxy='{}'",
         group_name,
         proxy_name
     );
 
-    let instance = get_corduit_instance().await?;
-    let corduit_guard = instance.read().await;
+    let instance = get_corduit_instance()?;
+    let corduit_guard = instance.read();
 
     if let Some(corduit) = corduit_guard.as_ref() {
         let proxy_manager = corduit.proxy_manager();
@@ -2131,7 +2079,6 @@ pub async fn select_proxy_in_group(group_name: String, proxy_name: String) -> Re
         if outbound_manager.get_proxy(&group_name).is_some() {
             outbound_manager
                 .set_selector_proxy(&group_name, &proxy_name)
-                .await
                 .map_err(CorduitError::from)?;
 
             tracing::info!("Proxy selection updated: {} -> {}", group_name, proxy_name);
@@ -2147,9 +2094,9 @@ pub async fn select_proxy_in_group(group_name: String, proxy_name: String) -> Re
     }
 }
 
-pub async fn get_selected_proxy_in_group(group_name: String) -> Result<Option<String>> {
-    let instance = get_corduit_instance().await?;
-    let corduit_guard = instance.read().await;
+pub fn get_selected_proxy_in_group(group_name: String) -> Result<Option<String>> {
+    let instance = get_corduit_instance()?;
+    let corduit_guard = instance.read();
 
     if let Some(corduit) = corduit_guard.as_ref() {
         let proxy_manager = corduit.proxy_manager();
@@ -2162,7 +2109,7 @@ pub async fn get_selected_proxy_in_group(group_name: String) -> Result<Option<St
 }
 
 // ============== Connection Tracking ==============
-pub async fn get_active_connections() -> Result<Vec<ActiveConnection>> {
+pub fn get_active_connections() -> Result<Vec<ActiveConnection>> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     let connections = tracker.get_all();
 
@@ -2242,18 +2189,18 @@ pub async fn get_active_connections() -> Result<Vec<ActiveConnection>> {
     Ok(result)
 }
 
-pub async fn close_active_connection(connection_id: String) -> Result<bool> {
+pub fn close_active_connection(connection_id: String) -> Result<bool> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     Ok(tracker.close_connection(&connection_id))
 }
 
-pub async fn close_all_connections() -> Result<()> {
+pub fn close_all_connections() -> Result<()> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     tracker.close_all();
     Ok(())
 }
 
-pub async fn get_connection_stats() -> Result<(u64, u64, u64, u64)> {
+pub fn get_connection_stats() -> Result<(u64, u64, u64, u64)> {
     let tracker = crate::engine::connection_tracker::global_tracker();
 
     #[allow(unused_mut)]
@@ -2290,29 +2237,29 @@ pub fn get_wintun_dll_path() -> Option<String> {
     crate::netstack::get_wintun_path().map(|p| p.to_string_lossy().to_string())
 }
 
-pub async fn ensure_wintun_dll() -> Result<String> {
+pub fn ensure_wintun_dll() -> Result<String> {
     let path = crate::netstack::ensure_wintun()
-        .await
         .map_err(|e| CorduitError::Internal(format!("Failed to ensure wintun: {}", e)))?;
     Ok(path.to_string_lossy().to_string())
 }
 
-pub async fn enable_tun_mode() -> Result<TunStatus> {
+pub fn enable_tun_mode() -> Result<TunStatus> {
     #[cfg(target_os = "linux")]
     let mode = "global";
     #[cfg(not(target_os = "linux"))]
     let mode = "rule";
 
-    enable_tun_mode_with_mode(mode.to_string()).await
+    enable_tun_mode_with_mode(mode.to_string())
 }
 
 #[cfg(target_os = "linux")]
-async fn stop_linux_tun_runtime() -> Vec<String> {
+fn stop_linux_tun_runtime() -> Vec<String> {
     let mut errors = Vec::new();
 
     if let Some(task) = crate::take_linux_packet_task() {
-        task.abort();
-        let _ = task.await;
+        // A std thread cannot be aborted; it exits once the TUN channel
+        // disconnects (device/processor dropped below). Detach by dropping.
+        drop(task);
     }
     if let Some(processor) = crate::take_linux_vpn_processor() {
         processor.stop();
@@ -2324,7 +2271,7 @@ async fn stop_linux_tun_runtime() -> Vec<String> {
         }
     }
     if let Some(mut device) = crate::take_linux_tun_device() {
-        if let Err(error) = device.stop().await {
+        if let Err(error) = device.stop() {
             errors.push(format!("failed to stop TUN device: {error}"));
         }
     }
@@ -2334,7 +2281,7 @@ async fn stop_linux_tun_runtime() -> Vec<String> {
 }
 
 #[cfg(windows)]
-async fn stop_windows_tun_runtime() -> Vec<String> {
+fn stop_windows_tun_runtime() -> Vec<String> {
     if let Some(mut routes) = crate::take_windows_route_manager() {
         if let Err(error) = routes.disable_global_mode() {
             crate::set_windows_route_manager(routes);
@@ -2343,7 +2290,7 @@ async fn stop_windows_tun_runtime() -> Vec<String> {
     }
 
     if let Some(mut device) = crate::take_windows_tun_device() {
-        if let Err(error) = device.stop().await {
+        if let Err(error) = device.stop() {
             crate::set_windows_tun_device(device);
             return vec![format!("failed to stop TUN device: {error}")];
         }
@@ -2358,16 +2305,17 @@ async fn stop_windows_tun_runtime() -> Vec<String> {
     Vec::new()
 }
 
-pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
-    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock().await;
+pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
+    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock();
     let mode_int = parse_proxy_mode(&mode)?;
 
     #[cfg(target_os = "windows")]
     {
         use crate::netstack::{TunConfig, TunDevice, WindowsRouteManager, WindowsVpnProcessor};
+        use std::net::ToSocketAddrs;
 
         tracing::info!("=== Enabling TUN mode on Windows with mode={} ===", mode);
-        let cleanup_errors = stop_windows_tun_runtime().await;
+        let cleanup_errors = stop_windows_tun_runtime();
         if !cleanup_errors.is_empty() {
             return Ok(TunStatus {
                 enabled: true,
@@ -2380,7 +2328,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             });
         }
 
-        match crate::netstack::ensure_wintun().await {
+        match crate::netstack::ensure_wintun() {
             Ok(path) => {
                 tracing::info!("wintun.dll available at {:?}", path);
             }
@@ -2395,10 +2343,10 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         }
 
         let (proxy_addr, proxy_servers) = {
-            let instance = get_corduit_instance().await?;
-            let corduit_guard = instance.read().await;
+            let instance = get_corduit_instance()?;
+            let corduit_guard = instance.read();
             if let Some(ref corduit) = *corduit_guard {
-                let is_running = corduit.is_running().await.unwrap_or(false);
+                let is_running = corduit.is_running().unwrap_or(false);
                 if !is_running {
                     tracing::error!("Corduit proxy service is NOT running! TUN will not work.");
                     return Ok(TunStatus {
@@ -2435,7 +2383,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
 
         tracing::info!("Using proxy endpoint {} for Windows TUN", proxy_addr);
 
-        if let Err(error) = tokio::net::TcpStream::connect(proxy_addr).await {
+        if let Err(error) = std::net::TcpStream::connect(proxy_addr) {
             return Ok(TunStatus {
                 enabled: false,
                 interface_name: None,
@@ -2455,7 +2403,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
                 });
             }
             for (server, port) in proxy_servers {
-                let addresses = match tokio::net::lookup_host((server.as_str(), port)).await {
+                let addresses = match (server.as_str(), port).to_socket_addrs() {
                     Ok(addresses) => addresses,
                     Err(error) => {
                         return Ok(TunStatus {
@@ -2495,7 +2443,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             dns: vec![std::net::Ipv4Addr::new(198, 18, 0, 2)],
         };
 
-        let mut tun = match TunDevice::with_config(config.clone()).await {
+        let mut tun = match TunDevice::with_config(config.clone()) {
             Ok(t) => t,
             Err(e) => {
                 return Ok(TunStatus {
@@ -2507,7 +2455,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             }
         };
 
-        if let Err(e) = tun.start().await {
+        if let Err(e) = tun.start() {
             return Ok(TunStatus {
                 enabled: false,
                 interface_name: None,
@@ -2552,30 +2500,34 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         ));
 
         let processor_clone = processor.clone();
-        tokio::spawn(async move {
-            tracing::info!("=== Windows TUN packet processing task started ===");
-            let mut packet_count = 0u64;
+        // Long-lived packet loop on a dedicated OS thread.
+        std::thread::Builder::new()
+            .name("corduit-tun-packet".to_string())
+            .spawn(move || {
+                tracing::info!("=== Windows TUN packet processing task started ===");
+                let mut packet_count = 0u64;
 
-            while let Some(packet) = tun_rx.recv().await {
-                packet_count += 1;
-                if packet_count <= 10 || packet_count.is_multiple_of(100) {
-                    tracing::debug!(
-                        "Processing packet #{}: {} bytes",
-                        packet_count,
-                        packet.len()
-                    );
+                while let Ok(packet) = tun_rx.recv() {
+                    packet_count += 1;
+                    if packet_count <= 10 || packet_count.is_multiple_of(100) {
+                        tracing::debug!(
+                            "Processing packet #{}: {} bytes",
+                            packet_count,
+                            packet.len()
+                        );
+                    }
+                    if let Err(e) = processor_clone.process_packet(&packet) {
+                        tracing::debug!("Packet processing error: {}", e);
+                    }
                 }
-                if let Err(e) = processor_clone.process_packet(&packet).await {
-                    tracing::debug!("Packet processing error: {}", e);
-                }
-            }
 
-            tracing::info!(
-                "Windows TUN packet processing task stopped, processed {} packets",
-                packet_count
-            );
-            processor_clone.stop();
-        });
+                tracing::info!(
+                    "Windows TUN packet processing task stopped, processed {} packets",
+                    packet_count
+                );
+                processor_clone.stop();
+            })
+            .ok();
 
         let mut route_manager = WindowsRouteManager::new(&config.name, tun_address);
 
@@ -2584,7 +2536,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             if let Err(error) = route_manager.enable_global_mode(&excluded_addresses) {
                 processor.stop();
                 processor.reset();
-                let _ = tun.stop().await;
+                let _ = tun.stop();
                 crate::engine::set_runtime_proxy_mode(0);
                 crate::netstack::set_windows_proxy_mode(0);
                 return Ok(TunStatus {
@@ -2625,8 +2577,9 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
     #[cfg(target_os = "linux")]
     {
         use crate::netstack::{RouteManager, TunConfig, TunDevice, TunPacketProcessor};
+        use std::net::ToSocketAddrs;
 
-        let cleanup_errors = stop_linux_tun_runtime().await;
+        let cleanup_errors = stop_linux_tun_runtime();
         if !cleanup_errors.is_empty() {
             return Ok(TunStatus {
                 enabled: false,
@@ -2652,8 +2605,8 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         }
 
         let (proxy_addr, proxy_servers) = {
-            let instance = get_corduit_instance().await?;
-            let guard = instance.read().await;
+            let instance = get_corduit_instance()?;
+            let guard = instance.read();
             let Some(corduit) = guard.as_ref() else {
                 return Ok(TunStatus {
                     enabled: false,
@@ -2662,7 +2615,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
                     error: Some("Corduit is not initialized".to_string()),
                 });
             };
-            if !corduit.is_running().await.unwrap_or(false) {
+            if !corduit.is_running().unwrap_or(false) {
                 return Ok(TunStatus {
                     enabled: false,
                     interface_name: None,
@@ -2692,7 +2645,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
                 error: Some("Global mode has no configured proxy server".to_string()),
             });
         }
-        if let Err(error) = tokio::net::TcpStream::connect(proxy_addr).await {
+        if let Err(error) = std::net::TcpStream::connect(proxy_addr) {
             return Ok(TunStatus {
                 enabled: false,
                 interface_name: None,
@@ -2703,13 +2656,11 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
 
         let mut excluded_addresses = std::collections::HashSet::new();
         for (server, port) in proxy_servers {
-            let addresses = tokio::net::lookup_host((server.as_str(), port))
-                .await
-                .map_err(|error| {
-                    CorduitError::Internal(format!(
-                        "Failed to resolve proxy server {server}:{port}: {error}"
-                    ))
-                })?;
+            let addresses = (server.as_str(), port).to_socket_addrs().map_err(|error| {
+                CorduitError::Internal(format!(
+                    "Failed to resolve proxy server {server}:{port}: {error}"
+                ))
+            })?;
             excluded_addresses.extend(addresses.map(|address| address.ip()));
         }
 
@@ -2722,9 +2673,8 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             dns: vec![std::net::Ipv4Addr::new(198, 18, 0, 2)],
         };
         let mut device = TunDevice::with_config(config.clone())
-            .await
             .map_err(|error| CorduitError::Internal(error.to_string()))?;
-        if let Err(error) = device.start().await {
+        if let Err(error) = device.start() {
             return Ok(TunStatus {
                 enabled: false,
                 interface_name: None,
@@ -2734,7 +2684,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         }
 
         let Some(tun_tx) = device.get_sender() else {
-            let _ = device.stop().await;
+            let _ = device.stop();
             return Ok(TunStatus {
                 enabled: false,
                 interface_name: None,
@@ -2743,7 +2693,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             });
         };
         let Some(mut tun_rx) = device.take_receiver() else {
-            let _ = device.stop().await;
+            let _ = device.stop();
             return Ok(TunStatus {
                 enabled: false,
                 interface_name: None,
@@ -2756,17 +2706,22 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             proxy_addr, config.mtu, tun_tx,
         ));
         let packet_processor = std::sync::Arc::clone(&processor);
-        let packet_task = tokio::spawn(async move {
-            while let Some(packet) = tun_rx.recv().await {
-                if !packet_processor.is_running() {
-                    break;
+        let packet_task = std::thread::Builder::new()
+            .name("corduit-tun-packet".to_string())
+            .spawn(move || {
+                while let Ok(packet) = tun_rx.recv() {
+                    if !packet_processor.is_running() {
+                        break;
+                    }
+                    if let Err(error) = packet_processor.process_packet(&packet) {
+                        tracing::debug!("Linux TUN packet processing failed: {}", error);
+                    }
                 }
-                if let Err(error) = packet_processor.process_packet(&packet).await {
-                    tracing::debug!("Linux TUN packet processing failed: {}", error);
-                }
-            }
-            packet_processor.stop();
-        });
+                packet_processor.stop();
+            })
+            .map_err(|error| {
+                CorduitError::Internal(format!("failed to spawn Linux TUN packet thread: {error}"))
+            })?;
 
         let mut routes = RouteManager::new();
         routes.set_tun_interface_name(&config.name);
@@ -2774,10 +2729,10 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             routes.exclude_address(address);
         }
         if let Err(error) = routes.setup_routes(config.address) {
-            packet_task.abort();
+            drop(packet_task);
             processor.stop();
             let _ = routes.restore_routes();
-            let _ = device.stop().await;
+            let _ = device.stop();
             return Ok(TunStatus {
                 enabled: false,
                 interface_name: None,
@@ -2816,7 +2771,7 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
     {
         crate::engine::set_runtime_proxy_mode(mode_int);
         crate::netstack::set_android_proxy_mode(mode_int);
-        let enabled = start_android_vpn_inner().await?;
+        let enabled = start_android_vpn_inner()?;
         if !enabled {
             crate::engine::set_runtime_proxy_mode(0);
             crate::netstack::set_android_proxy_mode(0);
@@ -2846,13 +2801,13 @@ pub async fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
     }
 }
 
-pub async fn disable_tun_mode() -> Result<TunStatus> {
-    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock().await;
+pub fn disable_tun_mode() -> Result<TunStatus> {
+    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock();
     tracing::info!("=== Disabling TUN mode ===");
 
     #[cfg(target_os = "windows")]
     {
-        let cleanup_errors = stop_windows_tun_runtime().await;
+        let cleanup_errors = stop_windows_tun_runtime();
         if !cleanup_errors.is_empty() {
             return Ok(TunStatus {
                 enabled: true,
@@ -2865,13 +2820,13 @@ pub async fn disable_tun_mode() -> Result<TunStatus> {
 
     #[cfg(target_os = "android")]
     {
-        stop_android_vpn_inner().await?;
+        stop_android_vpn_inner()?;
         crate::engine::set_runtime_proxy_mode(0);
     }
 
     #[cfg(target_os = "linux")]
     {
-        let cleanup_errors = stop_linux_tun_runtime().await;
+        let cleanup_errors = stop_linux_tun_runtime();
         if !cleanup_errors.is_empty() {
             return Ok(TunStatus {
                 enabled: false,
@@ -2890,7 +2845,7 @@ pub async fn disable_tun_mode() -> Result<TunStatus> {
     })
 }
 
-pub async fn get_tun_status() -> Result<TunStatus> {
+pub fn get_tun_status() -> Result<TunStatus> {
     #[cfg(target_os = "windows")]
     {
         if let Some(processor) = crate::get_windows_vpn_processor() {
@@ -2948,7 +2903,7 @@ pub async fn get_tun_status() -> Result<TunStatus> {
 
 pub fn set_windows_proxy_mode(mode: String) -> Result<bool> {
     let mode_int = parse_proxy_mode(&mode)?;
-    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.try_lock().map_err(|_| {
+    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.try_lock().ok_or_else(|| {
         CorduitError::Internal("A TUN lifecycle operation is already in progress".to_string())
     })?;
 
@@ -3003,7 +2958,7 @@ pub fn get_windows_tun_stats() -> Result<(u64, u64, u64, u64, usize, usize)> {
 }
 
 // ============== UWP Loopback ==============
-pub async fn enable_uwp_loopback() -> Result<bool> {
+pub fn enable_uwp_loopback() -> Result<bool> {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
@@ -3041,7 +2996,7 @@ pub async fn enable_uwp_loopback() -> Result<bool> {
     }
 }
 
-pub async fn open_uwp_loopback_utility() -> Result<bool> {
+pub fn open_uwp_loopback_utility() -> Result<bool> {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
@@ -3181,12 +3136,12 @@ pub fn clear_ios_vpn_fd() {
     }
 }
 
-pub async fn start_android_vpn() -> Result<bool> {
-    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock().await;
-    start_android_vpn_inner().await
+pub fn start_android_vpn() -> Result<bool> {
+    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock();
+    start_android_vpn_inner()
 }
 
-async fn start_android_vpn_inner() -> Result<bool> {
+fn start_android_vpn_inner() -> Result<bool> {
     #[cfg(target_os = "android")]
     {
         use crate::netstack::{TunConfig, TunDevice};
@@ -3201,10 +3156,12 @@ async fn start_android_vpn_inner() -> Result<bool> {
         tracing::info!("VPN fd={}", fd);
 
         if let Some(task) = crate::take_android_packet_task() {
-            task.abort();
+            // A std thread cannot be aborted; it exits once the TUN channel
+            // disconnects (device/processor dropped below). Detach by dropping.
+            drop(task);
         }
         if let Some(mut device) = crate::take_android_tun_device() {
-            let _ = device.stop().await;
+            let _ = device.stop();
         }
         if let Some(old_processor) = crate::get_android_vpn_processor() {
             tracing::info!("Cleaning up existing VPN processor before restart");
@@ -3229,10 +3186,10 @@ async fn start_android_vpn_inner() -> Result<bool> {
         }
 
         let (proxy_addr, proxy_port) = {
-            let instance = get_corduit_instance().await?;
-            let corduit_guard = instance.read().await;
+            let instance = get_corduit_instance()?;
+            let corduit_guard = instance.read();
             if let Some(ref corduit) = *corduit_guard {
-                let is_running = corduit.is_running().await.unwrap_or(false);
+                let is_running = corduit.is_running().unwrap_or(false);
                 if !is_running {
                     tracing::error!("Corduit proxy service is NOT running! VPN will not work.");
                     tracing::error!(
@@ -3262,7 +3219,7 @@ async fn start_android_vpn_inner() -> Result<bool> {
         };
 
         tracing::info!("Using proxy endpoint {} for Android VPN", proxy_addr);
-        match tokio::net::TcpStream::connect(proxy_addr).await {
+        match std::net::TcpStream::connect(proxy_addr) {
             Ok(_) => {
                 tracing::info!(
                     "Proxy port {} is listening and accepting connections",
@@ -3285,19 +3242,18 @@ async fn start_android_vpn_inner() -> Result<bool> {
             dns: vec![std::net::Ipv4Addr::new(198, 18, 0, 2)],
         };
         let mut device = TunDevice::with_config(config.clone())
-            .await
             .map_err(|error| CorduitError::Internal(error.to_string()))?;
-        if let Err(error) = device.start().await {
+        if let Err(error) = device.start() {
             tracing::error!("Failed to start Android TUN device: {}", error);
             return Ok(false);
         }
 
         let Some(tun_tx) = device.get_sender() else {
-            let _ = device.stop().await;
+            let _ = device.stop();
             return Ok(false);
         };
         let Some(mut tun_rx) = device.take_receiver() else {
-            let _ = device.stop().await;
+            let _ = device.stop();
             return Ok(false);
         };
 
@@ -3306,17 +3262,24 @@ async fn start_android_vpn_inner() -> Result<bool> {
                 proxy_addr, config.mtu, tun_tx,
             ));
         let packet_processor = std::sync::Arc::clone(&processor);
-        let packet_task = tokio::spawn(async move {
-            while let Some(packet) = tun_rx.recv().await {
-                if !packet_processor.is_running() {
-                    break;
+        let packet_task = std::thread::Builder::new()
+            .name("corduit-tun-packet".to_string())
+            .spawn(move || {
+                while let Ok(packet) = tun_rx.recv() {
+                    if !packet_processor.is_running() {
+                        break;
+                    }
+                    if let Err(error) = packet_processor.process_packet(&packet) {
+                        tracing::debug!("Android TUN packet processing failed: {}", error);
+                    }
                 }
-                if let Err(error) = packet_processor.process_packet(&packet).await {
-                    tracing::debug!("Android TUN packet processing failed: {}", error);
-                }
-            }
-            packet_processor.stop();
-        });
+                packet_processor.stop();
+            })
+            .map_err(|error| {
+                CorduitError::Internal(format!(
+                    "failed to spawn Android TUN packet thread: {error}"
+                ))
+            })?;
 
         crate::set_android_vpn_processor(processor);
         crate::set_android_tun_device(device);
@@ -3333,25 +3296,26 @@ async fn start_android_vpn_inner() -> Result<bool> {
     }
 }
 
-pub async fn stop_android_vpn() -> Result<bool> {
-    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock().await;
-    stop_android_vpn_inner().await
+pub fn stop_android_vpn() -> Result<bool> {
+    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock();
+    stop_android_vpn_inner()
 }
 
-async fn stop_android_vpn_inner() -> Result<bool> {
+fn stop_android_vpn_inner() -> Result<bool> {
     #[cfg(target_os = "android")]
     {
         tracing::info!("=== Stopping Android VPN packet processing ===");
 
         if let Some(mut device) = crate::take_android_tun_device() {
-            if let Err(error) = device.stop().await {
+            if let Err(error) = device.stop() {
                 tracing::warn!("Failed to stop Android TUN device: {}", error);
             }
         }
 
         if let Some(task) = crate::take_android_packet_task() {
-            task.abort();
-            let _ = task.await;
+            // A std thread cannot be aborted; it exits once the TUN channel
+            // disconnects (device/processor dropped below). Detach by dropping.
+            drop(task);
         }
 
         if let Some(processor) = crate::get_android_vpn_processor() {

@@ -21,8 +21,7 @@ use corduit::engine::{
     Config, Corduit, GeneralConfig, InboundConfig, InboundType, OutboundConfig, OutboundType,
 };
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = std::env::var("CORDUIT_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -57,19 +56,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `Corduit::new` validates the config, installs logging/TLS providers and
     // builds the whole engine (inbounds/outbounds/router/providers).
-    let engine = Corduit::new(config).await?;
+    let engine = Corduit::new(config)?;
 
     // Open the inbound listener. Connections are established lazily, so
     // nothing else is bound until traffic actually flows.
-    engine.start().await?;
+    engine.start()?;
 
-    println!("proxy running        : {}", engine.is_running().await?);
+    println!("proxy running        : {}", engine.is_running()?);
     println!("listening            : 127.0.0.1:{port}");
     println!("uptime (seconds)     : {}", engine.uptime_secs());
 
     // Without any rules, Rule mode falls back to the mainland-China
     // auto-direct shortcut; everything here goes DIRECT anyway.
-    engine.stop().await?;
-    println!("proxy stopped        : {}", !engine.is_running().await?);
+    engine.stop()?;
+    println!("proxy stopped        : {}", !engine.is_running()?);
     Ok(())
 }

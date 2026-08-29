@@ -1,9 +1,9 @@
 use crate::engine::error::{Error, Result};
 use crate::engine::mmdb::MmdbReader;
+use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// A two-letter ISO 3166-1 alpha-2 country code, stored as raw uppercase bytes.
 ///
@@ -101,11 +101,10 @@ impl CountryCodeSet {
 ///
 /// `Router` depends on this trait (not on `GeoIpManager` directly) so that
 /// tests and alternate data sources can inject a deterministic implementation.
-#[async_trait::async_trait]
 pub trait CountryMatcher: Send + Sync {
-    async fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool;
-    async fn load_database(&self, path: &str) -> Result<()>;
-    async fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()>;
+    fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool;
+    fn load_database(&self, path: &str) -> Result<()>;
+    fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()>;
 }
 
 pub struct GeoIpDatabase {
@@ -238,47 +237,46 @@ impl GeoIpManager {
         }
     }
 
-    pub async fn load_database<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    pub fn load_database<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let db = GeoIpDatabase::load_from_file(path)?;
-        let mut guard = self.database.write().await;
+        let mut guard = self.database.write();
         *guard = db;
         tracing::info!("GeoIP database loaded successfully");
         Ok(())
     }
 
-    pub async fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
+    pub fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
         let db = GeoIpDatabase::load_from_bytes(data)?;
-        let mut guard = self.database.write().await;
+        let mut guard = self.database.write();
         *guard = db;
         tracing::info!("GeoIP database loaded from bytes successfully");
         Ok(())
     }
 
-    pub async fn is_loaded(&self) -> bool {
-        self.database.read().await.is_loaded()
+    pub fn is_loaded(&self) -> bool {
+        self.database.read().is_loaded()
     }
 
-    pub async fn lookup_country(&self, ip: IpAddr) -> Option<CountryCode> {
-        self.database.read().await.lookup_country(ip)
+    pub fn lookup_country(&self, ip: IpAddr) -> Option<CountryCode> {
+        self.database.read().lookup_country(ip)
     }
 
-    pub async fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
-        self.database.read().await.matches_country(country_code, ip)
+    pub fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
+        self.database.read().matches_country(country_code, ip)
     }
 }
 
-#[async_trait::async_trait]
 impl CountryMatcher for GeoIpManager {
-    async fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
-        self.matches_country(country_code, ip).await
+    fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
+        self.matches_country(country_code, ip)
     }
 
-    async fn load_database(&self, path: &str) -> Result<()> {
-        self.load_database(path).await
+    fn load_database(&self, path: &str) -> Result<()> {
+        self.load_database(path)
     }
 
-    async fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
-        self.load_database_from_bytes(data).await
+    fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
+        self.load_database_from_bytes(data)
     }
 }
 
@@ -409,21 +407,13 @@ mod tests {
         // Without a real Country.mmdb on disk the manager must still construct,
         // start empty, and let GEOIP rules miss without panicking.
         let manager = GeoIpManager::from_embedded_country_database();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
 
-        runtime.block_on(async {
-            assert!(!manager.is_loaded().await);
-            // Empty database: every GEOIP lookup is a miss, falling through to
-            // the next rule instead of aborting routing.
-            assert!(!manager
-                .lookup_country(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))
-                .await
-                .is_some());
-            assert!(
-                !manager
-                    .matches_country("CN", IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))
-                    .await
-            );
-        });
+        assert!(!manager.is_loaded());
+        // Empty database: every GEOIP lookup is a miss, falling through to
+        // the next rule instead of aborting routing.
+        assert!(!manager
+            .lookup_country(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))
+            .is_some());
+        assert!(!manager.matches_country("CN", IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))));
     }
 }

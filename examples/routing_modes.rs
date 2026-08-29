@@ -19,13 +19,13 @@ use corduit::engine::{
     get_runtime_proxy_mode, proxy_mode, set_runtime_proxy_mode, Config, GeneralConfig,
     InboundConfig, InboundType, Mode, OutboundConfig, OutboundType, RuleConfig, RuleType,
 };
+use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// DIRECT + a plain SOCKS5 node + a two-rule table. Explicit IPs are passed to
 /// `match_outbound` so the example never performs DNS lookups.
-async fn router() -> Router {
+fn router() -> Router {
     let config = Config {
         general: GeneralConfig {
             mode: Mode::Rule,
@@ -70,39 +70,31 @@ async fn router() -> Router {
         ],
         ..Config::default()
     };
-    Router::new(Arc::new(RwLock::new(config)))
-        .await
-        .expect("router builds")
+    Router::new(Arc::new(RwLock::new(config))).expect("router builds")
 }
 
-async fn decide(router: &Router, domain: &str, ip: &str) -> String {
-    router
-        .match_outbound(Some(domain), ip.parse::<IpAddr>().ok(), Some(443), None)
-        .await
+fn decide(router: &Router, domain: &str, ip: &str) -> String {
+    router.match_outbound(Some(domain), ip.parse::<IpAddr>().ok(), Some(443), None)
 }
 
-#[tokio::main]
-async fn main() {
-    let router = router().await;
+fn main() {
+    let router = router();
 
     // mode 3 = rule
     set_runtime_proxy_mode(proxy_mode::RULE);
     println!("mode = {} (rule)", get_runtime_proxy_mode());
     println!(
         "  google.com  -> {}",
-        decide(&router, "google.com", "142.250.0.0").await
+        decide(&router, "google.com", "142.250.0.0")
     );
     println!(
         "  youtube.com -> {}",
-        decide(&router, "youtube.com", "93.184.216.34").await
+        decide(&router, "youtube.com", "93.184.216.34")
     );
-    println!(
-        "  x.com -> {}",
-        decide(&router, "x.com", "93.184.216.34").await
-    );
+    println!("  x.com -> {}", decide(&router, "x.com", "93.184.216.34"));
     println!(
         "  chatgpt.com -> {}",
-        decide(&router, "chatgpt.com", "93.184.216.34").await
+        decide(&router, "chatgpt.com", "93.184.216.34")
     );
 
     // mode 2 = direct
@@ -110,7 +102,7 @@ async fn main() {
     println!("mode = {} (direct)", get_runtime_proxy_mode());
     println!(
         "  google.com  -> {}",
-        decide(&router, "google.com", "142.250.0.0").await
+        decide(&router, "google.com", "142.250.0.0")
     );
 
     // mode 1 = global: no proxy group in this config, so the first
@@ -119,14 +111,11 @@ async fn main() {
     println!("mode = {} (global)", get_runtime_proxy_mode());
     println!(
         "  google.com  -> {}",
-        decide(&router, "google.com", "142.250.0.0").await
+        decide(&router, "google.com", "142.250.0.0")
     );
 
     // mode 0 = follow config.general.mode (rule here)
     set_runtime_proxy_mode(proxy_mode::CONFIG);
     println!("mode = {} (config -> rule)", get_runtime_proxy_mode());
-    println!(
-        "  x.com -> {}",
-        decide(&router, "x.com", "151.101.130.146").await
-    );
+    println!("  x.com -> {}", decide(&router, "x.com", "151.101.130.146"));
 }

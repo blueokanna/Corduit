@@ -3,7 +3,7 @@
 //! The same engine driven through the JSON-string facade that FFI and the
 //! JSON-RPC layer use internally: `start_proxy_from_yaml` accepts a full
 //! config document (including the `rule_providers` / `proxy_providers`
-//! top-level keys), then typed async helpers read runtime state back.
+//! top-level keys), then typed helpers read runtime state back.
 //!
 //! ```bash
 //! cargo run --example json_api
@@ -14,8 +14,7 @@ use corduit::api::{
     set_proxy_mode, start_proxy_from_yaml, stop_proxy,
 };
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = r#"{
       "general": {
         "mode": "rule",
@@ -47,10 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       "proxy_providers": []
     }"#;
 
-    start_proxy_from_yaml(config.to_string()).await?;
-    println!("running = {}", is_proxy_running().await?);
+    start_proxy_from_yaml(config.to_string())?;
+    println!("running = {}", is_proxy_running()?);
 
-    let proxies = get_proxies().await?;
+    let proxies = get_proxies()?;
     println!("{} outbound(s):", proxies.len());
     for proxy in proxies {
         println!(
@@ -59,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let rules = get_rules().await?;
+    let rules = get_rules()?;
     println!("{} rule(s):", rules.len());
     for rule in rules {
         println!(
@@ -69,17 +68,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Switch the runtime proxy mode: 0=config, 1=global, 2=direct, 3=rule.
-    set_proxy_mode(3).await?;
-    println!("runtime proxy mode after set = {}", get_proxy_mode().await?);
-    set_proxy_mode(0).await?; // back to following config.general.mode
+    set_proxy_mode(3)?;
+    println!("runtime proxy mode after set = {}", get_proxy_mode()?);
+    set_proxy_mode(0)?; // back to following config.general.mode
 
-    let stats = get_traffic_stats_dto().await?;
+    let stats = get_traffic_stats_dto()?;
     println!(
         "traffic: up={} down={} connections={} uptime={}s",
         stats.total_upload, stats.total_download, stats.connection_count, stats.uptime_secs
     );
 
-    stop_proxy().await?;
-    println!("stopped = {}", !is_proxy_running().await?);
+    stop_proxy()?;
+    println!("stopped = {}", !is_proxy_running()?);
     Ok(())
 }

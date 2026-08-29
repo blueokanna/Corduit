@@ -1,6 +1,7 @@
+use crate::common::stream::BoxStream;
 use crate::engine::config::OutboundConfig;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, ProxyRegistry, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, ProxyRegistry, TargetAddr};
 use parking_lot::RwLock as ParkingRwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -126,12 +127,12 @@ impl SelectorOutbound {
     }
 
     /// Find a proxy by tag from the registry
-    async fn find_proxy(&self, tag: &str) -> Option<Arc<dyn OutboundProxy>> {
-        self.registry.read().await.get(tag).cloned()
+    fn find_proxy(&self, tag: &str) -> Option<Arc<dyn OutboundProxy>> {
+        self.registry.read().get(tag).cloned()
     }
 
     /// Resolve the actual proxy to use (handles nested selectors)
-    async fn resolve_proxy(&self, max_depth: usize) -> Result<Arc<dyn OutboundProxy>> {
+    fn resolve_proxy(&self, max_depth: usize) -> Result<Arc<dyn OutboundProxy>> {
         if max_depth == 0 {
             return Err(Error::config("Selector chain too deep"));
         }
@@ -139,7 +140,7 @@ impl SelectorOutbound {
         let selected = self.get_selected();
         tracing::debug!("Selector '{}' resolving to '{}'", self.config.tag, selected);
 
-        if let Some(proxy) = self.find_proxy(&selected).await {
+        if let Some(proxy) = self.find_proxy(&selected) {
             // Check if the selected proxy is also a selector (nested group)
             // For now, we just return the proxy directly
             // In a full implementation, we'd check if it's a SelectorOutbound and resolve recursively
@@ -153,13 +154,12 @@ impl SelectorOutbound {
     }
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for SelectorOutbound {
-    async fn connect(&self) -> Result<()> {
+    fn connect(&self) -> Result<()> {
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    fn disconnect(&self) -> Result<()> {
         Ok(())
     }
 
@@ -169,12 +169,8 @@ impl OutboundProxy for SelectorOutbound {
 
     fn server_addr(&self) -> Option<(String, u16)> {
         // Try to get the server address from the currently selected proxy.
-        // `server_addr` is a sync trait method, so never block the async
-        // runtime thread — `try_read` fails gracefully when contended.
         let selected = self.get_selected();
-        let Ok(registry) = self.registry.try_read() else {
-            return None;
-        };
+        let registry = self.registry.read();
         if let Some(proxy) = registry.get(&selected) {
             proxy.server_addr()
         } else {
@@ -182,44 +178,39 @@ impl OutboundProxy for SelectorOutbound {
         }
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         test_url: &str,
         timeout: std::time::Duration,
     ) -> Result<std::time::Duration> {
-        let proxy = self.resolve_proxy(10).await?;
-        proxy.test_http_latency(test_url, timeout).await
+        let proxy = self.resolve_proxy(10)?;
+        proxy.test_http_latency(test_url, timeout)
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        inbound: Box<dyn AsyncReadWrite>,
+        inbound: BoxStream,
         target: TargetAddr,
         connection: Option<std::sync::Arc<crate::engine::connection_tracker::TrackedConnection>>,
     ) -> Result<()> {
-        let proxy = self.resolve_proxy(10).await?;
+        let proxy = self.resolve_proxy(10)?;
         tracing::debug!(
             "Selector '{}' relaying to '{}' for target {}",
             self.config.tag,
             proxy.tag(),
             target
         );
-        proxy
-            .relay_tcp_with_connection(inbound, target, connection)
-            .await
+        proxy.relay_tcp_with_connection(inbound, target, connection)
     }
 
     fn supports_udp(&self) -> bool {
-        // Check if the currently selected proxy supports UDP. Sync trait
-        // method: use a non-blocking read so we never block the runtime.
+        // Check if the currently selected proxy supports UDP.
         let selected = self.get_selected();
-        let Ok(registry) = self.registry.try_read() else {
-            return false;
-        };
+        let registry = self.registry.read();
         if let Some(proxy) = registry.get(&selected) {
             proxy.supports_udp()
         } else {
@@ -227,8 +218,8 @@ impl OutboundProxy for SelectorOutbound {
         }
     }
 
-    async fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        let proxy = self.resolve_proxy(10).await?;
+    fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+        let proxy = self.resolve_proxy(10)?;
         if !proxy.supports_udp() {
             return Err(Error::config(format!(
                 "Selected proxy '{}' does not support UDP",
@@ -241,6 +232,6 @@ impl OutboundProxy for SelectorOutbound {
             proxy.tag(),
             target
         );
-        proxy.relay_udp_packet(target, data).await
+        proxy.relay_udp_packet(target, data)
     }
 }

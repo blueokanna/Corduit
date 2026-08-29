@@ -1,7 +1,7 @@
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
 /// Traffic statistics
 #[derive(Debug, Clone, Default)]
@@ -118,7 +118,7 @@ impl TrafficStatsManager {
     }
 
     /// Start tracking a connection
-    pub async fn start_connection(
+    pub fn start_connection(
         &self,
         connection_id: String,
         proxy_tag: String,
@@ -131,7 +131,7 @@ impl TrafficStatsManager {
             .insert(connection_id.clone(), ConnectionTracker::new(connection_id));
 
         // Update connection count
-        let mut global = self.global_stats.write().await;
+        let mut global = self.global_stats.write();
         global.add_connection();
 
         let mut proxy = self.proxy_stats.entry(proxy_tag).or_default();
@@ -141,25 +141,20 @@ impl TrafficStatsManager {
     }
 
     /// Record traffic for a connection
-    pub async fn record_traffic(
-        &self,
-        connection_id: &str,
-        upload_bytes: u64,
-        download_bytes: u64,
-    ) {
+    pub fn record_traffic(&self, connection_id: &str, upload_bytes: u64, download_bytes: u64) {
         if let Some(mut tracker) = self.active_connections.get_mut(connection_id) {
             tracker.add_upload(upload_bytes);
             tracker.add_download(download_bytes);
         }
 
         // Update global stats
-        let mut global = self.global_stats.write().await;
+        let mut global = self.global_stats.write();
         global.add_upload(upload_bytes);
         global.add_download(download_bytes);
     }
 
     /// End tracking a connection
-    pub async fn end_connection(&self, connection_id: &str, proxy_tag: &str) {
+    pub fn end_connection(&self, connection_id: &str, proxy_tag: &str) {
         if let Some((_, tracker)) = self.active_connections.remove(connection_id) {
             let stats = tracker.finalize();
 
@@ -172,7 +167,7 @@ impl TrafficStatsManager {
 
             // Only add connection time to global stats (upload/download already recorded in record_traffic,
             // connection count was already added in start_connection)
-            let mut global = self.global_stats.write().await;
+            let mut global = self.global_stats.write();
             global.add_connection_time(std::time::Duration::from_secs(stats.connection_time_secs));
         }
     }
@@ -180,8 +175,8 @@ impl TrafficStatsManager {
     /// Get global traffic statistics
     pub fn global_stats(&self) -> TrafficStats {
         match self.global_stats.try_read() {
-            Ok(guard) => guard.clone(),
-            Err(_) => TrafficStats::default(),
+            Some(guard) => guard.clone(),
+            None => TrafficStats::default(),
         }
     }
 
@@ -218,8 +213,8 @@ impl TrafficStatsManager {
     }
 
     /// Reset all statistics
-    pub async fn reset(&self) {
-        *self.global_stats.write().await = TrafficStats::default();
+    pub fn reset(&self) {
+        *self.global_stats.write() = TrafficStats::default();
         self.proxy_stats.clear();
         // Note: active connections are not cleared as they represent current state
     }
@@ -268,20 +263,18 @@ impl std::fmt::Display for TrafficSummary {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_traffic_stats() {
+    #[test]
+    fn test_traffic_stats() {
         let manager = TrafficStatsManager::new();
 
-        // Start a connection (await the async function)
-        let _tracker = manager
-            .start_connection("conn1".to_string(), "proxy1".to_string())
-            .await;
+        // Start a connection
+        let _tracker = manager.start_connection("conn1".to_string(), "proxy1".to_string());
 
         // Record some traffic
-        manager.record_traffic("conn1", 1024, 2048).await;
+        manager.record_traffic("conn1", 1024, 2048);
 
         // End the connection
-        manager.end_connection("conn1", "proxy1").await;
+        manager.end_connection("conn1", "proxy1");
 
         // Check stats
         let global = manager.global_stats();

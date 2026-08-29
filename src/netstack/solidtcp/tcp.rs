@@ -7,9 +7,8 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
 /// TCP state (RFC 793)
@@ -193,10 +192,8 @@ impl TcpConnection {
         if !self.pending_data.is_empty() {
             let data: Vec<u8> = self.pending_data.drain(..).collect();
             info!("Flushing {} bytes of pending data to proxy", data.len());
-            let tx_clone = tx;
-            tokio::spawn(async move {
-                let _ = tx_clone.send(data).await;
-            });
+            // Unbounded std channel: send never blocks, only fails on disconnect.
+            let _ = tx.send(data);
         }
     }
 
@@ -474,32 +471,14 @@ impl TcpConnection {
             let tx = tx.clone();
             trace!("Sending {} bytes to proxy", data_len);
 
-            if data_len > 16384 {
-                debug!("Large data transfer: {} bytes to proxy", data_len);
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send(data).await {
-                        warn!("Failed to send large data to proxy: {}", e);
-                    }
-                });
-            } else {
-                match tx.try_send(data) {
-                    Ok(()) => {
-                        trace!("Data sent to proxy via try_send");
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                        debug!(
-                            "Proxy channel full, spawning send task for {} bytes",
-                            data.len()
-                        );
-                        tokio::spawn(async move {
-                            if let Err(e) = tx.send(data).await {
-                                warn!("Failed to send data to proxy: {}", e);
-                            }
-                        });
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        warn!("Proxy channel closed, cannot send {} bytes", data_len);
-                    }
+            // Unbounded std channel: send never blocks. The only failure mode
+            // is the receiver having been dropped (connection torn down).
+            match tx.send(data) {
+                Ok(()) => {
+                    trace!("Data sent to proxy");
+                }
+                Err(_) => {
+                    warn!("Proxy channel closed, cannot send {} bytes", data_len);
                 }
             }
         } else {

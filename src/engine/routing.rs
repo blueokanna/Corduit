@@ -5,6 +5,7 @@ use crate::engine::rule_provider::RuleProviderConfig;
 use crate::engine::rule_provider::RuleProviderManager;
 use ipnet::IpNet;
 use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -13,7 +14,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
 
 static RUNTIME_PROXY_MODE: AtomicI32 = AtomicI32::new(0);
 static RUNTIME_RULE_PROVIDERS: once_cell::sync::Lazy<StdRwLock<Vec<RuleProviderConfig>>> =
@@ -127,8 +127,8 @@ struct CompiledRule {
 }
 
 impl Router {
-    pub async fn new(config: Arc<RwLock<Config>>) -> Result<Self> {
-        let rules = Self::compile_rules(&config.read().await.rules)?;
+    pub fn new(config: Arc<RwLock<Config>>) -> Result<Self> {
+        let rules = Self::compile_rules(&config.read().rules)?;
         let geoip_manager: Arc<dyn CountryMatcher> =
             Arc::new(GeoIpManager::from_embedded_country_database());
         let rule_provider_manager = Arc::new(RuleProviderManager::new());
@@ -149,25 +149,22 @@ impl Router {
             }
         }
 
-        let load_results =
-            futures::future::join_all(provider_configs.into_iter().map(|provider| {
-                let provider_name = provider.name.clone();
-                let manager = &rule_provider_manager;
-                async move {
-                    manager.add_provider(provider).await.map_err(|error| {
-                        Error::config(format!(
-                            "Failed to load rule provider '{provider_name}': {error}"
-                        ))
-                    })
-                }
-            }))
-            .await;
-        for result in load_results {
-            result?;
+        // Load each rule provider synchronously in configuration order. Each
+        // provider fetch blocks (file read or bounded HTTP GET), which is
+        // fine at startup / reload on a worker thread.
+        for provider in provider_configs {
+            let provider_name = provider.name.clone();
+            rule_provider_manager
+                .add_provider(provider)
+                .map_err(|error| {
+                    Error::config(format!(
+                        "Failed to load rule provider '{provider_name}': {error}"
+                    ))
+                })?;
         }
 
         let defaults = {
-            let config_guard = config.read().await;
+            let config_guard = config.read();
             Self::resolve_default_outbounds(&config_guard)
         };
 
@@ -180,12 +177,12 @@ impl Router {
         })
     }
 
-    pub async fn load_geoip_database(&self, path: &str) -> Result<()> {
-        self.geoip_manager.load_database(path).await
+    pub fn load_geoip_database(&self, path: &str) -> Result<()> {
+        self.geoip_manager.load_database(path)
     }
 
-    pub async fn load_geoip_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
-        self.geoip_manager.load_database_from_bytes(data).await
+    pub fn load_geoip_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
+        self.geoip_manager.load_database_from_bytes(data)
     }
 
     pub fn rule_provider_manager(&self) -> &RuleProviderManager {
@@ -198,7 +195,7 @@ impl Router {
         Arc::clone(&self.rule_provider_manager)
     }
 
-    pub async fn match_outbound(
+    pub fn match_outbound(
         &self,
         domain: Option<&str>,
         ip: Option<IpAddr>,
@@ -207,7 +204,7 @@ impl Router {
     ) -> String {
         let runtime_mode = get_runtime_proxy_mode();
         let effective_mode = {
-            let config = self.config.read().await;
+            let config = self.config.read();
             match runtime_mode {
                 proxy_mode::GLOBAL => Mode::Global,
                 proxy_mode::DIRECT => Mode::Direct,
@@ -216,7 +213,7 @@ impl Router {
             }
         };
         let (direct_outbound, global_outbound, default_outbound) = {
-            let defaults = self.defaults.read().await;
+            let defaults = self.defaults.read();
             (
                 defaults.direct.clone(),
                 defaults.global.clone(),
@@ -245,7 +242,7 @@ impl Router {
             return direct_outbound;
         }
 
-        let rules = self.rules.read().await;
+        let rules = self.rules.read();
 
         // DNS is resolved lazily and cached for the duration of this request.
         // Pure domain-rule configs (the common case, e.g. clash-rules sets)
@@ -269,12 +266,9 @@ impl Router {
             }
 
             if resolved_ips.is_none() {
-                resolved_ips = Some(Self::resolve_destination_ips(domain, ip).await);
+                resolved_ips = Some(Self::resolve_destination_ips(domain, ip));
             }
-            if self
-                .is_mainland_china_ip(resolved_ips.as_deref().unwrap_or(&[]))
-                .await
-            {
+            if self.is_mainland_china_ip(resolved_ips.as_deref().unwrap_or(&[])) {
                 tracing::info!(
                     "Mainland China destination identified: domain={:?}, ips={:?} -> '{}'",
                     domain,
@@ -286,22 +280,17 @@ impl Router {
         }
 
         for rule in rules.iter() {
-            let mut matched = self
-                .matches_rule(rule, domain, ip, port, process_name)
-                .await;
+            let mut matched = self.matches_rule(rule, domain, ip, port, process_name);
             if !matched
                 && ip.is_none()
                 && matches!(rule.rule_type, RuleType::Geoip | RuleType::IpCidr)
             {
                 if resolved_ips.is_none() {
-                    resolved_ips = Some(Self::resolve_destination_ips(domain, ip).await);
+                    resolved_ips = Some(Self::resolve_destination_ips(domain, ip));
                 }
                 if let Some(resolved_ips) = resolved_ips.as_deref() {
                     for resolved_ip in resolved_ips {
-                        if self
-                            .matches_rule(rule, domain, Some(*resolved_ip), port, process_name)
-                            .await
-                        {
+                        if self.matches_rule(rule, domain, Some(*resolved_ip), port, process_name) {
                             matched = true;
                             break;
                         }
@@ -337,10 +326,10 @@ impl Router {
                 .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".cn"))
     }
 
-    async fn is_mainland_china_ip(&self, addresses: &[IpAddr]) -> bool {
+    fn is_mainland_china_ip(&self, addresses: &[IpAddr]) -> bool {
         for address in addresses {
             if is_local_or_private_ip(*address)
-                || self.geoip_manager.matches_country("CN", *address).await
+                || self.geoip_manager.matches_country("CN", *address)
             {
                 return true;
             }
@@ -348,7 +337,7 @@ impl Router {
         false
     }
 
-    async fn resolve_destination_ips(domain: Option<&str>, ip: Option<IpAddr>) -> Vec<IpAddr> {
+    fn resolve_destination_ips(domain: Option<&str>, ip: Option<IpAddr>) -> Vec<IpAddr> {
         if let Some(ip) = ip {
             return vec![ip];
         }
@@ -371,7 +360,7 @@ impl Router {
 
         let now = Instant::now();
         {
-            let mut cache = DNS_CACHE.lock().await;
+            let mut cache = DNS_CACHE.lock();
             if let Some(cached) = cache.get(&normalized) {
                 if cached.expires_at > now {
                     return cached.addresses.clone();
@@ -380,41 +369,32 @@ impl Router {
             cache.pop(&normalized);
         }
 
-        let lookup = tokio::time::timeout(
-            DNS_LOOKUP_TIMEOUT,
-            tokio::net::lookup_host((normalized.clone(), 0)),
-        )
-        .await;
-        let addresses = match lookup {
-            Ok(Ok(resolved)) => {
-                let mut addresses = Vec::new();
-                for socket_address in resolved {
-                    let address = socket_address.ip();
-                    if !addresses.contains(&address) {
-                        addresses.push(address);
+        // `resolve_host` runs the system resolver on a dedicated thread so the
+        // caller is not stalled for the resolver's full hang time; resolution
+        // errors degrade to domain-rule-only matching.
+        let addresses =
+            match crate::common::socket::resolve_host(&normalized, 0, DNS_LOOKUP_TIMEOUT) {
+                Ok(resolved) => {
+                    let mut addresses = Vec::new();
+                    for socket_address in resolved {
+                        let address = socket_address.ip();
+                        if !addresses.contains(&address) {
+                            addresses.push(address);
+                        }
                     }
+                    addresses
                 }
-                addresses
-            }
-            Ok(Err(error)) => {
-                tracing::debug!("Failed to resolve '{}' for routing: {}", normalized, error);
-                Vec::new()
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "DNS resolution for '{}' exceeded {:?}; continuing with domain rules",
-                    normalized,
-                    DNS_LOOKUP_TIMEOUT
-                );
-                Vec::new()
-            }
-        };
+                Err(error) => {
+                    tracing::debug!("Failed to resolve '{}' for routing: {}", normalized, error);
+                    Vec::new()
+                }
+            };
         let ttl = if addresses.is_empty() {
             DNS_NEGATIVE_CACHE_TTL
         } else {
             DNS_CACHE_TTL
         };
-        DNS_CACHE.lock().await.put(
+        DNS_CACHE.lock().put(
             normalized,
             CachedResolution {
                 addresses: addresses.clone(),
@@ -424,22 +404,22 @@ impl Router {
         addresses
     }
 
-    pub async fn reload(&self) -> Result<()> {
+    pub fn reload(&self) -> Result<()> {
         let (new_rules, defaults) = {
-            let config = self.config.read().await;
+            let config = self.config.read();
             let new_rules = Self::compile_rules(&config.rules)?;
             let defaults = Self::resolve_default_outbounds(&config);
             (new_rules, defaults)
         };
         {
-            let mut rules = self.rules.write().await;
+            let mut rules = self.rules.write();
             *rules = new_rules;
         }
         {
-            let mut defaults_guard = self.defaults.write().await;
+            let mut defaults_guard = self.defaults.write();
             *defaults_guard = defaults;
         }
-        self.refresh_rule_providers().await?;
+        self.refresh_rule_providers()?;
         Ok(())
     }
 
@@ -447,12 +427,11 @@ impl Router {
     /// remove providers that disappeared, add new ones, and replace providers
     /// whose config changed. Unchanged providers keep their loaded rules and
     /// are refreshed in the background by the provider updater.
-    async fn refresh_rule_providers(&self) -> Result<()> {
+    fn refresh_rule_providers(&self) -> Result<()> {
         let desired = runtime_rule_providers();
         let current: HashSet<String> = self
             .rule_provider_manager
             .get_provider_names()
-            .await
             .into_iter()
             .collect();
 
@@ -469,20 +448,20 @@ impl Router {
         // Remove providers that are no longer configured.
         for name in &current {
             if !desired_map.contains_key(name) {
-                self.rule_provider_manager.remove_provider(name).await;
+                self.rule_provider_manager.remove_provider(name);
             }
         }
 
         // Add new providers and replace changed ones.
         for (name, config) in desired_map {
-            match self.rule_provider_manager.get_provider(&name).await {
+            match self.rule_provider_manager.get_provider(&name) {
                 Some(existing) if !rule_provider_config_changed(existing.config(), &config) => {}
                 Some(_) => {
-                    self.rule_provider_manager.remove_provider(&name).await;
-                    self.rule_provider_manager.add_provider(config).await?;
+                    self.rule_provider_manager.remove_provider(&name);
+                    self.rule_provider_manager.add_provider(config)?;
                 }
                 None => {
-                    self.rule_provider_manager.add_provider(config).await?;
+                    self.rule_provider_manager.add_provider(config)?;
                 }
             }
         }
@@ -615,7 +594,7 @@ impl Router {
         Ok(ranges)
     }
 
-    async fn matches_rule(
+    fn matches_rule(
         &self,
         rule: &CompiledRule,
         domain: Option<&str>,
@@ -651,7 +630,7 @@ impl Router {
             }
             RuleType::Geoip => {
                 if let Some(ip) = ip {
-                    self.geoip_manager.matches_country(&rule.pattern, ip).await
+                    self.geoip_manager.matches_country(&rule.pattern, ip)
                 } else {
                     false
                 }
@@ -675,7 +654,6 @@ impl Router {
             RuleType::RuleSet => {
                 self.rule_provider_manager
                     .matches(&rule.pattern, domain, ip, process_name)
-                    .await
             }
             RuleType::Match => true,
         }
@@ -784,8 +762,8 @@ mod tests {
 
     /// The runtime proxy mode is a process-global; tests that set it must be
     /// serialized so parallel execution cannot interleave different modes.
-    pub(super) static MODE_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
-        once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+    pub(super) static MODE_LOCK: once_cell::sync::Lazy<parking_lot::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(()));
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     /// Deterministic matcher that mimics a real GeoIP database for a small set
@@ -793,9 +771,8 @@ mod tests {
     /// on-disk `Country.mmdb`.
     struct StubCountryMatcher;
 
-    #[async_trait::async_trait]
     impl CountryMatcher for StubCountryMatcher {
-        async fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
+        fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
             let is_cn = matches!(ip, IpAddr::V4(ipv4) if {
                 let octets = ipv4.octets();
                 octets == [114, 114, 114, 114] || octets == [1, 2, 4, 8]
@@ -803,11 +780,11 @@ mod tests {
             is_cn && country_code.eq_ignore_ascii_case("cn")
         }
 
-        async fn load_database(&self, _path: &str) -> Result<()> {
+        fn load_database(&self, _path: &str) -> Result<()> {
             Ok(())
         }
 
-        async fn load_database_from_bytes(&self, _data: Vec<u8>) -> Result<()> {
+        fn load_database_from_bytes(&self, _data: Vec<u8>) -> Result<()> {
             Ok(())
         }
     }
@@ -861,85 +838,75 @@ mod tests {
         router
     }
 
-    #[tokio::test]
-    async fn mainland_cn_domain_follows_rule_when_configured() {
+    #[test]
+    fn mainland_cn_domain_follows_rule_when_configured() {
         // With rules configured, the explicit MATCH rule wins over the
         // mainland-China auto-direct shortcut (Clash rule-order semantics).
-        let _mode_guard = MODE_LOCK.lock().await;
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
-        let outbound = router
-            .match_outbound(Some("WWW.EXAMPLE.CN."), None, Some(443), None)
-            .await;
+        let outbound = router.match_outbound(Some("WWW.EXAMPLE.CN."), None, Some(443), None);
 
         assert_eq!(outbound, "proxy");
     }
 
-    #[tokio::test]
-    async fn mainland_cn_ip_follows_rule_when_configured() {
-        let _mode_guard = MODE_LOCK.lock().await;
+    #[test]
+    fn mainland_cn_ip_follows_rule_when_configured() {
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
-        let outbound = router
-            .match_outbound(
-                None,
-                Some(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))),
-                Some(53),
-                None,
-            )
-            .await;
+        let outbound = router.match_outbound(
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))),
+            Some(53),
+            None,
+        );
 
         assert_eq!(outbound, "proxy");
     }
 
-    #[tokio::test]
-    async fn mainland_cn_domain_auto_direct_without_rules() {
+    #[test]
+    fn mainland_cn_domain_auto_direct_without_rules() {
         // No rules configured: the auto-direct fallback still applies.
-        let _mode_guard = MODE_LOCK.lock().await;
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router_no_rules();
 
-        let outbound = router
-            .match_outbound(Some("www.example.cn"), None, Some(443), None)
-            .await;
+        let outbound = router.match_outbound(Some("www.example.cn"), None, Some(443), None);
 
         assert_eq!(outbound, "bypass");
     }
 
-    #[tokio::test]
-    async fn mainland_cn_ip_auto_direct_without_rules() {
-        let _mode_guard = MODE_LOCK.lock().await;
+    #[test]
+    fn mainland_cn_ip_auto_direct_without_rules() {
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router_no_rules();
 
-        let outbound = router
-            .match_outbound(
-                None,
-                Some(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))),
-                Some(53),
-                None,
-            )
-            .await;
+        let outbound = router.match_outbound(
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))),
+            Some(53),
+            None,
+        );
 
         assert_eq!(outbound, "bypass");
     }
 
-    #[tokio::test]
-    async fn foreign_ip_still_uses_configured_proxy_rule() {
-        let _mode_guard = MODE_LOCK.lock().await;
+    #[test]
+    fn foreign_ip_still_uses_configured_proxy_rule() {
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
-        let outbound = router
-            .match_outbound(
-                None,
-                Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-                Some(53),
-                None,
-            )
-            .await;
+        let outbound = router.match_outbound(
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            Some(53),
+            None,
+        );
 
         assert_eq!(outbound, "proxy");
     }
@@ -1015,11 +982,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn global_mode_routes_all_traffic_through_proxy_group() {
+    #[test]
+    fn global_mode_routes_all_traffic_through_proxy_group() {
         // GLOBAL must send every connection (any domain/IP/port) through the
         // proxy group, regardless of the rule table.
-        let _mode_guard = MODE_LOCK.lock().await;
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::GLOBAL);
         let router = grouped_routing_test_router();
 
@@ -1030,7 +997,7 @@ mod tests {
             (None, Some(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))),
             (None, None),
         ] {
-            let outbound = router.match_outbound(domain, ip, Some(443), None).await;
+            let outbound = router.match_outbound(domain, ip, Some(443), None);
             assert_eq!(
                 outbound, "PROXY",
                 "GLOBAL must route domain={:?} ip={:?} through the proxy group",
@@ -1039,25 +1006,23 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn global_mode_uses_first_proxy_when_no_group() {
+    #[test]
+    fn global_mode_uses_first_proxy_when_no_group() {
         // Without a group, GLOBAL falls back to the first non-direct/reject
         // outbound instead of DIRECT.
-        let _mode_guard = MODE_LOCK.lock().await;
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::GLOBAL);
         let router = mainland_routing_test_router();
 
-        let outbound = router
-            .match_outbound(Some("example.com"), None, Some(443), None)
-            .await;
+        let outbound = router.match_outbound(Some("example.com"), None, Some(443), None);
         assert_eq!(outbound, "proxy");
     }
 
-    #[tokio::test]
-    async fn direct_mode_routes_all_traffic_to_direct() {
+    #[test]
+    fn direct_mode_routes_all_traffic_to_direct() {
         // DIRECT must route everything (even domains matched by rules) to the
         // direct outbound.
-        let _mode_guard = MODE_LOCK.lock().await;
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::DIRECT);
         let router = grouped_routing_test_router();
 
@@ -1065,22 +1030,20 @@ mod tests {
             (Some("example.com"), None),
             (None, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))),
         ] {
-            let outbound = router.match_outbound(domain, ip, Some(443), None).await;
+            let outbound = router.match_outbound(domain, ip, Some(443), None);
             assert_eq!(outbound, "DIRECT");
         }
     }
 
-    #[tokio::test]
-    async fn config_mode_follows_general_mode() {
+    #[test]
+    fn config_mode_follows_general_mode() {
         // Runtime mode 0 (CONFIG) falls back to `general.mode`; here it is
         // Rule, so the rule table decides.
-        let _mode_guard = MODE_LOCK.lock().await;
+        let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::CONFIG);
         let router = grouped_routing_test_router();
 
-        let outbound = router
-            .match_outbound(Some("example.com"), None, Some(443), None)
-            .await;
+        let outbound = router.match_outbound(Some("example.com"), None, Some(443), None);
         assert_eq!(outbound, "DIRECT");
     }
 
@@ -1228,25 +1191,20 @@ mod property_tests {
                 rule_provider_manager: Arc::new(RuleProviderManager::new()),
             };
 
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let matches_lower = rt.block_on(async {
-                router.matches_rule(
-                    &router.rules.read().await[0],
-                    Some(&lower),
-                    None,
-                    None,
-                    None,
-                ).await
-            });
-            let matches_upper = rt.block_on(async {
-                router.matches_rule(
-                    &router.rules.read().await[0],
-                    Some(&upper),
-                    None,
-                    None,
-                    None,
-                ).await
-            });
+            let matches_lower = router.matches_rule(
+                &router.rules.read()[0],
+                Some(&lower),
+                None,
+                None,
+                None,
+            );
+            let matches_upper = router.matches_rule(
+                &router.rules.read()[0],
+                Some(&upper),
+                None,
+                None,
+                None,
+            );
 
             prop_assert!(matches_lower);
             prop_assert!(matches_upper);
@@ -1281,16 +1239,13 @@ mod property_tests {
                 rule_provider_manager: Arc::new(RuleProviderManager::new()),
             };
 
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let matches = rt.block_on(async {
-                router.matches_rule(
-                    &router.rules.read().await[0],
-                    Some(&full_domain),
-                    None,
-                    None,
-                    None,
-                ).await
-            });
+            let matches = router.matches_rule(
+                &router.rules.read()[0],
+                Some(&full_domain),
+                None,
+                None,
+                None,
+            );
 
             prop_assert!(matches, "Domain suffix {} should match {}", base_domain, full_domain);
         }
@@ -1325,16 +1280,13 @@ mod property_tests {
                 rule_provider_manager: Arc::new(RuleProviderManager::new()),
             };
 
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let matches = rt.block_on(async {
-                router.matches_rule(
-                    &router.rules.read().await[0],
-                    Some(&domain),
-                    None,
-                    None,
-                    None,
-                ).await
-            });
+            let matches = router.matches_rule(
+                &router.rules.read()[0],
+                Some(&domain),
+                None,
+                None,
+                None,
+            );
 
             prop_assert!(matches, "Keyword {} should match domain {}", keyword, domain);
         }
@@ -1430,16 +1382,13 @@ mod property_tests {
                 rule_provider_manager: Arc::new(RuleProviderManager::new()),
             };
 
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let matches = rt.block_on(async {
-                router.matches_rule(
-                    &router.rules.read().await[0],
-                    domain.as_deref(),
-                    ip,
-                    port,
-                    None,
-                ).await
-            });
+            let matches = router.matches_rule(
+                &router.rules.read()[0],
+                domain.as_deref(),
+                ip,
+                port,
+                None,
+            );
 
             prop_assert!(matches, "MATCH rule should always match");
         }
@@ -1453,8 +1402,7 @@ mod property_tests {
             // (other tests may have staged a real HTTP provider), and pin the
             // runtime mode to CONFIG under the mode lock so parallel mode
             // tests cannot interleave a different mode.
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let _mode_guard = rt.block_on(async { tests::MODE_LOCK.lock().await });
+            let _mode_guard = tests::MODE_LOCK.lock();
             set_runtime_proxy_mode(proxy_mode::CONFIG);
 
             let rules = vec![
@@ -1492,10 +1440,8 @@ mod property_tests {
                 ..Default::default()
             };
 
-            let result = rt.block_on(async {
-                let router = Router::new(std::sync::Arc::new(RwLock::new(config))).await.unwrap();
-                router.match_outbound(Some(&domain), None, None, None).await
-            });
+            let router = Router::new(std::sync::Arc::new(RwLock::new(config))).unwrap();
+            let result = router.match_outbound(Some(&domain), None, None, None);
 
             prop_assert_eq!(result, "first", "First matching rule should be used");
         }

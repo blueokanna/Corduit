@@ -1,7 +1,7 @@
 use crate::engine::error::Result;
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
 /// Health check result
 #[derive(Debug, Clone)]
@@ -190,10 +190,9 @@ pub struct HealthStats {
 }
 
 /// Health check trait for outbound proxies
-#[async_trait::async_trait]
 pub trait HealthCheckable {
     /// Perform a health check
-    async fn health_check(&self) -> Result<HealthStatus>;
+    fn health_check(&self) -> Result<HealthStatus>;
 
     /// Get the health check target information
     fn health_target(&self) -> HealthTarget;
@@ -222,34 +221,32 @@ impl HealthChecker {
     }
 
     /// Start the health checker
-    pub async fn start(self) -> Result<()> {
-        tokio::spawn(async move {
-            loop {
-                let targets = self.monitor.targets_needing_check();
+    pub fn start(self) -> Result<()> {
+        crate::common::exec::spawn(move || loop {
+            let targets = self.monitor.targets_needing_check();
 
-                for target_tag in targets {
-                    if let Some(checkable) = self
-                        .checkables
-                        .iter()
-                        .find(|c| c.health_target().tag == target_tag)
-                    {
-                        match checkable.health_check().await {
-                            Ok(status) => {
-                                self.monitor.update_health(&target_tag, status);
-                            }
-                            Err(e) => {
-                                let status = HealthStatus::Unhealthy {
-                                    reason: "Health check failed".to_string(),
-                                    last_error: Some(e.to_string()),
-                                };
-                                self.monitor.update_health(&target_tag, status);
-                            }
+            for target_tag in targets {
+                if let Some(checkable) = self
+                    .checkables
+                    .iter()
+                    .find(|c| c.health_target().tag == target_tag)
+                {
+                    match checkable.health_check() {
+                        Ok(status) => {
+                            self.monitor.update_health(&target_tag, status);
+                        }
+                        Err(e) => {
+                            let status = HealthStatus::Unhealthy {
+                                reason: "Health check failed".to_string(),
+                                last_error: Some(e.to_string()),
+                            };
+                            self.monitor.update_health(&target_tag, status);
                         }
                     }
                 }
-
-                tokio::time::sleep(Duration::from_secs(1)).await;
             }
+
+            std::thread::sleep(Duration::from_secs(1));
         });
 
         Ok(())
@@ -260,8 +257,8 @@ impl HealthChecker {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_health_monitor() {
+    #[test]
+    fn test_health_monitor() {
         let monitor = HealthMonitor::new(HealthCheckConfig::default());
 
         // Register a target

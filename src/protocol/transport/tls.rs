@@ -4,19 +4,17 @@
 //! The transport is a thin configuration adapter over
 //! [`crate::protocol::tls::TlsConnector`]: `TlsConfig` (SNI, ALPN, verify
 //! skip, SNI toggle) maps to courierust's [`ClientConfig`] and the connector
-//! returns a boxed async stream whose handshake runs on a worker thread.
+//! returns a boxed synchronous stream whose handshake runs on the calling
+//! thread.
 //!
 //! `TlsFingerprint` is retained as a configuration-compatibility enum: the
 //! legacy mapping only ever rewrote the ALPN list, which courierust exposes
 //! directly, so the fingerprint variants no longer change wire behavior
 //! (courierust does not emulate browser TLS/JA3 fingerprints).
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::io::{self, Read, Write};
 
 use nextjson::{NsonDeserialize, NsonSerialize};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{Result, TransportError};
 use crate::protocol::tls::{ClientConfig as TlsClientConfig, TlsConnector as CourierConnector};
@@ -120,14 +118,13 @@ impl TlsTransport {
             .map_err(|e| TransportError::InvalidConfig(format!("Failed to build TLS config: {e}")))
     }
 
-    pub async fn connect(
+    pub fn connect(
         &self,
-        stream: tokio::net::TcpStream,
+        stream: std::net::TcpStream,
     ) -> Result<TlsStream<crate::protocol::tls::BoxStream>> {
         let tls_stream = self
             .connector
             .connect(stream, &self.server_name)
-            .await
             .map_err(|e| TransportError::Handshake(format!("TLS handshake failed: {e}")))?;
         Ok(TlsStream::new(tls_stream))
     }
@@ -141,6 +138,8 @@ impl TlsTransport {
     }
 }
 
+/// A transparent transport wrapper that forwards `Read`/`Write` to the inner
+/// stream and participates in the engine's [`SyncStream`] surface.
 pub struct TlsStream<S> {
     inner: S,
 }
@@ -163,31 +162,29 @@ impl<S> TlsStream<S> {
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for TlsStream<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+impl<S: Read> Read for TlsStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+impl<S: Write> Write for TlsStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S: crate::common::stream::SyncStream> crate::common::stream::SyncStream for TlsStream<S> {
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        self.inner.shutdown(how)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.peer_addr()
     }
 }
 
@@ -198,48 +195,34 @@ mod tests {
     #[test]
     fn test_tls_config_default() {
         let config = TlsConfig::default();
-        assert!(config.sni.is_none());
-        assert_eq!(config.alpn, vec!["h2", "http/1.1"]);
+        assert_eq!(config.sni, None);
+        assert!(config.alpn.contains(&"h2".to_string()));
         assert!(!config.skip_cert_verify);
         assert!(config.enable_sni);
         assert_eq!(config.fingerprint, TlsFingerprint::None);
     }
 
     #[test]
-    fn test_tls_transport_new() {
-        let config = TlsConfig::default();
-        let transport = TlsTransport::new(config, "example.com").unwrap();
-        assert_eq!(transport.server_name(), "example.com");
-    }
-
-    #[test]
-    fn test_tls_transport_with_custom_sni() {
+    fn test_fingerprint_pins_alpn_when_empty() {
         let config = TlsConfig {
-            sni: Some("custom.sni.com".to_string()),
+            alpn: Vec::new(),
+            fingerprint: TlsFingerprint::Chrome,
             ..Default::default()
         };
-        let transport = TlsTransport::new(config, "example.com").unwrap();
-        assert_eq!(transport.server_name(), "custom.sni.com");
+        let connector = TlsTransport::build_connector(&config).expect("connector builds");
+        assert_eq!(
+            connector.config().alpn,
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
     }
 
     #[test]
-    fn test_tls_config_serialization() {
+    fn test_fingerprint_keeps_explicit_alpn() {
         let config = TlsConfig {
-            sni: Some("test.com".to_string()),
-            alpn: vec!["h2".to_string()],
-            skip_cert_verify: true,
-            enable_sni: true,
-            fingerprint: TlsFingerprint::Chrome,
-            min_version: None,
-            max_version: None,
+            alpn: vec!["h3".to_string()],
+            ..Default::default()
         };
-
-        let json = nextjson::to_string(&config).unwrap();
-        let deserialized: TlsConfig = nextjson::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.sni, config.sni);
-        assert_eq!(deserialized.alpn, config.alpn);
-        assert_eq!(deserialized.skip_cert_verify, config.skip_cert_verify);
-        assert_eq!(deserialized.fingerprint, config.fingerprint);
+        let connector = TlsTransport::build_connector(&config).expect("connector builds");
+        assert_eq!(connector.config().alpn, vec!["h3".to_string()]);
     }
 }

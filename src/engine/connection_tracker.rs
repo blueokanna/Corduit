@@ -4,7 +4,7 @@
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::time::Instant;
+use std::time::Instant;
 
 /// Unique connection ID generator
 static CONNECTION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);

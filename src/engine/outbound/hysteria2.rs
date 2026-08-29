@@ -38,10 +38,11 @@
 //! (Hysteria's TCP-Brutal controller is not reimplemented); the configured
 //! `up`/`down` Mbps only feeds the `hysteria-cc-rx` rate hint.
 
+use crate::common::stream::BoxStream;
 use crate::engine::config::OutboundConfig;
-use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
+use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::engine::tls::yaml_value_to_string;
 use crate::protocol::qpack::{decode_block, encode_literal_fields};
 use crate::protocol::quic::{
@@ -49,13 +50,12 @@ use crate::protocol::quic::{
     Salamander,
 };
 use bytes::Buf;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 /// TCP request frame id (Hysteria 2 protocol spec).
@@ -145,7 +145,7 @@ impl Hysteria2Connection {
     }
 
     /// Authenticate over HTTP/3 (`POST /auth`), waiting for `:status 233`.
-    pub async fn authenticate(&self) -> Result<()> {
+    pub fn authenticate(&self) -> Result<()> {
         if *self.authenticated.read() {
             return Ok(());
         }
@@ -154,21 +154,20 @@ impl Hysteria2Connection {
         // control stream, the QPACK encoder stream and the QPACK decoder
         // stream before issuing requests; some servers wait for them.
         for stream_type in [H3_CONTROL_STREAM, 0x02, 0x03] {
-            if let Ok(mut s) = self.connection.open_uni().await {
+            if let Ok(mut s) = self.connection.open_uni() {
                 let mut setup = Vec::with_capacity(6);
                 write_varint(&mut setup, stream_type);
                 if stream_type == H3_CONTROL_STREAM {
                     write_varint(&mut setup, H3_SETTINGS_FRAME);
                     write_varint(&mut setup, 0);
                 }
-                let _ = s.write_all(&setup).await;
+                let _ = s.write_all(&setup);
             }
         }
 
         let (mut send, mut recv) = self
             .connection
             .open_bi()
-            .await
             .map_err(|e| Error::network(format!("Failed to open auth stream: {e}")))?;
 
         let padding = random_padding();
@@ -196,67 +195,58 @@ impl Hysteria2Connection {
         msg.extend_from_slice(&qpack);
 
         send.write_all(&msg)
-            .await
             .map_err(|e| Error::network(format!("Failed to send auth request: {e}")))?;
-        send.shutdown()
-            .await
+        send.finish()
             .map_err(|e| Error::network(format!("Failed to finish auth stream: {e}")))?;
 
-        // Read response frames until the HEADERS frame arrives.
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let (frame_type, payload) = read_h3_frame(&mut recv, 16384)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read auth response: {e}")))?;
-                if frame_type == H3_FRAME_HEADERS {
-                    let fields = decode_block(&payload)
-                        .map_err(|e| Error::protocol(format!("QPACK decode failed: {e}")))?;
-                    let mut status_ok = false;
-                    for (name, value) in &fields {
-                        if name.eq_ignore_ascii_case(b":status") {
-                            status_ok = value == b"233";
-                        }
+        // Read response frames until the HEADERS frame arrives (bounded by
+        // the 15s deadline: QUIC reads block, so retry on transient stalls).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let (frame_type, payload) = read_h3_frame(&mut recv, 16384, deadline)
+                .map_err(|e| Error::network(format!("Failed to read auth response: {e}")))?;
+            if frame_type == H3_FRAME_HEADERS {
+                let fields = decode_block(&payload)
+                    .map_err(|e| Error::protocol(format!("QPACK decode failed: {e}")))?;
+                let mut status_ok = false;
+                for (name, value) in &fields {
+                    if name.eq_ignore_ascii_case(b":status") {
+                        status_ok = value == b"233";
                     }
-                    if !status_ok {
-                        let detail: Vec<String> = fields
-                            .iter()
-                            .map(|(n, v)| {
-                                format!(
-                                    "{}: {}",
-                                    String::from_utf8_lossy(n),
-                                    String::from_utf8_lossy(v)
-                                )
-                            })
-                            .collect();
-                        return Err(Error::protocol(format!(
-                            "Hysteria2 authentication rejected (status != 233): {}",
-                            detail.join(", ")
-                        )));
-                    }
-                    return Ok(());
                 }
-                // Ignore DATA / SETTINGS / other frames on the auth stream.
+                if !status_ok {
+                    let detail: Vec<String> = fields
+                        .iter()
+                        .map(|(n, v)| {
+                            format!(
+                                "{}: {}",
+                                String::from_utf8_lossy(n),
+                                String::from_utf8_lossy(v)
+                            )
+                        })
+                        .collect();
+                    return Err(Error::protocol(format!(
+                        "Hysteria2 authentication rejected (status != 233): {}",
+                        detail.join(", ")
+                    )));
+                }
+                break;
             }
-        })
-        .await
-        .map_err(|_| Error::network("Auth response timeout"))??;
+            // Ignore DATA / SETTINGS / other frames on the auth stream.
+        }
 
         *self.authenticated.write() = true;
         debug!("Hysteria2 authentication completed");
         Ok(())
     }
 
-    /// Open a TCP relay: send the `0x401` request and await the status byte.
-    pub async fn open_tcp_stream(
-        &self,
-        target: &TargetAddr,
-    ) -> Result<(QuicSendStream, QuicRecvStream)> {
-        self.authenticate().await?;
+    /// Open a TCP relay: send the `0x401` request and read the status byte.
+    pub fn open_tcp_stream(&self, target: &TargetAddr) -> Result<(QuicSendStream, QuicRecvStream)> {
+        self.authenticate()?;
 
         let (mut send, mut recv) = self
             .connection
             .open_bi()
-            .await
             .map_err(|e| Error::network(format!("Failed to open bi stream: {e}")))?;
 
         let addr = encode_address(target);
@@ -267,10 +257,9 @@ impl Hysteria2Connection {
         write_varint(&mut msg, 0); // no padding
 
         send.write_all(&msg)
-            .await
             .map_err(|e| Error::network(format!("Failed to send TCP request: {e}")))?;
 
-        let status = read_tcp_response(&mut recv).await?;
+        let status = read_tcp_response(&mut recv)?;
         if status != 0 {
             return Err(Error::protocol(format!(
                 "Hysteria2 TCP connect failed (status {status})"
@@ -282,13 +271,8 @@ impl Hysteria2Connection {
     }
 
     /// Send one UDP payload as (possibly fragmented) QUIC datagrams.
-    pub async fn send_udp_packet(
-        &self,
-        session_id: u32,
-        target: &TargetAddr,
-        data: &[u8],
-    ) -> Result<()> {
-        self.authenticate().await?;
+    pub fn send_udp_packet(&self, session_id: u32, target: &TargetAddr, data: &[u8]) -> Result<()> {
+        self.authenticate()?;
 
         let addr = encode_address(target);
         let header_len = 4 + 2 + 1 + 1 + varint_len(addr.len() as u64) + addr.len();
@@ -298,7 +282,6 @@ impl Hysteria2Connection {
             let msg = write_udp_message(session_id, packet_id, 0, 1, &addr, data);
             self.connection
                 .send_datagram(msg)
-                .await
                 .map_err(|e| Error::network(format!("Failed to send UDP datagram: {e}")))?;
             debug!(
                 "Hysteria2 UDP packet sent to {target} ({} bytes)",
@@ -325,7 +308,6 @@ impl Hysteria2Connection {
             );
             self.connection
                 .send_datagram(msg)
-                .await
                 .map_err(|e| Error::network(format!("Failed to send UDP fragment: {e}")))?;
         }
         debug!(
@@ -337,12 +319,11 @@ impl Hysteria2Connection {
     }
 
     /// Receive the next complete UDP payload (reassembling fragments).
-    pub async fn recv_udp_packet(&self) -> Result<(u32, TargetAddr, Vec<u8>)> {
+    pub fn recv_udp_packet(&self) -> Result<(u32, TargetAddr, Vec<u8>)> {
         loop {
             let datagram = self
                 .connection
                 .read_datagram()
-                .await
                 .map_err(|e| Error::network(format!("Failed to receive UDP datagram: {e}")))?;
 
             let (session_id, packet_id, frag_id, frag_count, target, payload) =
@@ -352,7 +333,7 @@ impl Hysteria2Connection {
                 return Ok((session_id, target, payload));
             }
 
-            let mut assembler = self.assembler.lock().await;
+            let mut assembler = self.assembler.lock();
             if let Some(full) =
                 assembler.add(session_id, packet_id, frag_id, frag_count, target, payload)
             {
@@ -411,26 +392,27 @@ fn varint_len(value: u64) -> usize {
     }
 }
 
-async fn read_varint<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<u64> {
+fn read_varint<R: Read>(r: &mut R, deadline: Instant) -> std::io::Result<u64> {
     let mut b = [0u8; 1];
-    r.read_exact(&mut b).await?;
+    read_exact_deadline(r, &mut b, deadline)?;
     let first = b[0];
     let len = 1usize << (first >> 6);
     let mut value = (first & 0x3f) as u64;
     for _ in 1..len {
-        r.read_exact(&mut b).await?;
+        read_exact_deadline(r, &mut b, deadline)?;
         value = (value << 8) | b[0] as u64;
     }
     Ok(value)
 }
 
 /// Read one HTTP/3 frame: `[frame_type varint][length varint][payload]`.
-async fn read_h3_frame<R: tokio::io::AsyncRead + Unpin>(
+fn read_h3_frame<R: Read>(
     r: &mut R,
     max_len: usize,
+    deadline: Instant,
 ) -> std::io::Result<(u64, Vec<u8>)> {
-    let frame_type = read_varint(r).await?;
-    let len = read_varint(r).await? as usize;
+    let frame_type = read_varint(r, deadline)?;
+    let len = read_varint(r, deadline)? as usize;
     if len > max_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -438,7 +420,7 @@ async fn read_h3_frame<R: tokio::io::AsyncRead + Unpin>(
         ));
     }
     let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload).await?;
+    read_exact_deadline(r, &mut payload, deadline)?;
     Ok((frame_type, payload))
 }
 
@@ -447,33 +429,67 @@ async fn read_h3_frame<R: tokio::io::AsyncRead + Unpin>(
 /// The message and padding are drained best-effort with a hard cap so a
 /// peer claiming a huge length field cannot make us block forever. Only the
 /// status byte matters for the relay decision.
-async fn read_tcp_response<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<u8> {
+fn read_tcp_response<R: Read>(r: &mut R) -> Result<u8> {
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut b = [0u8; 1];
-    r.read_exact(&mut b)
-        .await
+    read_exact_deadline(r, &mut b, deadline)
         .map_err(|e| Error::network(format!("Failed to read TCP response: {e}")))?;
     let status = b[0];
 
-    if let Ok(msg_len) = read_varint(r).await {
-        let _ = skip_bounded(r, msg_len as usize).await;
-        if let Ok(pad_len) = read_varint(r).await {
-            let _ = skip_bounded(r, pad_len as usize).await;
+    if let Ok(msg_len) = read_varint(r, deadline) {
+        let _ = skip_bounded(r, msg_len as usize, deadline);
+        if let Ok(pad_len) = read_varint(r, deadline) {
+            let _ = skip_bounded(r, pad_len as usize, deadline);
         }
     }
     Ok(status)
 }
 
 /// Read and discard up to `total` bytes, but never more than a bounded cap.
-async fn skip_bounded<R: tokio::io::AsyncRead + Unpin>(
-    r: &mut R,
-    total: usize,
-) -> std::io::Result<()> {
+fn skip_bounded<R: Read>(r: &mut R, total: usize, deadline: Instant) -> std::io::Result<()> {
     let mut remaining = total.min(MAX_RESPONSE_STRING);
     let mut buf = [0u8; 512];
     while remaining > 0 {
         let take = remaining.min(buf.len());
-        r.read_exact(&mut buf[..take]).await?;
+        read_exact_deadline(r, &mut buf[..take], deadline)?;
         remaining -= take;
+    }
+    Ok(())
+}
+
+/// Read exactly `buf.len()` bytes, retrying transient stalls until
+/// `deadline`. QUIC reads block with a bounded park, so a `read` returning
+/// `WouldBlock`/`TimedOut` consumes nothing and can be safely retried.
+fn read_exact_deadline(
+    stream: &mut dyn Read,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        match stream.read(&mut buf[pos..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                ))
+            }
+            Ok(n) => pos += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "read timed out",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -815,8 +831,8 @@ impl Hysteria2Outbound {
         Ok(cfg)
     }
 
-    async fn get_or_create_connection(&self) -> Result<Arc<Hysteria2Connection>> {
-        let mut conn_guard = self.connection.lock().await;
+    fn get_or_create_connection(&self) -> Result<Arc<Hysteria2Connection>> {
+        let mut conn_guard = self.connection.lock();
 
         if let Some(ref conn) = *conn_guard {
             if !conn.is_closed() {
@@ -824,20 +840,30 @@ impl Hysteria2Outbound {
             }
         }
 
-        let addr = format!("{}:{}", self.hy2_config.server, self.hy2_config.port);
-        let socket_addr: SocketAddr = tokio::net::lookup_host(&addr)
-            .await
-            .map_err(|e| Error::network(format!("Failed to resolve Hysteria2 server {addr}: {e}")))?
-            .next()
-            .ok_or_else(|| {
-                Error::network(format!("No addresses found for Hysteria2 server {addr}"))
-            })?;
+        let socket_addr: SocketAddr = crate::common::socket::resolve_host(
+            &self.hy2_config.server,
+            self.hy2_config.port,
+            Duration::from_secs(30),
+        )
+        .map_err(|e| {
+            Error::network(format!(
+                "Failed to resolve Hysteria2 server {}:{}: {e}",
+                self.hy2_config.server, self.hy2_config.port
+            ))
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Error::network(format!(
+                "No addresses found for Hysteria2 server {}:{}",
+                self.hy2_config.server, self.hy2_config.port
+            ))
+        })?;
 
         let quic_config = self.build_quic_config(socket_addr)?;
         let client = QuicClient::new(quic_config);
         let connection = client
             .connect()
-            .await
             .map_err(|e| Error::network(format!("QUIC connection failed: {e}")))?;
 
         debug!("Hysteria2 QUIC connection established to {socket_addr}");
@@ -848,33 +874,40 @@ impl Hysteria2Outbound {
             self.hy2_config.down_mbps,
         ));
 
-        hy2_conn.authenticate().await?;
+        hy2_conn.authenticate()?;
 
         *conn_guard = Some(hy2_conn.clone());
 
         Ok(hy2_conn)
     }
 
-    pub async fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        let conn = self.get_or_create_connection().await?;
+    pub fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+        let conn = self.get_or_create_connection()?;
         let session_id: u32 = crate::engine::random::u32();
 
-        conn.send_udp_packet(session_id, target, data).await?;
+        conn.send_udp_packet(session_id, target, data)?;
 
+        // QUIC datagram receive blocks until data; bound it with a dedicated
+        // thread + channel receive timeout.
         let timeout = Duration::from_secs(30);
-        let result = tokio::time::timeout(timeout, conn.recv_udp_packet())
-            .await
-            .map_err(|_| Error::network("UDP receive timeout"))?;
+        let conn2 = conn.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(conn2.recv_udp_packet());
+        });
 
-        let (_recv_session_id, _recv_target, payload) = result?;
+        let (_recv_session_id, _recv_target, payload) = match rx.recv_timeout(timeout) {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(Error::network(format!("UDP receive failed: {e}"))),
+            Err(_) => return Err(Error::network("UDP receive timeout")),
+        };
         Ok(payload)
     }
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for Hysteria2Outbound {
-    async fn connect(&self) -> Result<()> {
-        let _conn = self.get_or_create_connection().await?;
+    fn connect(&self) -> Result<()> {
+        let _conn = self.get_or_create_connection()?;
         info!(
             "Hysteria2 outbound '{}' connected to {}:{}",
             self.config.tag, self.hy2_config.server, self.hy2_config.port
@@ -882,8 +915,8 @@ impl OutboundProxy for Hysteria2Outbound {
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
-        let mut conn_guard = self.connection.lock().await;
+    fn disconnect(&self) -> Result<()> {
+        let mut conn_guard = self.connection.lock();
         if let Some(conn) = conn_guard.take() {
             conn.close();
         }
@@ -902,11 +935,11 @@ impl OutboundProxy for Hysteria2Outbound {
         true // Hysteria2 always supports UDP
     }
 
-    async fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        self.relay_udp(target, data).await
+    fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
+        self.relay_udp(target, data)
     }
 
-    async fn test_http_latency(&self, test_url: &str, timeout: Duration) -> Result<Duration> {
+    fn test_http_latency(&self, test_url: &str, timeout: Duration) -> Result<Duration> {
         use std::time::Instant;
 
         let url = crate::common::url::Url::parse(test_url)
@@ -927,149 +960,105 @@ impl OutboundProxy for Hysteria2Outbound {
 
         let start = Instant::now();
 
-        let conn = tokio::time::timeout(timeout, self.get_or_create_connection())
-            .await
-            .map_err(|_| Error::network("Connection timeout"))??;
+        let conn = self.get_or_create_connection()?;
 
         let target = TargetAddr::Domain(host.clone(), url_port);
-        let (mut send, mut recv) = conn.open_tcp_stream(&target).await?;
+        let (mut send, mut recv) = conn.open_tcp_stream(&target)?;
 
         let http_request = format!(
             "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n"
         );
 
         send.write_all(http_request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send HTTP request: {e}")))?;
 
-        let result = tokio::time::timeout(timeout, async {
+        // QUIC stream reads block until data; bound them via a thread + channel.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut response = vec![0u8; 1024];
-            let n = recv
-                .read(&mut response)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read response: {e}")))?;
-            if n == 0 {
-                return Err(Error::network("Empty response"));
-            }
-            let response_str = String::from_utf8_lossy(&response[..n]);
-            if response_str.starts_with("HTTP/") {
-                Ok(())
-            } else {
-                Err(Error::network("Invalid HTTP response"))
-            }
-        })
-        .await;
+            let r = recv.read(&mut response).map(|n| response[..n].to_vec());
+            let _ = tx.send(r);
+        });
 
-        match result {
-            Ok(Ok(())) => {
-                let elapsed = start.elapsed();
-                info!("Hysteria2 latency test success: {}ms", elapsed.as_millis());
-                Ok(elapsed)
-            }
-            Ok(Err(e)) => {
-                warn!("Hysteria2 latency test failed: {e}");
-                Err(e)
-            }
-            Err(_) => {
-                warn!("Hysteria2 latency test timeout");
-                Err(Error::network("Response timeout"))
-            }
+        let response = match rx.recv_timeout(timeout) {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(Error::network(format!("Failed to read response: {e}"))),
+            Err(_) => return Err(Error::network("Response timeout")),
+        };
+
+        let response_str = String::from_utf8_lossy(&response);
+        if response_str.starts_with("HTTP/") {
+            let elapsed = start.elapsed();
+            info!("Hysteria2 latency test success: {}ms", elapsed.as_millis());
+            Ok(elapsed)
+        } else {
+            Err(Error::network("Invalid HTTP response"))
         }
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        inbound: Box<dyn AsyncReadWrite>,
+        inbound: BoxStream,
         target: TargetAddr,
         connection: Option<Arc<TrackedConnection>>,
     ) -> Result<()> {
-        let conn = self.get_or_create_connection().await?;
-        let (mut send, mut recv) = conn.open_tcp_stream(&target).await?;
+        let conn = self.get_or_create_connection()?;
+        let (send, recv) = conn.open_tcp_stream(&target)?;
 
         debug!(
             "Hysteria2: relaying TCP to {target} via {}:{}",
             self.hy2_config.server, self.hy2_config.port
         );
 
-        let tracker = global_tracker();
-        let (mut ri, mut wi) = tokio::io::split(inbound);
+        let pair = QuicStreamPair::new(send, recv);
+        relay_streams!(inbound, pair, connection)
+    }
+}
 
-        let conn_upload = connection.clone();
-        let conn_download = connection.clone();
+/// Combines a QUIC stream's send/recv halves into one duplex `SyncStream` so
+/// the bidirectional relay can drive both directions concurrently (each half
+/// is an independent handle to the same QUIC stream).
+struct QuicStreamPair {
+    send: Mutex<QuicSendStream>,
+    recv: Mutex<QuicRecvStream>,
+}
 
-        let client_to_remote = async {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                let n = ri
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read from inbound: {e}")))?;
-                if n == 0 {
-                    break;
-                }
-                send.write_all(&buf[..n])
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to write to Hysteria2: {e}")))?;
-
-                tracker.add_global_upload(n as u64);
-                if let Some(ref conn) = conn_upload {
-                    conn.add_upload(n as u64);
-                }
-            }
-            send.shutdown().await.ok();
-            Ok::<(), Error>(())
-        };
-
-        let remote_to_client = async {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match recv.read(&mut buf).await {
-                    Ok(n) if n > 0 => {
-                        wi.write_all(&buf[..n]).await.map_err(|e| {
-                            Error::network(format!("Failed to write to inbound: {e}"))
-                        })?;
-
-                        tracker.add_global_download(n as u64);
-                        if let Some(ref conn) = conn_download {
-                            conn.add_download(n as u64);
-                        }
-                    }
-                    Ok(_) => break,
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("reset") || err_str.contains("closed") {
-                            break;
-                        }
-                        return Err(Error::network(format!(
-                            "Failed to read from Hysteria2: {e}"
-                        )));
-                    }
-                }
-            }
-            wi.shutdown().await.ok();
-            Ok::<(), Error>(())
-        };
-
-        let result = tokio::try_join!(client_to_remote, remote_to_client);
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("connection")
-                    || err_str.contains("reset")
-                    || err_str.contains("broken")
-                {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }
+impl QuicStreamPair {
+    fn new(send: QuicSendStream, recv: QuicRecvStream) -> Self {
+        Self {
+            send: Mutex::new(send),
+            recv: Mutex::new(recv),
         }
+    }
+}
+
+impl Read for QuicStreamPair {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.recv.lock().read(buf)
+    }
+}
+
+impl Write for QuicStreamPair {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.send.lock().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send.lock().flush()
+    }
+}
+
+impl crate::common::stream::SyncStream for QuicStreamPair {
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        if matches!(how, std::net::Shutdown::Write | std::net::Shutdown::Both) {
+            // Half-close: queue the QUIC stream FIN after buffered data.
+            self.send.lock().finish()?;
+        }
+        Ok(())
     }
 }
 

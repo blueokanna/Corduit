@@ -1,11 +1,10 @@
+use crate::common::stream::BoxStream;
 use crate::crypto::encoding::{encode as b64_encode, Config as B64Config};
 use crate::engine::config::OutboundConfig;
-use crate::engine::connection_tracker::global_tracker;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::direct::relay_bidirectional_with_connection;
-use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use crate::engine::outbound::{OutboundProxy, TargetAddr};
+use std::io::{BufReader, Write};
+use std::time::Duration;
 
 /// HTTP outbound proxy (HTTP CONNECT tunnel)
 pub struct HttpOutbound {
@@ -21,13 +20,12 @@ pub struct HttpOutbound {
 /// `read_line` has no length limit: a misbehaving proxy that never sends a
 /// newline could grow memory without bound (until the caller's timeout). This
 /// helper stops as soon as the line is delimited, hits the cap, or hits EOF.
-async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<String> {
+fn read_bounded_line<R: std::io::BufRead>(reader: &mut R) -> Result<String> {
     const MAX_LINE: usize = 4096;
     let mut line: Vec<u8> = Vec::with_capacity(128);
     loop {
         let buf = reader
             .fill_buf()
-            .await
             .map_err(|e| Error::network(format!("Failed to read response line: {e}")))?;
         if buf.is_empty() {
             break; // EOF
@@ -55,11 +53,11 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -
 ///
 /// Both the number of lines and their sizes are attacker-controlled; without
 /// a cap a misbehaving proxy could stream headers without end.
-async fn skip_headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<()> {
+fn skip_headers<R: std::io::BufRead>(reader: &mut R) -> Result<()> {
     const MAX_HEADER_BYTES: usize = 16 * 1024;
     let mut total = 0usize;
     loop {
-        let line = read_bounded_line(reader).await?;
+        let line = read_bounded_line(reader)?;
         total += line.len();
         if total > MAX_HEADER_BYTES {
             return Err(Error::network("HTTP proxy response headers too large"));
@@ -71,18 +69,21 @@ async fn skip_headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Res
     Ok(())
 }
 
-#[async_trait::async_trait]
 impl OutboundProxy for HttpOutbound {
-    async fn connect(&self) -> Result<()> {
+    fn connect(&self) -> Result<()> {
         // Test connection to HTTP proxy server
-        let addr = format!("{}:{}", self.server, self.port);
-        let _stream = TcpStream::connect(&addr).await.map_err(|e| {
-            Error::network(format!("Failed to connect to HTTP proxy {}: {}", addr, e))
-        })?;
+        let _stream =
+            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
+                .map_err(|e| {
+                Error::network(format!(
+                    "Failed to connect to HTTP proxy {}:{}: {}",
+                    self.server, self.port, e
+                ))
+            })?;
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    fn disconnect(&self) -> Result<()> {
         Ok(())
     }
 
@@ -94,7 +95,7 @@ impl OutboundProxy for HttpOutbound {
         Some((self.server.clone(), self.port))
     }
 
-    async fn test_http_latency(
+    fn test_http_latency(
         &self,
         test_url: &str,
         timeout: std::time::Duration,
@@ -120,12 +121,15 @@ impl OutboundProxy for HttpOutbound {
 
         let start = Instant::now();
 
-        // Connect to HTTP proxy
-        let server_addr = format!("{}:{}", self.server, self.port);
-        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&server_addr))
-            .await
-            .map_err(|_| Error::network("Connection timeout"))?
+        // Connect to HTTP proxy (bounded by the socket read/write timeouts below)
+        let mut stream = crate::common::socket::connect_host(&self.server, self.port, timeout)
             .map_err(|e| Error::network(format!("Failed to connect: {}", e)))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
         // Send CONNECT request to establish tunnel
         let target_str = format!("{}:{}", host, url_port);
@@ -144,12 +148,11 @@ impl OutboundProxy for HttpOutbound {
 
         stream
             .write_all(connect_request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send CONNECT: {}", e)))?;
 
         // Read CONNECT response
         let mut reader = BufReader::new(&mut stream);
-        let response_line = read_bounded_line(&mut reader).await?;
+        let response_line = read_bounded_line(&mut reader)?;
 
         if !response_line.contains("200") {
             return Err(Error::network(format!(
@@ -159,7 +162,7 @@ impl OutboundProxy for HttpOutbound {
         }
 
         // Skip headers
-        skip_headers(&mut reader).await?;
+        skip_headers(&mut reader)?;
 
         // Now send HTTP request through the tunnel
         let http_request = format!(
@@ -171,51 +174,49 @@ impl OutboundProxy for HttpOutbound {
         let stream = reader.into_inner();
         stream
             .write_all(http_request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send HTTP request: {}", e)))?;
 
-        // Read HTTP response
-        let result = tokio::time::timeout(timeout, async {
-            let mut reader = BufReader::new(stream);
-            let response_line = read_bounded_line(&mut reader).await?;
+        // Read HTTP response (bounded by the socket read timeout)
+        let mut reader = BufReader::new(stream);
+        let response_line = read_bounded_line(&mut reader)?;
 
-            if response_line.starts_with("HTTP/") {
-                Ok(())
-            } else {
-                Err(Error::network("Invalid HTTP response"))
-            }
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => Ok(start.elapsed()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(Error::network("Response timeout")),
+        if response_line.starts_with("HTTP/") {
+            Ok(start.elapsed())
+        } else {
+            Err(Error::network("Invalid HTTP response"))
         }
     }
 
-    async fn relay_tcp(&self, inbound: Box<dyn AsyncReadWrite>, target: TargetAddr) -> Result<()> {
-        self.relay_tcp_with_connection(inbound, target, None).await
+    fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
+        self.relay_tcp_with_connection(inbound, target, None)
     }
 
-    async fn relay_tcp_with_connection(
+    fn relay_tcp_with_connection(
         &self,
-        mut inbound: Box<dyn AsyncReadWrite>,
+        inbound: BoxStream,
         target: TargetAddr,
         connection: Option<std::sync::Arc<crate::engine::connection_tracker::TrackedConnection>>,
     ) -> Result<()> {
         // Connect to HTTP proxy
-        let server_addr = format!("{}:{}", self.server, self.port);
-        let outbound = TcpStream::connect(&server_addr).await.map_err(|e| {
-            Error::network(format!(
-                "Failed to connect to HTTP proxy {}: {}",
-                server_addr, e
-            ))
-        })?;
+        let mut outbound =
+            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
+                .map_err(|e| {
+                Error::network(format!(
+                    "Failed to connect to HTTP proxy {}:{}: {}",
+                    self.server, self.port, e
+                ))
+            })?;
+        outbound
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
+        outbound
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
         tracing::debug!(
-            "HTTP proxy: connected to {} for target {}",
-            server_addr,
+            "HTTP proxy: connected to {}:{} for target {}",
+            self.server,
+            self.port,
             target
         );
 
@@ -235,15 +236,13 @@ impl OutboundProxy for HttpOutbound {
 
         request.push_str("\r\n");
 
-        let mut outbound = outbound;
         outbound
             .write_all(request.as_bytes())
-            .await
             .map_err(|e| Error::network(format!("Failed to send CONNECT request: {}", e)))?;
 
         // Read response
-        let mut reader = BufReader::new(&mut outbound);
-        let response_line = read_bounded_line(&mut reader).await?;
+        let mut reader = BufReader::new(outbound);
+        let response_line = read_bounded_line(&mut reader)?;
 
         // Parse response status
         let parts: Vec<&str> = response_line.split_whitespace().collect();
@@ -264,23 +263,15 @@ impl OutboundProxy for HttpOutbound {
         }
 
         // Skip remaining headers (read until empty line, bounded)
-        skip_headers(&mut reader).await?;
+        skip_headers(&mut reader)?;
 
         // Get the stream back from the reader
         let outbound = reader.into_inner();
-        let mut outbound = outbound;
 
         tracing::debug!("HTTP proxy: tunnel established to {}", target);
 
         // Relay data with traffic tracking
-        let tracker = global_tracker();
-        let result =
-            relay_bidirectional_with_connection(&mut inbound, &mut outbound, tracker, connection)
-                .await;
-
-        let _ = outbound.shutdown().await;
-
-        result
+        relay_streams!(inbound, outbound, connection)
     }
 }
 
