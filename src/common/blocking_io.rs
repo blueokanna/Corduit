@@ -149,10 +149,6 @@ impl<S: CRead + CWrite + Send + 'static> BlockingStream<S> {
                 let mut stream = stream;
                 let mut buf = vec![0u8; IO_CHUNK];
                 let mut shutdown_hook = shutdown_hook;
-                // Set once the async side drops the write half. Combined with
-                // the read half being dropped (checked below), this means the
-                // whole bridge is gone and the stream must be released so the
-                // peer observes EOF.
                 let mut write_gone = false;
 
                 loop {
@@ -186,16 +182,10 @@ impl<S: CRead + CWrite + Send + 'static> BlockingStream<S> {
                         }
                     }
 
-                    // The async side dropped the whole bridge (write half gone
-                    // and no reader left): exit and drop the stream so the
-                    // peer observes EOF. Without this the owner thread would
-                    // spin forever holding the socket open.
                     if write_gone && read_tx.is_closed() {
                         break;
                     }
 
-                    // 2. Try a read. The socket carries a short timeout, so
-                    //    this returns promptly when the peer is silent.
                     match CRead::read(&mut stream, &mut buf) {
                         Ok(n) if n > 0 => {
                             let chunk = buf[..n].to_vec();
@@ -218,10 +208,6 @@ impl<S: CRead + CWrite + Send + 'static> BlockingStream<S> {
                             break;
                         }
                     }
-
-                    // 3. Park briefly, then poll again. Bounds write latency
-                    //    when the peer is idle and lets newly arrived
-                    //    inbound data be noticed by the next read.
                     std::thread::sleep(POLL_INTERVAL);
                 }
             })
@@ -263,7 +249,6 @@ impl<S: CRead + CWrite + Send + 'static> AsyncRead for BlockingStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Serve buffered bytes first.
         if !self.read_pending.is_empty() {
             let n = std::cmp::min(buf.remaining(), self.read_pending.len());
             for b in self.read_pending.drain(..n) {
@@ -306,8 +291,6 @@ impl<S: CRead + CWrite + Send + 'static> AsyncWrite for BlockingStream<S> {
         if let Some(e) = self.inner.write_error.lock().unwrap().take() {
             return Poll::Ready(Err(e));
         }
-        // Reserve one slot without blocking the runtime; the caller retries
-        // the same buffer when we return `Pending` (AsyncWrite contract).
         let mut slot = std::pin::pin!(self.write_tx.reserve());
         match slot.as_mut().poll(cx) {
             Poll::Ready(Ok(permit)) => {
@@ -353,8 +336,6 @@ impl<S: CRead + CWrite + Send + 'static> AsyncWrite for BlockingStream<S> {
             return Poll::Ready(Ok(()));
         }
         self.write_closed = true;
-        // Deliver the shutdown message even when the channel is full; the
-        // owner thread drains whatever precedes it first.
         let mut slot = std::pin::pin!(self.write_tx.reserve());
         match slot.as_mut().poll(cx) {
             Poll::Ready(Ok(permit)) => {
@@ -394,13 +375,9 @@ mod tests {
         stream.set_read_timeout(Some(POLL_INTERVAL)).unwrap();
         let bridge = BlockingStream::new(stream, 8, None);
 
-        // tokio refuses to wrap a blocking-mode socket (it would block the
-        // runtime reactor thread); flip the fd before handing it over. This
-        // is required on Unix — `TcpStream::from_std` panics otherwise.
         let raw_peer = Arc::try_unwrap(peer).unwrap();
         raw_peer.set_nonblocking(true).unwrap();
         let mut client = tokio::net::TcpStream::from_std(raw_peer).unwrap();
-        // Server side: read the full payload (TCP may split it), echo it.
         const PAYLOAD: &[u8] = b"hello bridge"; // 12 bytes
         let server = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -441,29 +418,35 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_runs_hook_and_closes() {
-        let (_peer, stream) = socket_pair();
+        let (peer, stream) = socket_pair();
         stream.set_read_timeout(Some(POLL_INTERVAL)).unwrap();
-        let hook_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hook_flag = hook_called.clone();
+
+        let (hook_tx, hook_rx) = std::sync::mpsc::channel::<()>();
         let bridge = BlockingStream::new(
             stream,
             8,
             Some(Box::new(move |_s: &mut Arc<TcpStream>| {
-                hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = hook_tx.send(());
             })),
         );
         let mut bridge = bridge;
         bridge.shutdown().await.unwrap();
-        // Give the owner thread a moment to run the hook.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(hook_called.load(std::sync::atomic::Ordering::SeqCst));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while hook_rx.try_recv().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown hook did not run within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        drop(peer);
+        drop(bridge);
     }
 
     #[test]
     fn writer_and_reader_share_stream_concurrently() {
-        // Full-duplex echo through the bridge: the raw peer echoes every
-        // byte it receives while the bridge both writes and reads at the
-        // same time. The single-owner design must not deadlock or starve.
         let (peer, stream) = socket_pair();
         stream.set_read_timeout(Some(POLL_INTERVAL)).unwrap();
 
@@ -494,11 +477,6 @@ mod tests {
         rt.block_on(async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut bridge = BlockingStream::new(stream, 8, None);
-            // Larger than one read chunk, so multiple read/write cycles
-            // interleave. Write and read in alternating chunks — a
-            // write-then-read burst with an echoing peer deadlocks at the
-            // TCP layer (both directions' buffers fill), which is a property
-            // of the echo, not the bridge.
             let payload = vec![0x5au8; 64 * 1024];
             let mut written = 0;
             let mut received = Vec::new();
@@ -527,8 +505,6 @@ mod tests {
             assert_eq!(received, payload);
         });
 
-        // Dropping the bridge closed the server end; the echo thread then
-        // observed EOF and exited with the full byte count.
         assert_eq!(echo_handle.join().unwrap(), 64 * 1024);
     }
 }
