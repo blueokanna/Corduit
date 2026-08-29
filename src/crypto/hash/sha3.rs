@@ -121,7 +121,8 @@ impl Sha3 {
 
     fn absorb_block(&mut self, block: &[u8]) {
         debug_assert_eq!(block.len(), self.rate);
-        for (i, chunk) in block.chunks_exact(8).enumerate() {
+        debug_assert!(self.rate.is_multiple_of(8));
+        for (i, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
             self.state[i] ^= load_u64_le(chunk);
         }
         keccak_f1600(&mut self.state);

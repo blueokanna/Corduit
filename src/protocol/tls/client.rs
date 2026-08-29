@@ -67,7 +67,7 @@ impl TlsConnector {
         let connector = self.inner.clone();
 
         tokio::task::spawn_blocking(move || {
-            let std_stream = stream.into_std().map_err(|e| TlsError::Io(e))?;
+            let std_stream = stream.into_std().map_err(TlsError::Io)?;
             let _ = std_stream.set_nodelay(true);
             let _ = std_stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
             let _ = std_stream.set_write_timeout(Some(WRITE_TIMEOUT));
@@ -81,14 +81,11 @@ impl TlsConnector {
             // thread is never starved by a blocked reader.
             let _ = arc.set_read_timeout(Some(RELAY_READ_TIMEOUT));
 
-            let hook: Box<
-                dyn FnOnce(
-                        &mut courierust::courierust_tls::TlsStream<
-                            Arc<std::net::TcpStream>,
-                            Arc<std::net::TcpStream>,
-                        >,
-                    ) + Send,
-            > = Box::new(|s| {
+            type Stream = courierust::courierust_tls::TlsStream<
+                Arc<std::net::TcpStream>,
+                Arc<std::net::TcpStream>,
+            >;
+            let hook: crate::common::ShutdownHook<Stream> = Box::new(|s| {
                 let _ = s.close_notify();
             });
 

@@ -171,14 +171,14 @@ impl DotClient {
             // Resolve the host (courierust's transport is synchronous).
             let addrs: Vec<SocketAddr> = (server.as_str(), port)
                 .to_socket_addrs()
-                .map_err(|e| DnsError::Io(e))?
+                .map_err(DnsError::Io)?
                 .collect();
             let addr = addrs
                 .first()
                 .copied()
                 .ok_or_else(|| DnsError::Config(format!("no address for {server}:{port}")))?;
 
-            let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|e| DnsError::Io(e))?;
+            let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(DnsError::Io)?;
             let _ = tcp.set_read_timeout(Some(timeout));
             let _ = tcp.set_write_timeout(Some(timeout));
 

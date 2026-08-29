@@ -80,8 +80,8 @@ impl Url {
     ///
     /// Returns [`UrlError`] for any malformed input. The parser accepts the
     /// `http`, `https`, `ws`, `wss`, `ftp` and `ssh` schemes, plus the
-    /// `ss`/`trojan`/`vmess`/`vless`/`tuic`/`hysteria2` proxy schemes used by
-    /// Corduit outbound configurations.
+    /// `ss`/`trojan`/`vmess`/`vless` proxy schemes used by Corduit outbound
+    /// configurations.
     pub fn parse(input: &str) -> Result<Self, UrlError> {
         if input.is_empty() {
             return Err(UrlError::Empty);
@@ -391,16 +391,7 @@ mod tests {
 
     #[test]
     fn proxy_schemes_are_accepted() {
-        for scheme in [
-            "ss",
-            "vmess",
-            "vless",
-            "trojan",
-            "tuic",
-            "hysteria2",
-            "socks5",
-            "http",
-        ] {
+        for scheme in ["ss", "vmess", "vless", "trojan", "socks5", "http"] {
             let url = Url::parse(&format!("{scheme}://user:pass@host:10086")).unwrap();
             assert_eq!(url.scheme(), scheme);
             assert_eq!(url.host_str(), Some("host"));

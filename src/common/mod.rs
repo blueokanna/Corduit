@@ -34,6 +34,7 @@ pub mod roots;
 pub mod url;
 
 pub use blocking_io::BlockingStream;
+pub(crate) use blocking_io::ShutdownHook;
 pub use http::{HttpClient, HttpError, HttpResponse};
 pub use url::{Url, UrlError};
 

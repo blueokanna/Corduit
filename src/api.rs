@@ -21,8 +21,8 @@ where
 }
 
 pub fn init_app() {
-    // Ensure a rustls crypto provider is active before any TLS consumer
-    // (quinn, tokio-rustls, protocol layer) builds its first configuration.
+    // Keep the legacy rustls provider hook for API compatibility; courierust
+    // carries its own crypto primitives.
     crate::engine::tls::install_crypto_provider();
 
     if TRACING_INITIALIZED
@@ -36,9 +36,8 @@ pub fn init_app() {
 fn init_tracing_safe() -> std::result::Result<(), ()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("debug,corduit=debug,hyper=warn,tokio=warn,rustls=warn")
-    });
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("debug,corduit=debug,tokio=warn"));
 
     let bridge_log_layer = BridgeLogLayer;
     #[cfg(target_os = "android")]
@@ -1480,9 +1479,6 @@ fn parse_outbound_type(value: &str, tag: &str) -> Result<crate::engine::Outbound
         "wireguard" => Ok(OutboundType::Wireguard),
         "socks" | "socks5" => Ok(OutboundType::Socks5),
         "http" => Ok(OutboundType::Http),
-        "tuic" => Ok(OutboundType::Tuic),
-        "hysteria2" | "hy2" => Ok(OutboundType::Hysteria2),
-        "quic" | "shadowquic" => Ok(OutboundType::Quic),
         "selector" => Ok(OutboundType::Selector),
         "urltest" | "url-test" => Ok(OutboundType::Urltest),
         "fallback" => Ok(OutboundType::Fallback),
@@ -3488,13 +3484,14 @@ mod config_conversion_tests {
     #[test]
     fn supported_aliases_are_explicit() {
         assert_eq!(
-            parse_outbound_type("hy2", "proxy").unwrap(),
-            crate::engine::OutboundType::Hysteria2
-        );
-        assert_eq!(
             parse_outbound_type("socks", "proxy").unwrap(),
             crate::engine::OutboundType::Socks5
         );
+        // QUIC-based protocols were removed with the quinn dependency; they
+        // must be rejected, never silently downgraded.
+        assert!(parse_outbound_type("tuic", "proxy").is_err());
+        assert!(parse_outbound_type("hysteria2", "proxy").is_err());
+        assert!(parse_outbound_type("quic", "proxy").is_err());
     }
 
     #[test]

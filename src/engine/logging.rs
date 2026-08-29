@@ -109,16 +109,6 @@ fn init_logging_inner(level: LogLevel) -> Result<()> {
             "tokio=warn"
                 .parse()
                 .map_err(|e| Error::config(format!("Invalid log directive: {}", e)))?,
-        )
-        .add_directive(
-            "hyper=warn"
-                .parse()
-                .map_err(|e| Error::config(format!("Invalid log directive: {}", e)))?,
-        )
-        .add_directive(
-            "rustls=warn"
-                .parse()
-                .map_err(|e| Error::config(format!("Invalid log directive: {}", e)))?,
         );
 
     // Create formatter for console

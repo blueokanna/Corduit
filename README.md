@@ -26,9 +26,12 @@ together, and are released as one unit.
 
 What you get out of the box:
 
-- **Protocols**: Shadowsocks, VMess, VLESS, Trojan, TUIC, Hysteria2, WireGuard,
-  SOCKS5, HTTP(S), QUIC — plus proxy groups (selector, url-test, fallback,
-  load-balance, relay).
+- **Protocols**: Shadowsocks, VMess, VLESS, Trojan, WireGuard, SOCKS5,
+  HTTP(S) — plus proxy groups (selector, url-test, fallback, load-balance,
+  relay).
+- **Self-contained HTTP/TLS**: every HTTP/1.1, HTTP/2, HTTP/3, TLS 1.2/1.3
+  and WebSocket exchange runs on [courierust](https://crates.io/crates/courierust)
+  — a zero-dependency codec stack. No hyper, no rustls, no tokio-tungstenite.
 - **Anti-pollution DNS**: UDP/TCP/DoH/DoT servers and clients, TTL-aware cache,
   fake-IP, hosts, bogon filtering, split resolution.
 - **TUN support**: a userspace TCP/IP stack (SolidTCP) with NAT for transparent
@@ -108,10 +111,10 @@ src/
 ├── ffi.rs          # hand-written C ABI
 ├── rpc/            # shared dispatch + localhost HTTP/WebSocket JSON-RPC
 ├── types.rs        # shared DTOs
-├── common/         # URL parser + HTTP client
+├── common/         # URL parser, courierust HTTP client/server, blocking-IO bridge, roots
 ├── engine/         # config, routing, inbound/outbound, stats
 ├── crypto/         # in-repo crypto primitives
-├── protocol/       # wire protocols (TLS, QUIC, TUIC, WireGuard…)
+├── protocol/       # wire protocols (TLS, WebSocket, WireGuard…)
 ├── dns/            # DNS servers/clients, cache, fake-IP
 └── netstack/       # userspace TCP/IP, TUN, NAT, VPN drivers
 ```
@@ -124,7 +127,21 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-MSRV: Rust 1.95.
+MSRV: Rust 1.95. The crate builds with **no HTTP/TLS/QUIC third-party
+dependencies** — the entire stack is courierust plus hand-rolled protocol
+codecs in-tree.
+
+## Why the old HTTP/TLS/QUIC stack is gone
+
+Corduit used to depend on hyper/h2/http, rustls + tokio-rustls, and quinn for
+its network layer. Each pulled its own dependency tree, its own TLS provider,
+its own release cadence, and its own security advisories. The engine now talks
+HTTP/1.1, HTTP/2, HTTP/3, TLS 1.2/1.3 and WebSocket through courierust (a
+zero-dependency codec suite) and hand-written RFC 6455 framing, with the
+blocking/async seam bridged by an in-house thread-pumped adapter. The QUIC-based
+outbound transports (TUIC, Hysteria2, VMess-over-QUIC) were removed along with
+quinn — courierust's QUIC surface is codec-only, and shipping a from-scratch
+QUIC stack that interoperates with real servers wasn't worth the risk.
 
 ## Security
 

@@ -121,8 +121,9 @@ impl RouteManager {
     pub fn restore_routes(&mut self) -> Result<()> {
         info!("Restoring original routes");
 
-        // Remove all routes we added
-        for route in self.added_routes.drain(..).collect::<Vec<_>>() {
+        // Remove all routes we added (take the whole collection so the
+        // borrow checker allows deleting routes while iterating).
+        for route in std::mem::take(&mut self.added_routes) {
             if let Err(e) = self.delete_route(&route) {
                 warn!("Failed to delete route {:?}: {}", route, e);
             }

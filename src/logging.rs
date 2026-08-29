@@ -18,10 +18,7 @@ where
         let level = metadata.level();
         let target = metadata.target();
 
-        if target.starts_with("tokio")
-            || target.starts_with("hyper")
-            || target.starts_with("rustls")
-        {
+        if target.starts_with("tokio") {
             return;
         }
 

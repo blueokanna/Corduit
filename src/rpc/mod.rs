@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn every_declared_method_is_dispatched() {
-        // Ensure platform hooks (incl. the rustls crypto provider) are ready
+        // Ensure platform hooks (incl. the legacy crypto-provider no-op) are ready
         // before dispatching methods that build HTTP clients.
         api::init_app();
 

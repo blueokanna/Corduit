@@ -17,12 +17,9 @@ categories = [
 ]
 
 [features]
-default = ["quic", "tls", "wireguard", "tuic", "tuic-quinn"]
-quic = []
+default = ["tls", "wireguard"]
 tls = []
 wireguard = []
-tuic = []
-tuic-quinn = []
 
 [dependencies]
 
@@ -52,36 +49,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # --- HTTP / TLS / QUIC (self-contained engine) ------------------------------
-courierust = { version = "1.0.3" }
 
-# --- TEMPORARY: legacy HTTP/TLS/QUIC deps during migration to courierust -----
-# Removed once every module has migrated. Do NOT add new code that depends on
-# them.
-h2 = "0.4"
-http = "1"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
-hyper-util = { version = "0.1", features = [
-    "tokio",
-    "server-auto",
-    "client-legacy",
-] }
-quinn = { version = "0.11.11", default-features = false, features = [
-    "futures-io",
-    "runtime-tokio",
-    "rustls",
-] }
-rustls = { version = "0.23", default-features = false, features = [
-    "std",
-    "ring",
-] }
-rustls-native-certs = "0.8"
-rustls-pki-types = "1"
-tokio-rustls = { version = "0.26", default-features = false, features = [
-    "ring",
-] }
-tokio-tungstenite = "0.30.0"
-webpki-roots = "1"
+courierust = { version = "1.0.3" }
 
 # --- DNS ---------------------------------------------------------------------
 ipnet = "2"

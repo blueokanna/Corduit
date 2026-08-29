@@ -406,7 +406,7 @@ fn read_to_eof_capped<R: CRead>(
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read_more(&mut chunk) {
-            Ok(n) if n == 0 => return Ok(out),
+            Ok(0) => return Ok(out),
             Ok(n) => {
                 if out.len() + n > max {
                     return Err(HttpError::BodyTooLarge);

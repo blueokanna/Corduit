@@ -162,7 +162,7 @@ impl HttpInbound {
         }
         self.running
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let _ = self.cancel_token.cancel();
+        self.cancel_token.cancel();
         Ok(())
     }
 }

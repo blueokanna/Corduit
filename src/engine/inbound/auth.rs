@@ -97,20 +97,12 @@ where
     auth.check(username, password)
 }
 
-/// Look up a header value by (case-insensitive) name. Implemented for the
-/// courierust header map and for `http::HeaderMap` (kept for any legacy
-/// callers until they are fully migrated).
+/// Look up a header value by (case-insensitive) name.
 pub trait HeaderLookup {
     fn lookup(&self, name: &str) -> Option<&str>;
 }
 
 impl HeaderLookup for courierust::courierust_http::HeaderMap {
-    fn lookup(&self, name: &str) -> Option<&str> {
-        self.get(name).and_then(|v| v.to_str().ok())
-    }
-}
-
-impl HeaderLookup for http::HeaderMap {
     fn lookup(&self, name: &str) -> Option<&str> {
         self.get(name).and_then(|v| v.to_str().ok())
     }
@@ -196,42 +188,45 @@ mod tests {
         assert!(!checker.check("", "s3cret"));
     }
 
+    use courierust::courierust_http::{HeaderName, HeaderValue};
+
+    fn set_header(headers: &mut courierust::courierust_http::HeaderMap, value: &str) {
+        headers.insert(
+            HeaderName::from_static("proxy-authorization"),
+            HeaderValue::from(value.to_string()),
+        );
+    }
+
     #[test]
     fn open_inbound_when_no_credentials() {
         let checker = InboundAuth::new(None);
-        let mut headers = hyper::HeaderMap::new();
+        let mut headers = courierust::courierust_http::HeaderMap::new();
         // No header at all is accepted when auth is not required.
         assert!(check_proxy_authorization(&headers, &checker));
-        headers.insert("proxy-authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        set_header(&mut headers, "Basic dXNlcjpwYXNz");
         assert!(check_proxy_authorization(&headers, &checker));
     }
 
     #[test]
     fn basic_auth_round_trip() {
         let checker = auth("user", "pass");
-        let mut headers = hyper::HeaderMap::new();
+        let mut headers = courierust::courierust_http::HeaderMap::new();
         let encoded = encoding::encode(b"user:pass", Config::STANDARD);
 
-        headers.insert(
-            "proxy-authorization",
-            format!("Basic {encoded}").parse().unwrap(),
-        );
+        set_header(&mut headers, &format!("Basic {encoded}"));
         assert!(check_proxy_authorization(&headers, &checker));
 
         // Wrong password.
         let encoded = encoding::encode(b"user:nope", Config::STANDARD);
-        headers.insert(
-            "proxy-authorization",
-            format!("Basic {encoded}").parse().unwrap(),
-        );
+        set_header(&mut headers, &format!("Basic {encoded}"));
         assert!(!check_proxy_authorization(&headers, &checker));
 
         // Missing header / malformed scheme / bad base64 are all rejected.
         headers.clear();
         assert!(!check_proxy_authorization(&headers, &checker));
-        headers.insert("proxy-authorization", "Bearer abc".parse().unwrap());
+        set_header(&mut headers, "Bearer abc");
         assert!(!check_proxy_authorization(&headers, &checker));
-        headers.insert("proxy-authorization", "Basic !!!".parse().unwrap());
+        set_header(&mut headers, "Basic !!!");
         assert!(!check_proxy_authorization(&headers, &checker));
     }
 }

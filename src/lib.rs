@@ -11,7 +11,7 @@
 //! * [`crypto`]   — cryptographic primitives (digests, AEAD, KDF, X25519…).
 //! * [`dns`]      — DNS resolver, cache, fake-IP and DoH/DoT servers.
 //! * [`netstack`] — userspace TCP/IP stack for TUN-based transparent proxy.
-//! * [`protocol`] — wire protocols & transports (TLS, QUIC, TUIC, WireGuard…).
+//! * [`protocol`] — wire protocols & transports (TLS, WireGuard…).
 //!
 //! ## Examples
 //!

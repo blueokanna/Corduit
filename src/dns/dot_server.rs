@@ -121,7 +121,7 @@ impl DotServer {
                     }
                 }
             })
-            .map_err(|e| DnsError::Io(e))?;
+            .map_err(DnsError::Io)?;
 
         let _ = shutdown_rx.recv().await;
         shutdown.store(true, Ordering::SeqCst);

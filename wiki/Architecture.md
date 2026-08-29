@@ -13,7 +13,7 @@ flowchart TB
     ROOT --> FFI["ffi.rs<br/>手写 C ABI"]
     ROOT --> RPC["rpc/<br/>分发表 + HTTP/WebSocket 服务"]
     ROOT --> TYPES["types.rs<br/>共享 DTO"]
-    ROOT --> COMMON["common/<br/>URL 解析 + HTTP 客户端"]
+    ROOT --> COMMON["common/<br/>URL 解析 + courierust HTTP 客户端/服务端<br/>+ 阻塞-异步桥 + 根证书"]
     ROOT --> ENGINE["engine/<br/>代理引擎核心"]
     ROOT --> CRYPTO["crypto/<br/>加密原语"]
     ROOT --> PROTOCOL["protocol/<br/>线缆协议"]
@@ -22,7 +22,7 @@ flowchart TB
 
     ENGINE --> EC["config/<br/>校验过的配置模型"]
     ENGINE --> EI["inbound/<br/>HTTP / SOCKS5 / mixed 监听"]
-    ENGINE --> EO["outbound/<br/>Direct/SS/VMess/VLESS/Trojan/TUIC/Hy2/WireGuard...<br/>+ proxy-provider 节点注册表"]
+    ENGINE --> EO["outbound/<br/>Direct/SS/VMess/VLESS/Trojan/WireGuard/HTTP(S)/SOCKS5<br/>+ proxy-provider 节点注册表"]
     ENGINE --> ER["routing.rs<br/>规则 → 出站匹配 + rule-provider 管理"]
     ENGINE --> EG["geoip.rs + mmdb.rs<br/>CountryMatcher + MMDB 读取"]
     ENGINE --> EP["proxy.rs<br/>ProxyManager 协调器"]
@@ -141,3 +141,16 @@ flowchart LR
 ```
 
 详细说明见 [Security](Security)。
+
+## no_std 边界
+
+引擎整体**不能** no_std——它跑在 tokio 上，依赖 `std::net`、线程、TUN 驱动和文件系统。可以独立出来做 no_std 的部分：
+
+| 模块 | 状态 |
+|---|---|
+| `crypto/`（哈希/MAC/流密码/AEAD/KDF/X25519/Base64/Hex/UUID） | ✅ 已 no_std：全模块零 `std::` 引用，只用 `core` + `alloc`，无任何外部依赖 |
+| `protocol/address.rs`（SOCKS 地址编解码） | ⚠️ 接近：仅 `fmt` / `io::Cursor` / `net` 三处 std，可平移 |
+| `dns/wire.rs`（DNS 报文编解码） | ⚠️ 接近：`fmt` / `net` / `HashMap` 可换 `core` / `alloc` |
+| `engine` / `rpc` / `api` / `ffi` / `netstack` / `common` | ❌ 依赖 tokio + std + 平台 API，无法 no_std |
+
+也就是说：**加密与线缆编解码核心可以无 std 复用（比如做固件/嵌入式端）**，但完整代理引擎需要 std + tokio，这是设计使然，不是遗漏。

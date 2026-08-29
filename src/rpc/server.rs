@@ -219,10 +219,7 @@ fn handle_http_request(
 
     // Only `POST /rpc` is the JSON-RPC endpoint.
     if req.method != Method::POST || path != "/rpc" {
-        return json_response(
-            StatusCode::NOT_FOUND,
-            r#"{"code":1,"error":"not found"}"#,
-        );
+        return json_response(StatusCode::NOT_FOUND, r#"{"code":1,"error":"not found"}"#);
     }
 
     // Bearer-token authorization (constant-time comparison).
@@ -340,7 +337,10 @@ fn is_websocket_upgrade(req: &Request<Body>) -> bool {
         .headers
         .get("connection")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")));
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        });
     upgrade && connection
 }
 

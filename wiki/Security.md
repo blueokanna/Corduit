@@ -28,7 +28,7 @@ Corduit 同时做**依赖图审计**与**源码级加固**。
 | 项 | 状态 |
 |---|---|
 | CWE-78 命令注入 | 接口名进 PowerShell/netsh 前经 `sanitize_interface_name` 校验 |
-| CWE-190 整数截断 | QUIC 负载 > 64 KiB 直接拒绝；SOCKS5 凭据按 RFC 1929 校验长度 |
+| CWE-190 整数截断 | SOCKS5 凭据按 RFC 1929 校验长度；WebSocket 帧长按 RFC 6455 校验且 ≤16 MiB |
 | CWE-295 TLS 校验 | `skip_cert_verify` 默认关；只有显式配置才绕过；默认用系统根证书 |
 | CWE-400 资源耗尽 | DNS 压缩指针 ≤128 跳；MMDB 读取全程边界检查；HTTP body ≤64 MiB；RPC body/WS 消息 ≤16 MiB；RPC 连接 600s 上限 |
 | CWE-306 缺少鉴权 | RPC 必须 token |

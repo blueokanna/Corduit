@@ -19,7 +19,8 @@ Corduit 反过来：**一个 crate 里装下全部**——配置模型、规则�
 
 开箱即有的东西：
 
-- **协议**：Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、WireGuard、SOCKS5、HTTP(S)、QUIC，加上代理组（选择、测速、回退、负载均衡、中继）。
+- **协议**：Shadowsocks、VMess、VLESS、Trojan、WireGuard、SOCKS5、HTTP(S)，加上代理组（选择、测速、回退、负载均衡、中继）。
+- **HTTP/TLS 全部自包含**：HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket 全走 [courierust](https://crates.io/crates/courierust)（零依赖编解码栈），外加仓库内手写的 RFC 6455 帧。不再有 hyper、rustls、tokio-tungstenite。
 - **抗污染 DNS**：UDP/TCP/DoH/DoT 服务端与客户端、TTL 缓存、fake-IP、hosts、Bogon 过滤、国内外分流。
 - **TUN 支持**：仓库内用户态 TCP/IP 栈（SolidTCP）加 NAT，Windows / Linux / macOS / Android 都能做透明代理。
 - **热重载**：`Corduit::reload()` 原子换配置。
@@ -93,10 +94,10 @@ src/
 ├── ffi.rs          # 手写 C ABI
 ├── rpc/            # 共享分发表 + 本地 HTTP/WebSocket JSON-RPC
 ├── types.rs        # 共享 DTO
-├── common/         # URL 解析 + HTTP 客户端
+├── common/         # URL 解析、courierust HTTP 客户端/服务端、阻塞-异步桥、根证书
 ├── engine/         # 配置、路由、入站/出站、统计
 ├── crypto/         # 仓库内加密原语
-├── protocol/       # 线缆协议（TLS、QUIC、TUIC、WireGuard…）
+├── protocol/       # 线缆协议（TLS、WebSocket、WireGuard…）
 ├── dns/            # DNS 服务端/客户端、缓存、fake-IP
 └── netstack/       # 用户态 TCP/IP、TUN、NAT、VPN 驱动
 ```
@@ -109,7 +110,11 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-最低 Rust 版本：1.95。
+最低 Rust 版本：1.95。整个 crate 不依赖任何第三方 HTTP/TLS/QUIC 库——网络层全是 courierust 加仓库内手写协议编解码。
+
+## 为什么旧 HTTP/TLS/QUIC 栈没了
+
+以前 Corduit 的网络层靠 hyper/h2/http、rustls + tokio-rustls、quinn 拼起来：每个都带自己的依赖树、自己的 TLS provider、自己的发版节奏和自己的安全公告。现在 HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket 全走 courierust（零依赖），RFC 6455 帧是手写的，阻塞/异步之间的缝隙由仓库内一个单线程泵的适配器补上。基于 QUIC 的出站传输（TUIC、Hysteria2、VMess-over-QUIC）连同 quinn 一起移除了——courierust 的 QUIC 只有编解码器，为一个没法跟真实服务器互通的自研 QUIC 栈承担风险不值。
 
 ## 安全
 

@@ -111,15 +111,13 @@
 | WireGuard | `wireguard` | `private_key`, `public_key`, `endpoint`, `allowed_ips` |
 | SOCKS5 | `socks5` / `socks` | `username`, `password`, `udp` |
 | HTTP | `http` | `username`, `password` |
-| TUIC | `tuic` | `uuid`, `password`, `congestion_control` |
-| Hysteria2 | `hysteria2` / `hy2` | `password`, `up`, `down`, `sni` |
 | 选择组 | `selector` / `select` | `outbounds: [tag,...]`，可选 `use: [provider]` |
 | 测速组 | `url-test` / `urltest` | `outbounds`, `url`, `interval` |
 | 回退组 | `fallback` | `outbounds`, `url` |
 | 负载均衡 | `load-balance` | `outbounds` |
 | 中继 | `relay` | `outbounds`（链式） |
 
-> 关于 `quic`：`type` 枚举能解析 `quic`/`shadowquic`，但**引擎未实现该出站**，配置里出现会直接报错（拒绝静默直连降级），不是可用的协议。
+> `tuic`/`hysteria2`/`quic` 等基于 QUIC 的出站已随 quinn 依赖一起移除：`type` 解析器不认识这些值，配置里出现会直接报错（拒绝静默直连降级）。
 
 > 任何出站都能加 `skip-cert-verify: true` 跳过 TLS 证书校验（默认关闭，仅显式配置时生效）。
 

@@ -75,9 +75,3 @@ impl From<crate::dns::wire::WireError> for DnsError {
         DnsError::Protocol(e.to_string())
     }
 }
-
-impl From<rustls::Error> for DnsError {
-    fn from(e: rustls::Error) -> Self {
-        DnsError::Tls(e.to_string())
-    }
-}

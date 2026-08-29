@@ -93,7 +93,6 @@ pub mod prelude {
     pub use crate::protocol::error::{ProtocolError, Result};
 
     pub use crate::protocol::transport::{
-        GrpcConfig, GrpcMode, GrpcStream, GrpcTransport, H2Config, H2Stream, H2Transport,
         TlsConfig, TlsFingerprint, TlsStream, TlsTransport, TransportError, WebSocketConfig,
         WebSocketTransport, WsStream,
     };

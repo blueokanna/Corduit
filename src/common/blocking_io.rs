@@ -55,6 +55,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
+/// Optional graceful-shutdown hook run by the owner thread (e.g. emitting a
+/// TLS `close_notify`).
+pub(crate) type ShutdownHook<S> = Box<dyn FnOnce(&mut S) + Send>;
+
 /// Byte buffer size used by the owner thread (also the max `poll_write`
 /// message size accepted in one chunk).
 const IO_CHUNK: usize = 16 * 1024;
@@ -130,11 +134,7 @@ impl<S: CRead + CWrite + Send + 'static> BlockingStream<S> {
     /// # Panics
     ///
     /// Panics if the owner thread cannot be spawned.
-    pub fn new(
-        stream: S,
-        read_capacity: usize,
-        shutdown_hook: Option<Box<dyn FnOnce(&mut S) + Send>>,
-    ) -> Self {
+    pub fn new(stream: S, read_capacity: usize, shutdown_hook: Option<ShutdownHook<S>>) -> Self {
         let inner = Arc::new(Inner {
             write_error: Mutex::new(None),
         });

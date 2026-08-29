@@ -177,12 +177,10 @@ impl AesGcm {
             }
             let h = self.h();
             let mut state = 0u128;
-            let mut chunks = nonce.chunks_exact(16);
-            for c in &mut chunks {
-                let block: [u8; 16] = c.try_into().expect("16");
-                state = gf_mul(state ^ u128::from_be_bytes(block), h);
+            let (blocks, rem) = nonce.as_chunks::<16>();
+            for block in blocks {
+                state = gf_mul(state ^ u128::from_be_bytes(*block), h);
             }
-            let rem = chunks.remainder();
             if !rem.is_empty() {
                 let mut block = [0u8; 16];
                 block[..rem.len()].copy_from_slice(rem);

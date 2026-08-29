@@ -7,16 +7,12 @@ use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{AsyncReadWrite, OutboundProxy, TargetAddr};
-use crate::engine::tls::SkipServerVerification;
 use dashmap::DashMap;
-use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 
 const VMESS_VERSION: u8 = 1;
 const VMESS_AEAD_AUTH_LEN: usize = 16;
@@ -98,7 +94,6 @@ pub enum VmessTransport {
     Ws,
     H2,
     Grpc,
-    Quic,
 }
 
 impl VmessTransport {
@@ -107,7 +102,7 @@ impl VmessTransport {
             "ws" | "websocket" => VmessTransport::Ws,
             "h2" | "http2" => VmessTransport::H2,
             "grpc" => VmessTransport::Grpc,
-            "quic" => VmessTransport::Quic,
+            "quic" => VmessTransport::Tcp,
             _ => VmessTransport::Tcp,
         }
     }
@@ -176,76 +171,6 @@ impl VmessUdpSession {
         } else {
             true
         }
-    }
-}
-
-/// QUIC bidirectional stream wrapper that implements AsyncRead and AsyncWrite
-pub struct QuicBiStream {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-}
-
-impl QuicBiStream {
-    pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { send, recv }
-    }
-}
-
-impl AsyncRead for QuicBiStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use std::task::Poll;
-
-        let this = self.get_mut();
-        let recv = &mut this.recv;
-        let unfilled = buf.initialize_unfilled();
-        use futures::AsyncRead as FuturesAsyncRead;
-        let pinned = std::pin::Pin::new(recv);
-
-        match FuturesAsyncRead::poll_read(pinned, cx, unfilled) {
-            Poll::Ready(Ok(n)) => {
-                buf.advance(n);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for QuicBiStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        use futures::AsyncWrite as FuturesAsyncWrite;
-        let this = self.get_mut();
-        let pinned = std::pin::Pin::new(&mut this.send);
-        FuturesAsyncWrite::poll_write(pinned, cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use futures::AsyncWrite as FuturesAsyncWrite;
-        let this = self.get_mut();
-        let pinned = std::pin::Pin::new(&mut this.send);
-        FuturesAsyncWrite::poll_flush(pinned, cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use futures::AsyncWrite as FuturesAsyncWrite;
-        let this = self.get_mut();
-        let pinned = std::pin::Pin::new(&mut this.send);
-        FuturesAsyncWrite::poll_close(pinned, cx)
     }
 }
 
@@ -695,10 +620,9 @@ pub struct VmessOutbound {
     skip_cert_verify: bool,
     sni: Option<String>,
     ws_opts: Option<VmessWsOptions>,
-    // QUIC-specific fields
-    quic_endpoint: Mutex<Option<Endpoint>>,
-    quic_connection: Mutex<Option<quinn::Connection>>,
-    quic_alpn: Vec<String>,
+    // ALPN override for the TLS layer (was `quic-opts.alpn` before the QUIC
+    // transport was removed; kept as the TLS ALPN source).
+    alpn: Vec<String>,
     // UDP session management
     udp_sessions: DashMap<String, Arc<VmessUdpSession>>,
 }
@@ -829,8 +753,7 @@ impl VmessOutbound {
             None
         };
 
-        // Parse QUIC ALPN
-        let quic_alpn = config
+        let alpn = config
             .options
             .get("quic-opts")
             .and_then(|v| v.get("alpn"))
@@ -840,7 +763,7 @@ impl VmessOutbound {
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect()
             })
-            .unwrap_or_else(|| vec!["h3".to_string()]);
+            .unwrap_or_default();
 
         let cmd_key = generate_cmd_key(&uuid_bytes);
 
@@ -869,9 +792,7 @@ impl VmessOutbound {
             skip_cert_verify,
             sni,
             ws_opts,
-            quic_endpoint: Mutex::new(None),
-            quic_connection: Mutex::new(None),
-            quic_alpn,
+            alpn,
             udp_sessions: DashMap::new(),
         })
     }
@@ -1046,10 +967,9 @@ impl VmessOutbound {
 
     /// Build the courierust TLS connector from the VMess options.
     fn create_tls_connector(&self) -> Result<crate::engine::tls::TlsConnector> {
-        let mut alpn = self.quic_alpn.clone();
+        let mut alpn = self.alpn.clone();
         if alpn.is_empty() {
-            // VMess-over-TLS/WS speaks h2 / http1.1 unless the user pinned
-            // QUIC ALPN.
+            // VMess-over-TLS/WS speaks h2 / http1.1 by default.
             alpn = vec!["h2".into(), "http/1.1".into()];
         }
         let config = crate::engine::tls::ClientConfig {
@@ -1087,12 +1007,7 @@ impl VmessOutbound {
                     Ok(Box::new(ws_stream) as Box<dyn AsyncReadWrite>)
                 }
             }
-            VmessTransport::Quic => {
-                let quic_stream = self.connect_quic().await?;
-                Ok(Box::new(quic_stream) as Box<dyn AsyncReadWrite>)
-            }
             _ => {
-                // TCP or other transports
                 if self.tls_enabled {
                     let tls_stream = self.connect_tls().await?;
                     Ok(Box::new(tls_stream) as Box<dyn AsyncReadWrite>)
@@ -1102,111 +1017,6 @@ impl VmessOutbound {
                 }
             }
         }
-    }
-
-    /// Connect via QUIC transport
-    async fn connect_quic(&self) -> Result<QuicBiStream> {
-        let addr = format!("{}:{}", self.server, self.port);
-        let socket_addr: SocketAddr = tokio::net::lookup_host(&addr)
-            .await
-            .map_err(|e| Error::network(format!("Failed to resolve VMess server {}: {}", addr, e)))?
-            .next()
-            .ok_or_else(|| {
-                Error::network(format!("No addresses found for VMess server {}", addr))
-            })?;
-
-        // Check if we have an existing connection
-        {
-            let conn_guard = self.quic_connection.lock().await;
-            if let Some(ref conn) = *conn_guard {
-                if conn.close_reason().is_none() {
-                    // Connection is still alive, open a new stream
-                    let (send, recv) = conn.open_bi().await.map_err(|e| {
-                        Error::network(format!("Failed to open QUIC stream: {}", e))
-                    })?;
-                    return Ok(QuicBiStream::new(send, recv));
-                }
-            }
-        }
-
-        // Create new connection
-        let mut endpoint_guard = self.quic_endpoint.lock().await;
-        let endpoint = match endpoint_guard.take() {
-            Some(ep) => ep,
-            None => {
-                let bind_addr: SocketAddr = if socket_addr.is_ipv6() {
-                    "[::]:0".parse().unwrap()
-                } else {
-                    "0.0.0.0:0".parse().unwrap()
-                };
-                Endpoint::client(bind_addr)
-                    .map_err(|e| Error::network(format!("Failed to create QUIC endpoint: {}", e)))?
-            }
-        };
-
-        // Build TLS config for QUIC
-        let mut root_store = rustls::RootCertStore::empty();
-        let certs = rustls_native_certs::load_native_certs();
-        for cert in certs.certs {
-            root_store.add(cert).ok();
-        }
-
-        let mut tls_config = if self.skip_cert_verify {
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-                .with_no_client_auth()
-        } else {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        };
-
-        tls_config.alpn_protocols = self
-            .quic_alpn
-            .iter()
-            .map(|s| s.as_bytes().to_vec())
-            .collect();
-
-        let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
-            .map_err(|e| Error::config(format!("Failed to create QUIC config: {}", e)))?;
-
-        let mut client_config = QuinnClientConfig::new(Arc::new(quic_config));
-
-        // Configure transport
-        let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_concurrent_bidi_streams(100u32.into());
-        transport_config.max_concurrent_uni_streams(100u32.into());
-        transport_config.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-        transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
-        client_config.transport_config(Arc::new(transport_config));
-
-        let server_name = self.sni.as_deref().unwrap_or(&self.server);
-
-        let connecting = endpoint
-            .connect_with(client_config, socket_addr, server_name)
-            .map_err(|e| {
-                Error::network(format!("Failed to connect to VMess QUIC server: {}", e))
-            })?;
-
-        let connection = connecting
-            .await
-            .map_err(|e| Error::network(format!("QUIC connection failed: {}", e)))?;
-
-        tracing::debug!("VMess QUIC connection established to {}", socket_addr);
-
-        // Open a bidirectional stream
-        let (send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| Error::network(format!("Failed to open QUIC stream: {}", e)))?;
-
-        // Store connection and endpoint for reuse
-        *endpoint_guard = Some(endpoint);
-        let mut conn_guard = self.quic_connection.lock().await;
-        *conn_guard = Some(connection);
-
-        Ok(QuicBiStream::new(send, recv))
     }
 
     async fn handshake<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(

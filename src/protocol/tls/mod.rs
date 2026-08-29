@@ -4,9 +4,8 @@
 //! * [`TlsConnector`] — client connector; [`TlsConnector::connect`] performs
 //!   the handshake on a worker thread and returns a boxed async stream.
 //! * [`TlsAcceptor`] — server acceptor; same model.
-//! * `SkipServerVerification` — kept as a marker for API compatibility;
-//!   skipping verification is configured via
-//!   [`ClientConfig::skip_cert_verify`].
+//! * `SkipServerVerification` — compatibility marker; skipping verification
+//!   is configured via [`ClientConfig::skip_cert_verify`].
 
 mod client;
 mod config;

@@ -117,7 +117,7 @@ fn parse_private_key_pem(pem: &str) -> std::io::Result<(Vec<u8>, bool)> {
 }
 
 /// Extract the base64 body of a PEM block between `begin` and `end`.
-fn extract_block<'a>(pem: &'a str, begin: &str, end: &str) -> Option<String> {
+fn extract_block(pem: &str, begin: &str, end: &str) -> Option<String> {
     let start = pem.find(begin)?;
     let after = &pem[start + begin.len()..];
     let finish = after.find(end)?;
@@ -137,6 +137,7 @@ fn contains_oid(der: &[u8], oid: &[u8]) -> bool {
 /// between the reader and writer via `Arc` (the same shape the blocking-IO
 /// bridge and the client use). Public so a CONNECT-tunnel handler can wrap
 /// it in a [`crate::common::BlockingStream`].
+#[allow(clippy::large_enum_variant)] // the TLS variant legitimately owns a handshake object
 pub enum RawConnection {
     /// A plain TCP socket.
     Plain(Arc<TcpStream>),
@@ -433,9 +434,9 @@ fn handle_connection(
                     let deadline = std::time::Instant::now() + DRAIN_DEADLINE;
                     while std::time::Instant::now() < deadline {
                         match CRead::read(&mut conn, &mut buf) {
-                            Ok(0) => break,     // client closed
-                            Ok(_) => continue,  // keep discarding
-                            Err(_) => break,    // idle => client stopped
+                            Ok(0) => break,    // client closed
+                            Ok(_) => continue, // keep discarding
+                            Err(_) => break,   // idle => client stopped
                         }
                     }
                 }

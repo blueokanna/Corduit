@@ -2,7 +2,9 @@ use crate::engine::config::Config;
 use crate::engine::health_check::{HealthMonitor, HealthStatus};
 use crate::engine::proxy::ProxyManager;
 use crate::engine::traffic_stats::TrafficStatsManager;
-use courierust::courierust_http::{Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
+use courierust::courierust_http::{
+    Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
+};
 use nextjson::{NsonDeserialize, NsonSerialize};
 use std::sync::Arc;
 

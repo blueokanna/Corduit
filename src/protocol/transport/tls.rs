@@ -1,17 +1,25 @@
+//! TLS transport on courierust's TLS 1.2/1.3 (replacing `rustls` +
+//! `tokio-rustls`).
+//!
+//! The transport is a thin configuration adapter over
+//! [`crate::protocol::tls::TlsConnector`]: `TlsConfig` (SNI, ALPN, verify
+//! skip, SNI toggle) maps to courierust's [`ClientConfig`] and the connector
+//! returns a boxed async stream whose handshake runs on a worker thread.
+//!
+//! `TlsFingerprint` is retained as a configuration-compatibility enum: the
+//! legacy mapping only ever rewrote the ALPN list, which courierust exposes
+//! directly, so the fingerprint variants no longer change wire behavior
+//! (courierust does not emulate browser TLS/JA3 fingerprints).
+
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use nextjson::{NsonDeserialize, NsonSerialize};
-use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_rustls::TlsConnector;
 
 use super::{Result, TransportError};
-
-#[cfg(feature = "tls")]
-use crate::protocol::tls::SkipServerVerification;
+use crate::protocol::tls::{ClientConfig as TlsClientConfig, TlsConnector as CourierConnector};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsFingerprint {
@@ -75,7 +83,7 @@ impl Default for TlsConfig {
 
 pub struct TlsTransport {
     config: TlsConfig,
-    connector: TlsConnector,
+    connector: CourierConnector,
     server_name: String,
 }
 
@@ -94,81 +102,33 @@ impl TlsTransport {
         })
     }
 
-    fn build_connector(config: &TlsConfig) -> Result<TlsConnector> {
-        let mut root_store = rustls::RootCertStore::empty();
-
-        let certs = rustls_native_certs::load_native_certs();
-        for cert in certs.certs {
-            root_store.add(cert).ok();
+    fn build_connector(config: &TlsConfig) -> Result<CourierConnector> {
+        // A legacy `TlsFingerprint` that isn't `None` pins the ALPN to the
+        // browser-friendly h2/http1.1 pair (the same effect the old
+        // implementation had).
+        let mut alpn = config.alpn.clone();
+        if config.fingerprint != TlsFingerprint::None && alpn.is_empty() {
+            alpn = vec!["h2".into(), "http/1.1".into()];
         }
-
-        let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
-
-        let mut tls_config = if config.skip_cert_verify {
-            let verifier = Arc::new(SkipServerVerification);
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth()
-        } else {
-            builder.with_no_client_auth()
+        let tls_cfg = TlsClientConfig {
+            server_name: config.sni.clone(),
+            alpn,
+            skip_cert_verify: config.skip_cert_verify,
+            enable_sni: config.enable_sni,
         };
-
-        tls_config.alpn_protocols = config.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
-
-        if !config.enable_sni {
-            tls_config.enable_sni = false;
-        }
-
-        Self::apply_fingerprint(&mut tls_config, config.fingerprint);
-
-        Ok(TlsConnector::from(Arc::new(tls_config)))
+        CourierConnector::new(tls_cfg)
+            .map_err(|e| TransportError::InvalidConfig(format!("Failed to build TLS config: {e}")))
     }
 
-    fn apply_fingerprint(config: &mut rustls::ClientConfig, fingerprint: TlsFingerprint) {
-        match fingerprint {
-            TlsFingerprint::None => {}
-            TlsFingerprint::Chrome => {
-                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            }
-            TlsFingerprint::Firefox => {
-                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            }
-            TlsFingerprint::Safari => {
-                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            }
-            TlsFingerprint::Ios => {
-                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            }
-            TlsFingerprint::Android => {
-                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            }
-            TlsFingerprint::Edge => {
-                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            }
-            TlsFingerprint::Random => {
-                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            }
-        }
-    }
-
-    pub async fn connect<S>(
+    pub async fn connect(
         &self,
-        stream: S,
-    ) -> Result<TlsStream<tokio_rustls::client::TlsStream<S>>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
-        let server_name = ServerName::try_from(self.server_name.clone()).map_err(|_| {
-            TransportError::InvalidConfig(format!("Invalid SNI: {}", self.server_name))
-        })?;
-
+        stream: tokio::net::TcpStream,
+    ) -> Result<TlsStream<crate::protocol::tls::BoxStream>> {
         let tls_stream = self
             .connector
-            .connect(server_name, stream)
+            .connect(stream, &self.server_name)
             .await
-            .map_err(|e| TransportError::Handshake(format!("TLS handshake failed: {}", e)))?;
-
+            .map_err(|e| TransportError::Handshake(format!("TLS handshake failed: {e}")))?;
         Ok(TlsStream::new(tls_stream))
     }
 
@@ -228,57 +188,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-#[cfg(not(feature = "tls"))]
-#[derive(Debug)]
-struct SkipServerVerification;
-
-#[cfg(not(feature = "tls"))]
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
     }
 }
 

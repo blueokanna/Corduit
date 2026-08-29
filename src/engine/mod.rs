@@ -14,8 +14,8 @@
 //!   database without touching the engine.
 //! * **Inbound listeners** ([`inbound`]): HTTP, SOCKS5 and mixed.
 //! * **Outbound protocols & groups** ([`outbound`]): Shadowsocks, VMess, VLESS,
-//!   Trojan, TUIC, Hysteria2, WireGuard, QUIC, HTTP(S), SOCKS5, Direct, Reject —
-//!   plus selector / url-test / fallback / load-balance / relay groups.
+//!   Trojan, WireGuard, HTTP(S), SOCKS5, Direct, Reject — plus selector /
+//!   url-test / fallback / load-balance / relay groups.
 //! * **Hot reload** ([`Corduit::reload`]) with atomic config swaps.
 //! * **Observability**: `tracing`-based structured logging and span helpers.
 //!
@@ -118,8 +118,8 @@ impl Corduit {
         config.validate()?;
         logging::init_logging(config.general.log_level)?;
 
-        // Ensure a rustls crypto provider is active before any TLS consumer
-        // (quinn, tokio-rustls, protocol layer) builds its first configuration.
+        // Keep the legacy rustls provider hook for API compatibility; the
+        // courierust TLS layer does not need it.
         tls::install_crypto_provider();
 
         let proxy_manager = ProxyManager::new(config.clone()).await?;
