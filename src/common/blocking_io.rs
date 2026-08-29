@@ -394,7 +394,12 @@ mod tests {
         stream.set_read_timeout(Some(POLL_INTERVAL)).unwrap();
         let bridge = BlockingStream::new(stream, 8, None);
 
-        let mut client = tokio::net::TcpStream::from_std(Arc::try_unwrap(peer).unwrap()).unwrap();
+        // tokio refuses to wrap a blocking-mode socket (it would block the
+        // runtime reactor thread); flip the fd before handing it over. This
+        // is required on Unix — `TcpStream::from_std` panics otherwise.
+        let raw_peer = Arc::try_unwrap(peer).unwrap();
+        raw_peer.set_nonblocking(true).unwrap();
+        let mut client = tokio::net::TcpStream::from_std(raw_peer).unwrap();
         // Server side: read the full payload (TCP may split it), echo it.
         const PAYLOAD: &[u8] = b"hello bridge"; // 12 bytes
         let server = tokio::spawn(async move {

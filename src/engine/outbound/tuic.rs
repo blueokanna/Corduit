@@ -31,9 +31,10 @@ use crate::engine::tls::yaml_value_to_string;
 use crate::protocol::quic::{ClientConfig as QuicClientConfig, ClientConnection, QuicClient};
 use bytes::{Buf, BufMut, BytesMut};
 use parking_lot::RwLock;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -50,8 +51,17 @@ const TUIC_ADDR_TYPE_IPV4: u8 = 0x01;
 const TUIC_ADDR_TYPE_DOMAIN: u8 = 0x03;
 const TUIC_ADDR_TYPE_IPV6: u8 = 0x04;
 
-/// How UDP payloads are carried: native QUIC datagrams (RFC 9221) or
-/// one-shot uni-streams (the `udp-relay-mode: quic` variant).
+/// Maximum size of one TUIC datagram (including its header). Conservative:
+/// the QUIC transport fits a datagram into min(peer_max_udp_payload, 1200)
+/// minus packet overhead, so 1080 always fits. Larger payloads are split
+/// across fragments using the `frag_total` / `frag_id` fields.
+const MAX_TUIC_DATAGRAM: usize = 1080;
+/// Reassembly TTL for fragmented UDP packets.
+const FRAGMENT_TTL: Duration = Duration::from_secs(10);
+
+/// How UDP payloads are carried: native QUIC datagrams (RFC 9221, with
+/// TUIC v5 fragmentation for oversized payloads) or one-shot uni-streams
+/// (the `udp-relay-mode: quic` variant).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UdpRelayMode {
     #[default]
@@ -115,6 +125,8 @@ pub struct TuicConnection {
     password: String,
     authenticated: RwLock<bool>,
     udp_relay_mode: UdpRelayMode,
+    /// Reassembly state for fragmented UDP relay packets.
+    assembler: Mutex<TuicFragAssembler>,
 }
 
 impl TuicConnection {
@@ -130,6 +142,7 @@ impl TuicConnection {
             password,
             authenticated: RwLock::new(false),
             udp_relay_mode,
+            assembler: Mutex::new(TuicFragAssembler::new()),
         }
     }
 
@@ -204,38 +217,52 @@ impl TuicConnection {
     ) -> Result<()> {
         self.authenticate().await?;
 
-        if data.len() > u16::MAX as usize {
-            return Err(Error::protocol(format!(
-                "UDP payload too large for TUIC ({} bytes, u16 length field)",
-                data.len()
-            )));
-        }
-
-        let mut buf = BytesMut::with_capacity(data.len() + 64);
-        buf.put_u8(TUIC_VERSION);
-        buf.put_u8(TUIC_CMD_PACKET);
-        buf.put_u16(assoc_id);
-        buf.put_u8(frag_total);
-        buf.put_u8(frag_id);
-        buf.put_u16(data.len() as u16);
-        encode_address(&mut buf, target)?;
-        buf.put_slice(data);
-
         match self.udp_relay_mode {
             UdpRelayMode::Native => {
-                self.connection
-                    .send_datagram(buf.to_vec())
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to send UDP datagram: {e}")))?;
+                // Native relay: one TUIC packet per QUIC datagram. Payloads
+                // that do not fit are split across fragments using the
+                // `frag_total` / `frag_id` fields (TUIC v5 wire format).
+                let addr = encode_address_bytes(target)?;
+                let header_len = 8 + addr.len();
+                let max_chunk = MAX_TUIC_DATAGRAM.saturating_sub(header_len);
+                if max_chunk == 0 {
+                    return Err(Error::protocol(
+                        "target address too long for a TUIC datagram",
+                    ));
+                }
+                if data.len() <= max_chunk {
+                    let msg = build_udp_message(assoc_id, 1, 0, &addr, data)?;
+                    self.connection
+                        .send_datagram(msg)
+                        .await
+                        .map_err(|e| Error::network(format!("Failed to send UDP datagram: {e}")))?;
+                } else {
+                    let frag_count = data.len().div_ceil(max_chunk);
+                    if frag_count > 255 {
+                        return Err(Error::protocol(format!(
+                            "UDP payload too large to fragment ({} fragments)",
+                            frag_count
+                        )));
+                    }
+                    for (i, chunk) in data.chunks(max_chunk).enumerate() {
+                        let msg =
+                            build_udp_message(assoc_id, frag_count as u8, i as u8, &addr, chunk)?;
+                        self.connection.send_datagram(msg).await.map_err(|e| {
+                            Error::network(format!("Failed to send UDP fragment: {e}"))
+                        })?;
+                    }
+                }
             }
             UdpRelayMode::Quic => {
+                let addr = encode_address_bytes(target)?;
+                let msg = build_udp_message(assoc_id, frag_total, frag_id, &addr, data)?;
                 let mut stream = self
                     .connection
                     .open_uni()
                     .await
                     .map_err(|e| Error::network(format!("Failed to open UDP stream: {e}")))?;
                 stream
-                    .write_all(&buf)
+                    .write_all(&msg)
                     .await
                     .map_err(|e| Error::network(format!("Failed to send UDP packet: {e}")))?;
                 stream
@@ -250,24 +277,32 @@ impl TuicConnection {
     }
 
     pub async fn recv_udp_packet(&self) -> Result<(u16, TargetAddr, Vec<u8>)> {
-        match self.udp_relay_mode {
-            UdpRelayMode::Native => {
-                let datagram =
-                    self.connection.read_datagram().await.map_err(|e| {
+        loop {
+            let data = match self.udp_relay_mode {
+                UdpRelayMode::Native => {
+                    let datagram = self.connection.read_datagram().await.map_err(|e| {
                         Error::network(format!("Failed to receive UDP datagram: {e}"))
                     })?;
-                parse_udp_packet(&datagram)
+                    datagram
+                }
+                UdpRelayMode::Quic => {
+                    let mut stream =
+                        self.connection.accept_uni().await.map_err(|e| {
+                            Error::network(format!("Failed to accept UDP stream: {e}"))
+                        })?;
+                    read_all_limited(&mut stream, 65536)
+                        .await
+                        .map_err(|e| Error::network(format!("Failed to read UDP stream: {e}")))?
+                }
+            };
+
+            let (assoc_id, frag_total, frag_id, target, payload) = parse_udp_packet(&data)?;
+            if frag_total <= 1 {
+                return Ok((assoc_id, target, payload));
             }
-            UdpRelayMode::Quic => {
-                let mut stream = self
-                    .connection
-                    .accept_uni()
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to accept UDP stream: {e}")))?;
-                let data = read_all_limited(&mut stream, 65536)
-                    .await
-                    .map_err(|e| Error::network(format!("Failed to read UDP stream: {e}")))?;
-                parse_udp_packet(&data)
+            let mut assembler = self.assembler.lock().await;
+            if let Some(full) = assembler.add(assoc_id, frag_id, frag_total, target, payload) {
+                return Ok((assoc_id, full.0, full.1));
             }
         }
     }
@@ -364,7 +399,41 @@ fn encode_address(buf: &mut BytesMut, target: &TargetAddr) -> Result<()> {
     Ok(())
 }
 
-fn parse_udp_packet(data: &[u8]) -> Result<(u16, TargetAddr, Vec<u8>)> {
+/// Encode a SOCKS-style address into a byte vector.
+fn encode_address_bytes(target: &TargetAddr) -> Result<Vec<u8>> {
+    let mut buf = BytesMut::new();
+    encode_address(&mut buf, target)?;
+    Ok(buf.to_vec())
+}
+
+/// Build one TUIC v5 UDP packet message: `[VER][CMD=0x02][assoc_id u16]
+/// [frag_total u8][frag_id u8][len u16][addr][payload]`.
+fn build_udp_message(
+    assoc_id: u16,
+    frag_total: u8,
+    frag_id: u8,
+    addr: &[u8],
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    if data.len() > u16::MAX as usize {
+        return Err(Error::protocol(format!(
+            "UDP payload too large for TUIC ({} bytes, u16 length field)",
+            data.len()
+        )));
+    }
+    let mut buf = BytesMut::with_capacity(addr.len() + data.len() + 16);
+    buf.put_u8(TUIC_VERSION);
+    buf.put_u8(TUIC_CMD_PACKET);
+    buf.put_u16(assoc_id);
+    buf.put_u8(frag_total);
+    buf.put_u8(frag_id);
+    buf.put_u16(data.len() as u16);
+    buf.put_slice(addr);
+    buf.put_slice(data);
+    Ok(buf.to_vec())
+}
+
+fn parse_udp_packet(data: &[u8]) -> Result<(u16, u8, u8, TargetAddr, Vec<u8>)> {
     if data.len() < 8 {
         return Err(Error::protocol("UDP packet too short"));
     }
@@ -381,8 +450,8 @@ fn parse_udp_packet(data: &[u8]) -> Result<(u16, TargetAddr, Vec<u8>)> {
     }
 
     let assoc_id = buf.get_u16();
-    let _frag_total = buf.get_u8();
-    let _frag_id = buf.get_u8();
+    let frag_total = buf.get_u8();
+    let frag_id = buf.get_u8();
     let length = buf.get_u16() as usize;
 
     let (target, remaining) = parse_address(buf)?;
@@ -392,7 +461,7 @@ fn parse_udp_packet(data: &[u8]) -> Result<(u16, TargetAddr, Vec<u8>)> {
     }
 
     let payload = remaining[..length].to_vec();
-    Ok((assoc_id, target, payload))
+    Ok((assoc_id, frag_total, frag_id, target, payload))
 }
 
 fn parse_address(data: &[u8]) -> Result<(TargetAddr, &[u8])> {
@@ -441,6 +510,60 @@ fn parse_address(data: &[u8]) -> Result<(TargetAddr, &[u8])> {
         _ => Err(Error::protocol(format!(
             "Unknown address type: {addr_type}"
         ))),
+    }
+}
+
+/// One in-flight fragmented TUIC packet: `(fragment count, fragments, target,
+/// received at)`.
+type PendingTuicFragment = (u8, BTreeMap<u8, Vec<u8>>, TargetAddr, Instant);
+
+/// Reassembly buffer for fragmented TUIC UDP packets, keyed by association
+/// id (TUIC v5: all fragments of one packet share the same `assoc_id`).
+struct TuicFragAssembler {
+    /// assoc_id -> pending fragment state.
+    pending: HashMap<u16, PendingTuicFragment>,
+}
+
+impl TuicFragAssembler {
+    fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Insert a fragment; returns `(target, reassembled payload)` when the
+    /// whole packet has arrived.
+    fn add(
+        &mut self,
+        assoc_id: u16,
+        frag_id: u8,
+        frag_total: u8,
+        target: TargetAddr,
+        payload: Vec<u8>,
+    ) -> Option<(TargetAddr, Vec<u8>)> {
+        let now = Instant::now();
+        if self.pending.len() > 64 {
+            let cutoff = now - FRAGMENT_TTL;
+            self.pending.retain(|_, (_, _, _, at)| *at > cutoff);
+        }
+
+        let entry = self
+            .pending
+            .entry(assoc_id)
+            .or_insert_with(|| (frag_total, BTreeMap::new(), target.clone(), now));
+        entry.1.insert(frag_id, payload);
+        entry.3 = now;
+
+        if entry.1.len() as u8 >= entry.0 {
+            let (_, map, tgt, _) = self.pending.remove(&assoc_id)?;
+            let mut full = Vec::new();
+            for (_, chunk) in map {
+                full.extend_from_slice(&chunk);
+            }
+            Some((tgt, full))
+        } else {
+            None
+        }
     }
 }
 
@@ -1001,18 +1124,14 @@ mod tests {
     fn test_parse_udp_packet_roundtrip() {
         let target = TargetAddr::Domain("example.com".to_string(), 443);
         let payload = b"hello udp";
-        let mut buf = BytesMut::with_capacity(64);
-        buf.put_u8(TUIC_VERSION);
-        buf.put_u8(TUIC_CMD_PACKET);
-        buf.put_u16(0x1234);
-        buf.put_u8(1);
-        buf.put_u8(0);
-        buf.put_u16(payload.len() as u16);
-        encode_address(&mut buf, &target).unwrap();
-        buf.put_slice(payload);
+        let addr = encode_address_bytes(&target).unwrap();
+        let msg = build_udp_message(0x1234, 3, 1, &addr, payload).unwrap();
 
-        let (assoc_id, decoded_target, decoded_payload) = parse_udp_packet(&buf).unwrap();
+        let (assoc_id, frag_total, frag_id, decoded_target, decoded_payload) =
+            parse_udp_packet(&msg).unwrap();
         assert_eq!(assoc_id, 0x1234);
+        assert_eq!(frag_total, 3);
+        assert_eq!(frag_id, 1);
         assert_eq!(decoded_target, target);
         assert_eq!(decoded_payload, payload);
     }
@@ -1029,5 +1148,39 @@ mod tests {
         buf.put_u8(0);
         buf.put_u16(0);
         assert!(parse_udp_packet(&buf).is_err());
+    }
+
+    #[test]
+    fn test_udp_message_rejects_oversize() {
+        let addr =
+            encode_address_bytes(&TargetAddr::Domain("example.com".to_string(), 443)).unwrap();
+        let big = vec![0u8; u16::MAX as usize + 1];
+        assert!(build_udp_message(0, 1, 0, &addr, &big).is_err());
+    }
+
+    #[test]
+    fn test_fragment_assembler_reassembles() {
+        let mut a = TuicFragAssembler::new();
+        let target = TargetAddr::Domain("example.com".to_string(), 443);
+        assert!(a.add(7, 0, 3, target.clone(), b"hel".to_vec()).is_none());
+        assert!(a.add(7, 2, 3, target.clone(), b"ld".to_vec()).is_none());
+        let (t, full) = a.add(7, 1, 3, target.clone(), b"lo wor".to_vec()).unwrap();
+        assert_eq!(t, target);
+        assert_eq!(full, b"hello world");
+    }
+
+    #[test]
+    fn test_fragment_assembler_keeps_associations_separate() {
+        let mut a = TuicFragAssembler::new();
+        let t1 = TargetAddr::Domain("a.example".to_string(), 1);
+        let t2 = TargetAddr::Domain("b.example".to_string(), 2);
+        a.add(1, 0, 2, t1.clone(), b"aa".to_vec());
+        let (t, full) = a.add(2, 0, 1, t2.clone(), b"b".to_vec()).unwrap();
+        assert_eq!(t, t2);
+        assert_eq!(full, b"b");
+        // Association 1 is still incomplete.
+        let (t, full) = a.add(1, 1, 2, t1.clone(), b"bb".to_vec()).unwrap();
+        assert_eq!(t, t1);
+        assert_eq!(full, b"aabb");
     }
 }

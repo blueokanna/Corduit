@@ -23,6 +23,9 @@ pub enum QuicError {
     StreamReset { error_code: u64 },
     /// Flow-control / stream-limit violation.
     StreamLimit,
+    /// The datagram exceeds the maximum size a single QUIC packet can carry
+    /// (RFC 9221 §2). The sender must fragment it.
+    DatagramTooLarge,
     /// Invalid configuration.
     InvalidConfig(String),
     /// Idle timeout expired.
@@ -45,6 +48,7 @@ impl fmt::Display for QuicError {
                 write!(f, "QUIC stream reset by peer (code {error_code})")
             }
             QuicError::StreamLimit => write!(f, "QUIC stream limit exceeded"),
+            QuicError::DatagramTooLarge => write!(f, "QUIC datagram exceeds packet size"),
             QuicError::InvalidConfig(m) => write!(f, "QUIC invalid config: {m}"),
             QuicError::IdleTimeout => write!(f, "QUIC idle timeout"),
         }

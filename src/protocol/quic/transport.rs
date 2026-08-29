@@ -37,6 +37,14 @@ use crate::protocol::quic::{INITIAL_CWND, MAX_PACKET, MAX_UDP_PAYLOAD, MIN_CWND}
 const MAX_SEND_BUFFER: usize = 4 * 1024 * 1024;
 /// Maximum buffered receive bytes per stream.
 const MAX_RECV_BUFFER: u64 = 16 * 1024 * 1024;
+/// Bound on the packet numbers retained for ACK generation. RFC 9000 §19.3.1
+/// permits implementations to limit ACK ranges; without a cap a long-lived
+/// connection would accumulate every received packet number forever.
+const MAX_ACK_QUEUE: usize = 256;
+/// Per-packet overhead reserved when sizing a DATAGRAM frame (short header +
+/// connection ID + packet number + AEAD tag + frame header). Conservative so
+/// an accepted datagram always fits its own packet.
+const DATAGRAM_OVERHEAD: u64 = 48;
 /// Time-threshold loss factor (RFC 9002 §6.1.2).
 const LOSS_REDUCTION: f64 = 9.0 / 8.0;
 /// Retry integrity key/nonce (RFC 9001 §5.8; public by design).
@@ -137,6 +145,10 @@ pub(crate) struct StreamState {
     ack_pos: u64,
     write_pos: u64,
     sent_through: u64,
+    /// Highest `sent_through` ever reached. Used for flow-control accounting:
+    /// retransmissions rewind `sent_through` but must not consume connection
+    /// credit a second time.
+    sent_high: u64,
     peer_limit: u64,
     fin_queued: bool,
     fin_sent: bool,
@@ -161,6 +173,7 @@ impl StreamState {
             ack_pos: 0,
             write_pos: 0,
             sent_through: 0,
+            sent_high: 0,
             peer_limit,
             fin_queued: false,
             fin_sent: false,
@@ -229,6 +242,8 @@ pub(crate) struct ConnState {
     pub(crate) streams_notify: Arc<Notify>,
     pub(crate) handshake_complete: bool,
     handshake_confirmed: bool,
+    /// Keep-alive: a PING has been scheduled (sent on the next flush).
+    ping_pending: bool,
     pub(crate) closed: Option<QuicError>,
     last_recv: Instant,
     keep_alive_next: Instant,
@@ -341,6 +356,7 @@ impl QuicConn {
             streams_notify: Arc::new(Notify::new()),
             handshake_complete: false,
             handshake_confirmed: false,
+            ping_pending: false,
             closed: None,
             last_recv: Instant::now(),
             keep_alive_next: Instant::now() + Duration::from_secs(60),
@@ -444,6 +460,9 @@ impl QuicConn {
                 }
             }
             self.send_all(&out).await;
+            if out.len() >= 32 {
+                self.writer.notify_one();
+            }
             if self.lock().closed.is_some() || self.shutdown.load(Ordering::Acquire) {
                 return;
             }
@@ -477,8 +496,10 @@ impl QuicConn {
         if st.handshake_complete {
             if let Some(_ka) = st.config.keep_alive_interval {
                 if Instant::now() >= st.keep_alive_next {
-                    st.spaces[2].ack_pending = true;
-                    enqueue_application_ping(st);
+                    // Send an ack-eliciting PING so the peer replies and the
+                    // connection stays alive. An ACK frame alone is not
+                    // ack-eliciting and would not solicit a response.
+                    st.ping_pending = true;
                     st.keep_alive_next = Instant::now() + _ka;
                 }
             }
@@ -500,20 +521,36 @@ impl QuicConn {
         }
         let first = data[0];
 
-        // Version-negotiation packet (version == 0): we only speak QUIC v1.
-        if first & 0x80 != 0
-            && data.len() >= 5
-            && u32::from_be_bytes(data[1..5].try_into().unwrap()) == 0
-        {
-            return Err(QuicError::Protocol(
-                "server sent a version-negotiation packet".into(),
-            ));
-        }
-
+        // Long-header packet: verify the version and that it is addressed to
+        // our connection ID (RFC 9000 §5.2). Anything unrecognised is
+        // discarded, not fatal — stray UDP can hit the socket at any time.
         if first & 0x80 != 0 {
+            if data.len() < 5 {
+                return Ok(());
+            }
+            let version = u32::from_be_bytes(data[1..5].try_into().unwrap());
+            if version == 0 {
+                // Version-negotiation packet: the server does not speak v1.
+                return Err(QuicError::Protocol(
+                    "server sent a version-negotiation packet".into(),
+                ));
+            }
+            if version != crate::protocol::quic::QUIC_VERSION {
+                return Ok(()); // unsupported version: drop
+            }
             let ptype = (first >> 4) & 0x03;
             if ptype == 0x03 {
                 return self.process_retry(st, data);
+            }
+            if data.len() < 6 {
+                return Ok(());
+            }
+            let dcid_len = data[5] as usize;
+            if dcid_len != st.scid.len()
+                || data.len() < 6 + dcid_len
+                || &data[6..6 + dcid_len] != st.scid.as_slice()
+            {
+                return Ok(()); // not addressed to us: drop
             }
             let space = match ptype {
                 0x00 => PnSpace::Initial,
@@ -525,8 +562,9 @@ impl QuicConn {
             return self.process_packet(st, data, space, pn_offset, true);
         }
 
+        // Short-header packet: destination connection ID must match ours.
         let pn_offset = 1 + st.scid.len();
-        if data.len() <= pn_offset {
+        if data.len() <= pn_offset || &data[1..pn_offset] != st.scid.as_slice() {
             return Ok(());
         }
         self.process_packet(st, data, PnSpace::Application, pn_offset, false)
@@ -574,10 +612,14 @@ impl QuicConn {
         tok.extend_from_slice(token);
         pseudo.extend_from_slice(&tok);
 
-        if courierust::courierust_tls::crypto::gcm::open(&RETRY_KEY, &RETRY_NONCE, &pseudo, tag)
-            .is_none()
+        // RFC 9000 §5.8: a client MUST discard a Retry whose DCID does not
+        // match the one it sent or that fails the integrity check — it is a
+        // stray/spoofed packet, not a reason to tear the connection down.
+        if retry_dcid != st.dcid.as_slice()
+            || courierust::courierust_tls::crypto::gcm::open(&RETRY_KEY, &RETRY_NONCE, &pseudo, tag)
+                .is_none()
         {
-            return Err(QuicError::Protocol("Retry integrity check failed".into()));
+            return Ok(());
         }
 
         // Restart the Initial space with the new DCID + token.
@@ -669,6 +711,13 @@ impl QuicConn {
             }
             st.spaces[space.index()].ack_queue.insert(pn);
             st.spaces[space.index()].ack_pending = true;
+            // Bound the ACK queue so a long-lived connection doesn't retain
+            // every received packet number forever (RFC 9000 §19.3.1).
+            let q = &mut st.spaces[space.index()].ack_queue;
+            while q.len() > MAX_ACK_QUEUE {
+                let oldest = *q.iter().next().expect("non-empty queue");
+                q.remove(&oldest);
+            }
         }
         Ok(())
     }
@@ -886,7 +935,6 @@ impl QuicConn {
         ack_delay: u64,
         ranges: Vec<(u64, u64)>,
     ) -> Result<()> {
-        // Reconstruct the acknowledged set.
         let mut acked = BTreeSet::new();
         acked.insert(largest_acked);
         let first_len = ranges.first().map(|(_, l)| *l).unwrap_or(0);
@@ -947,7 +995,6 @@ impl QuicConn {
             self.on_acks_cc(st, acked.len() as u64);
         }
 
-        // RTT sample from the newest acked ack-eliciting packet.
         if let Some((sent_at, _)) = newest_acked_time {
             let latest = sent_at.elapsed();
             let delay = Duration::from_millis(ack_delay << 3); // exp=3
@@ -1042,7 +1089,6 @@ impl QuicConn {
             }
             _ => {}
         }
-        // Congestion: one multiplicative decrease per recovery period.
         let in_recovery = st
             .recovery_start
             .map(|t| {
@@ -1089,27 +1135,62 @@ impl QuicConn {
             if st.spaces[idx].write_key.is_none() {
                 continue;
             }
+
+            if st.spaces[idx].ack_pending {
+                if let Some(ack) = build_ack(&st.spaces[idx]) {
+                    st.spaces[idx].ack_pending = false;
+                    let mut frames = vec![ack];
+                    let _ = self.send_one(st, space, &mut frames, false, max_datagram, &mut out);
+                }
+            }
+
             loop {
                 let cwnd_avail = st.cwnd.saturating_sub(st.bytes_in_flight);
                 if cwnd_avail < 40 {
                     break;
                 }
-                let mut frames: Vec<Frame> = Vec::new();
-                let mut ack_eliciting = false;
 
-                // ACK.
-                if st.spaces[idx].ack_pending {
-                    if let Some(ack) = build_ack(&st.spaces[idx]) {
-                        frames.push(ack);
-                        st.spaces[idx].ack_pending = false;
+                if space == PnSpace::Application {
+                    if let Some(d) = st.datagram_tx.pop_front() {
+                        if d.len() as u64 > max_datagram.saturating_sub(DATAGRAM_OVERHEAD) {
+                            st.datagram_tx.push_front(d);
+                        } else {
+                            let mut frames = vec![Frame::Datagram {
+                                data: d,
+                                length: None,
+                            }];
+                            let _ = self.send_one(
+                                st,
+                                space,
+                                &mut frames,
+                                false,
+                                max_datagram,
+                                &mut out,
+                            );
+                            if out.len() >= 32 {
+                                break;
+                            }
+                            continue;
+                        }
                     }
                 }
 
-                // CRYPTO (Initial / Handshake).
+                let mut frames: Vec<Frame> = Vec::new();
+                let mut ack_eliciting = false;
+
+                // CRYPTO (Initial / Handshake). Chunked so a single frame
+                // always fits inside one QUIC packet.
                 if space != PnSpace::Application && st.spaces[idx].has_crypto_to_send() {
                     let sp = &st.spaces[idx];
                     let start = (sp.crypto_sent - sp.crypto_acked) as usize;
-                    let data: Vec<u8> = sp.crypto_send.iter().skip(start).copied().collect();
+                    let take = (max_datagram.saturating_sub(50)) as usize;
+                    let data: Vec<u8> = sp
+                        .crypto_send
+                        .iter()
+                        .skip(start)
+                        .take(take)
+                        .copied()
+                        .collect();
                     if !data.is_empty() {
                         frames.push(Frame::Crypto {
                             offset: sp.crypto_sent,
@@ -1124,15 +1205,11 @@ impl QuicConn {
                     self.collect_stream_frames(st, &mut frames, max_datagram, &mut ack_eliciting);
                 }
 
-                // DATAGRAM.
-                if space == PnSpace::Application {
-                    if let Some(d) = st.datagram_tx.pop_front() {
-                        frames.push(Frame::Datagram {
-                            data: d,
-                            length: None,
-                        });
-                        ack_eliciting = false;
-                    }
+                // Keep-alive PING (ack-eliciting, so the peer replies).
+                if st.ping_pending {
+                    frames.push(Frame::Ping);
+                    ack_eliciting = true;
+                    st.ping_pending = false;
                 }
 
                 // PTO probe.
@@ -1145,67 +1222,97 @@ impl QuicConn {
                     break;
                 }
 
-                let mut payload = Vec::new();
-                for f in &frames {
-                    f.encode(&mut payload);
-                }
-
-                let (header, pn_offset, long) = match build_packet_header(st, space) {
-                    Ok(h) => h,
-                    Err(_) => break,
-                };
-                let pn = st.spaces[idx].next_pn;
-                st.spaces[idx].next_pn += 1;
-                let key = st.spaces[idx].write_key.clone().expect("write key present");
-                let sealed = match key.seal(pn, &header, &payload) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        st.spaces[idx].next_pn -= 1;
-                        break;
-                    }
-                };
-
-                let mut datagram = header;
-                datagram.extend_from_slice(&sealed);
-                if datagram.len() as u64 > max_datagram {
-                    st.spaces[idx].next_pn -= 1;
-                    break; // too large: try again next flush
-                }
-                if key.protect_header(&mut datagram, pn_offset, long).is_err() {
-                    st.spaces[idx].next_pn -= 1;
+                if !self.send_one(
+                    st,
+                    space,
+                    &mut frames,
+                    ack_eliciting,
+                    max_datagram,
+                    &mut out,
+                ) {
                     break;
                 }
-
-                // Advance CRYPTO sent offset.
-                if space != PnSpace::Application {
-                    let sent_bytes = st.spaces[idx].crypto_sent;
-                    let data_len = match frames.iter().find(|f| matches!(f, Frame::Crypto { .. })) {
-                        Some(Frame::Crypto { data, .. }) => data.len() as u64,
-                        _ => 0,
-                    };
-                    st.spaces[idx].crypto_sent = sent_bytes + data_len;
-                }
-
-                st.bytes_in_flight = st.bytes_in_flight.saturating_add(datagram.len() as u64);
-                if ack_eliciting {
-                    st.spaces[idx].last_ack_eliciting = Some(Instant::now());
-                    st.spaces[idx].sent.push_back(SentPacket {
-                        pn,
-                        time: Instant::now(),
-                        size: datagram.len(),
-                        ack_eliciting: true,
-                        in_flight: true,
-                        frames,
-                    });
-                    st.pto_due = Some(Instant::now() + self.pto_period(st));
-                }
-                out.push(datagram);
                 if out.len() >= 32 {
                     break;
                 }
             }
         }
         out
+    }
+
+    /// Encode, protect and enqueue one packet from `frames`. Returns `false`
+    /// (rolling back the packet number) if the packet cannot be produced.
+    /// Only ack-eliciting packets consume congestion-window credit and are
+    /// tracked for loss recovery.
+    fn send_one(
+        &self,
+        st: &mut ConnState,
+        space: PnSpace,
+        frames: &mut Vec<Frame>,
+        ack_eliciting: bool,
+        max_datagram: u64,
+        out: &mut Vec<Vec<u8>>,
+    ) -> bool {
+        let idx = space.index();
+        let mut payload = Vec::new();
+        for f in frames.iter() {
+            f.encode(&mut payload);
+        }
+
+        let (header, pn_offset, long) = match build_packet_header(st, space) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        let pn = st.spaces[idx].next_pn;
+        st.spaces[idx].next_pn += 1;
+        let key = match &st.spaces[idx].write_key {
+            Some(k) => k.clone(),
+            None => return false,
+        };
+        let sealed = match key.seal(pn, &header, &payload) {
+            Ok(s) => s,
+            Err(_) => {
+                st.spaces[idx].next_pn -= 1;
+                return false;
+            }
+        };
+
+        let mut datagram = header;
+        datagram.extend_from_slice(&sealed);
+        if datagram.len() as u64 > max_datagram {
+            st.spaces[idx].next_pn -= 1;
+            return false;
+        }
+        if key.protect_header(&mut datagram, pn_offset, long).is_err() {
+            st.spaces[idx].next_pn -= 1;
+            return false;
+        }
+
+        // Advance CRYPTO sent offset.
+        if space != PnSpace::Application {
+            let sent_bytes = st.spaces[idx].crypto_sent;
+            let data_len = match frames.iter().find(|f| matches!(f, Frame::Crypto { .. })) {
+                Some(Frame::Crypto { data, .. }) => data.len() as u64,
+                _ => 0,
+            };
+            st.spaces[idx].crypto_sent = sent_bytes + data_len;
+        }
+
+        if ack_eliciting {
+            st.bytes_in_flight = st.bytes_in_flight.saturating_add(datagram.len() as u64);
+            st.spaces[idx].last_ack_eliciting = Some(Instant::now());
+            st.spaces[idx].sent.push_back(SentPacket {
+                pn,
+                time: Instant::now(),
+                size: datagram.len(),
+                ack_eliciting: true,
+                in_flight: true,
+                frames: std::mem::take(frames),
+            });
+            st.pto_due = Some(Instant::now() + self.pto_period(st));
+        }
+        out.push(datagram);
+        true
     }
 
     fn collect_stream_frames(
@@ -1261,8 +1368,12 @@ impl QuicConn {
                 .min(s.write_pos.saturating_sub(s.sent_through) as usize);
             if take > 0 {
                 let data: Vec<u8> = s.send_buf.iter().skip(start).take(take).copied().collect();
-                s.sent_through += take as u64;
-                st.total_sent = st.total_sent.saturating_add(take as u64);
+                let new_through = s.sent_through + take as u64;
+                st.total_sent = st
+                    .total_sent
+                    .saturating_add(new_through.saturating_sub(s.sent_high));
+                s.sent_high = new_through;
+                s.sent_through = new_through;
                 budget -= take as u64;
                 let fin = s.fin_queued && !s.fin_sent && s.sent_through == s.write_pos;
                 if fin {
@@ -1490,8 +1601,11 @@ impl QuicConn {
         if let Some(e) = &st.closed {
             return Err(e.clone());
         }
-        if data.len() as u64 > st.peer_max_udp_payload().saturating_sub(40) {
-            return Err(QuicError::Protocol("datagram too large".into()));
+        // The same bound the driver applies when building packets, so an
+        // accepted datagram is never silently dropped at flush time.
+        let max_datagram = st.peer_max_udp_payload().min(MAX_UDP_PAYLOAD);
+        if data.len() as u64 > max_datagram.saturating_sub(DATAGRAM_OVERHEAD) {
+            return Err(QuicError::DatagramTooLarge);
         }
         st.datagram_tx.push_back(data);
         Ok(())
@@ -1720,11 +1834,6 @@ fn build_ack_ranges(acked: &BTreeSet<u64>) -> Vec<(u64, u64)> {
         gap_base = q;
     }
     ranges
-}
-
-fn enqueue_application_ping(st: &mut ConnState) {
-    st.spaces[PnSpace::Application.index()].last_ack_eliciting = Some(Instant::now());
-    let _ = st;
 }
 
 fn next_deadline(st: &ConnState) -> Instant {
