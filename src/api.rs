@@ -1477,6 +1477,8 @@ fn parse_outbound_type(value: &str, tag: &str) -> Result<crate::engine::Outbound
         "vless" => Ok(OutboundType::Vless),
         "trojan" => Ok(OutboundType::Trojan),
         "wireguard" => Ok(OutboundType::Wireguard),
+        "tuic" => Ok(OutboundType::Tuic),
+        "hysteria2" | "hy2" => Ok(OutboundType::Hysteria2),
         "socks" | "socks5" => Ok(OutboundType::Socks5),
         "http" => Ok(OutboundType::Http),
         "selector" => Ok(OutboundType::Selector),
@@ -3487,11 +3489,18 @@ mod config_conversion_tests {
             parse_outbound_type("socks", "proxy").unwrap(),
             crate::engine::OutboundType::Socks5
         );
-        // QUIC-based protocols were removed with the quinn dependency; they
-        // must be rejected, never silently downgraded.
-        assert!(parse_outbound_type("tuic", "proxy").is_err());
-        assert!(parse_outbound_type("hysteria2", "proxy").is_err());
-        assert!(parse_outbound_type("quic", "proxy").is_err());
+        assert_eq!(
+            parse_outbound_type("tuic", "proxy").unwrap(),
+            crate::engine::OutboundType::Tuic
+        );
+        assert_eq!(
+            parse_outbound_type("hysteria2", "proxy").unwrap(),
+            crate::engine::OutboundType::Hysteria2
+        );
+        assert_eq!(
+            parse_outbound_type("hy2", "proxy").unwrap(),
+            crate::engine::OutboundType::Hysteria2
+        );
     }
 
     #[test]

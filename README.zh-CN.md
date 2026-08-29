@@ -19,8 +19,8 @@ Corduit 反过来：**一个 crate 里装下全部**——配置模型、规则�
 
 开箱即有的东西：
 
-- **协议**：Shadowsocks、VMess、VLESS、Trojan、WireGuard、SOCKS5、HTTP(S)，加上代理组（选择、测速、回退、负载均衡、中继）。
-- **HTTP/TLS 全部自包含**：HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket 全走 [courierust](https://crates.io/crates/courierust)（零依赖编解码栈），外加仓库内手写的 RFC 6455 帧。不再有 hyper、rustls、tokio-tungstenite。
+- **协议**：Shadowsocks、VMess、VLESS、Trojan、WireGuard、TUIC、Hysteria2、SOCKS5、HTTP(S)，加上代理组（选择、测速、回退、负载均衡、中继）。
+- **HTTP/TLS/QUIC 全部自包含**：HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket、QUIC v1 全走 [courierust](https://crates.io/crates/courierust) 加仓库内手写编解码——包括一套从零写的 QUIC v1 客户端传输（RFC 9000/9001/9002），自带 TLS 1.3-over-QUIC 握手和 QPACK/HPACK 头编解码。不再有 hyper、rustls、quinn。
 - **抗污染 DNS**：UDP/TCP/DoH/DoT 服务端与客户端、TTL 缓存、fake-IP、hosts、Bogon 过滤、国内外分流。
 - **TUN 支持**：仓库内用户态 TCP/IP 栈（SolidTCP）加 NAT，Windows / Linux / macOS / Android 都能做透明代理。
 - **热重载**：`Corduit::reload()` 原子换配置。
@@ -97,7 +97,7 @@ src/
 ├── common/         # URL 解析、courierust HTTP 客户端/服务端、阻塞-异步桥、根证书
 ├── engine/         # 配置、路由、入站/出站、统计
 ├── crypto/         # 仓库内加密原语
-├── protocol/       # 线缆协议（TLS、WebSocket、WireGuard…）
+├── protocol/       # 线缆协议（QUIC v1 客户端、TLS、WebSocket、QPACK…）
 ├── dns/            # DNS 服务端/客户端、缓存、fake-IP
 └── netstack/       # 用户态 TCP/IP、TUN、NAT、VPN 驱动
 ```
@@ -112,9 +112,13 @@ cargo clippy --all-targets -- -D warnings
 
 最低 Rust 版本：1.95。整个 crate 不依赖任何第三方 HTTP/TLS/QUIC 库——网络层全是 courierust 加仓库内手写协议编解码。
 
-## 为什么旧 HTTP/TLS/QUIC 栈没了
+## 为什么网络层全部手写
 
-以前 Corduit 的网络层靠 hyper/h2/http、rustls + tokio-rustls、quinn 拼起来：每个都带自己的依赖树、自己的 TLS provider、自己的发版节奏和自己的安全公告。现在 HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket 全走 courierust（零依赖），RFC 6455 帧是手写的，阻塞/异步之间的缝隙由仓库内一个单线程泵的适配器补上。基于 QUIC 的出站传输（TUIC、Hysteria2、VMess-over-QUIC）连同 quinn 一起移除了——courierust 的 QUIC 只有编解码器，为一个没法跟真实服务器互通的自研 QUIC 栈承担风险不值。
+以前 Corduit 的网络层靠 hyper/h2/http、rustls + tokio-rustls、quinn 拼起来：每个都带自己的依赖树、自己的 TLS provider、自己的发版节奏和自己的安全公告——三套"各自的 TLS 世界观"在同一张 socket 上打架。现在 HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket 全走 courierust（零依赖），RFC 6455 帧手写，阻塞/异步之间的缝隙由仓库内一个单线程泵的适配器补上。
+
+QUIC 才是重头戏。courierust 提供 RFC 9000/9001 的线缆编解码（包头、帧、varint、包保护）和 TLS 1.3 加密原语，但没有 QUIC 连接运行时。与其搬一个跟真实服务器对不上话的栈，Corduit 把缺的那层补在 `protocol::quic`：一个真正的客户端 QUIC v1 传输——TLS 1.3-over-QUIC 握手（ClientHello → ServerHello → EncryptedExtensions/Certificate/CertificateVerify/Finished）、三个包号空间、带 PTO 的 ACK/丢包恢复、NewReno 拥塞控制、流与连接级流量控制、RFC 9221 数据报——全部站在 courierust 的公开原语上。再往上就是 QPACK/HPACK 头编解码（`protocol::qpack`）和恢复的 TUIC v5、Hysteria2 出站。Hysteria2 严格按官方协议规范实现：HTTP/3 `POST /auth` 认证、`0x401` TCP 请求、带分片/重组的会话 UDP 数据报、可选的 Salamander 包混淆（BLAKE2b-256）。
+
+明确不提供、且配置里一要求就打显式警告、绝不静默假装支持：0-RTT（early data）、BBR/TCP-Brutal 拥塞控制（只有 NewReno）、源端口跳动、TLS 指纹伪装。
 
 ## 安全
 

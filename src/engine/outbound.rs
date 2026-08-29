@@ -9,11 +9,13 @@ use tokio::sync::RwLock;
 
 mod direct;
 mod http;
+mod hysteria2;
 mod reject;
 mod selector;
 mod shadowsocks;
 mod socks5;
 mod trojan;
+mod tuic;
 mod vless;
 mod vmess;
 mod wireguard;
@@ -21,11 +23,13 @@ mod wireguard;
 pub use direct::relay_bidirectional_with_connection;
 pub use direct::DirectOutbound;
 pub use http::HttpOutbound;
+pub use hysteria2::Hysteria2Outbound;
 pub use reject::RejectOutbound;
 pub use selector::SelectorOutbound;
 pub use shadowsocks::ShadowsocksOutbound;
 pub use socks5::Socks5Outbound;
 pub use trojan::TrojanOutbound;
+pub use tuic::TuicOutbound;
 pub use vless::VlessOutbound;
 pub use vmess::VmessOutbound;
 pub use wireguard::WireguardOutbound;
@@ -37,7 +41,7 @@ pub fn get_global_selector_selections() -> &'static ParkingRwLock<HashMap<String
     GLOBAL_SELECTOR_SELECTIONS.get_or_init(|| ParkingRwLock::new(HashMap::new()))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetAddr {
     Domain(String, u16),
     Ip(std::net::SocketAddr),
@@ -192,6 +196,8 @@ pub(crate) fn build_outbound_proxy(
         OutboundType::Vless => Some(Arc::new(VlessOutbound::new(config.clone())?)),
         OutboundType::Trojan => Some(Arc::new(TrojanOutbound::new(config.clone())?)),
         OutboundType::Wireguard => Some(Arc::new(WireguardOutbound::new(config.clone())?)),
+        OutboundType::Tuic => Some(Arc::new(TuicOutbound::new(config.clone())?)),
+        OutboundType::Hysteria2 => Some(Arc::new(Hysteria2Outbound::new(config.clone())?)),
         OutboundType::Selector
         | OutboundType::Urltest
         | OutboundType::Fallback

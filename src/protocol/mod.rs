@@ -9,7 +9,8 @@
 //! | Module | Purpose |
 //! |---|---|
 //! | [`address`] | SOCKS-style address encoding/decoding (`Address`, `AddressType`) |
-//! | [`transport`] | Layered transports: TLS, h2, gRPC, WebSocket |
+//! | [`transport`] | Layered transports: TLS, WebSocket |
+//! | [`quic`] | QUIC v1 client transport on courierust codecs (TLS 1.3-over-QUIC) |
 //! | [`tls`] | TLS client/server layers over courierust |
 //! | [`wireguard`] | WireGuard handshake & data-path primitives (curve25519, ChaCha20Poly1305) |
 //!
@@ -77,6 +78,8 @@ macro_rules! impl_protocol_enum {
 
 pub mod address;
 pub mod error;
+pub mod qpack;
+pub mod quic;
 pub mod transport;
 
 #[cfg(feature = "tls")]

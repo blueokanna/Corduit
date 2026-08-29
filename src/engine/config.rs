@@ -311,6 +311,8 @@ pub enum OutboundType {
     Vless,
     Trojan,
     Wireguard,
+    Tuic,
+    Hysteria2,
     Socks5,
     Http,
     // Proxy group types
@@ -329,6 +331,8 @@ impl_config_enum!(OutboundType {
     Vless => "vless",
     Trojan => "trojan",
     Wireguard => "wireguard",
+    Tuic => "tuic",
+    Hysteria2 => "hysteria2" | "hy2",
     Socks5 => "socks5" | "socks",
     Http => "http",
     Selector => "selector" | "select",

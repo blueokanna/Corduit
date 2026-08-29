@@ -197,7 +197,9 @@ impl ConfigValidator {
                 | OutboundType::Vmess
                 | OutboundType::Vless
                 | OutboundType::Trojan
-                | OutboundType::Wireguard => {
+                | OutboundType::Wireguard
+                | OutboundType::Tuic
+                | OutboundType::Hysteria2 => {
                     Self::require_outbound_endpoint(outbound)?;
                 }
                 // Proxy group types don't need server/port

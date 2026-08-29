@@ -109,6 +109,8 @@
 | VLESS | `vless` | `uuid`, `flow`, `tls` 等 |
 | Trojan | `trojan` | `password`, `sni` |
 | WireGuard | `wireguard` | `private_key`, `public_key`, `endpoint`, `allowed_ips` |
+| TUIC | `tuic` | `uuid`, `password`, `alpn`（默认 `["h3"]`）, `sni`, `skip-cert-verify`, `congestion-controller`（`cubic`/`new_reno`/`bbr`，均驱动 NewReno 控制器）, `udp-relay-mode`（`native`/`quic`）, `heartbeat-interval` |
+| Hysteria2 | `hysteria2` / `hy2` | `password`/`auth`, `obfs`（`salamander` + `obfs-password`）, `sni`, `skip-cert-verify`, `alpn`, `up`/`down`（Mbps，仅用于 `hysteria-cc-rx` 速率提示）, `fingerprint`（解析但忽略）, `ports`/`hop-interval`（解析但忽略） |
 | SOCKS5 | `socks5` / `socks` | `username`, `password`, `udp` |
 | HTTP | `http` | `username`, `password` |
 | 选择组 | `selector` / `select` | `outbounds: [tag,...]`，可选 `use: [provider]` |
@@ -117,7 +119,9 @@
 | 负载均衡 | `load-balance` | `outbounds` |
 | 中继 | `relay` | `outbounds`（链式） |
 
-> `tuic`/`hysteria2`/`quic` 等基于 QUIC 的出站已随 quinn 依赖一起移除：`type` 解析器不认识这些值，配置里出现会直接报错（拒绝静默直连降级）。
+> `tuic` 与 `hysteria2`/`hy2` 跑在仓库内自研的 QUIC v1 客户端传输上（`protocol::quic`，RFC 9000/9001/9002，TLS 1.3-over-QUIC 握手，NewReno 拥塞控制）。TUIC 走 v5 线缆协议（uni 流认证 + bi 流 TCP + datagram UDP）；Hysteria2 按官方协议规范实现，认证是 HTTP/3 `POST /auth`。
+>
+> 明确不支持的选项（配置里出现会打警告、不会静默假装）：TUIC 的 `reduce-rtt`/`zero-rtt-handshake`（无 0-RTT）、Hysteria2 的 `fingerprint`（TLS 指纹伪装）与 `ports`/`hop-interval`（源端口跳动）。
 
 > 任何出站都能加 `skip-cert-verify: true` 跳过 TLS 证书校验（默认关闭，仅显式配置时生效）。
 

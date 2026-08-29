@@ -26,12 +26,15 @@ together, and are released as one unit.
 
 What you get out of the box:
 
-- **Protocols**: Shadowsocks, VMess, VLESS, Trojan, WireGuard, SOCKS5,
-  HTTP(S) — plus proxy groups (selector, url-test, fallback, load-balance,
-  relay).
-- **Self-contained HTTP/TLS**: every HTTP/1.1, HTTP/2, HTTP/3, TLS 1.2/1.3
-  and WebSocket exchange runs on [courierust](https://crates.io/crates/courierust)
-  — a zero-dependency codec stack. No hyper, no rustls, no tokio-tungstenite.
+- **Protocols**: Shadowsocks, VMess, VLESS, Trojan, WireGuard, TUIC,
+  Hysteria2, SOCKS5, HTTP(S) — plus proxy groups (selector, url-test,
+  fallback, load-balance, relay).
+- **Self-contained HTTP/TLS/QUIC**: every HTTP/1.1, HTTP/2, HTTP/3,
+  TLS 1.2/1.3, WebSocket and QUIC v1 exchange runs on
+  [courierust](https://crates.io/crates/courierust) plus in-tree codecs —
+  including a from-scratch QUIC v1 client transport (RFC 9000/9001/9002)
+  with its own TLS 1.3-over-QUIC handshake and QPACK/HPACK header codec.
+  No hyper, no rustls, no quinn.
 - **Anti-pollution DNS**: UDP/TCP/DoH/DoT servers and clients, TTL-aware cache,
   fake-IP, hosts, bogon filtering, split resolution.
 - **TUN support**: a userspace TCP/IP stack (SolidTCP) with NAT for transparent
@@ -114,7 +117,7 @@ src/
 ├── common/         # URL parser, courierust HTTP client/server, blocking-IO bridge, roots
 ├── engine/         # config, routing, inbound/outbound, stats
 ├── crypto/         # in-repo crypto primitives
-├── protocol/       # wire protocols (TLS, WebSocket, WireGuard…)
+├── protocol/       # wire protocols (QUIC v1 client, TLS, WebSocket, QPACK…)
 ├── dns/            # DNS servers/clients, cache, fake-IP
 └── netstack/       # userspace TCP/IP, TUN, NAT, VPN drivers
 ```
@@ -128,20 +131,39 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 MSRV: Rust 1.95. The crate builds with **no HTTP/TLS/QUIC third-party
-dependencies** — the entire stack is courierust plus hand-rolled protocol
+libraries** — the entire stack is courierust plus hand-rolled protocol
 codecs in-tree.
 
-## Why the old HTTP/TLS/QUIC stack is gone
+## Why the network stack is hand-rolled
 
 Corduit used to depend on hyper/h2/http, rustls + tokio-rustls, and quinn for
 its network layer. Each pulled its own dependency tree, its own TLS provider,
-its own release cadence, and its own security advisories. The engine now talks
+its own release cadence, and its own security advisories — three different
+"one way to do TLS" ecosystems fighting over one socket. The engine now talks
 HTTP/1.1, HTTP/2, HTTP/3, TLS 1.2/1.3 and WebSocket through courierust (a
-zero-dependency codec suite) and hand-written RFC 6455 framing, with the
-blocking/async seam bridged by an in-house thread-pumped adapter. The QUIC-based
-outbound transports (TUIC, Hysteria2, VMess-over-QUIC) were removed along with
-quinn — courierust's QUIC surface is codec-only, and shipping a from-scratch
-QUIC stack that interoperates with real servers wasn't worth the risk.
+zero-dependency codec suite), with the blocking/async seam bridged by an
+in-house thread-pumped adapter.
+
+QUIC is the interesting part. courierust ships the RFC 9000/9001 wire codecs
+(packet headers, frames, varints, packet protection) and the TLS 1.3 crypto
+primitives, but no QUIC connection runtime. Instead of shipping a stack that
+can't talk to real servers, Corduit builds the missing layer in
+`protocol::quic`: a real client-side QUIC v1 transport — the TLS
+1.3-over-QUIC handshake (ClientHello → ServerHello →
+EncryptedExtensions/Certificate/CertificateVerify/Finished), three
+packet-number spaces, ACK/loss recovery with PTO, NewReno congestion control,
+stream and connection flow control, and RFC 9221 datagrams — all on
+courierust's public primitives. On top of that sit a QPACK/HPACK header codec
+(`protocol::qpack`) and the restored TUIC v5 and Hysteria2 outbounds.
+Hysteria2 is implemented against the official protocol spec: HTTP/3
+`POST /auth` authentication, `0x401` TCP requests, session/UDP datagram
+framing with fragmentation, and optional Salamander packet obfuscation
+(BLAKE2b-256).
+
+Deliberately not offered — and each is called out with an explicit warning
+when a config asks for it, never silently faked: 0-RTT (early data), BBR /
+TCP-Brutal congestion control (NewReno only), source-port hopping, and TLS
+fingerprint mimicry.
 
 ## Security
 
