@@ -171,13 +171,13 @@
 
 ```rust
 // 1. 字符串
-api::start_proxy_from_yaml(config_json.to_string()).await?;
+api::start_proxy_from_yaml(config_json.to_string())?;
 // 2. 文件
-api::start_proxy_from_file("/path/config.json".to_string()).await?;
+api::start_proxy_from_file("/path/config.json".to_string())?;
 // 3. Rust 结构体
 use corduit::engine::Config;
 let cfg: Config = nextjson::from_str(&config_json)?;   // 或手写结构体
-let engine = corduit::engine::Corduit::new(cfg).await?;
+let engine = corduit::engine::Corduit::new(cfg)?;
 ```
 
 > `rule_providers` / `proxy_providers` 两个键只在走 `api::*`（`initialize_corduit` / `reload_corduit` / `test_config` / `start_proxy_from_yaml`）时被读取和注入；直接 `Corduit::new(cfg)` 构建的 `Config` 结构体本身没有这两个字段。

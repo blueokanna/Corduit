@@ -197,6 +197,14 @@ pub fn relay_bidirectional_with_connection(
     connection: Option<Arc<crate::engine::connection_tracker::TrackedConnection>>,
     token: CancellationToken,
 ) -> Result<()> {
+    // Bound every blocking read so no thread holds a stream's lock across
+    // an unbounded block (see `crate::common::stream::RELAY_READ_POLL`), and
+    // give writes a generous ceiling.
+    let _ = a.set_read_timeout(Some(crate::common::stream::RELAY_READ_POLL));
+    let _ = b.set_read_timeout(Some(crate::common::stream::RELAY_READ_POLL));
+    let _ = a.set_write_timeout(Some(Duration::from_secs(60)));
+    let _ = b.set_write_timeout(Some(Duration::from_secs(60)));
+
     let a = Arc::new(std::sync::Mutex::new(a));
     let b = Arc::new(std::sync::Mutex::new(b));
 

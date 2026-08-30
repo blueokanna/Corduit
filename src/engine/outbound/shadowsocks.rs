@@ -603,6 +603,14 @@ impl crate::common::stream::SyncStream for ShadowsocksStream {
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner.lock().peer_addr().ok()
     }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.inner.lock().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.inner.lock().set_write_timeout(timeout)
+    }
 }
 
 /// AEAD cipher specifications

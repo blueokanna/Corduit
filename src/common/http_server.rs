@@ -214,6 +214,20 @@ impl crate::common::stream::SyncStream for RawConnection {
             RawConnection::Tls(_) => None,
         }
     }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            RawConnection::Plain(s) => s.set_read_timeout(timeout),
+            RawConnection::Tls(_) => Ok(()),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            RawConnection::Plain(s) => s.set_write_timeout(timeout),
+            RawConnection::Tls(_) => Ok(()),
+        }
+    }
 }
 
 /// A synchronous HTTP request handler.

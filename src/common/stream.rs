@@ -14,10 +14,25 @@ use crate::common::cancel::CancellationToken;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Copy buffer size (32 KiB — a good middle ground between syscall
 /// frequency and L2 cache footprint).
 pub const RELAY_BUF_SIZE: usize = 32 * 1024;
+
+/// Read timeout the relay installs on both transports before starting its
+/// copy threads.
+///
+/// The relay's two threads share each stream behind a mutex (boxed streams
+/// need `&mut` for both read and write). If a thread blocked in `read()`
+/// while holding that mutex indefinitely, the *other* thread could never
+/// write to the same stream — a lock-ordering deadlock the moment one side
+/// has data while the other is idle. A short read timeout bounds every lock
+/// hold, so the mutex is guaranteed to be released within one poll interval;
+/// the other direction's writes then get through within that window. This is
+/// the same cadence the old blocking bridge used (20 ms), and it costs
+/// nothing on a busy connection (reads return as soon as data arrives).
+pub const RELAY_READ_POLL: Duration = Duration::from_millis(25);
 
 /// A boxed synchronous duplex byte stream — the engine's canonical relay
 /// type.
@@ -34,6 +49,18 @@ pub trait SyncStream: Read + Write + Send {
     fn peer_addr(&self) -> Option<SocketAddr> {
         None
     }
+
+    /// Bound how long a blocking read can hold the stream (see
+    /// [`RELAY_READ_POLL`]). Transports without a socket underneath leave
+    /// this as a no-op.
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Bound how long a blocking write can block. Default no-op.
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl SyncStream for TcpStream {
@@ -43,6 +70,14 @@ impl SyncStream for TcpStream {
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         TcpStream::peer_addr(self).ok()
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
     }
 }
 
@@ -54,6 +89,14 @@ impl<T: SyncStream + ?Sized> SyncStream for &mut T {
     fn peer_addr(&self) -> Option<SocketAddr> {
         (**self).peer_addr()
     }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        (**self).set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        (**self).set_write_timeout(timeout)
+    }
 }
 
 impl SyncStream for Box<dyn SyncStream> {
@@ -63,6 +106,14 @@ impl SyncStream for Box<dyn SyncStream> {
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         (**self).peer_addr()
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        (**self).set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        (**self).set_write_timeout(timeout)
     }
 }
 
@@ -131,12 +182,21 @@ fn copy_one_way(
 ///
 /// # Locking
 ///
-/// Each stream is shared behind a mutex, but **no operation holds two locks
-/// at once** — a read locks one stream, copies out, unlocks, then a write
-/// locks the other. That ordering is what makes the two-thread relay
-/// deadlock-free by construction (thread A reads `x` while thread B writes
-/// `x`, never both holding opposing locks).
+/// Each stream is shared behind a mutex (boxed streams need `&mut` for both
+/// read and write), and the relay installs a short read timeout on both
+/// transports before starting, so **no thread ever holds a stream's lock
+/// across an unbounded block**. A read that would wait forever returns
+/// `WouldBlock`/`TimedOut` after [`RELAY_READ_POLL`] and releases the lock;
+/// the other direction's write then gets through within that window. This is
+/// what makes the two-thread relay deadlock-free by construction.
 pub fn relay(a: BoxStream, b: BoxStream, token: CancellationToken) -> io::Result<RelayStats> {
+    // Bound every blocking read (see RELAY_READ_POLL) and give writes a
+    // generous ceiling so a stalled peer cannot pin a lock forever.
+    let _ = a.set_read_timeout(Some(RELAY_READ_POLL));
+    let _ = b.set_read_timeout(Some(RELAY_READ_POLL));
+    let _ = a.set_write_timeout(Some(Duration::from_secs(60)));
+    let _ = b.set_write_timeout(Some(Duration::from_secs(60)));
+
     let a = Arc::new(Mutex::new(a));
     let b = Arc::new(Mutex::new(b));
     let stats = Arc::new(Mutex::new(RelayStats::default()));

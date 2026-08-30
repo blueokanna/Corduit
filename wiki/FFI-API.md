@@ -31,7 +31,7 @@ void                corduit_binary_free(FfiBinaryResponse resp);
 
 1. `args_json` 是**命名参数对象**，例如 `{"tag":"ss-jp","test_url":"http://example.com","timeout_ms":3000}`；不需要参数时传 `NULL`。
 2. 返回的 `data` 是**调用方负责释放**的堆内存（`corduit_string_free` / `corduit_binary_free`）。
-3. 线程安全：内部共享一个多线程 Tokio runtime；可从任意线程调用。
+3. 线程安全：内部是同步引擎（work-stealing 池 + 专用线程），无 async runtime；`corduit_call*` 可从任意线程调用。
 4. **不会跨边界 panic**：内部 panic 会被捕获并转为 `code!=0` 的错误响应。
 
 ## C 语言示例

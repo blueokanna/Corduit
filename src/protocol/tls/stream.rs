@@ -129,4 +129,12 @@ impl crate::common::stream::SyncStream for TlsStream {
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer
     }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.socket.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.socket.set_write_timeout(timeout)
+    }
 }

@@ -9,11 +9,11 @@ flowchart TB
     ROOT["corduit (单一 crate)<br/>crate 根 = src/lib.rs"]
 
     ROOT --> LIB["lib.rs<br/>模块装配 / 全局单例 / 平台入口"]
-    ROOT --> API["api.rs<br/>类型化异步 API"]
+    ROOT --> API["api.rs<br/>类型化同步 API"]
     ROOT --> FFI["ffi.rs<br/>手写 C ABI"]
     ROOT --> RPC["rpc/<br/>分发表 + HTTP/WebSocket 服务"]
     ROOT --> TYPES["types.rs<br/>共享 DTO"]
-    ROOT --> COMMON["common/<br/>URL 解析 + courierust HTTP 客户端/服务端<br/>+ 阻塞-异步桥 + 根证书"]
+    ROOT --> COMMON["common/<br/>同步调度器 + socket 原语 + 双向中继<br/>+ 定时器 + 取消 + URL 解析<br/>+ courierust HTTP 客户端/服务端 + 根证书"]
     ROOT --> ENGINE["engine/<br/>代理引擎核心"]
     ROOT --> CRYPTO["crypto/<br/>加密原语"]
     ROOT --> PROTOCOL["protocol/<br/>线缆协议（QUIC v1 客户端、TLS、QPACK/HPACK、WebSocket）"]
@@ -30,6 +30,19 @@ flowchart TB
     ENGINE --> EPP["proxy_provider.rs<br/>ProxyProviderManager（订阅节点）"]
     ENGINE --> ET["traffic_stats.rs<br/>流量统计"]
 ```
+
+## 同步并发模型
+
+Corduit 没有 async runtime。并发是分层的，每一层只做它擅长的事：
+
+1. **短任务**（accept 分发、握手、DNS 查询、控制面、周期刷新）跑在 courierust 的
+   work-stealing 线程池上（每 worker 私有 LIFO、全局 FIFO、跨 worker 偷取、空闲零 CPU）。
+2. **长连接中继**跑在专用线程上（每连接两条、每方向一条、带半关闭），由会话门限
+   （`SessionGate`）限制并发数，避免中继饿死握手容量。
+3. **accept 循环**每个监听器一条专用线程，把接到的 socket 交给池。
+
+阻塞由 socket 超时（`SO_RCVTIMEO` / `SO_SNDTIMEO`）约束：`WouldBlock`/`TimedOut` 即
+“暂时无事”，循环在两次操作之间检查 `CancellationToken`。
 
 ## 一个分发表，三种传输
 
@@ -96,7 +109,8 @@ sequenceDiagram
     PM-->>C: Ok(())
 ```
 
-> 注意：`ProxyManager::reload` 先替换配置、释放写锁，再让各子管理器各自拿读锁重载。Tokio 的 `RwLock` 不可重入，持写锁等读锁会死锁——这是刻意设计。
+> 注意：`ProxyManager::reload` 先替换配置、释放写锁，再让各子管理器各自拿读锁重载。
+> parking_lot 的 `RwLock` 不可重入，持写锁等读锁会死锁——这是刻意设计。
 
 重载时 provider 的同步（`Router::reload` + `OutboundManager::reload`）：
 
@@ -116,6 +130,12 @@ sequenceDiagram
 ```
 
 ProviderUpdater 在 `Corduit::start` 时启动、`stop` 时停止，默认 60 秒 tick，按各自 `interval` 刷新订阅/规则并跑健康检查（见 [Rules](Rules#6-后台-providerupdater)）。
+
+## no_std 核心
+
+`default-features = false` 时 crate 以 `no_std + alloc` 编译：`crypto/`、`common/url`、
+`protocol/{address,qpack,error}` 零 OS 依赖；线程化网络层（engine、DNS 服务器、
+netstack、RPC、传输）由 `std` feature 门控。
 
 ## 安全边界
 

@@ -1,6 +1,6 @@
 # Corduit
 
-**Corduit** 是一个用 Rust 写的统一网络代理引擎。配置、路由、DNS、用户态网络栈和全部线缆协议都收在一个 crate 里，不拼接任何第三方代理内核。HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket、QUIC v1 全走零依赖的 [courierust](https://crates.io/crates/courierust) 编解码栈——QUIC 客户端传输（RFC 9000/9001/9002，TLS 1.3-over-QUIC 握手、NewReno、RFC 9221 数据报）和 QPACK/HPACK 头编解码都是仓库内从零写的，TUIC v5 与 Hysteria2（官方 HTTP/3 `POST /auth` 认证）出站跑在上面——不再依赖 hyper / rustls / tokio-tungstenite / quinn。
+**Corduit** 是一个用 Rust 写的统一网络代理引擎。配置、路由、DNS、用户态网络栈和全部线缆协议都收在一个 crate 里，不拼接任何第三方代理内核，也**没有任何 async runtime**。HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket、QUIC v1 全走零依赖的 [courierust](https://crates.io/crates/courierust) 编解码栈——QUIC 客户端传输（RFC 9000/9001/9002，TLS 1.3-over-QUIC 握手、NewReno、RFC 9221 数据报）和 QPACK/HPACK 头编解码都是仓库内从零写的，TUIC v5 与 Hysteria2（官方 HTTP/3 `POST /auth` 认证）出站跑在上面——不再依赖 hyper / rustls / tokio / tokio-tungstenite / quinn。
 
 > 本 Wiki 由 GitHub Actions 在每次 `main` 分支 CI 通过后，从仓库的 `wiki/` 目录自动同步到本页面。改文档请改仓库里的 `wiki/`。
 
@@ -22,9 +22,9 @@ flowchart LR
     subgraph Corduit
         D["ffi (C ABI)"]
         E["rpc::server (HTTP + WebSocket)"]
-        F["api (typed async)"]
+        F["api (typed sync)"]
         G["rpc::dispatch<br/>(唯一分发表)"]
-        H["引擎: 路由 / 出站 / DNS / TUN"]
+        H["引擎: 路由 / 出站 / DNS / TUN<br/>(同步 + work-stealing 池)"]
     end
     A -->|corduit_call| D
     B -->|POST /rpc 或 WebSocket| E
@@ -39,7 +39,7 @@ flowchart LR
 |---|---|---|
 | Flutter / Kotlin / Swift / C++ 原生 | C ABI：`corduit_call` / `corduit_call_binary` | [FFI-API](FFI-API) |
 | 网页仪表盘 / 任意语言 | 本地 HTTP + WebSocket JSON-RPC | [RPC-API](RPC-API) |
-| Rust 应用 | 类型化异步 `api::*` | [Rust-API](Rust-API) |
+| Rust 应用 | 类型化同步 `api::*` | [Rust-API](Rust-API) |
 
 ## 快速上手（30 秒）
 
@@ -52,7 +52,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer <你的token>" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# => {"code":0,"data":"Corduit v0.1.0"}
+# => {"code":0,"data":"Corduit v0.2.0"}
 ```
 
 ## 文档目录

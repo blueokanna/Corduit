@@ -186,6 +186,14 @@ impl<S: crate::common::stream::SyncStream> crate::common::stream::SyncStream for
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner.peer_addr()
     }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(timeout)
+    }
 }
 
 #[cfg(test)]

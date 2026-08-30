@@ -488,6 +488,14 @@ impl<S: crate::common::stream::SyncStream> crate::common::stream::SyncStream
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner.lock().peer_addr()
     }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.inner.lock().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.inner.lock().set_write_timeout(timeout)
+    }
 }
 
 pub struct VmessOutbound {
@@ -1563,6 +1571,14 @@ impl crate::common::stream::SyncStream for VmessStream {
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner.lock().peer_addr()
+    }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.inner.lock().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.inner.lock().set_write_timeout(timeout)
     }
 }
 

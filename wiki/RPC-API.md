@@ -6,7 +6,7 @@
 
 ```rust,no_run
 use corduit::api;
-api::start_rpc_server(8765, Some("my-secret-token".into())).await?;
+api::start_rpc_server(8765, Some("my-secret-token".into()))?;
 // 不传 token 会自动生成 256 位随机 token；
 // 端口传 0 会随机分配，用 api::get_rpc_server_status() 查实际地址。
 ```
