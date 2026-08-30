@@ -9,7 +9,7 @@ description = "A synchronous, no_std-ready unified network proxy engine core wri
 homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
 readme = "README.md"
-keywords = ["proxy", "protocol", "network", "tun", "vpn", "no-std"]
+keywords = ["proxy", "protocol", "network", "tun", "vpn"]
 categories = [
     "network-programming",
     "web-programming",
