@@ -173,7 +173,8 @@ mod macos_impl {
         }
 
         // Scan only the written bytes; never reads past the buffer.
-        let path = unsafe { CStr::from_bytes_until_nul(&buffer[..len]) }.ok()?;
+        // `from_bytes_until_nul` is a safe function, so no `unsafe` is needed.
+        let path = CStr::from_bytes_until_nul(&buffer[..len]).ok()?;
         let path_str = path.to_string_lossy();
 
         path_str.rsplit('/').next().map(|s| s.to_string())
