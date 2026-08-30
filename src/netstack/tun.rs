@@ -595,7 +595,7 @@ impl TunDevice {
                 running_read.store(false, Ordering::Relaxed);
                 info!("TUN read task stopped");
             })
-            .map_err(|e| NetStackError::Io(e))?;
+            .map_err(NetStackError::Io)?;
 
         // Write task: pull packets from the stack and write them to the fd.
         let running_write = running.clone();
@@ -646,7 +646,7 @@ impl TunDevice {
                 running_write.store(false, Ordering::Relaxed);
                 info!("TUN write task stopped");
             })
-            .map_err(|e| NetStackError::Io(e))?;
+            .map_err(NetStackError::Io)?;
 
         Ok(())
     }
@@ -751,7 +751,7 @@ impl TunDevice {
                 running_read.store(false, Ordering::Relaxed);
                 info!("Android TUN read task stopped");
             })
-            .map_err(|e| NetStackError::Io(e))?;
+            .map_err(NetStackError::Io)?;
 
         let running_write = running.clone();
         let write_fd = dup_fd;
@@ -802,7 +802,7 @@ impl TunDevice {
                 running_write.store(false, Ordering::Relaxed);
                 info!("Android TUN write task stopped");
             })
-            .map_err(|e| NetStackError::Io(e))?;
+            .map_err(NetStackError::Io)?;
 
         info!("TUN initialized with fd={}", fd);
         Ok(())
