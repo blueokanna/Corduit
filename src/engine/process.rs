@@ -160,11 +160,20 @@ mod macos_impl {
             )
         };
 
+        // `proc_pidpath` returns the number of bytes written; 0 means the
+        // process is gone or inaccessible. If the returned length fills the
+        // whole buffer there is no room left for the NUL terminator, and
+        // `CStr::from_ptr` would read past the buffer — reject it instead.
         if result <= 0 {
             return None;
         }
+        let len = result as usize;
+        if len >= buffer.len() {
+            return None;
+        }
 
-        let path = unsafe { CStr::from_ptr(buffer.as_ptr() as *const i8) };
+        // Scan only the written bytes; never reads past the buffer.
+        let path = unsafe { CStr::from_bytes_until_nul(&buffer[..len]) }.ok()?;
         let path_str = path.to_string_lossy();
 
         path_str.rsplit('/').next().map(|s| s.to_string())

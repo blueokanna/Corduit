@@ -292,17 +292,35 @@ mod tests {
     fn every_fires_repeatedly_and_serialized() {
         let t = Timer::new();
         let hits = Arc::new(AtomicUsize::new(0));
-        let h = hits.clone();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let (h, a, m) = (hits.clone(), active.clone(), max_active.clone());
         // Keep the handle alive so the repeating timer is not cancelled.
         let _handle = t.every(Duration::from_millis(10), move || {
+            let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+            m.fetch_max(cur, Ordering::SeqCst);
             h.fetch_add(1, Ordering::SeqCst);
+            a.fetch_sub(1, Ordering::SeqCst);
         });
-        let deadline = Instant::now() + Duration::from_millis(150);
+        // Observe for a generous window. macOS CI VMs coalesce condvar
+        // timeouts (parking_lot waits with CLOCK_REALTIME
+        // `pthread_cond_timedwait` there), so a 10ms timer can fire as
+        // rarely as every ~100ms under load. Assert a conservative lower
+        // bound: even a ~10x slowdown still clears it, while a timer that
+        // fails to repeat (or fires only once) is still caught.
+        let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         let n = hits.load(Ordering::SeqCst);
         assert!(n >= 3, "expected at least 3 firings, got {n}");
+        // The wheel runs callbacks on a single thread and re-arms only after
+        // the previous callback returns, so executions never overlap.
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "callbacks must not overlap"
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! DNS handling with Fake-IP support
 
+use crate::common::lru::LruCache;
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use dashmap::DashMap;
-use lru::LruCache;
 use parking_lot::Mutex;
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;

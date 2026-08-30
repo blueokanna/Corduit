@@ -58,6 +58,8 @@ pub mod http;
 #[cfg(feature = "std")]
 pub mod http_server;
 #[cfg(feature = "std")]
+pub mod lru;
+#[cfg(feature = "std")]
 pub mod roots;
 #[cfg(feature = "std")]
 pub mod socket;

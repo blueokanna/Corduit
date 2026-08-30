@@ -1,10 +1,10 @@
+use crate::common::lru::LruCache;
 use crate::engine::config::{Config, Mode, RuleConfig, RuleType};
 use crate::engine::error::{Error, Result};
 use crate::engine::geoip::{is_local_or_private_ip, CountryMatcher, GeoIpManager};
 use crate::engine::rule_provider::RuleProviderConfig;
 use crate::engine::rule_provider::RuleProviderManager;
 use ipnet::IpNet;
-use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
