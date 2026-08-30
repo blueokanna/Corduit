@@ -10,12 +10,7 @@ homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
 readme = "README.md"
 keywords = ["proxy", "protocol", "network", "tun", "vpn"]
-categories = [
-    "network-programming",
-    "web-programming",
-    "no-std",
-    "networking",
-]
+categories = ["network-programming", "web-programming", "no-std"]
 
 [features]
 default = ["std", "tls", "wireguard"]
