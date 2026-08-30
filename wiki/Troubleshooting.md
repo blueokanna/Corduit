@@ -67,7 +67,7 @@ fake-ip 需要 TUN/透明代理配合映射回真实 IP；纯本地代理请用 
 `set_log_level("debug")`，或环境变量 `RUST_LOG=debug,corduit=debug`。日志缓冲区最大 5000 条，`get_logs` 可取。
 
 **Q: 日志时间戳时区？**
-日志时间戳是 UTC（`tzcraft`），不是本地时区——这是有意的，避免歧义。
+日志时间戳是 UTC（`common::clock`），不是本地时区——这是有意的，避免歧义。
 
 ## 还有问题？
 

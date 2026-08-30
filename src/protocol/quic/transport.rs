@@ -1031,7 +1031,7 @@ impl QuicConn {
                 st.smoothed_rtt = latest;
                 st.rttvar = latest / 2;
             } else {
-                // `Duration::abs_diff` stabilized after 1.78; compute manually.
+                // abs_diff (stable 1.81) — hand-rolled for MSRV 1.78.
                 let diff = if st.smoothed_rtt >= adj {
                     st.smoothed_rtt - adj
                 } else {

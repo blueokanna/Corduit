@@ -50,6 +50,8 @@ pub mod url;
 #[cfg(feature = "std")]
 pub mod cancel;
 #[cfg(feature = "std")]
+pub mod clock;
+#[cfg(feature = "std")]
 pub mod exec;
 #[cfg(feature = "std")]
 pub mod http;

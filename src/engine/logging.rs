@@ -5,11 +5,9 @@ use std::sync::{Arc, Mutex, Once};
 use tracing::Level;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-/// Format the current UTC time as `YYYY-MM-DD HH:MM:SS` via `tzcraft`.
+/// Format the current UTC time as `YYYY-MM-DD HH:MM:SS`.
 fn now_timestamp() -> String {
-    tzcraft::Zoned::now_utc()
-        .and_then(|z| z.format("%Y-%m-%d %H:%M:%S"))
-        .unwrap_or_else(|_| "1970-01-01 00:00:00".to_string())
+    crate::common::clock::now_utc_timestamp()
 }
 
 static INIT: Once = Once::new();

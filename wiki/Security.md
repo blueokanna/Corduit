@@ -5,7 +5,7 @@ Corduit 同时做**依赖图审计**与**源码级加固**。
 ## 依赖面
 
 - 整个依赖图零 serde（`Cargo.lock` 里没有 `serde*`），序列化只走 `nextjson` / `rustbinary`（两者都 `#![deny(unsafe_code)]`）；
-- 时间用 `tzcraft`（`#![deny(unsafe_code)]`）替代 `chrono`；
+- 时间用仓库内的 UTC 时钟（`common/clock.rs`，Hinnant 历法算法）格式化；
 - `cargo audit` 无已知漏洞。
 
 ## 远程控制面

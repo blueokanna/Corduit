@@ -1,6 +1,6 @@
 [package]
 name = "corduit"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.78"
 license-file = "LICENSE"
@@ -23,13 +23,6 @@ std = []
 tls = []
 wireguard = []
 
-# rustbinary 0.1.7 uses `core::error::Error` (error_in_core, stabilized in Rust
-# 1.81), which breaks the declared MSRV 1.78. We vendor the crate under
-# vendor/rustbinary with a minimal, feature-preserving patch that routes the
-# std::error::Error impl through `std`; the API surface is unchanged.
-[patch.crates-io]
-rustbinary = { path = "vendor/rustbinary" }
-
 [dependencies]
 
 # --- concurrency / sync primitives ------------------------------------------
@@ -42,11 +35,10 @@ thiserror = "2.0.20"
 
 # --- codec / time  -------------------------------
 nextjson = { version = "0.1.4", features = ["derive"] }
-rustbinary = { version = "0.1.7", default-features = false, features = [
+rustbinary = { version = "0.1.8", default-features = false, features = [
     "derive",
     "std",
 ] }
-tzcraft = { version = "0.1.2", features = ["std", "serde", "binary"] }
 
 # --- tracing / telemetry -----------------------------------------------------
 tracing = "0.1"
@@ -57,17 +49,17 @@ courierust = { version = "1.0.3" }
 
 # --- DNS ---------------------------------------------------------------------
 ipnet = "2"
-lru = "0.16"
+lru = "=0.16.4"
 
 # --- crypto ------------------------------------------------------------------
-getrandom = { version = "0.3", features = ["std"] }
+getrandom = { version = "0.3.2", features = ["std"] }
 
 # --- networking / system -----------------------------------------------------
 bitflags = "2"
 bytes = "1"
 libc = "0.2"
 regex = "1"
-smoltcp = { version = "0.11", default-features = false, features = [
+smoltcp = { version = "=0.11.0", default-features = false, features = [
     "std",
     "log",
     "medium-ip",
@@ -77,13 +69,13 @@ smoltcp = { version = "0.11", default-features = false, features = [
     "socket-tcp",
 ] }
 socket2 = { version = "0.6", features = ["all"] }
-sysinfo = "0.36"
-tun-rs = { version = "2" }
+sysinfo = "=0.36.1"
+tun-rs = { version = "=2.5.7" }
 
 [target.'cfg(windows)'.dependencies]
 wintun-bindings = { version = "0.7" }
-zip = { version = "4", default-features = false, features = ["deflate"] }
-windows = { version = "0.61", features = [
+zip = { version = "=4.2.0", default-features = false, features = ["deflate"] }
+windows = { version = "=0.61.3", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
@@ -99,4 +91,4 @@ jni = "0.22"
 tracing-android = "0.2"
 
 [dev-dependencies]
-proptest = "1.8"
+proptest = "=1.8.0"
