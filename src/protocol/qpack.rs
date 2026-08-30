@@ -57,7 +57,10 @@ impl core::fmt::Display for QpackError {
     }
 }
 
-impl core::error::Error for QpackError {}
+// `core::error::Error` (error_in_core) only stabilized in Rust 1.81; keep the
+// declared MSRV 1.78 by routing the impl through `std` when available.
+#[cfg(feature = "std")]
+impl std::error::Error for QpackError {}
 
 // ---------------------------------------------------------------------------
 // HPACK static table (RFC 7541 Appendix A)
@@ -744,7 +747,7 @@ mod tests {
             }
         }
         // Pad with EOS prefix (ones).
-        while !bits.len().is_multiple_of(8) {
+        while bits.len() % 8 != 0 {
             bits.push(1);
         }
         let mut data = Vec::with_capacity(bits.len() / 8);

@@ -8,7 +8,7 @@ tree**.
 
 [![Crates.io](https://img.shields.io/crates/v/corduit)](https://crates.io/crates/corduit)
 [![docs.rs](https://img.shields.io/docsrs/corduit)](https://docs.rs/corduit)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.78-blue)](Cargo.toml)
 
 - **中文说明** → [README.zh-CN.md](README.zh-CN.md)
 - **完整文档** → [Wiki](https://github.com/blueokanna/Corduit/wiki)（含 FFI / RPC / 全部方法参考）
@@ -220,7 +220,7 @@ cargo fmt --all -- --check
 cargo check --no-default-features   # the no_std protocol core
 ```
 
-MSRV: Rust 1.88. The crate builds with **no HTTP/TLS/QUIC third-party
+MSRV: Rust 1.78. The crate builds with **no HTTP/TLS/QUIC third-party
 libraries and no async runtime** — the entire network stack is courierust
 plus hand-rolled protocol codecs in-tree, and concurrency is courierust's
 work-stealing pool plus `std::thread`.

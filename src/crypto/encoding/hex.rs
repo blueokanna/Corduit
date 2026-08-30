@@ -23,11 +23,11 @@ pub enum DecodeError {
 
 /// Decode a hex string (odd length or invalid digits rejected).
 pub fn decode(input: &[u8]) -> Result<alloc::vec::Vec<u8>, DecodeError> {
-    if !input.len().is_multiple_of(2) {
+    if input.len() % 2 != 0 {
         return Err(DecodeError::OddLength);
     }
     let mut out = alloc::vec::Vec::with_capacity(input.len() / 2);
-    for pair in input.as_chunks::<2>().0 {
+    for pair in input.chunks_exact(2) {
         let hi = hex_val(pair[0]).ok_or(DecodeError::InvalidHexDigit)?;
         let lo = hex_val(pair[1]).ok_or(DecodeError::InvalidHexDigit)?;
         out.push((hi << 4) | lo);

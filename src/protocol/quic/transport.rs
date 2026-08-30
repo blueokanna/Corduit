@@ -1031,7 +1031,12 @@ impl QuicConn {
                 st.smoothed_rtt = latest;
                 st.rttvar = latest / 2;
             } else {
-                let diff = st.smoothed_rtt.abs_diff(adj);
+                // `Duration::abs_diff` stabilized after 1.78; compute manually.
+                let diff = if st.smoothed_rtt >= adj {
+                    st.smoothed_rtt - adj
+                } else {
+                    adj - st.smoothed_rtt
+                };
                 st.rttvar = (st.rttvar * 3 + diff) / 4;
                 st.smoothed_rtt = (st.smoothed_rtt * 7 + adj) / 8;
             }

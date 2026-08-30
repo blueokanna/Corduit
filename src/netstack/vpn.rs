@@ -77,8 +77,7 @@ impl TunPacketProcessor {
         }
 
         let packet_number = self.packet_count.fetch_add(1, Ordering::Relaxed) + 1;
-        #[allow(clippy::manual_is_multiple_of)]
-        if packet_number <= 10 || packet_number.is_multiple_of(500) {
+        if packet_number <= 10 || packet_number % 500 == 0 {
             debug!(packet_number, bytes = packet.len(), "processing TUN packet");
         }
 

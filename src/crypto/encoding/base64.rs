@@ -71,8 +71,8 @@ pub fn encode_into(data: &[u8], config: Config, out: &mut alloc::vec::Vec<u8>) {
         Alphabet::UrlSafe => URL_SAFE,
     };
 
-    let (chunks, rem) = data.as_chunks::<3>();
-    for c in chunks {
+    let mut chunks = data.chunks_exact(3);
+    for c in &mut chunks {
         let b0 = c[0] as u32;
         let b1 = c[1] as u32;
         let b2 = c[2] as u32;
@@ -81,6 +81,7 @@ pub fn encode_into(data: &[u8], config: Config, out: &mut alloc::vec::Vec<u8>) {
         out.push(table[(((b1 << 2) | (b2 >> 6)) & 0x3f) as usize]);
         out.push(table[(b2 & 0x3f) as usize]);
     }
+    let rem = chunks.remainder();
 
     if !rem.is_empty() {
         let b0 = rem[0] as u32;
@@ -144,8 +145,8 @@ pub fn decode_into(
         return Err(DecodeError::InvalidLength);
     }
 
-    let (chunks, rem) = body.as_chunks::<4>();
-    for c in chunks {
+    let mut chunks = body.chunks_exact(4);
+    for c in &mut chunks {
         let a = decode_value(c[0], config.alphabet).ok_or(DecodeError::InvalidByte)?;
         let b = decode_value(c[1], config.alphabet).ok_or(DecodeError::InvalidByte)?;
         let cc = decode_value(c[2], config.alphabet).ok_or(DecodeError::InvalidByte)?;
@@ -154,6 +155,7 @@ pub fn decode_into(
         out.push((b << 4) | (cc >> 2));
         out.push((cc << 6) | d);
     }
+    let rem = chunks.remainder();
 
     match rem.len() {
         2 => {

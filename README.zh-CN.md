@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/corduit)](https://crates.io/crates/corduit)
 [![docs.rs](https://img.shields.io/docsrs/corduit)](https://docs.rs/corduit)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.78-blue)](Cargo.toml)
 
 - **English** → [README.md](README.md)
 - **完整文档** → [Wiki](https://github.com/blueokanna/Corduit/wiki)（含 FFI / RPC / 全部方法参考）
@@ -167,7 +167,7 @@ cargo fmt --all -- --check
 cargo check --no-default-features   # no_std 协议核心
 ```
 
-MSRV：Rust 1.88。**没有任何 HTTP/TLS/QUIC 第三方库、没有任何 async runtime**——整个网络栈是 courierust 加仓库内手写协议编解码，并发是 courierust 的 work-stealing 池加 `std::thread`。
+MSRV：Rust 1.78。**没有任何 HTTP/TLS/QUIC 第三方库、没有任何 async runtime**——整个网络栈是 courierust 加仓库内手写协议编解码，并发是 courierust 的 work-stealing 池加 `std::thread`。
 
 ## 为什么网络栈是手写的
 

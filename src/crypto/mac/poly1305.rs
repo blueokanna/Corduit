@@ -58,8 +58,8 @@ impl Poly1305 {
         let s4 = r[4].wrapping_mul(5);
 
         let mut h = self.h;
-        debug_assert!(m.len().is_multiple_of(16));
-        for block in m.as_chunks::<16>().0 {
+        debug_assert!(m.len() % 16 == 0);
+        for block in m.chunks_exact(16) {
             let t0 = u32::from_le_bytes(block[0..4].try_into().expect("4"));
             let t1 = u32::from_le_bytes(block[4..8].try_into().expect("4"));
             let t2 = u32::from_le_bytes(block[8..12].try_into().expect("4"));

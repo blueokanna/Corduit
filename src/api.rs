@@ -2509,7 +2509,7 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
 
                 while let Ok(packet) = tun_rx.recv() {
                     packet_count += 1;
-                    if packet_count <= 10 || packet_count.is_multiple_of(100) {
+                    if packet_count <= 10 || packet_count % 100 == 0 {
                         tracing::debug!(
                             "Processing packet #{}: {} bytes",
                             packet_count,

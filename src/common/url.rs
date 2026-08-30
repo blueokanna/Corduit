@@ -57,7 +57,10 @@ impl fmt::Display for UrlError {
     }
 }
 
-impl core::error::Error for UrlError {}
+// `core::error::Error` (error_in_core) only stabilized in Rust 1.81; keep the
+// declared MSRV 1.78 by routing the impl through `std` when available.
+#[cfg(feature = "std")]
+impl std::error::Error for UrlError {}
 
 /// A parsed absolute URL.
 ///

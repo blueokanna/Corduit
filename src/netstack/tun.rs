@@ -604,7 +604,6 @@ impl TunDevice {
         let running_write = running.clone();
         let shutdown_write = shutdown.clone();
         let write_fd = fd;
-        let mut rx_from_stack = rx_from_stack;
         std::thread::Builder::new()
             .name("tun-write".into())
             .spawn(move || {
@@ -766,7 +765,6 @@ impl TunDevice {
         // Write task - write packets from stack to TUN
         let running_write = running.clone();
         let write_fd = dup_fd;
-        let mut rx_from_stack = rx_from_stack;
         std::thread::Builder::new()
             .name("tun-fd-write".into())
             .spawn(move || {

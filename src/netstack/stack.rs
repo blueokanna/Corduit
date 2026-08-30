@@ -331,8 +331,8 @@ fn process_ipv4_packet(
     let ipv4 = Ipv4Packet::new_checked(packet)
         .map_err(|e| NetStackError::InvalidPacket(format!("Invalid IPv4 packet: {}", e)))?;
 
-    let src_ip = IpAddr::V4(ipv4.src_addr());
-    let dst_ip = IpAddr::V4(ipv4.dst_addr());
+    let src_ip = IpAddr::V4(ipv4.src_addr().into());
+    let dst_ip = IpAddr::V4(ipv4.dst_addr().into());
     let protocol = ipv4.next_header();
     let payload = ipv4.payload();
 
@@ -366,8 +366,8 @@ fn process_ipv6_packet(
     let ipv6 = Ipv6Packet::new_checked(packet)
         .map_err(|e| NetStackError::InvalidPacket(format!("Invalid IPv6 packet: {}", e)))?;
 
-    let src_ip = IpAddr::V6(ipv6.src_addr());
-    let dst_ip = IpAddr::V6(ipv6.dst_addr());
+    let src_ip = IpAddr::V6(ipv6.src_addr().into());
+    let dst_ip = IpAddr::V6(ipv6.dst_addr().into());
     let protocol = ipv6.next_header();
     let payload = ipv6.payload();
 
