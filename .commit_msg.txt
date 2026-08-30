@@ -1,0 +1,11 @@
+Derive CORDUIT_API_VERSION from the crate version; fix Cargo.toml category
+
+- src/rpc/mod.rs: CORDUIT_API_VERSION was a hand-maintained "0.2.0" that had
+  drifted from the manifest (0.1.3) and was surfaced by corduit_api_version().
+  Derive it from env!("CARGO_PKG_VERSION") so the wire contract and the
+  manifest share a single source of truth and can never drift again.
+- Cargo.toml: replace the "asynchronous" category with "no-std" - the engine
+  is synchronous by design and no_std-ready, so the old category was wrong.
+
+Verified: clippy/fmt clean, 1.78 check clean, tests 481 passed (including
+ffi/rpc api_version_is_semver_like).

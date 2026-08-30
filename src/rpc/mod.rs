@@ -410,10 +410,11 @@ pub fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
 // Bridge metadata
 // ---------------------------------------------------------------------------
 
-/// Bridge ABI version. Bump on any breaking change to the dispatch surface
-/// or the wire schemas of `corduit_call` / `corduit_call_binary` / the RPC
-/// server.
-pub const CORDUIT_API_VERSION: &str = "0.2.0";
+/// Bridge ABI version, derived from the crate version so the wire contract
+/// and the manifest can never drift. `corduit_api_version()` and the RPC
+/// surface report this value; a breaking dispatch change therefore goes out
+/// with a manifest version bump and nothing else to update.
+pub const CORDUIT_API_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Every method accepted by [`dispatch`]. Cross-language hosts use this to
 /// validate their bindings against the running library instead of hard-coding
@@ -558,8 +559,6 @@ mod tests {
 
     #[test]
     fn every_declared_method_is_dispatched() {
-        // Ensure platform hooks (incl. the legacy crypto-provider no-op) are ready
-        // before dispatching methods that build HTTP clients.
         api::init_app();
 
         let value = nextjson::Value::Null;

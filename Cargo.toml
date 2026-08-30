@@ -13,7 +13,7 @@ keywords = ["proxy", "protocol", "network", "tun", "vpn", "no-std"]
 categories = [
     "network-programming",
     "web-programming",
-    "asynchronous",
+    "no-std",
     "networking",
 ]
 
