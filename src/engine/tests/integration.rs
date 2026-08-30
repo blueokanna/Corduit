@@ -51,6 +51,13 @@ fn free_port() -> u16 {
 
 /// Build an engine with one mixed inbound + DIRECT outbound.
 fn engine_with_mixed_inbound(port: u16) -> Corduit {
+    // Isolate from process-global runtime state staged by other (parallel)
+    // tests: `Corduit::new` merges `runtime_proxy_providers` and rule
+    // providers, so a provider left behind by an api test would make these
+    // e2e tests try to load a file that does not exist.
+    crate::engine::proxy_provider::set_runtime_proxy_providers(Vec::new());
+    crate::engine::set_runtime_rule_providers(Vec::new());
+
     let config = Config {
         general: GeneralConfig {
             mixed_port: Some(port),

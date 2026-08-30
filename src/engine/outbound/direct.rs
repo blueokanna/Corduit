@@ -18,6 +18,15 @@ use std::time::{Duration, Instant};
 /// Copy buffer size for the relay threads.
 const RELAY_CHUNK: usize = 32 * 1024;
 
+/// Lock-fairness yield after an idle relay poll.
+///
+/// The two relay threads share each stream behind a `std::sync::Mutex` whose
+/// handoff is not fair: after a read times out (idle), a thread re-locks its
+/// source stream almost instantly, which can starve the opposite direction's
+/// writes for seconds on Linux. Sleeping for this window with the lock
+/// released lets the other direction write through within a bounded time.
+const RELAY_POLL_YIELD: Duration = Duration::from_millis(15);
+
 pub struct DirectOutbound {
     config: OutboundConfig,
 }
@@ -190,6 +199,16 @@ impl DirectOutbound {
 /// Threads need `'static` streams, so both transports are owned (boxed) and
 /// shared behind mutexes; each operation locks exactly one stream, which
 /// keeps the two-thread relay deadlock-free by construction.
+///
+/// # Lock fairness
+///
+/// `std::sync::Mutex` handoff is not fair, so an idle direction that polls
+/// its source stream with a short read timeout would otherwise starve the
+/// opposite direction's writes for seconds (seen on Linux: a 13-byte echo
+/// took 2.1 s). When a poll comes back idle (`WouldBlock`/`TimedOut`) each
+/// thread therefore drops the source stream's lock and yields for
+/// [`RELAY_POLL_YIELD`] so the other direction can write through within a
+/// bounded time.
 pub fn relay_bidirectional_with_connection(
     a: crate::common::stream::BoxStream,
     b: crate::common::stream::BoxStream,
@@ -207,9 +226,6 @@ pub fn relay_bidirectional_with_connection(
 
     let a = Arc::new(std::sync::Mutex::new(a));
     let b = Arc::new(std::sync::Mutex::new(b));
-
-    // Every shared handle is cloned into each thread's closure so the two
-    // relay threads own their own copies (no move-after-move).
     let t1 = {
         let a1 = a.clone();
         let b1 = b.clone();
@@ -226,24 +242,35 @@ pub fn relay_bidirectional_with_connection(
                         let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
                         return Err(Error::network("relay cancelled"));
                     }
-                    let n = match a1.lock().unwrap().read(&mut buf) {
-                        Ok(0) => {
-                            let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Write);
-                            return Ok(());
-                        }
-                        Ok(n) => n,
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                            ) =>
-                        {
-                            continue;
-                        }
-                        Err(e) => {
-                            let _ = a1.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                            let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                            return Err(Error::network(format!("relay read failed: {e}")));
+                    let n = {
+                        let mut guard = a1.lock().unwrap();
+                        match guard.read(&mut buf) {
+                            Ok(0) => {
+                                drop(guard);
+                                let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Write);
+                                return Ok(());
+                            }
+                            Ok(n) => n,
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                // Release the source stream's lock BEFORE
+                                // yielding so the opposite direction can write
+                                // through (the std mutex handoff is not fair
+                                // and otherwise starves it for seconds).
+                                drop(guard);
+                                std::thread::sleep(RELAY_POLL_YIELD);
+                                continue;
+                            }
+                            Err(e) => {
+                                drop(guard);
+                                let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                                let _ = a1.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                                return Err(Error::network(format!("relay read failed: {e}")));
+                            }
                         }
                     };
                     if let Err(e) = b1.lock().unwrap().write_all(&buf[..n]) {
@@ -276,24 +303,31 @@ pub fn relay_bidirectional_with_connection(
                         let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
                         return Err(Error::network("relay cancelled"));
                     }
-                    let n = match b2.lock().unwrap().read(&mut buf) {
-                        Ok(0) => {
-                            let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Write);
-                            return Ok(());
-                        }
-                        Ok(n) => n,
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                            ) =>
-                        {
-                            continue;
-                        }
-                        Err(e) => {
-                            let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                            let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                            return Err(Error::network(format!("relay read failed: {e}")));
+                    let n = {
+                        let mut guard = b2.lock().unwrap();
+                        match guard.read(&mut buf) {
+                            Ok(0) => {
+                                drop(guard);
+                                let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Write);
+                                return Ok(());
+                            }
+                            Ok(n) => n,
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                drop(guard);
+                                std::thread::sleep(RELAY_POLL_YIELD);
+                                continue;
+                            }
+                            Err(e) => {
+                                drop(guard);
+                                let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                                let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                                return Err(Error::network(format!("relay read failed: {e}")));
+                            }
                         }
                     };
                     if let Err(e) = a2.lock().unwrap().write_all(&buf[..n]) {

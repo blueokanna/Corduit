@@ -417,9 +417,6 @@ impl TunDevice {
     fn configure_windows_adapter(&self, prefix_len: u8) -> Result<()> {
         use std::process::Command;
 
-        // The interface name is interpolated into a PowerShell `-Command`
-        // string below; reject shell metacharacters before anything is
-        // executed (CWE-78).
         let name = crate::netstack::windows_route::sanitize_interface_name(&self.config.name)
             .map_err(NetStackError::InvalidConfig)?;
 
@@ -604,7 +601,7 @@ impl TunDevice {
         let running_write = running.clone();
         let shutdown_write = shutdown.clone();
         let write_fd = fd;
-        let mut rx_from_stack = rx_from_stack;
+        let rx_from_stack = rx_from_stack;
         std::thread::Builder::new()
             .name("tun-write".into())
             .spawn(move || {
@@ -670,8 +667,6 @@ impl TunDevice {
 
         info!("Starting TUN with VPN fd={}", fd);
 
-        // Duplicate the file descriptor so we don't take ownership of the original
-        // The original fd is owned by the OS VPN layer and must remain valid
         let dup_fd = unsafe { libc::dup(fd) };
         if dup_fd < 0 {
             return Err(NetStackError::TunError(format!(
@@ -682,13 +677,9 @@ impl TunDevice {
 
         info!("Duplicated VPN fd: {} -> {}", fd, dup_fd);
 
-        // Own the duplicated fd with a File so it is closed when the device
-        // is dropped. The worker threads operate on the raw fd below.
-        // SAFETY: dup_fd is a valid duplicated fd that we own.
         let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
         self.vpn_file = Some(file);
 
-        // Create channels for packet communication
         let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
         let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>();
         let shutdown = CancellationToken::new();
@@ -701,7 +692,6 @@ impl TunDevice {
         let read_shutdown = shutdown.clone();
         let write_shutdown = shutdown;
 
-        // Read task - read packets from TUN and send to stack
         let running_read = running.clone();
         let read_fd = dup_fd;
         std::thread::Builder::new()
@@ -763,10 +753,9 @@ impl TunDevice {
             })
             .map_err(|e| NetStackError::Io(e))?;
 
-        // Write task - write packets from stack to TUN
         let running_write = running.clone();
         let write_fd = dup_fd;
-        let mut rx_from_stack = rx_from_stack;
+        let rx_from_stack = rx_from_stack;
         std::thread::Builder::new()
             .name("tun-fd-write".into())
             .spawn(move || {

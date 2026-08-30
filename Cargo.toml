@@ -69,7 +69,13 @@ smoltcp = { version = "=0.11.0", default-features = false, features = [
     "socket-tcp",
 ] }
 socket2 = { version = "0.6", features = ["all"] }
+# sysinfo 0.37+ uses edition 2024 (rust-version 1.88); 0.36.1 is edition 2021 / 1.75.
+# Exact pin: a caret here could still resolve within 0.36.x only, but keep it
+# exact to match the committed lockfile and the MSRV guarantee.
 sysinfo = "=0.36.1"
+# tun-rs 2.6+ pulls netconfig-rs (rust-version 1.85); 2.5.7 needs only libloading 0.8.
+# Exact pin is REQUIRED: a caret ("2.5.7") would let `cargo update` jump to
+# 2.8.x and silently break the declared MSRV 1.78.
 tun-rs = { version = "=2.5.7" }
 
 [target.'cfg(windows)'.dependencies]

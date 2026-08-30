@@ -32,6 +32,12 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
     let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
     sock.set_nonblocking(true)?;
     sock.connect_timeout(&(*addr).into(), timeout)?;
+    // `connect_timeout` requires a non-blocking socket but leaves it that
+    // way; the synchronous engine needs a plain blocking stream (read/write
+    // timeouts via SO_RCVTIMEO/SO_SNDTIMEO only behave as intended on
+    // blocking sockets — on Linux a leftover O_NONBLOCK makes relay reads
+    // return WouldBlock instantly and stalls bidirectional copies).
+    sock.set_nonblocking(false)?;
     let stream: TcpStream = sock.into();
     stream.set_nodelay(true)?;
     Ok(stream)

@@ -3433,6 +3433,10 @@ mod config_conversion_tests {
             }]
         }"#;
         assert!(configure_proxy_providers(ok).is_ok());
+
+        // Leave no staged provider in the process-global static for parallel
+        // tests (the engine loads runtime proxy providers on `Corduit::new`).
+        crate::engine::proxy_provider::set_runtime_proxy_providers(Vec::new());
     }
 
     #[test]
