@@ -1,8 +1,7 @@
 [package]
 name = "corduit"
-version = "0.2.0"
+version = "0.1.2"
 edition = "2021"
-rust-version = "1.88"
 license-file = "LICENSE"
 authors = ["blueokanna"]
 description = "A synchronous, no_std-ready unified network proxy engine core written in Rust"
@@ -19,9 +18,6 @@ categories = [
 
 [features]
 default = ["std", "tls", "wireguard"]
-# `std` gates the threaded networking layer (engine, netstack, DNS servers,
-# RPC). Disabling it leaves a `no_std + alloc` protocol core: crypto, wire
-# codecs (address/QPACK/QUIC frames/DNS wire), URL, rules — zero OS deps.
 std = []
 tls = []
 wireguard = []
@@ -53,7 +49,7 @@ courierust = { version = "1.0.3" }
 
 # --- DNS ---------------------------------------------------------------------
 ipnet = "2"
-lru = "0.18.2"
+lru = "0.18.3"
 
 # --- crypto ------------------------------------------------------------------
 getrandom = { version = "0.4.3", features = ["std"] }
