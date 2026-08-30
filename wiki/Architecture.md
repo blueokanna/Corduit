@@ -164,13 +164,15 @@ flowchart LR
 
 ## no_std 边界
 
-引擎整体**不能** no_std——它跑在 tokio 上，依赖 `std::net`、线程、TUN 驱动和文件系统。可以独立出来做 no_std 的部分：
+引擎整体**不能** no_std——它依赖 `std::net`、线程、TUN 驱动和文件系统（注意：**不需要 tokio**，但需要 `std`）。可以独立出来做 no_std 的部分：
 
 | 模块 | 状态 |
 |---|---|
-| `crypto/`（哈希/MAC/流密码/AEAD/KDF/X25519/Base64/Hex/UUID） | ✅ 已 no_std：全模块零 `std::` 引用，只用 `core` + `alloc`，无任何外部依赖 |
-| `protocol/address.rs`（SOCKS 地址编解码） | ⚠️ 接近：仅 `fmt` / `io::Cursor` / `net` 三处 std，可平移 |
-| `dns/wire.rs`（DNS 报文编解码） | ⚠️ 接近：`fmt` / `net` / `HashMap` 可换 `core` / `alloc` |
-| `engine` / `rpc` / `api` / `ffi` / `netstack` / `common` | ❌ 依赖 tokio + std + 平台 API，无法 no_std |
+| `crypto/`（哈希/MAC/流密码/AEAD/KDF/X25519/Base64/Hex/UUID） | ✅ no_std：全模块只用 `core` + `alloc`，零外部依赖 |
+| `common/url`（URL 解析） | ✅ no_std + alloc |
+| `protocol/address`（SOCKS 地址编解码） | ✅ no_std + alloc |
+| `protocol/qpack`（QPACK/HPACK 头编解码） | ✅ no_std + alloc |
+| `protocol/error`（协议错误类型） | ✅ no_std + alloc |
+| `engine` / `rpc` / `api` / `ffi` / `netstack` / `dns` / 传输层 | ❌ 依赖 std（线程、socket、文件系统、平台 API），随 `std` feature 编译 |
 
-也就是说：**加密与线缆编解码核心可以无 std 复用（比如做固件/嵌入式端）**，但完整代理引擎需要 std + tokio，这是设计使然，不是遗漏。
+也就是说：**加密与线缆编解码核心可以无 std 复用（比如做固件/嵌入式端）**，但完整代理引擎需要 std——**不需要 tokio**，这是设计使然，不是遗漏。验证方式：`cargo check --no-default-features`（协议核心）与 `cargo check --all-targets`（完整引擎）。

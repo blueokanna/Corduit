@@ -72,7 +72,7 @@ start it, stop it. That's the whole lifecycle.
 
 ```toml
 [dependencies]
-corduit = "0.2"
+corduit = "0.1"
 ```
 
 ```rust,no_run
@@ -141,7 +141,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.2.0"}
+# {"code":0,"data":"Corduit v0.1.3"}
 ```
 
 ## How the synchronous engine works
@@ -213,7 +213,7 @@ behind the `std` feature.
 
 ```bash
 cargo check --all-targets
-cargo test            # 470 unit tests + property tests
+cargo test            # ≈480 unit tests + property tests
 cargo test --doc
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check

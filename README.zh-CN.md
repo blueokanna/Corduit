@@ -45,7 +45,7 @@ Corduit 不需要 runtime：构造 `Config`、建引擎、启动、停止——�
 
 ```toml
 [dependencies]
-corduit = "0.2"
+corduit = "0.1"
 ```
 
 ```rust,no_run
@@ -114,7 +114,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.2.0"}
+# {"code":0,"data":"Corduit v0.1.3"}
 ```
 
 ## 同步引擎怎么工作
@@ -160,7 +160,7 @@ no_std 核心在 `crypto/`、`common/url`、`protocol/address`、`protocol/qpack
 
 ```bash
 cargo check --all-targets
-cargo test            # 470 个单元测试 + 属性测试
+cargo test            # ≈480 个单元测试 + 属性测试
 cargo test --doc
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check

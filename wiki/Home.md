@@ -52,7 +52,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer <你的token>" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# => {"code":0,"data":"Corduit v0.2.0"}
+# => {"code":0,"data":"Corduit v0.1.3"}
 ```
 
 ## 文档目录

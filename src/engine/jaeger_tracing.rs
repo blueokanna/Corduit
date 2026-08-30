@@ -69,23 +69,24 @@ pub fn init_tracing(_config: TracingConfig) -> Result<()> {
 /// Shut tracing down. No-op without the OTLP exporter.
 pub fn shutdown_tracing() {}
 
-/// Instrument an async block with a `dns_resolution` span.
+/// Instrument a synchronous block with a `dns_resolution` span.
 #[macro_export]
 macro_rules! trace_dns_resolution {
     ($domain:expr, $body:expr) => {{
-        use tracing::Instrument;
         let span = tracing::info_span!("dns_resolution", domain = %$domain);
-        async move { $body }.instrument(span).await
+        let _guard = span.entered();
+        $body
     }};
 }
 
-/// Instrument an async block with a `proxy_connection` span.
+/// Instrument a synchronous block with a `proxy_connection` span.
 #[macro_export]
 macro_rules! trace_proxy_connection {
     ($target:expr, $protocol:expr, $body:expr) => {{
-        use tracing::Instrument;
-        let span = tracing::info_span!("proxy_connection", target = %$target, protocol = %$protocol);
-        async move { $body }.instrument(span).await
+        let span =
+            tracing::info_span!("proxy_connection", target = %$target, protocol = %$protocol);
+        let _guard = span.entered();
+        $body
     }};
 }
 
@@ -106,31 +107,31 @@ macro_rules! trace_routing_decision {
     }};
 }
 
-/// Instrument an async block with an `inbound_connection` span.
+/// Instrument a synchronous block with an `inbound_connection` span.
 #[macro_export]
 macro_rules! trace_inbound_connection {
     ($inbound_type:expr, $src_addr:expr, $body:expr) => {{
-        use tracing::Instrument;
         let span = tracing::info_span!(
             "inbound_connection",
             inbound_type = %$inbound_type,
             src_addr = %$src_addr
         );
-        async move { $body }.instrument(span).await
+        let _guard = span.entered();
+        $body
     }};
 }
 
-/// Instrument an async block with an `outbound_connection` span.
+/// Instrument a synchronous block with an `outbound_connection` span.
 #[macro_export]
 macro_rules! trace_outbound_connection {
     ($outbound_type:expr, $target:expr, $body:expr) => {{
-        use tracing::Instrument;
         let span = tracing::info_span!(
             "outbound_connection",
             outbound_type = %$outbound_type,
             target = %$target
         );
-        async move { $body }.instrument(span).await
+        let _guard = span.entered();
+        $body
     }};
 }
 
@@ -280,6 +281,21 @@ mod tests {
         let _dns_span = DnsResolutionSpan::new("example.com");
         let _proxy_span = ProxyConnectionSpan::new("example.com:443", "https");
         let _routing_span = RoutingDecisionSpan::new(Some("example.com"), None);
+    }
+
+    #[test]
+    fn test_sync_trace_macros_run_inline() {
+        // The `trace_*!` macros are synchronous: they enter a span, run the
+        // body in scope and return its value. No async runtime is involved.
+        let out = trace_dns_resolution!("example.com", 42);
+        assert_eq!(out, 42);
+        let out = trace_proxy_connection!("example.com:443", "https", "relayed");
+        assert_eq!(out, "relayed");
+        let out = trace_inbound_connection!("socks5", "127.0.0.1:1234", 1u8);
+        assert_eq!(out, 1);
+        let out = trace_outbound_connection!("direct", "example.com:80", true);
+        assert!(out);
+        trace_routing_decision!(Some("example.com"), None::<&str>, "rule-set", "DIRECT");
     }
 
     #[test]
