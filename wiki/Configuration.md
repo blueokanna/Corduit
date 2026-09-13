@@ -111,6 +111,7 @@
 | WireGuard | `wireguard` | `private_key`, `public_key`, `endpoint`, `allowed_ips` |
 | TUIC（需 `tuic` feature） | `tuic` | `uuid`, `password`, `alpn`（默认 `["h3"]`）, `sni`, `skip-cert-verify`, `congestion-controller`（`cubic`/`new_reno`/`bbr`，均驱动 NewReno 控制器）, `udp-relay-mode`（`native`/`quic`）, `heartbeat-interval` |
 | Hysteria2（需 `hysteria2` feature） | `hysteria2` / `hy2` | `password`/`auth`, `obfs`（`salamander` + `obfs-password`）, `sni`, `skip-cert-verify`, `alpn`, `up`/`down`（Mbps，仅用于 `hysteria-cc-rx` 速率提示）, `fingerprint`（解析但忽略）, `ports`/`hop-interval`（解析但忽略） |
+| VLESS / Trojan / VMess + REALITY（需 `reality` feature） | `vless` / `trojan` / `vmess` | 在这些出站的 options 里加 `security: "reality"`, `public-key`（服务端 X25519 公钥，base64 或 64 位 hex）, `short-id`（hex，≤8 字节）, `server-name`（伪装 SNI）, `fingerprint`（`chrome`/`randomized`/`off`，默认 `chrome`） |
 | SOCKS5 | `socks5` / `socks` | `username`, `password`, `udp` |
 | HTTP | `http` | `username`, `password` |
 | 选择组 | `selector` / `select` | `outbounds: [tag,...]`，可选 `use: [provider]` |
@@ -120,6 +121,8 @@
 | 中继 | `relay` | `outbounds`（链式） |
 
 > `tuic` 与 `hysteria2`/`hy2` 是**默认关闭的可选 feature**：需在 Cargo.toml 中显式启用 `tuic` / `hysteria2`（两者都会启用 `quic`）。未启用时，这两个类型在配置校验阶段就会被拒绝，并提示缺失的 feature——不会静默退回直连。
+>
+> 同样地，`fingerprint` 需要 `tls13` feature，`security: reality` 需要 `reality` feature（隐含 `tls13`）。REALITY 只实现客户端：session id 按参考格式密封（version/时间/short-id + AES-256-GCM，AAD 为 session-id 清零后的 ClientHello），服务端认证用临时证书证明（证书签名字段 = HMAC-SHA512）；`mldsa65-verify` 未实现，配置里出现会直接报错，收到真证书（回落/MITM）是硬错误。不宣告证书压缩（RFC 8879）与 ALPS。
 >
 > 两者跑在仓库内自研的 QUIC v1 客户端传输上（`protocol::quic`，RFC 9000/9001/9002，TLS 1.3-over-QUIC 握手，NewReno 拥塞控制）。TUIC 走 v5 线缆协议（uni 流认证 + bi 流 TCP + datagram UDP）；Hysteria2 按官方协议规范实现，认证是 HTTP/3 `POST /auth`。
 >

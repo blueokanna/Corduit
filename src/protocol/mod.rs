@@ -9,13 +9,14 @@
 //! | Module | Purpose |
 //! |---|---|
 //! | [`address`] | SOCKS-style address encoding/decoding (`Address`, `AddressType`) |
-//! | [`transport`] | Layered transports: TLS, WebSocket |
 //! | `quic` | QUIC v1 client transport on courierust codecs (TLS 1.3-over-QUIC) — feature `quic` |
+//! | `tls13` | TLS 1.3 client with profile-shaped `ClientHello` (feature `tls13`) |
+//! | `reality` | REALITY client authentication on top of `tls13` (feature `reality`) |
 //! | [`tls`] | TLS client/server layers over courierust — feature `tls` |
 //! | [`wireguard`] | WireGuard handshake & data-path primitives (curve25519, ChaCha20Poly1305) — feature `wireguard` |
 //!
 //! Feature-gated modules are marked with the corresponding crate feature
-//! (`tls`, `wireguard`, `quic`).
+//! (`tls`, `wireguard`, `quic`, `tls13`, `reality`).
 //!
 //! ## Quick start
 //!
@@ -82,10 +83,12 @@ pub mod qpack;
 
 #[cfg(all(feature = "std", feature = "quic"))]
 pub mod quic;
+#[cfg(feature = "reality")]
+pub mod reality;
 #[cfg(all(feature = "std", feature = "tls"))]
 pub mod tls;
-#[cfg(feature = "std")]
-pub mod transport;
+#[cfg(feature = "tls13")]
+pub mod tls13;
 
 #[cfg(all(feature = "std", feature = "wireguard"))]
 pub mod wireguard;
@@ -96,12 +99,6 @@ pub use error::{ProtocolError, Result};
 pub mod prelude {
     pub use crate::protocol::address::{Address, AddressType};
     pub use crate::protocol::error::{ProtocolError, Result};
-
-    #[cfg(feature = "std")]
-    pub use crate::protocol::transport::{
-        TlsConfig, TlsFingerprint, TlsStream, TlsTransport, TransportError, WebSocketConfig,
-        WebSocketTransport, WsStream,
-    };
 
     #[cfg(all(feature = "std", feature = "tls"))]
     pub use crate::protocol::tls::{TlsAcceptor, TlsConnector, TlsStream as TlsModuleStream};

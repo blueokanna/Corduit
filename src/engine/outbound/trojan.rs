@@ -41,6 +41,7 @@ pub struct TrojanOutbound {
     sni: String,
     skip_cert_verify: bool,
     alpn: Vec<String>,
+    advanced: crate::engine::tls::AdvancedTlsOptions,
     udp_enabled: bool,
 }
 
@@ -99,6 +100,8 @@ impl TrojanOutbound {
 
         let password_hash = compute_password_hash(&password);
 
+        let advanced = crate::engine::tls::AdvancedTlsOptions::from_options(&config.options, &sni)?;
+
         Ok(Self {
             config,
             server,
@@ -108,6 +111,7 @@ impl TrojanOutbound {
             sni,
             skip_cert_verify,
             alpn,
+            advanced,
             udp_enabled,
         })
     }
@@ -137,9 +141,19 @@ impl TrojanOutbound {
             })?;
 
         let connector = self.create_tls_connector()?;
-        let tls_stream = connector
-            .connect(stream, &self.sni)
-            .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?;
+        let tls_stream = if self.advanced.is_empty() {
+            connector
+                .connect(stream, &self.sni)
+                .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?
+        } else {
+            crate::engine::tls::connect_advanced_tls(
+                stream,
+                &self.sni,
+                &self.alpn,
+                self.skip_cert_verify,
+                &self.advanced,
+            )?
+        };
 
         tracing::debug!(
             "Trojan TLS connection established to {} (SNI: {})",

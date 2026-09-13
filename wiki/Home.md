@@ -1,6 +1,6 @@
 # Corduit
 
-**Corduit** 是一个用 Rust 写的统一网络代理引擎。配置、路由、DNS、用户态网络栈和全部线缆协议都收在一个 crate 里，不拼接任何第三方代理内核，也**没有任何 async runtime**。HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket、QUIC v1 全走零依赖的 [courierust](https://crates.io/crates/courierust) 编解码栈——QUIC 客户端传输（RFC 9000/9001/9002，TLS 1.3-over-QUIC 握手、NewReno、RFC 9221 数据报）和 QPACK/HPACK 头编解码都是仓库内从零写的，TUIC v5 与 Hysteria2（官方 HTTP/3 `POST /auth` 认证）出站跑在上面——不再依赖 hyper / rustls / tokio / tokio-tungstenite / quinn。TUIC 与 Hysteria2 是**默认关闭的可选 feature**（`tuic` / `hysteria2`，隐含 `quic`）。
+**Corduit** 是一个用 Rust 写的统一网络代理引擎。配置、路由、DNS、用户态网络栈和全部线缆协议都收在一个 crate 里，不拼接任何第三方代理内核，也**没有任何 async runtime**。HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket、QUIC v1 全走零依赖的 [courierust](https://crates.io/crates/courierust) 编解码栈——QUIC 客户端传输（RFC 9000/9001/9002，TLS 1.3-over-QUIC 握手、NewReno、RFC 9221 数据报）和 QPACK/HPACK 头编解码都是仓库内从零写的，TUIC v5 与 Hysteria2（官方 HTTP/3 `POST /auth` 认证）出站跑在上面——不再依赖 hyper / rustls / tokio / tokio-tungstenite / quinn。TUIC 与 Hysteria2 是**默认关闭的可选 feature**（`tuic` / `hysteria2`，隐含 `quic`）。同样默认关闭的还有 `tls13`（仓库内 TLS 1.3 客户端 + 浏览器中的 `ClientHello` 指纹：`chrome`/`randomized`/`off`，测试用 JA3/JA4 反解析校验）与 `reality`（VLESS/Trojan/VMess 的 REALITY 客户端认证：session id 密封 + 临时证书证明；服务端回落硬错误，不静默降级）。CI 的 all-features 任务已覆盖这两条组合。
 
 > 本 Wiki 由 GitHub Actions 在每次 `main` 分支 CI 通过后，从仓库的 `wiki/` 目录自动同步到本页面。改文档请改仓库里的 `wiki/`。
 

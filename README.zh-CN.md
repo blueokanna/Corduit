@@ -11,7 +11,7 @@
 
 ---
 
-## 法律声明 —— 构建或运行前必读
+## 法律声明 —— 所有的构建或运行前必读
 
 Corduit 是网络工程工具：代理协议、规则路由、DNS 与用户态 TCP/IP 协议栈。它只面向**合法用途**发布。
 
@@ -52,8 +52,19 @@ Corduit 反过来：**一个 crate 装下全部**——配置、路由、DNS、�
 | `quic` | 关 | `protocol::quic`——仓库内自研的 QUIC v1 客户端传输（RFC 9000/9001/9002）。 |
 | `tuic` | 关 | TUIC v5 出站。隐含 `quic`。 |
 | `hysteria2` | 关 | Hysteria2 出站（HTTP/3 `POST /auth`、Salamander 混淆）。隐含 `quic`。 |
+| `tls13` | 关 | 仓库内 TLS 1.3 客户端与浏览器对于 `ClientHello` 指纹（`chrome`、`randomized`、`off`）设计。 |
+| `reality` | 关 | VLESS/Trojan/VMess 的 REALITY 客户端认证（`security: reality`）。隐含 `tls13`。 |
 
-未开启 `tuic` / `hysteria2` 的构建会**直接拒绝**对应出站配置，并报出指出缺失 feature 的明确错误——绝不会静默退回直连。
+未开启 `tuic` / `hysteria2` 的构建会**直接拒绝**对应出站配置，并报出指出缺失 feature 的明确错误——绝不会静默退回直连。`security: reality` 与 `fingerprint` 在没有对应 feature 时同样如此。
+
+## REALITY 与 TLS 指纹
+
+可选的 `tls13` / `reality` feature 在 courierust 连接器之外增加第二套 TLS 引擎：`ClientHello` 由数据驱动，服务端认证是可插拔钩子。
+
+- **指纹**（`fingerprint: chrome` | `randomized` | `off`）：密码套件表、扩展集合与顺序、groups、签名算法、ALPN 与填充都来自 [courierust_fingerprint](https://crates.io/crates/courierust) 的 Chrome profile（JA4 规范里给出的参数集），并按浏览器习惯加入 GREASE 与 512 字节对齐填充。测试会把发出去的字节反解析成 profile，对比 JA3/JA4。
+- **REALITY**（`security: reality` + `public-key`、`short-id`、`server-name`）：session id 携带参考实现的 `version || time || short-id`，用 X25519 派生密钥下的 AES-256-GCM 密封；服务端认证用“临时证书证明”（证书签名字段 = `HMAC-SHA512(key, 证书公钥)`）代替 CA 链。
+- **只上报、不伪造**：证书压缩（RFC 8879）与 ALPS 不对外宣告（本客户端无法解压/呈现）、`mldsa65` 校验直接报不支持、REALITY *回落*（收到真证书）是硬错误而不是静默降级。
+- **仅客户端**：REALITY *服务端* 需要 Ed25519 签名能力（仓库内加密层不提供）；会话 id 的**验证**方向已实现并测试（`protocol::reality::wire::unseal_session_id`）。
 
 ```toml
 [dependencies]

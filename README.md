@@ -15,7 +15,7 @@ tree**.
 
 ---
 
-## Legal notice — read this before you build or run
+## Legal notice — read this before you build all components or run programs
 
 Corduit is a network engineering toolkit: proxy protocols, a rule router, DNS
 and a userspace TCP/IP stack. It is published for **lawful use only**.
@@ -92,10 +92,40 @@ What you get out of the box:
 | `quic` | off | `protocol::quic` — the in-repo QUIC v1 client transport (RFC 9000/9001/9002). |
 | `tuic` | off | TUIC v5 outbound. Implies `quic`. |
 | `hysteria2` | off | Hysteria2 outbound (HTTP/3 `POST /auth`, Salamander obfuscation). Implies `quic`. |
+| `tls13` | off | The in-repo TLS 1.3 client and the browser-shaped `ClientHello` fingerprints it can present (`chrome`, `randomized`, `off`). |
+| `reality` | off | REALITY client authentication for VLESS/Trojan/VMess (`security: reality`). Implies `tls13`. |
 
 A build without `tuic` / `hysteria2` **rejects** a `tuic` / `hysteria2`
 outbound with an explicit config error naming the missing feature — it never
-degrades to a direct connection.
+degrades to a direct connection. The same fail-closed rule applies to
+`security: reality` and `fingerprint` without their features.
+
+## REALITY and TLS fingerprints
+
+The optional `tls13` / `reality` features add a second TLS engine next to
+courierust's connector — one whose `ClientHello` is data-driven and whose
+server authentication is a hook:
+
+- **Fingerprints** (`fingerprint: chrome` | `randomized` | `off`): the
+  cipher-suite list, extension set/order, groups, signature algorithms, ALPN
+  and padding are built from
+  [`courierust_fingerprint`](https://crates.io/crates/courierust)'s
+  Chrome profile (the parameter set from the JA4 specification), with GREASE
+  and 512-byte padding like a browser hello. The profile shapes are validated
+  in tests by parsing the emitted bytes back and comparing JA3/JA4.
+- **REALITY** (`security: reality` + `public-key`, `short-id`, `server-name`):
+  the session id carries the reference format's `version || time || short-id`
+  sealed with AES-256-GCM under the X25519-derived auth key, and the server
+  is authenticated by the ephemeral-certificate proof (`HMAC-SHA512` over the
+  key inside the certificate's signature field) instead of a CA chain.
+- **Reported, never faked**: certificate compression (RFC 8879) and ALPS are
+  not advertised (the client cannot decompress or present them), `mldsa65`
+  verification is rejected as unsupported, and a REALITY *fallback* (a real
+  certificate arrived) is a hard error rather than a silent downgrade.
+- **Client side only**: a REALITY *server* would need an Ed25519 signer for
+  `CertificateVerify`, which the in-repo crypto does not provide; the
+  session-id *verification* half is implemented and tested
+  (`protocol::reality::wire::unseal_session_id`).
 
 ```toml
 [dependencies]

@@ -518,6 +518,9 @@ pub struct VmessOutbound {
     // ALPN override for the TLS layer (was `quic-opts.alpn` before the QUIC
     // transport was removed; kept as the TLS ALPN source).
     alpn: Vec<String>,
+    /// `fingerprint` / `security: reality`: handshake options courierust's
+    /// connector cannot express (parsed at construction, fail-closed).
+    advanced: crate::engine::tls::AdvancedTlsOptions,
     // UDP session management
     udp_sessions: DashMap<String, Arc<VmessUdpSession>>,
 }
@@ -662,6 +665,11 @@ impl VmessOutbound {
 
         let cmd_key = generate_cmd_key(&uuid_bytes);
 
+        let advanced = crate::engine::tls::AdvancedTlsOptions::from_options(
+            &config.options,
+            sni.as_deref().unwrap_or(&server),
+        )?;
+
         tracing::info!(
             "VMess outbound '{}' created: server={}:{}, transport={:?}, tls={}, udp={}",
             config.tag,
@@ -688,6 +696,7 @@ impl VmessOutbound {
             sni,
             ws_opts,
             alpn,
+            advanced,
             udp_sessions: DashMap::new(),
         })
     }
@@ -855,6 +864,15 @@ impl VmessOutbound {
         let tcp_stream = self.connect_tcp()?;
 
         let sni = self.sni.as_deref().unwrap_or(&self.server).to_string();
+        if !self.advanced.is_empty() {
+            return crate::engine::tls::connect_advanced_tls(
+                tcp_stream,
+                &sni,
+                &self.alpn,
+                self.skip_cert_verify,
+                &self.advanced,
+            );
+        }
         let connector = self.create_tls_connector()?;
         connector
             .connect(tcp_stream, &sni)

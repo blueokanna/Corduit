@@ -102,6 +102,10 @@ pub struct VlessOutbound {
     sni: String,
     skip_cert_verify: bool,
     alpn: Vec<String>,
+    /// `fingerprint` / `security: reality`: handshake options courierust's
+    /// connector cannot express. Parsed at construction, so an invalid or
+    /// feature-disabled option fails when the outbound is built.
+    advanced: crate::engine::tls::AdvancedTlsOptions,
     udp_enabled: bool,
 }
 
@@ -159,6 +163,8 @@ impl VlessOutbound {
             })
             .unwrap_or_else(|| vec!["h2".to_string(), "http/1.1".to_string()]);
 
+        let advanced = crate::engine::tls::AdvancedTlsOptions::from_options(&config.options, &sni)?;
+
         // Default UDP to true to support QUIC and other UDP protocols
         let udp_enabled = config
             .options
@@ -176,6 +182,7 @@ impl VlessOutbound {
             sni,
             skip_cert_verify,
             alpn,
+            advanced,
             udp_enabled,
         })
     }
@@ -202,9 +209,19 @@ impl VlessOutbound {
             })?;
 
         let connector = self.create_tls_connector()?;
-        let tls_stream = connector
-            .connect(stream, &self.sni)
-            .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?;
+        let tls_stream = if self.advanced.is_empty() {
+            connector
+                .connect(stream, &self.sni)
+                .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?
+        } else {
+            crate::engine::tls::connect_advanced_tls(
+                stream,
+                &self.sni,
+                &self.alpn,
+                self.skip_cert_verify,
+                &self.advanced,
+            )?
+        };
 
         tracing::debug!(
             "VLess TLS connection established to {} (SNI: {})",

@@ -7,22 +7,18 @@
 //! * [`TlsAcceptor`] — server acceptor; same model.
 //! * [`TlsStream`] — the synchronous TLS stream (std `Read`/`Write` +
 //!   half-close).
-//! * `SkipServerVerification` — compatibility marker; skipping verification
-//!   is configured via [`ClientConfig::skip_cert_verify`].
 
 mod client;
 mod config;
 mod error;
 mod server;
 mod stream;
-mod verifier;
 
 pub use client::TlsConnector;
 pub use config::{ClientConfig, ServerConfig};
 pub use error::{Result, TlsError};
 pub use server::TlsAcceptor;
 pub use stream::TlsStream;
-pub use verifier::SkipServerVerification;
 
 /// A boxed synchronous duplex stream (the engine's canonical relay stream
 /// type).

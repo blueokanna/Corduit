@@ -71,7 +71,6 @@ pub mod error;
 pub mod geoip;
 pub mod health_check;
 pub mod inbound;
-pub mod jaeger_tracing;
 pub mod logging;
 pub mod mmdb;
 pub mod outbound;
@@ -118,10 +117,6 @@ impl Corduit {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
         logging::init_logging(config.general.log_level)?;
-
-        // Keep the legacy rustls provider hook for API compatibility; the
-        // courierust TLS layer does not need it.
-        tls::install_crypto_provider();
 
         let proxy_manager = ProxyManager::new(config.clone())?;
         let traffic_stats = TrafficStatsManager::new();

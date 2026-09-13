@@ -62,6 +62,8 @@ pub mod lru;
 #[cfg(feature = "std")]
 pub mod roots;
 #[cfg(feature = "std")]
+pub mod shared_socket;
+#[cfg(feature = "std")]
 pub mod socket;
 #[cfg(feature = "std")]
 pub mod stream;

@@ -20,6 +20,8 @@ wireguard = []
 quic = ["std"]
 tuic = ["quic"]
 hysteria2 = ["quic"]
+tls13 = []
+reality = ["tls13"]
 
 [dependencies]
 

@@ -1,8 +1,6 @@
 use crate::engine::error::{Error, Result};
 
-pub use crate::protocol::tls::{
-    ClientConfig, ServerConfig, SkipServerVerification, TlsAcceptor, TlsConnector, TlsStream,
-};
+pub use crate::protocol::tls::{ClientConfig, TlsConnector};
 
 pub fn yaml_value_to_string(value: &nextjson::Value) -> String {
     match value {
@@ -13,126 +11,173 @@ pub fn yaml_value_to_string(value: &nextjson::Value) -> String {
     }
 }
 
-/// No-op kept for API compatibility.
-///
-/// The old implementation installed the `ring` crypto provider for rustls.
-/// TLS is now provided by courierust (self-contained, zero dependencies),
-/// so there is no global provider to install. The function remains so entry
-/// points (`Corduit::new`, FFI `init_app`, …) don't need to change.
-pub fn install_crypto_provider() {
-    // Intentionally empty: courierust carries its own crypto primitives.
+#[derive(Default, Clone)]
+pub struct AdvancedTlsOptions {
+    #[cfg(feature = "tls13")]
+    pub fingerprint: Option<String>,
+    #[cfg(feature = "reality")]
+    pub reality: Option<crate::protocol::reality::RealityClientOptions>,
 }
 
-#[derive(Clone)]
-pub struct Certificate(pub Vec<u8>);
-
-impl Certificate {
-    pub fn from_pem(pem: &[u8]) -> Result<Self> {
-        Ok(Self(pem.to_vec()))
-    }
-}
-
-/// Private key wrapper for compatibility
-#[derive(Clone)]
-pub struct PrivateKey(pub Vec<u8>);
-
-impl PrivateKey {
-    pub fn from_pem(pem: &[u8]) -> Result<Self> {
-        Ok(Self(pem.to_vec()))
-    }
-}
-
-/// Create a TLS connector with default settings
-pub fn create_tls_connector() -> Result<TlsConnector> {
-    let config = ClientConfig::default();
-    TlsConnector::new(config).map_err(|e| Error::Tls {
-        message: format!("Failed to create TLS connector: {}", e),
-        source: None,
-    })
-}
-
-pub fn create_insecure_tls_connector() -> Result<TlsConnector> {
-    let config = ClientConfig {
-        skip_cert_verify: true,
-        ..Default::default()
-    };
-    TlsConnector::new(config).map_err(|e| Error::Tls {
-        message: format!("Failed to create insecure TLS connector: {}", e),
-        source: None,
-    })
-}
-
-/// Create a TLS acceptor with certificate and key
-pub fn create_tls_acceptor(cert_pem: &str, key_pem: &str) -> Result<TlsAcceptor> {
-    let config = ServerConfig {
-        certificate: cert_pem.to_string(),
-        private_key: key_pem.to_string(),
-        ..Default::default()
-    };
-    TlsAcceptor::new(config).map_err(|e| Error::Tls {
-        message: format!("Failed to create TLS acceptor: {}", e),
-        source: None,
-    })
-}
-
-/// Shadow TLS implementation
-/// Enhanced TLS with additional obfuscation features
-pub mod shadow_tls {
-    use super::*;
-
-    pub struct ShadowTlsConnector {
-        inner: TlsConnector,
-        obfuscation_enabled: bool,
+impl AdvancedTlsOptions {
+    pub fn is_empty(&self) -> bool {
+        #[cfg(feature = "tls13")]
+        if self
+            .fingerprint
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return false;
+        }
+        #[cfg(feature = "reality")]
+        if self.reality.is_some() {
+            return false;
+        }
+        true
     }
 
-    impl ShadowTlsConnector {
-        pub fn new() -> Result<Self> {
-            let inner = create_tls_connector()?;
-            Ok(Self {
-                inner,
-                obfuscation_enabled: true,
-            })
+    pub fn from_options(
+        options: &std::collections::HashMap<String, nextjson::Value>,
+        #[cfg_attr(not(feature = "reality"), allow(unused_variables))] default_server_name: &str,
+    ) -> Result<Self> {
+        #[cfg_attr(not(any(feature = "tls13", feature = "reality")), allow(unused_mut))]
+        let mut out = AdvancedTlsOptions::default();
+
+        let security = options
+            .get("security")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let fingerprint = options
+            .get("fingerprint")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if security == "reality" {
+            #[cfg(feature = "reality")]
+            {
+                let reality = crate::protocol::reality::RealityClientOptions::from_options(
+                    options,
+                    default_server_name,
+                )
+                .map_err(|e| Error::config(format!("REALITY outbound options: {e}")))?;
+                out.fingerprint = Some(
+                    fingerprint
+                        .clone()
+                        .unwrap_or_else(|| reality.fingerprint.canonical_name().to_string()),
+                );
+                out.reality = Some(reality);
+                return Ok(out);
+            }
+            #[cfg(not(feature = "reality"))]
+            return Err(Error::config(
+                "this outbound uses security 'reality', but the build has the `reality` feature \
+                 disabled; rebuild with --features reality",
+            ));
         }
 
-        /// Enable/disable TLS fingerprint obfuscation
-        pub fn set_obfuscation(&mut self, enabled: bool) {
-            self.obfuscation_enabled = enabled;
+        if let Some(name) = fingerprint {
+            #[cfg(feature = "tls13")]
+            {
+                crate::protocol::tls13::fingerprint::Fingerprint::parse(&name)
+                    .map_err(|e| Error::config(format!("outbound fingerprint: {e}")))?;
+                out.fingerprint = Some(name);
+                return Ok(out);
+            }
+            #[cfg(not(feature = "tls13"))]
+            return Err(Error::config(format!(
+                "this outbound sets fingerprint '{name}', but the build has the `tls13` feature \
+                 disabled; rebuild with --features tls13"
+            )));
         }
 
-        pub fn connect(
-            &self,
-            stream: std::net::TcpStream,
-            server_name: &str,
-        ) -> Result<ShadowTlsStream> {
-            let tls_stream = self
-                .inner
-                .connect(stream, server_name)
-                .map_err(|e| Error::Tls {
-                    message: format!("Shadow TLS connection failed: {}", e),
-                    source: None,
-                })?;
-            Ok(ShadowTlsStream {
-                inner: tls_stream,
-                obfuscation_enabled: self.obfuscation_enabled,
-            })
-        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "tls13")]
+const ADVANCED_RELAY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+pub fn connect_advanced_tls(
+    stream: std::net::TcpStream,
+    server_name: &str,
+    alpn: &[String],
+    skip_cert_verify: bool,
+    options: &AdvancedTlsOptions,
+) -> Result<crate::common::stream::BoxStream> {
+    #[cfg(feature = "reality")]
+    if let Some(reality) = options.reality.clone() {
+        let alpn = if alpn.is_empty() {
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        } else {
+            alpn.to_vec()
+        };
+        return crate::protocol::reality::connect(stream, reality, alpn).map_err(|e| Error::Tls {
+            message: format!("REALITY handshake failed: {e}"),
+            source: None,
+        });
     }
 
-    impl Default for ShadowTlsConnector {
-        fn default() -> Self {
-            Self::new().expect("Failed to create default Shadow TLS connector")
-        }
+    #[cfg(feature = "tls13")]
+    if let Some(name) = options.fingerprint.as_deref() {
+        use crate::protocol::tls13::fingerprint::Fingerprint;
+        let fingerprint = Fingerprint::parse(name).map_err(|e| Error::Tls {
+            message: e.to_string(),
+            source: None,
+        })?;
+        let alpn = if alpn.is_empty() {
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        } else {
+            alpn.to_vec()
+        };
+        let socket = crate::common::shared_socket::SharedTcpStream::new(stream);
+        let reader = socket.clone();
+        let writer = socket.clone();
+        let control = socket.clone();
+        let hook_socket = socket.clone();
+        let shutdown_hook =
+            Some(
+                std::sync::Arc::new(move |how: std::net::Shutdown| hook_socket.shutdown(how))
+                    as std::sync::Arc<
+                        dyn Fn(std::net::Shutdown) -> std::io::Result<()> + Send + Sync,
+                    >,
+            );
+        let config = crate::protocol::tls13::Tls13ClientConfig {
+            server_name: server_name.to_string(),
+            alpn,
+            fingerprint: fingerprint.clone(),
+            now: unix_now_seconds(),
+            roots: if skip_cert_verify {
+                None
+            } else {
+                Some(crate::common::roots::system_root_store().clone())
+            },
+            verify: !skip_cert_verify,
+            auth: None,
+            hello_hook: None,
+            compatibility_ccs: !matches!(fingerprint, Fingerprint::Off),
+            shutdown_hook,
+        };
+        let tls =
+            crate::protocol::tls13::connect(reader, writer, config).map_err(|e| Error::Tls {
+                message: format!("TLS 1.3 handshake failed: {e}"),
+                source: None,
+            })?;
+        let _ = control.set_read_timeout(Some(ADVANCED_RELAY_READ_TIMEOUT));
+        return Ok(Box::new(tls) as crate::common::stream::BoxStream);
     }
 
-    pub struct ShadowTlsStream {
-        inner: crate::protocol::tls::BoxStream,
-        #[allow(dead_code)]
-        obfuscation_enabled: bool,
-    }
+    let _ = (stream, server_name, alpn, skip_cert_verify, options);
+    Err(Error::config(
+        "connect_advanced_tls called without any advanced TLS option",
+    ))
+}
 
-    impl ShadowTlsStream {
-        pub fn into_inner(self) -> crate::protocol::tls::BoxStream {
-            self.inner
-        }
-    }
+#[cfg(feature = "tls13")]
+fn unix_now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

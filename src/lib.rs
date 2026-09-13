@@ -41,6 +41,8 @@
 //! | `quic` | no | `protocol::quic`, the in-repo QUIC v1 client transport |
 //! | `tuic` | no | TUIC v5 outbound (implies `quic`) |
 //! | `hysteria2` | no | Hysteria2 outbound (implies `quic`) |
+//! | `tls13` | no | the in-repo TLS 1.3 client with profile-shaped `ClientHello` fingerprints |
+//! | `reality` | no | REALITY client authentication on top of `tls13` (implies `tls13`) |
 //!
 //! `tuic` and `hysteria2` are never in `default`: a default build ships no
 //! QUIC transport and rejects a `tuic` / `hysteria2` outbound with an explicit

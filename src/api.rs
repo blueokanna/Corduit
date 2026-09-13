@@ -21,10 +21,6 @@ where
 }
 
 pub fn init_app() {
-    // Keep the legacy rustls provider hook for API compatibility; courierust
-    // carries its own crypto primitives.
-    crate::engine::tls::install_crypto_provider();
-
     if TRACING_INITIALIZED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
