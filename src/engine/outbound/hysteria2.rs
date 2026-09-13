@@ -819,7 +819,7 @@ impl Hysteria2Outbound {
             .unwrap_or_else(|| self.hy2_config.server.clone());
 
         let mut cfg = QuicClientConfig::new(socket_addr, server_name);
-        cfg.alpn = self.hy2_config.alpn.clone();
+        cfg.alpn.clone_from(&self.hy2_config.alpn);
         cfg.skip_cert_verify = self.hy2_config.skip_cert_verify;
         cfg.idle_timeout = Duration::from_secs(30);
         cfg.keep_alive_interval = Some(Duration::from_secs(10));

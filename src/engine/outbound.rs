@@ -8,6 +8,11 @@
 //! Concurrency model: every method is blocking; long-lived relays run on
 //! dedicated threads spawned by [`relay`](crate::common::stream::relay) and
 //! are bounded by the engine's session gate.
+//!
+//! WireGuard, TUIC v5 and Hysteria2 sit behind the `wireguard`, `tuic` and
+//! `hysteria2` cargo features: with a feature off the corresponding outbound is
+//! not compiled and `build_outbound_proxy` rejects any config naming it, so a
+//! disabled protocol can never fall back to a direct connection.
 
 use crate::common::stream::BoxStream;
 use crate::engine::config::{Config, OutboundConfig, OutboundType};
@@ -20,29 +25,35 @@ use std::sync::OnceLock;
 
 mod direct;
 mod http;
+#[cfg(feature = "hysteria2")]
 mod hysteria2;
 mod reject;
 mod selector;
 mod shadowsocks;
 mod socks5;
 mod trojan;
+#[cfg(feature = "tuic")]
 mod tuic;
 mod vless;
 mod vmess;
+#[cfg(feature = "wireguard")]
 mod wireguard;
 
 pub use direct::relay_bidirectional_with_connection;
 pub use direct::DirectOutbound;
 pub use http::HttpOutbound;
+#[cfg(feature = "hysteria2")]
 pub use hysteria2::Hysteria2Outbound;
 pub use reject::RejectOutbound;
 pub use selector::SelectorOutbound;
 pub use shadowsocks::ShadowsocksOutbound;
 pub use socks5::Socks5Outbound;
 pub use trojan::TrojanOutbound;
+#[cfg(feature = "tuic")]
 pub use tuic::TuicOutbound;
 pub use vless::VlessOutbound;
 pub use vmess::VmessOutbound;
+#[cfg(feature = "wireguard")]
 pub use wireguard::WireguardOutbound;
 
 static GLOBAL_SELECTOR_SELECTIONS: OnceLock<ParkingRwLock<HashMap<String, String>>> =
@@ -222,9 +233,33 @@ pub(crate) fn build_outbound_proxy(
         OutboundType::Vmess => Some(Arc::new(VmessOutbound::new(config.clone())?)),
         OutboundType::Vless => Some(Arc::new(VlessOutbound::new(config.clone())?)),
         OutboundType::Trojan => Some(Arc::new(TrojanOutbound::new(config.clone())?)),
+        #[cfg(feature = "wireguard")]
         OutboundType::Wireguard => Some(Arc::new(WireguardOutbound::new(config.clone())?)),
+        #[cfg(not(feature = "wireguard"))]
+        OutboundType::Wireguard => {
+            return Err(crate::engine::config::disabled_protocol_error(
+                &config.tag,
+                "wireguard",
+            ))
+        }
+        #[cfg(feature = "tuic")]
         OutboundType::Tuic => Some(Arc::new(TuicOutbound::new(config.clone())?)),
+        #[cfg(not(feature = "tuic"))]
+        OutboundType::Tuic => {
+            return Err(crate::engine::config::disabled_protocol_error(
+                &config.tag,
+                "tuic",
+            ))
+        }
+        #[cfg(feature = "hysteria2")]
         OutboundType::Hysteria2 => Some(Arc::new(Hysteria2Outbound::new(config.clone())?)),
+        #[cfg(not(feature = "hysteria2"))]
+        OutboundType::Hysteria2 => {
+            return Err(crate::engine::config::disabled_protocol_error(
+                &config.tag,
+                "hysteria2",
+            ))
+        }
         OutboundType::Selector
         | OutboundType::Urltest
         | OutboundType::Fallback

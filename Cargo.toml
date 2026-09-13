@@ -1,11 +1,11 @@
 [package]
 name = "corduit"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.78"
 license-file = "LICENSE"
 authors = ["blueokanna"]
-description = "A synchronous, no_std-ready unified network proxy engine core written in Rust"
+description = "A synchronous, no_std-ready unified network proxy engine core"
 homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
 readme = "README.md"
@@ -14,9 +14,12 @@ categories = ["network-programming", "web-programming", "no-std"]
 
 [features]
 default = ["std", "tls", "wireguard"]
-std = []
+std = ["tls"]
 tls = []
 wireguard = []
+quic = ["std"]
+tuic = ["quic"]
+hysteria2 = ["quic"]
 
 [dependencies]
 
@@ -40,10 +43,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # --- HTTP / TLS / QUIC / multithreading --
-courierust = { version = "1.0.3" }
+courierust = { version = "1.0.4" }
 
 # --- DNS ---------------------------------------------------------------------
-ipnet = "2"
+ipnet = "2.12.2"
 
 
 # --- crypto ------------------------------------------------------------------
@@ -87,3 +90,6 @@ tracing-android = "0.2"
 
 [dev-dependencies]
 proptest = "1.8.0"
+
+[package.metadata.docs.rs]
+all-features = true

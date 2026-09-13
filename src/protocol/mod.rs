@@ -10,12 +10,12 @@
 //! |---|---|
 //! | [`address`] | SOCKS-style address encoding/decoding (`Address`, `AddressType`) |
 //! | [`transport`] | Layered transports: TLS, WebSocket |
-//! | [`quic`] | QUIC v1 client transport on courierust codecs (TLS 1.3-over-QUIC) |
-//! | [`tls`] | TLS client/server layers over courierust |
-//! | [`wireguard`] | WireGuard handshake & data-path primitives (curve25519, ChaCha20Poly1305) |
+//! | `quic` | QUIC v1 client transport on courierust codecs (TLS 1.3-over-QUIC) — feature `quic` |
+//! | [`tls`] | TLS client/server layers over courierust — feature `tls` |
+//! | [`wireguard`] | WireGuard handshake & data-path primitives (curve25519, ChaCha20Poly1305) — feature `wireguard` |
 //!
 //! Feature-gated modules are marked with the corresponding crate feature
-//! (`tls`, `wireguard`).
+//! (`tls`, `wireguard`, `quic`).
 //!
 //! ## Quick start
 //!
@@ -80,7 +80,7 @@ pub mod address;
 pub mod error;
 pub mod qpack;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "quic"))]
 pub mod quic;
 #[cfg(all(feature = "std", feature = "tls"))]
 pub mod tls;

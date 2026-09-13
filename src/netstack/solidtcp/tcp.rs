@@ -388,7 +388,9 @@ impl TcpConnection {
         if self.seq_after(seq, self.rcv_nxt) {
             self.dup_ack_count += 1;
             if self.ooo_size + data.len() <= self.max_ooo_size {
-                if !self.ooo_segments.contains_key(&seq) {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    self.ooo_segments.entry(seq)
+                {
                     debug!(
                         "Buffering out-of-order segment: seq={}, len={}, expected={}, gap={}",
                         seq,
@@ -396,7 +398,7 @@ impl TcpConnection {
                         self.rcv_nxt,
                         seq.wrapping_sub(self.rcv_nxt)
                     );
-                    self.ooo_segments.insert(seq, data.to_vec());
+                    entry.insert(data.to_vec());
                     self.ooo_size += data.len();
                 }
             } else {

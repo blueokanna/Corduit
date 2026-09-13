@@ -15,6 +15,32 @@ tree**.
 
 ---
 
+## Legal notice — read this before you build or run
+
+Corduit is a network engineering toolkit: proxy protocols, a rule router, DNS
+and a userspace TCP/IP stack. It is published for **lawful use only**.
+
+- **Your local law governs.** Nothing in this repository, its license, or its
+documentation grants you any permission that the law applying to you does not
+already give you. You alone are responsible for how you use it.
+- **Do not use it to break the law.** In some jurisdictions — mainland China
+included — providing or using a proxy, VPN, or tunnel service to bypass state
+network controls is illegal. Corduit grants no right to do that; the
+maintainers neither authorize nor support it.
+- **TUIC and Hysteria2 are opt-in.** Both are disabled Cargo features
+(`tuic`, `hysteria2`) and are absent from a default build. Enabling them is
+an explicit, deliberate decision of yours.
+- **Unlawful use gets no support.** Issues, pull requests, and discussions
+that would enable unlawful use will be closed.
+- **No warranty, no liability.** The software is provided as is. See
+[LICENSE](LICENSE), whose additional licensor terms make lawful use a
+condition of every license granted.
+- **This is not legal advice.** If you are unsure whether your intended use
+is lawful, consult a qualified lawyer in your jurisdiction before building
+or running anything.
+
+---
+
 ## What it is
 
 Traditional proxies are composites. Clash, sing-box, V2Ray: each one glues a
@@ -28,9 +54,10 @@ together, and are released as one unit.
 
 What you get out of the box:
 
-- **Protocols**: Shadowsocks, VMess, VLESS, Trojan, WireGuard, TUIC,
-  Hysteria2, SOCKS5, HTTP(S) — plus proxy groups (selector, url-test,
-  fallback, load-balance, relay).
+- **Protocols**: Shadowsocks, VMess, VLESS, Trojan, WireGuard, SOCKS5,
+  HTTP(S) — plus opt-in TUIC v5 (`tuic`) and Hysteria2 (`hysteria2`)
+  outbounds, and proxy groups (selector, url-test, fallback, load-balance,
+  relay).
 - **Synchronous by design**: no tokio, no reactor, no `async`/`await` in the
   engine. Concurrency comes from courierust's work-stealing thread pool for
   short tasks and dedicated threads for long-lived relays. `cargo tree`
@@ -43,7 +70,8 @@ What you get out of the box:
   TLS 1.2/1.3, WebSocket and QUIC v1 exchange runs on
   [courierust](https://crates.io/crates/courierust) plus in-tree codecs —
   including a from-scratch QUIC v1 client transport (RFC 9000/9001/9002)
-  with its own TLS 1.3-over-QUIC handshake and QPACK/HPACK header codec.
+  with its own TLS 1.3-over-QUIC handshake and QPACK/HPACK header codec
+  (the QUIC transport is the optional `quic` feature).
   No hyper, no rustls, no quinn, no tokio.
 - **Anti-pollution DNS**: UDP/TCP/DoH/DoT servers and clients, TTL-aware cache,
   fake-IP, hosts, bogon filtering, split resolution.
@@ -53,6 +81,28 @@ What you get out of the box:
 - **Traffic accounting**: per-connection upload/download, speed, active list.
 - **Three ways to drive it** — see below — all backed by one typed dispatch
   table.
+
+## Cargo features
+
+| Feature | Default | What it adds |
+|---|---|---|
+| `std` | on | Threaded engine layer: engine, DNS servers, netstack, RPC, FFI. Implies `tls`. |
+| `tls` | on | `protocol::tls` client/server layers and the TLS-based outbounds (HTTPS, Trojan, VMess/VLESS TLS, TLS inbounds). |
+| `wireguard` | on | `protocol::wireguard` plus the WireGuard outbound. |
+| `quic` | off | `protocol::quic` — the in-repo QUIC v1 client transport (RFC 9000/9001/9002). |
+| `tuic` | off | TUIC v5 outbound. Implies `quic`. |
+| `hysteria2` | off | Hysteria2 outbound (HTTP/3 `POST /auth`, Salamander obfuscation). Implies `quic`. |
+
+A build without `tuic` / `hysteria2` **rejects** a `tuic` / `hysteria2`
+outbound with an explicit config error naming the missing feature — it never
+degrades to a direct connection.
+
+```toml
+[dependencies]
+corduit = "0.1"                                    # std + tls + wireguard
+# optional QUIC-based outbounds — enable deliberately, use lawfully:
+# corduit = { version = "0.1", features = ["tuic", "hysteria2"] }
+```
 
 ## How you talk to it
 
@@ -213,12 +263,18 @@ behind the `std` feature.
 
 ```bash
 cargo check --all-targets
-cargo test            # ≈480 unit tests + property tests
+cargo test                            # unit + property tests (default features)
+cargo test --features tuic,hysteria2  # include the optional QUIC-based outbounds
 cargo test --doc
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-cargo check --no-default-features   # the no_std protocol core
+cargo check --no-default-features                 # the no_std protocol core
+cargo check --no-default-features --features std  # engine layer, no optional protocols
 ```
+
+CI runs the default matrix on Linux, macOS and Windows, plus an all-features
+job (so the gated QUIC/TUIC/Hysteria2 code is built and tested too) and the
+`no_std` core check.
 
 MSRV: Rust 1.78. The crate builds with **no HTTP/TLS/QUIC third-party
 libraries and no async runtime** — the entire network stack is courierust
@@ -247,11 +303,12 @@ courierust's public primitives. A dedicated driver thread per connection owns
 the UDP socket; streams are synchronous `Read`/`Write` handles over
 mutex-guarded buffers with condvar wakeups.
 
-On top of that sit a QPACK/HPACK header codec (`protocol::qpack`) and the
-TUIC v5 and Hysteria2 outbounds. Hysteria2 is implemented against the
-official protocol spec: HTTP/3 `POST /auth` authentication, `0x401` TCP
-requests, session/UDP datagram framing with fragmentation, and optional
-Salamander packet obfuscation (BLAKE2b-256).
+On top of that sit a QPACK/HPACK header codec (`protocol::qpack`) and, behind
+the `quic` feature, the TUIC v5 (`tuic`) and Hysteria2 (`hysteria2`)
+outbounds. Hysteria2 is implemented against the official protocol spec:
+HTTP/3 `POST /auth` authentication, `0x401` TCP requests, session/UDP
+datagram framing with fragmentation, and optional Salamander packet
+obfuscation (BLAKE2b-256).
 
 Deliberately not offered — and each is called out with an explicit warning
 when a config asks for it, never silently faked: 0-RTT (early data), BBR /
@@ -273,5 +330,14 @@ More: [Security](https://github.com/blueokanna/Corduit/wiki/Security).
 
 ## License
 
-PolyForm Perimeter 1.0.1. Use, modify and distribute freely; the only
-restriction is offering a product that substitutes for Corduit itself.
+[PolyForm Strict License 1.0.0](LICENSE), plus additional licensor terms.
+
+- **Permitted**: personal use (research, experiment, testing, personal study,
+hobby projects) and noncommercial purposes, including use by noncommercial
+organizations.
+- **Not permitted**: distributing the software in any form (free or paid) and
+making changes or new works based on it.
+- **Conditioned on lawful use**: no circumvention rights are granted, and use
+must stay inside the law that applies to you.
+
+Required Notice: Copyright 2026 blueokanna (https://github.com/blueokanna/Corduit)

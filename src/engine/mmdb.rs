@@ -12,6 +12,7 @@
 //! * metadata is a data-section-format map starting at the **last** occurrence
 //!   of `\xab\xcd\xefMaxMind.com`.
 
+use std::cmp::Ordering;
 use std::net::IpAddr;
 
 /// Metadata values required to walk the search tree.
@@ -218,15 +219,16 @@ impl MmdbReader {
             for i in (0..8).rev() {
                 let bit = (byte >> i) & 1;
                 let record = self.read_record(node, bit)?;
-                if record < self.meta.node_count {
-                    node = record;
-                } else if record > self.meta.node_count {
-                    // `$offset_in_file = record - node_count + tree_size`.
-                    let off = (record - self.meta.node_count) as usize
-                        + self.meta.search_tree_size as usize;
-                    return Some(off);
-                } else {
-                    return None; // record == node_count: not in database
+                match record.cmp(&self.meta.node_count) {
+                    Ordering::Less => node = record,
+                    Ordering::Greater => {
+                        // `$offset_in_file = record - node_count + tree_size`.
+                        let off = (record - self.meta.node_count) as usize
+                            + self.meta.search_tree_size as usize;
+                        return Some(off);
+                    }
+                    // record == node_count: not in database
+                    Ordering::Equal => return None,
                 }
             }
         }

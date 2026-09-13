@@ -11,6 +11,19 @@
 
 ---
 
+## 法律声明 —— 构建或运行前必读
+
+Corduit 是网络工程工具：代理协议、规则路由、DNS 与用户态 TCP/IP 协议栈。它只面向**合法用途**发布。
+
+- **以你所在司法辖区的法律为准。** 本仓库、其许可证与文档都不授予你任何当地法律未曾给予的许可；使用后果完全由你承担。
+- **不得用于违法用途。** 在某些司法辖区——包括中国大陆——提供或使用代理、VPN、隧道类服务规避国家网络管控属于违法。Corduit 不授予此类权利，维护者既不授权也不支持。
+- **TUIC 与 Hysteria2 默认关闭。** 两者是可选 Cargo feature（`tuic`、`hysteria2`），默认构建中不包含；开启它们是你显式且经过考虑的决定。
+- **违法用途不提供支持。** 涉及违法用途的 issue、PR、讨论一律关闭。
+- **无担保、无责任。** 软件按“现状”提供，见 [LICENSE](LICENSE)——其中的附加许可人条款把合法使用作为所有许可的前提条件。
+- **本声明不是法律意见。** 若不确定你的用途是否合法，请先咨询你所在辖区的执业律师，再构建或运行。
+
+---
+
 ## 这是什么
 
 传统代理都是"拼"出来的：Clash、sing-box、V2Ray 把配置加载器、规则引擎、DNS 解析器和一堆协议内核粘在一起，每个部件来自不同上游，各有各的版本、各有各的坑。
@@ -19,15 +32,35 @@ Corduit 反过来：**一个 crate 装下全部**——配置、路由、DNS、�
 
 开箱即有的东西：
 
-- **协议**：Shadowsocks、VMess、VLESS、Trojan、WireGuard、TUIC、Hysteria2、SOCKS5、HTTP(S)，外加代理组（selector、url-test、fallback、load-balance、relay）。
+- **协议**：Shadowsocks、VMess、VLESS、Trojan、WireGuard、SOCKS5、HTTP(S)，外加**可选**的 TUIC v5（`tuic`）与 Hysteria2（`hysteria2`）出站，以及代理组（selector、url-test、fallback、load-balance、relay）。
 - **同步设计**：没有 tokio、没有 reactor、引擎里没有 `async`/`await`。并发来自 courierust 的 work-stealing 线程池（短任务）+ 专用线程（长连接中继）。`cargo tree` 里 **零** `tokio` / `futures` / `async-trait`。
 - **no_std 核心**：`default-features = false` 时 crate 以 `no_std + alloc` 编译——加密原语、URL 解析器和纯线缆编解码（SOCKS 式地址、QPACK/HPACK、DNS wire）零 OS 依赖。
-- **HTTP/TLS/QUIC 全部自包含**：HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket、QUIC v1 全走 [courierust](https://crates.io/crates/courierust) 加仓库内手写编解码——包括一套从零写的 QUIC v1 客户端传输（RFC 9000/9001/9002），自带 TLS 1.3-over-QUIC 握手和 QPACK/HPACK 头编解码。不再有 hyper、rustls、quinn、tokio。
+- **HTTP/TLS/QUIC 全部自包含**：HTTP/1.1、HTTP/2、HTTP/3、TLS 1.2/1.3、WebSocket、QUIC v1 全走 [courierust](https://crates.io/crates/courierust) 加仓库内手写编解码——包括一套从零写的 QUIC v1 客户端传输（RFC 9000/9001/9002），自带 TLS 1.3-over-QUIC 握手和 QPACK/HPACK 头编解码（QUIC 传输由可选 `quic` feature 控制）。不再有 hyper、rustls、quinn、tokio。
 - **抗污染 DNS**：UDP/TCP/DoH/DoT 服务端与客户端、TTL 感知缓存、fake-IP、hosts、bogon 过滤、内外分流。
 - **TUN 支持**：仓库内用户态 TCP/IP 栈（SolidTCP）加 NAT，Windows / Linux / macOS / Android 都能做透明代理。
 - **热重载**：`Corduit::reload()` 原子换配置。
 - **流量统计**：逐连接上下行、速度、活跃列表。
 - **三种调用方式**（见下），背后是同一张分发表。
+
+## Cargo feature
+
+| Feature | 默认 | 作用 |
+|---|---|---|
+| `std` | 开 | 线程化引擎层：engine、DNS 服务端、netstack、RPC、FFI。隐含 `tls`。 |
+| `tls` | 开 | `protocol::tls` 客户端/服务端层，以及依赖它的出站（HTTPS、Trojan、VMess/VLESS TLS、TLS 入站）。 |
+| `wireguard` | 开 | `protocol::wireguard` 与 WireGuard 出站。 |
+| `quic` | 关 | `protocol::quic`——仓库内自研的 QUIC v1 客户端传输（RFC 9000/9001/9002）。 |
+| `tuic` | 关 | TUIC v5 出站。隐含 `quic`。 |
+| `hysteria2` | 关 | Hysteria2 出站（HTTP/3 `POST /auth`、Salamander 混淆）。隐含 `quic`。 |
+
+未开启 `tuic` / `hysteria2` 的构建会**直接拒绝**对应出站配置，并报出指出缺失 feature 的明确错误——绝不会静默退回直连。
+
+```toml
+[dependencies]
+corduit = "0.1"                                    # std + tls + wireguard
+# 可选的 QUIC 出站——请有意开启，且仅在合法前提下使用：
+# corduit = { version = "0.1", features = ["tuic", "hysteria2"] }
+```
 
 ## 怎么调用
 
@@ -160,12 +193,16 @@ no_std 核心在 `crypto/`、`common/url`、`protocol/address`、`protocol/qpack
 
 ```bash
 cargo check --all-targets
-cargo test            # ≈480 个单元测试 + 属性测试
+cargo test                            # 单元 + 属性测试（默认 feature）
+cargo test --features tuic,hysteria2  # 连同可选的 QUIC 出站一起测
 cargo test --doc
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-cargo check --no-default-features   # no_std 协议核心
+cargo check --no-default-features                 # no_std 协议核心
+cargo check --no-default-features --features std  # 引擎层，不含可选协议
 ```
+
+CI 在 Linux、macOS、Windows 上跑默认矩阵，另有一个 all-features 任务（保证门控的 QUIC/TUIC/Hysteria2 代码也被构建和测试）与 `no_std` 核心检查。
 
 MSRV：Rust 1.78。**没有任何 HTTP/TLS/QUIC 第三方库、没有任何 async runtime**——整个网络栈是 courierust 加仓库内手写协议编解码，并发是 courierust 的 work-stealing 池加 `std::thread`。
 
@@ -175,7 +212,7 @@ Corduit 曾经依赖 hyper/h2/http、rustls + tokio-rustls、quinn 和 tokio。�
 
 QUIC 是最有意思的部分。courierust 提供 RFC 9000/9001 线缆编解码（包头、帧、varint、包保护）和 TLS 1.3 加密原语，但没有 QUIC 连接运行时。为了不交出一个连不上真服务器的栈，Corduit 在 `protocol::quic` 里补上缺失的一层：一个真实的客户端 QUIC v1 传输——TLS 1.3-over-QUIC 握手（ClientHello → ServerHello → EncryptedExtensions/Certificate/CertificateVerify/Finished）、三个包号空间、ACK/丢包恢复 + PTO、NewReno 拥塞控制、流与连接级流控、RFC 9221 数据报——全部基于 courierust 的公开原语。每条连接一条专用驱动线程持有 UDP socket；流是同步 `Read`/`Write` 句柄，底层是互斥锁保护的缓冲区加 condvar 唤醒。
 
-之上是 QPACK/HPACK 头编解码（`protocol::qpack`）和 TUIC v5、Hysteria2 出站。Hysteria2 按官方协议规范实现：HTTP/3 `POST /auth` 认证、`0x401` TCP 请求、带分片的会话/UDP 数据报帧、可选 Salamander 包混淆（BLAKE2b-256）。
+之上是 QPACK/HPACK 头编解码（`protocol::qpack`），以及由 `quic` feature 门控的 TUIC v5（`tuic`）与 Hysteria2（`hysteria2`）出站。Hysteria2 按官方协议规范实现：HTTP/3 `POST /auth` 认证、`0x401` TCP 请求、带分片的会话/UDP 数据报帧、可选 Salamander 包混淆（BLAKE2b-256）。
 
 明确不支持——配置里出现会显式告警，绝不静默假装：0-RTT（early data）、BBR / TCP-Brutal 拥塞控制（只有 NewReno）、源端口跳动、TLS 指纹伪装。
 
@@ -191,4 +228,10 @@ QUIC 是最有意思的部分。courierust 提供 RFC 9000/9001 线缆编解码�
 
 ## License
 
-PolyForm Perimeter 1.0.1。可自由使用、修改、分发；唯一限制是不能提供替代 Corduit 本身的产品。
+[PolyForm Strict License 1.0.0](LICENSE)，外加附加许可人条款。
+
+- **允许**：个人用途（研究、实验、测试、个人学习、业余项目）与非商业目的，包括非商业组织使用。
+- **不允许**：以任何形式分发本软件（无论免费或收费），以及基于本软件修改或创作衍生作品。
+- **前提条件——合法使用**：不授予任何绕过网络管控的权利，且必须在你所在辖区的法律允许范围内使用。
+
+Required Notice: Copyright 2026 blueokanna (https://github.com/blueokanna/Corduit)

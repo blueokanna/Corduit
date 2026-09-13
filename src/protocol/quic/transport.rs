@@ -392,7 +392,9 @@ impl QuicConn {
             Some(PacketKey::initial(&dcid, false).map_err(|e| QuicError::Protocol(e.to_string()))?);
         state.spaces[0].key =
             Some(PacketKey::initial(&dcid, true).map_err(|e| QuicError::Protocol(e.to_string()))?);
-        state.spaces[0].crypto_send = state.tls.client_hello.clone();
+        state.spaces[0]
+            .crypto_send
+            .clone_from(&state.tls.client_hello);
         state.spaces[0].crypto_written = state.tls.client_hello.len() as u64;
 
         let conn = Arc::new(QuicConn {
@@ -424,17 +426,12 @@ impl QuicConn {
     fn run(self: Arc<Self>) {
         let mut buf = [0u8; MAX_PACKET];
         loop {
-            // 1. Receive one datagram. A quiet socket times out after
-            //    DRIVER_POLL and falls through to timer / writer servicing.
             match self.udp.recv_from(&mut buf) {
                 Ok((n, _)) => {
                     let out = {
                         let mut st = self.lock();
                         st.last_recv = Instant::now();
                         match &self.obfs {
-                            // Salamander: strip the 8-byte salt and XOR the
-                            // keystream back out. Packets too short to carry
-                            // a salt are invalid and discarded.
                             Some(obfs) => match obfs.deobfuscate_packet(&buf[..n]) {
                                 Some(plain) => {
                                     if let Err(e) = self.process_inbound(&mut st, &plain) {
@@ -466,10 +463,6 @@ impl QuicConn {
                             | io::ErrorKind::ConnectionReset
                     ) =>
                 {
-                    // Transient: idle socket, or (on Windows) an ICMP error
-                    // surfacing on a connected UDP socket. Both are normal
-                    // for QUIC — loss recovery is the activity authority,
-                    // not per-recv errors.
                     let _ = self.writer.notified();
                     let out = {
                         let mut st = self.lock();
@@ -484,7 +477,6 @@ impl QuicConn {
                 }
             }
 
-            // 2. Exit once the connection is closed or shutdown is requested.
             let closed = {
                 let st = self.lock();
                 st.closed.is_some() || self.shutdown.load(Ordering::Acquire)
@@ -659,7 +651,7 @@ impl QuicConn {
         st.spaces[0].key = Some(
             PacketKey::initial(retry_scid, true).map_err(|e| QuicError::Protocol(e.to_string()))?,
         );
-        st.spaces[0].crypto_send = st.tls.client_hello.clone();
+        st.spaces[0].crypto_send.clone_from(&st.tls.client_hello);
         st.spaces[0].crypto_written = st.tls.client_hello.len() as u64;
         st.tls.reset_after_retry();
         Ok(())
@@ -714,7 +706,7 @@ impl QuicConn {
         // all subsequent packets (RFC 9000 §7.2).
         if let ParsedPacket::Long(h) = &parsed {
             if !h.scid.is_empty() {
-                st.dcid = h.scid.clone();
+                st.dcid.clone_from(&h.scid);
             }
         }
 
@@ -862,27 +854,27 @@ impl QuicConn {
         // Contiguous crypto handling (servers send CRYPTO in order; overlap
         // only occurs on retransmission).
         let expected = sp.crypto_recv.len() as u64;
-        if offset == expected {
-            sp.crypto_recv.extend_from_slice(&data);
-        } else if offset < expected {
-            let start = offset as usize;
-            let new = (offset + data.len() as u64).min(expected) as usize;
-            if new > start {
-                sp.crypto_recv[start..new].copy_from_slice(&data[..new - start]);
+        match offset.cmp(&expected) {
+            std::cmp::Ordering::Equal => sp.crypto_recv.extend_from_slice(&data),
+            std::cmp::Ordering::Less => {
+                let start = offset as usize;
+                let new = (offset + data.len() as u64).min(expected) as usize;
+                if new > start {
+                    sp.crypto_recv[start..new].copy_from_slice(&data[..new - start]);
+                }
+                if offset + data.len() as u64 > expected {
+                    let from = (expected - offset) as usize;
+                    sp.crypto_recv.extend_from_slice(&data[from..]);
+                }
             }
-            if offset + data.len() as u64 > expected {
-                let from = (expected - offset) as usize;
-                sp.crypto_recv.extend_from_slice(&data[from..]);
+            std::cmp::Ordering::Greater => {
+                return Err(QuicError::Protocol("CRYPTO gap from peer".into()))
             }
-        } else {
-            return Err(QuicError::Protocol("CRYPTO gap from peer".into()));
         }
 
         let consumed = st.tls.consume_crypto(&sp.crypto_recv)?;
         sp.crypto_recv.drain(..consumed);
 
-        // The TLS layer may have queued the client Finished into the
-        // handshake space's send buffer.
         let pending = st.tls.take_crypto_pending();
         if !pending.is_empty() {
             let hsp = &mut st.spaces[PnSpace::Handshake.index()];
@@ -905,12 +897,10 @@ impl QuicConn {
         data: Vec<u8>,
         fin: bool,
     ) -> Result<()> {
-        if !st.streams.contains_key(&stream_id) {
-            st.streams.insert(
-                stream_id,
-                StreamState::new(0, recv_window_for(st, stream_id)),
-            );
-        }
+        let recv_window = recv_window_for(st, stream_id);
+        st.streams
+            .entry(stream_id)
+            .or_insert_with(|| StreamState::new(0, recv_window));
         let s = st
             .streams
             .get_mut(&stream_id)

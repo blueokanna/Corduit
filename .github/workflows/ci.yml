@@ -35,7 +35,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --all-features
 
   # ---- MSRV job: the declared rust-version must really compile --------------
   msrv:
@@ -119,10 +119,35 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+  # ---- Feature matrix: the optional QUIC/TUIC/Hysteria2 code must compile ---
+  features:
+    name: feature matrix (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check (all features, all targets)
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+
+      - name: Check (std, no optional protocols)
+        run: cargo check --no-default-features --features std
+
+      - name: Check (no_std core)
+        run: cargo check --no-default-features
 
   # ---- Wiki: publish docs after CI succeeds on main ------------------------
   # The `wiki/` directory in the repository is the source of truth. After every
@@ -134,7 +159,7 @@ jobs:
   # to the wiki — the expression below falls back to it automatically.
   wiki:
     name: Publish Wiki
-    needs: [native, msrv, lint]
+    needs: [native, msrv, lint, features]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

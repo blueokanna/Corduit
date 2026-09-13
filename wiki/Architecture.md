@@ -22,7 +22,7 @@ flowchart TB
 
     ENGINE --> EC["config/<br/>校验过的配置模型"]
     ENGINE --> EI["inbound/<br/>HTTP / SOCKS5 / mixed 监听"]
-    ENGINE --> EO["outbound/<br/>Direct/SS/VMess/VLESS/Trojan/WireGuard/TUIC/Hysteria2/HTTP(S)/SOCKS5<br/>+ proxy-provider 节点注册表"]
+    ENGINE --> EO["outbound/<br/>Direct/SS/VMess/VLESS/Trojan/WireGuard/HTTP(S)/SOCKS5<br/>TUIC · Hysteria2（可选 feature）<br/>+ proxy-provider 节点注册表"]
     ENGINE --> ER["routing.rs<br/>规则 → 出站匹配 + rule-provider 管理"]
     ENGINE --> EG["geoip.rs + mmdb.rs<br/>CountryMatcher + MMDB 读取"]
     ENGINE --> EP["proxy.rs<br/>ProxyManager 协调器"]
@@ -136,6 +136,9 @@ ProviderUpdater 在 `Corduit::start` 时启动、`stop` 时停止，默认 60 �
 `default-features = false` 时 crate 以 `no_std + alloc` 编译：`crypto/`、`common/url`、
 `protocol/{address,qpack,error}` 零 OS 依赖；线程化网络层（engine、DNS 服务器、
 netstack、RPC、传输）由 `std` feature 门控。
+
+可选 feature：`quic`（仓库内自研 QUIC v1 传输）、`tuic`、`hysteria2`（两者隐含 `quic`）——
+默认全部关闭，默认构建里不包含任何 QUIC / TUIC / Hysteria2 代码。
 
 ## 安全边界
 

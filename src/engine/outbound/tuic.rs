@@ -266,12 +266,10 @@ impl TuicConnection {
     pub fn recv_udp_packet(&self) -> Result<(u16, TargetAddr, Vec<u8>)> {
         loop {
             let data = match self.udp_relay_mode {
-                UdpRelayMode::Native => {
-                    let datagram = self.connection.read_datagram().map_err(|e| {
-                        Error::network(format!("Failed to receive UDP datagram: {e}"))
-                    })?;
-                    datagram
-                }
+                UdpRelayMode::Native => self
+                    .connection
+                    .read_datagram()
+                    .map_err(|e| Error::network(format!("Failed to receive UDP datagram: {e}")))?,
                 UdpRelayMode::Quic => {
                     let mut stream = self
                         .connection
@@ -698,7 +696,7 @@ impl TuicOutbound {
         };
 
         let mut cfg = QuicClientConfig::new(socket_addr, server_name);
-        cfg.alpn = self.tuic_config.alpn.clone();
+        cfg.alpn.clone_from(&self.tuic_config.alpn);
         cfg.skip_cert_verify = self.tuic_config.skip_cert_verify;
         cfg.idle_timeout = Duration::from_secs(30);
         cfg.keep_alive_interval = Some(Duration::from_millis(self.tuic_config.heartbeat));

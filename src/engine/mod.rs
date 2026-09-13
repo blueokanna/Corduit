@@ -14,8 +14,10 @@
 //!   database without touching the engine.
 //! * **Inbound listeners** ([`inbound`]): HTTP, SOCKS5 and mixed.
 //! * **Outbound protocols & groups** ([`outbound`]): Shadowsocks, VMess, VLESS,
-//!   Trojan, WireGuard, HTTP(S), SOCKS5, Direct, Reject — plus selector /
-//!   url-test / fallback / load-balance / relay groups.
+//!   Trojan, HTTP(S), SOCKS5, Direct, Reject — plus selector / url-test /
+//!   fallback / load-balance / relay groups. WireGuard (feature `wireguard`),
+//!   TUIC v5 (feature `tuic`) and Hysteria2 (feature `hysteria2`) are
+//!   feature-gated; the two QUIC-based ones are off by default.
 //! * **Hot reload** ([`Corduit::reload`]) with atomic config swaps.
 //! * **Observability**: `tracing`-based structured logging and span helpers.
 //!

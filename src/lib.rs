@@ -31,6 +31,22 @@
 //! servers, RPC, HTTP/TLS/QUIC transports) is gated behind the `std`
 //! feature.
 //!
+//! ## Cargo features
+//!
+//! | Feature | Default | Adds |
+//! |---|---|---|
+//! | `std` | yes | the threaded engine layer (implies `tls`) |
+//! | `tls` | yes | `protocol::tls` client/server layers |
+//! | `wireguard` | yes | `protocol::wireguard` and the WireGuard outbound |
+//! | `quic` | no | `protocol::quic`, the in-repo QUIC v1 client transport |
+//! | `tuic` | no | TUIC v5 outbound (implies `quic`) |
+//! | `hysteria2` | no | Hysteria2 outbound (implies `quic`) |
+//!
+//! `tuic` and `hysteria2` are never in `default`: a default build ships no
+//! QUIC transport and rejects a `tuic` / `hysteria2` outbound with an explicit
+//! "feature disabled" config error — it never falls back to a direct
+//! connection.
+//!
 //! ## Examples
 //!
 //! Runnable, offline-friendly examples live in [`examples/`](https://github.com/blueokanna/Corduit/tree/main/examples)

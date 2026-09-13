@@ -342,6 +342,33 @@ impl_config_enum!(OutboundType {
     Relay => "relay",
 });
 
+impl OutboundType {
+    /// The cargo feature this build would have needed for the outbound to be
+    /// constructible: `Some(feature)` when the protocol was **not** compiled
+    /// in, `None` when it is available.
+    ///
+    /// Both config validation and the outbound factory consult this, so a
+    /// config naming a disabled protocol fails closed with one actionable
+    /// message instead of degrading to a direct connection.
+    pub const fn disabled_feature(self) -> Option<&'static str> {
+        match self {
+            OutboundType::Wireguard if !cfg!(feature = "wireguard") => Some("wireguard"),
+            OutboundType::Tuic if !cfg!(feature = "tuic") => Some("tuic"),
+            OutboundType::Hysteria2 if !cfg!(feature = "hysteria2") => Some("hysteria2"),
+            _ => None,
+        }
+    }
+}
+
+/// Error for a config that names a protocol this build disabled. `feature` is
+/// the cargo feature that turns it on (see [`OutboundType::disabled_feature`]).
+pub(crate) fn disabled_protocol_error(tag: &str, feature: &str) -> crate::engine::error::Error {
+    crate::engine::error::Error::config(format!(
+        "Outbound '{tag}' requires the `{feature}` cargo feature, which this build \
+         disabled; rebuild with `--features {feature}`"
+    ))
+}
+
 /// Rule types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleType {

@@ -714,8 +714,8 @@ impl Tls13Client {
         let client_hs = self.derive_secret_from(&hs_secret, b"c hs traffic", &ch_sh_hash, hash_len);
         let server_hs = self.derive_secret_from(&hs_secret, b"s hs traffic", &ch_sh_hash, hash_len);
 
-        self.client_hs_secret = client_hs.clone();
-        self.server_hs_secret = server_hs.clone();
+        self.client_hs_secret.clone_from(&client_hs);
+        self.server_hs_secret.clone_from(&server_hs);
         self.ecdhe_shared = shared.to_vec();
         self.ch_sh_hash = ch_sh_hash;
         self.hs_write = Some(PacketKey::from_secret(suite, &client_hs)?);

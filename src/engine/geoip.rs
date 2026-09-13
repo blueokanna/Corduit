@@ -411,9 +411,9 @@ mod tests {
         assert!(!manager.is_loaded());
         // Empty database: every GEOIP lookup is a miss, falling through to
         // the next rule instead of aborting routing.
-        assert!(!manager
+        assert!(manager
             .lookup_country(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))
-            .is_some());
+            .is_none());
         assert!(!manager.matches_country("CN", IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))));
     }
 }

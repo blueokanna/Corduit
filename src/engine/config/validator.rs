@@ -181,6 +181,12 @@ impl ConfigValidator {
                 return Err(Error::config("Outbound tag cannot be empty"));
             }
 
+            // A protocol this build did not compile in fails here, naming the
+            // cargo feature — not later on a missing server field.
+            if let Some(feature) = outbound.outbound_type.disabled_feature() {
+                return Err(disabled_protocol_error(&outbound.tag, feature));
+            }
+
             // Check for direct outbound
             if outbound.outbound_type == OutboundType::Direct {
                 has_direct = true;
@@ -511,5 +517,61 @@ mod tests {
         };
 
         assert!(ConfigValidator::validate(&config).is_err());
+    }
+
+    /// A protocol whose cargo feature this build disabled must be rejected at
+    /// validation time with a message naming the feature — fail closed, never
+    /// a silent fallback to a direct connection.
+    #[test]
+    fn feature_gated_outbounds_fail_closed() {
+        for (outbound_type, feature) in [
+            (OutboundType::Wireguard, "wireguard"),
+            (OutboundType::Tuic, "tuic"),
+            (OutboundType::Hysteria2, "hysteria2"),
+        ] {
+            let config = Config {
+                general: GeneralConfig::default(),
+                dns: DnsConfig::default(),
+                inbounds: vec![InboundConfig {
+                    inbound_type: InboundType::Http,
+                    tag: "http-in".to_string(),
+                    listen: "127.0.0.1".to_string(),
+                    port: 7890,
+                    options: Default::default(),
+                }],
+                outbounds: vec![
+                    OutboundConfig {
+                        outbound_type: OutboundType::Direct,
+                        tag: "direct".to_string(),
+                        server: None,
+                        port: None,
+                        options: Default::default(),
+                    },
+                    OutboundConfig {
+                        outbound_type,
+                        tag: "proxy".to_string(),
+                        server: Some("example.com".to_string()),
+                        port: Some(443),
+                        options: Default::default(),
+                    },
+                ],
+                rules: vec![],
+            };
+
+            match outbound_type.disabled_feature() {
+                Some(missing) => {
+                    assert_eq!(missing, feature);
+                    let error = ConfigValidator::validate(&config)
+                        .expect_err("a disabled protocol must be rejected")
+                        .to_string();
+                    assert!(
+                        error.contains(feature),
+                        "error must name the missing feature: {error}"
+                    );
+                }
+                None => ConfigValidator::validate(&config)
+                    .expect("a compiled-in protocol must validate"),
+            }
+        }
     }
 }

@@ -168,7 +168,7 @@ pub unsafe extern "C" fn corduit_call(
 ) -> FfiResponse {
     // A panic must never unwind across the `extern "C"` boundary (UB). The
     // whole body is fenced so any internal panic becomes a structured error.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let method = unsafe { read_cstr(method) }.to_string();
         let raw = unsafe { read_cstr(args_json) };
         let value: nextjson::Value = if raw.is_empty() {
@@ -178,7 +178,9 @@ pub unsafe extern "C" fn corduit_call(
         };
 
         dispatch(&method, &value)
-    })) {
+    }));
+
+    match result {
         Ok(Ok(v)) => match nextjson::to_string(&v) {
             Ok(s) => FfiResponse::ok(s),
             Err(e) => FfiResponse::err(format!("response encode failed: {e}")),
@@ -211,7 +213,7 @@ pub unsafe extern "C" fn corduit_call_binary(
     len: usize,
 ) -> FfiBinaryResponse {
     // A panic must never unwind across the `extern "C"` boundary (UB).
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let method = unsafe { read_cstr(method) }.to_string();
         let value: nextjson::Value = if payload.is_null() || len == 0 {
             nextjson::Value::Null
@@ -221,7 +223,9 @@ pub unsafe extern "C" fn corduit_call_binary(
         };
 
         dispatch(&method, &value)
-    })) {
+    }));
+
+    match result {
         Ok(Ok(v)) => match rustbinary::serialize(&v) {
             Ok(bytes) => FfiBinaryResponse::ok(bytes),
             Err(e) => FfiBinaryResponse::err(format!("response encode failed: {e}")),
