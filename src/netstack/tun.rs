@@ -149,6 +149,21 @@ impl Default for TunConfig {
     }
 }
 
+impl TunConfig {
+    /// Prefix length implied by [`TunConfig::netmask`].
+    ///
+    /// Both platform setup paths want it: `netsh` (Windows) and `tun_rs`
+    /// (Linux/macOS/BSD) configure the interface from a prefix length, not
+    /// from a dotted mask.
+    pub fn prefix_len(&self) -> u8 {
+        self.netmask
+            .octets()
+            .iter()
+            .map(|o| o.count_ones() as u8)
+            .sum()
+    }
+}
+
 /// TUN device wrapper
 pub struct TunDevice {
     config: TunConfig,
@@ -308,7 +323,7 @@ impl TunDevice {
         };
 
         // Configure IP address
-        let prefix_len = netmask_to_prefix(self.config.netmask);
+        let prefix_len = self.config.prefix_len();
         self.configure_windows_adapter(prefix_len)?;
 
         // Start session - returns Arc<Session>
@@ -505,7 +520,7 @@ impl TunDevice {
         use std::os::fd::AsRawFd;
         use tun_rs::DeviceBuilder;
 
-        let prefix_len = netmask_to_prefix(self.config.netmask);
+        let prefix_len = self.config.prefix_len();
 
         let device = DeviceBuilder::new()
             .name(&self.config.name)
@@ -924,22 +939,24 @@ impl Drop for TunDevice {
     }
 }
 
-/// Convert a dotted netmask to a prefix length (`netsh` wants the length).
-#[cfg(any(windows, test))]
-fn netmask_to_prefix(netmask: Ipv4Addr) -> u8 {
-    netmask.octets().iter().map(|o| o.count_ones() as u8).sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_netmask_to_prefix() {
-        assert_eq!(netmask_to_prefix(Ipv4Addr::new(255, 255, 255, 0)), 24);
-        assert_eq!(netmask_to_prefix(Ipv4Addr::new(255, 255, 0, 0)), 16);
-        assert_eq!(netmask_to_prefix(Ipv4Addr::new(255, 0, 0, 0)), 8);
-        assert_eq!(netmask_to_prefix(Ipv4Addr::new(255, 255, 255, 255)), 32);
+    fn prefix_len_from_netmask() {
+        let prefix_len = |netmask: Ipv4Addr| {
+            TunConfig {
+                netmask,
+                ..TunConfig::default()
+            }
+            .prefix_len()
+        };
+        assert_eq!(prefix_len(Ipv4Addr::new(255, 255, 255, 0)), 24);
+        assert_eq!(prefix_len(Ipv4Addr::new(255, 255, 0, 0)), 16);
+        assert_eq!(prefix_len(Ipv4Addr::new(255, 0, 0, 0)), 8);
+        assert_eq!(prefix_len(Ipv4Addr::new(255, 255, 255, 255)), 32);
+        assert_eq!(prefix_len(Ipv4Addr::new(0, 0, 0, 0)), 0);
     }
 
     #[test]
