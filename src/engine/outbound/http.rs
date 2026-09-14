@@ -1,5 +1,4 @@
 use crate::common::stream::BoxStream;
-use crate::crypto::encoding::{encode as b64_encode, Config as B64Config};
 use crate::engine::config::OutboundConfig;
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
@@ -141,7 +140,7 @@ impl OutboundProxy for HttpOutbound {
         // Add proxy auth if configured
         if let (Some(user), Some(pass)) = (&self.username, &self.password) {
             let credentials = format!("{}:{}", user, pass);
-            let encoded = b64_encode(credentials.as_bytes(), B64Config::STANDARD);
+            let encoded = courierust::courierust_crypto::base64::encode(credentials.as_bytes());
             connect_request.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
         }
         connect_request.push_str("\r\n");
@@ -230,7 +229,7 @@ impl OutboundProxy for HttpOutbound {
         // Add proxy auth if configured
         if let (Some(user), Some(pass)) = (&self.username, &self.password) {
             let credentials = format!("{}:{}", user, pass);
-            let encoded = b64_encode(credentials.as_bytes(), B64Config::STANDARD);
+            let encoded = courierust::courierust_crypto::base64::encode(credentials.as_bytes());
             request.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
         }
 

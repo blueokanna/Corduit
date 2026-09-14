@@ -28,9 +28,11 @@ Corduit 同时做**依赖图审计**与**源码级加固**。
 | 项 | 状态 |
 |---|---|
 | CWE-78 命令注入 | 接口名进 PowerShell/netsh 前经 `sanitize_interface_name` 校验 |
-| CWE-190 整数截断 | SOCKS5 凭据按 RFC 1929 校验长度；WebSocket 帧长按 RFC 6455 校验且 ≤16 MiB |
+| CWE-190 整数截断 | SOCKS5 凭据按 RFC 1929 校验长度；WebSocket 帧长与分片上限由 `courierust_ws` 会话强制（≤16 MiB） |
+| CWE-345 伪装升级 | 出站 WebSocket 握手校验 `Sec-WebSocket-Accept`（`base64(SHA-1(key‖GUID))`），不匹配即硬失败，绝不“告警后继续” |
+| CWE-93 头注入 | 出站 WS 握手头在写线之前校验（token 名称、值中不得含 CR/LF 或 NUL），保留头（Host/Upgrade/Connection/Sec-WebSocket-*）不允许被配置覆盖 |
 | CWE-295 TLS 校验 | `skip_cert_verify` 默认关；只有显式配置才绕过；默认用系统根证书 |
-| CWE-400 资源耗尽 | DNS 压缩指针 ≤128 跳；MMDB 读取全程边界检查；HTTP body ≤64 MiB；RPC body/WS 消息 ≤16 MiB；RPC 连接 600s 上限 |
+| CWE-400 资源耗尽 | DNS 压缩指针 ≤128 跳；MMDB 读取全程边界检查；HTTP body ≤64 MiB；RPC body/WS 消息 ≤16 MiB；RPC 连接 600s 上限；重定向 ≤8 跳 |
 | CWE-306 缺少鉴权 | RPC 必须 token |
 | CWE-502 反序列化 | FFI 二进制走 rustbinary 有界 profile（64MiB + 集合上限 + 拒绝尾部字节） |
 | 开放代理 | SOCKS5 UDP ASSOCIATE 只中继已认证客户端 IP 的数据报 |
@@ -40,7 +42,8 @@ Corduit 同时做**依赖图审计**与**源码级加固**。
 
 - AEAD 标签校验、GHASH、AES S-box、X25519 全部避免数据相关分支/索引；
 - MAC 比较用常数时间；
-- 所有 hash/加密原语仓库内实现，无外部加密依赖（熵源 `getrandom` 除外）；
+- 哈希/加密原语在仓库内实现（熵源 `getrandom` 除外）；文本编解码中的 base64 复用
+  `courierust_crypto::base64`，全工作区只有一份实现，不做第二遍；
 - MD5/SHA-1 仅用于协议兼容（SS/VMess 派生），不用于抗碰撞场景。
 
 ## 给使用者的提醒

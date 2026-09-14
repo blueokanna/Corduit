@@ -45,7 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # --- HTTP / TLS / QUIC / multithreading --
-courierust = { version = "1.0.4" }
+courierust = { version = "1.0.6" }
 
 # --- DNS ---------------------------------------------------------------------
 ipnet = "2.12.2"
@@ -57,11 +57,9 @@ getrandom = { version = "0.3.2", features = ["std"] }
 # --- networking / system -----------------------------------------------------
 bitflags = "2"
 bytes = "1"
-libc = "0.2"
 regex = "1"
 smoltcp = { version = "0.11.0", default-features = false, features = [
     "std",
-    "log",
     "medium-ip",
     "proto-ipv4",
     "proto-ipv6",
@@ -70,6 +68,11 @@ smoltcp = { version = "0.11.0", default-features = false, features = [
 ] }
 socket2 = { version = "0.6", features = ["all"] }
 sysinfo = "=0.36.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 tun-rs = { version = "=2.5.7" }
 
 [target.'cfg(windows)'.dependencies]
@@ -77,10 +80,6 @@ wintun-bindings = { version = "0.7" }
 zip = { version = "4.2.0", default-features = false, features = ["deflate"] }
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
-    "Win32_NetworkManagement_Rras",
-    "Win32_Networking_WinSock",
     "Win32_Security_Cryptography",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",

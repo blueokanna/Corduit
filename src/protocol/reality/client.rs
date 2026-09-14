@@ -73,7 +73,7 @@ impl RealityClientOptions {
                 let hex = v
                     .as_str()
                     .ok_or_else(|| RealityError::Config("'short-id' must be a string".into()))?;
-                let bytes = crate::crypto::encoding::hex_decode(hex.as_bytes()).map_err(|e| {
+                let bytes = crate::crypto::codec::hex_decode(hex.as_bytes()).map_err(|e| {
                     RealityError::Config(alloc::format!("'short-id' is not valid hex: {e:?}"))
                 })?;
                 if bytes.len() > MAX_SHORT_ID_LEN {
@@ -145,14 +145,11 @@ fn decode_public_key(text: &str) -> RealityResult<[u8; 32]> {
     // A 64-character hex string is accepted as well; the reference prints
     // X25519 keys in base64.
     let bytes = if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        crate::crypto::encoding::hex_decode(trimmed.as_bytes())
+        crate::crypto::codec::hex_decode(trimmed.as_bytes())
             .map_err(|e| RealityError::Config(alloc::format!("'public-key' hex: {e:?}")))?
     } else {
-        crate::crypto::encoding::decode(
-            trimmed.as_bytes(),
-            crate::crypto::encoding::Config::STANDARD,
-        )
-        .map_err(|e| RealityError::Config(alloc::format!("'public-key' base64: {e:?}")))?
+        crate::crypto::codec::base64_decode(trimmed)
+            .ok_or_else(|| RealityError::Config("'public-key' is not valid base64".into()))?
     };
     if bytes.len() != 32 {
         return Err(RealityError::Config(alloc::format!(

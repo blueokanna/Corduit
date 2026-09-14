@@ -1066,7 +1066,7 @@ static RPC_SERVER: once_cell::sync::Lazy<
 /// Generate a fresh 256-bit random bearer token (hex-encoded).
 fn generate_rpc_token() -> String {
     let bytes = crate::engine::random::bytes::<32>();
-    crate::crypto::encoding::hex_encode(&bytes)
+    crate::crypto::codec::hex_encode(&bytes)
 }
 
 /// Start the localhost JSON-RPC server (web dashboards).

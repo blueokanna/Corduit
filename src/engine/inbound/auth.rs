@@ -82,10 +82,7 @@ where
     else {
         return false;
     };
-    let Ok(decoded) = crate::crypto::encoding::decode(
-        encoded.trim().as_bytes(),
-        crate::crypto::encoding::Config::STANDARD,
-    ) else {
+    let Some(decoded) = crate::crypto::codec::base64_decode(encoded.trim()) else {
         return false;
     };
     let Ok(decoded) = String::from_utf8(decoded) else {
@@ -158,7 +155,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::encoding::{self, Config};
     use crate::engine::config::AuthenticationConfig;
 
     fn auth(username: &str, password: &str) -> InboundAuth {
@@ -206,13 +202,13 @@ mod tests {
     fn basic_auth_round_trip() {
         let checker = auth("user", "pass");
         let mut headers = courierust::courierust_http::HeaderMap::new();
-        let encoded = encoding::encode(b"user:pass", Config::STANDARD);
+        let encoded = courierust::courierust_crypto::base64::encode(b"user:pass");
 
         set_header(&mut headers, &format!("Basic {encoded}"));
         assert!(check_proxy_authorization(&headers, &checker));
 
         // Wrong password.
-        let encoded = encoding::encode(b"user:nope", Config::STANDARD);
+        let encoded = courierust::courierust_crypto::base64::encode(b"user:nope");
         set_header(&mut headers, &format!("Basic {encoded}"));
         assert!(!check_proxy_authorization(&headers, &checker));
 

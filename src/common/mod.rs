@@ -6,12 +6,12 @@
 //! single layer:
 //!
 //! * [`exec`] — the synchronous scheduler: a typed layer over courierust's
-//!   work-stealing [`ThreadPool`](courierust::courierust_pool::ThreadPool)
+//!   work-stealing [`courierust::courierust_pool::ThreadPool`]
 //!   plus session admission control.
 //! * [`socket`] — blocking socket primitives: timeout-bounded connect,
 //!   hostname resolution, one-shot UDP exchange.
 //! * [`stream`] — the canonical [`SyncStream`] trait and the bidirectional
-//!   [`relay`](stream::relay) that backs every proxy connection.
+//!   [`stream::relay`] that backs every proxy connection.
 //! * [`timer`] — a single-threaded timer wheel whose callbacks run on the
 //!   pool (health checks, provider refresh).
 //! * [`cancel`] — [`CancellationToken`], the synchronous cancellation

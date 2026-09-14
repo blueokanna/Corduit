@@ -7,7 +7,6 @@
 
 use crate::common::cancel::CancellationToken;
 use crate::common::http_server::{error_response, HttpServer, HttpServerConfig, TlsIdentity};
-use crate::crypto::encoding::{decode as b64_decode, Config as B64Config};
 use crate::dns::error::{DnsError, Result};
 use crate::dns::resolver::DnsResolver;
 use crate::dns::wire::{BinDecodable, BinEncodable, Message};
@@ -185,8 +184,8 @@ fn handle_get_request(req: &Request<Body>, resolver: &DnsResolver) -> Result<Mes
         })
         .ok_or_else(|| DnsError::Protocol("Missing 'dns' query parameter".to_string()))?;
 
-    let query_bytes = b64_decode(dns_param.as_bytes(), B64Config::URL_SAFE_NO_PAD)
-        .map_err(|e| DnsError::Protocol(format!("Invalid base64: {:?}", e)))?;
+    let query_bytes = crate::crypto::codec::base64url_decode(dns_param)
+        .ok_or_else(|| DnsError::Protocol("Invalid base64url in 'dns'".to_string()))?;
 
     process_dns_query(&query_bytes, resolver)
 }

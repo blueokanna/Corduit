@@ -13,10 +13,12 @@
 //! | `tls13` | TLS 1.3 client with profile-shaped `ClientHello` (feature `tls13`) |
 //! | `reality` | REALITY client authentication on top of `tls13` (feature `reality`) |
 //! | [`tls`] | TLS client/server layers over courierust — feature `tls` |
+//! | [`ws`] | WebSocket (RFC 6455) transport over any `SyncStream`, client and server — feature `std` |
 //! | [`wireguard`] | WireGuard handshake & data-path primitives (curve25519, ChaCha20Poly1305) — feature `wireguard` |
 //!
 //! Feature-gated modules are marked with the corresponding crate feature
-//! (`tls`, `wireguard`, `quic`, `tls13`, `reality`).
+//! (`tls`, `wireguard`, `quic`, `tls13`, `reality`) or with `std`, which the
+//! WebSocket transport needs for its sockets and timeouts.
 //!
 //! ## Quick start
 //!
@@ -79,7 +81,6 @@ macro_rules! impl_protocol_enum {
 
 pub mod address;
 pub mod error;
-pub mod qpack;
 
 #[cfg(all(feature = "std", feature = "quic"))]
 pub mod quic;
@@ -92,6 +93,8 @@ pub mod tls13;
 
 #[cfg(all(feature = "std", feature = "wireguard"))]
 pub mod wireguard;
+#[cfg(feature = "std")]
+pub mod ws;
 
 pub use address::{Address, AddressType};
 pub use error::{ProtocolError, Result};

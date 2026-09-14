@@ -1,10 +1,12 @@
 //! # corduit-crypto
 //!
-//! Dependency-free, `no_std` cryptographic primitives for the Corduit proxy
-//! engine. Every algorithm here is implemented from scratch against the
-//! published specification (RFC 1321 / RFC 6234 / FIPS 180-4 / FIPS 202 /
+//! `no_std` cryptographic primitives for the Corduit proxy engine. Every
+//! algorithm here is implemented from scratch against the published
+//! specification (RFC 1321 / RFC 6234 / FIPS 180-4 / FIPS 202 /
 //! RFC 7693 / BLAKE3 spec / RFC 8439 / NIST SP 800-38D / RFC 5869 / RFC 7748).
-//! There are no external crate dependencies at all.
+//! The one codec that is *not* reimplemented is base64: it comes from
+//! `courierust_crypto`, so the workspace holds a single implementation of
+//! the bit packing (see [`codec`]).
 //!
 //! ## Design
 //!
@@ -28,7 +30,7 @@
 //! | [`aead`]      | ChaCha20-Poly1305, AES-GCM |
 //! | [`kdf`]       | HKDF |
 //! | [`dh`]        | X25519 |
-//! | [`encoding`]  | Base64, hex |
+//! | [`codec`]     | hex, and the base64 entry points over courierust's codec |
 //! | [`rng`]       | ChaCha-based deterministic CSPRNG |
 //! | [`uuid`]      | RFC 4122 UUID |
 //!
@@ -49,9 +51,9 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod aead;
+pub mod codec;
 pub mod dh;
 pub mod digest;
-pub mod encoding;
 pub mod hash;
 pub mod kdf;
 /// Message authentication codes (HMAC, keyed BLAKE2s, Poly1305).

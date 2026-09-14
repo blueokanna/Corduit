@@ -286,17 +286,49 @@ fn direct_get(client: &Client, url: &str, _timeout: Duration) -> Result<HttpResp
     })
 }
 
-/// Proxy path: CONNECT tunnel, optional TLS, then a single HTTP/1.1 GET
-/// spoken with courierust's public codec.
+/// Proxy path: CONNECT tunnel, optional TLS, then an HTTP/1.1 GET spoken
+/// with courierust's public codec. Redirects are followed up to
+/// `MAX_REDIRECTS` hops; every hop re-establishes the tunnel, so a redirect
+/// to another origin can never reuse a connection built for the previous
+/// one.
 fn proxy_get(
     _client: &Client,
     url: &str,
     proxy: SocketAddr,
     timeout: Duration,
 ) -> Result<HttpResponse, HttpError> {
-    let parsed = Url::parse(url).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
-    validate_scheme(&parsed.scheme)?;
+    let mut current = Url::parse(url).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
+    validate_scheme(&current.scheme)?;
 
+    for _ in 0..=MAX_REDIRECTS {
+        let response = proxy_get_once(&current, proxy, timeout)?;
+        let redirect = (300..400).contains(&response.status) && response.status != 304;
+        if !redirect {
+            return Ok(response);
+        }
+        let location = response
+            .headers
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                HttpError::InvalidResponse(format!(
+                    "{} response without a Location header",
+                    response.status
+                ))
+            })?;
+        let next = resolve_location(&current, location)?;
+        validate_scheme(&next.scheme)?;
+        current = next;
+    }
+    Err(HttpError::TooManyRedirects)
+}
+
+/// One proxy-path request over a freshly established CONNECT tunnel.
+fn proxy_get_once(
+    parsed: &Url,
+    proxy: SocketAddr,
+    timeout: Duration,
+) -> Result<HttpResponse, HttpError> {
     let mut tcp = TcpStream::connect_timeout(&proxy, timeout)
         .map_err(|e| HttpError::Proxy(format!("connect to {proxy}: {e}")))?;
     let _ = tcp.set_read_timeout(Some(timeout));
@@ -307,12 +339,36 @@ fn proxy_get(
         let mut tls = shared_tls_connector()
             .connect(&parsed.host, &tcp, &tcp)
             .map_err(|e| HttpError::Tls(e.to_string()))?;
-        h1_get_once(&mut tls, &parsed, timeout)
+        h1_get_once(&mut tls, parsed, timeout)
     } else {
         // `&TcpStream` (not the owned stream) implements courierust's
         // transport traits, so hand a reborrow to the codec.
-        h1_get_once(&mut &tcp, &parsed, timeout)
+        h1_get_once(&mut &tcp, parsed, timeout)
     }
+}
+
+/// Resolve a `Location` header against the URL it arrived with — the four
+/// reference forms an HTTP redirect actually uses (RFC 3986 §5.3).
+fn resolve_location(base: &Url, location: &str) -> Result<Url, HttpError> {
+    let location = location.trim();
+    if location.is_empty() {
+        return Err(HttpError::InvalidUrl("empty Location header".into()));
+    }
+    let absolute = if location.contains("://") {
+        location.to_string()
+    } else if let Some(scheme_relative) = location.strip_prefix("//") {
+        format!("{}://{scheme_relative}", base.scheme)
+    } else if location.starts_with('/') {
+        format!("{}://{}{}", base.scheme, base.authority(), location)
+    } else {
+        let path = base.path_and_query.path();
+        let dir = match path.rfind('/') {
+            Some(index) => &path[..=index],
+            None => "/",
+        };
+        format!("{}://{}{dir}{location}", base.scheme, base.authority())
+    };
+    Url::parse(&absolute).map_err(|e| HttpError::InvalidUrl(format!("bad redirect target: {e}")))
 }
 
 /// Perform a single HTTP/1.1 GET over an established (possibly TLS) stream,
@@ -560,6 +616,37 @@ mod tests {
         assert_eq!(u.port, 443);
         assert_eq!(u.path_and_query.as_str(), "/a/b?q=1");
         assert_eq!(u.authority(), "example.com:443");
+    }
+
+    #[test]
+    fn location_resolution_covers_the_redirect_forms() {
+        let base = Url::parse("https://example.com/a/b?q=1").unwrap();
+
+        let absolute = resolve_location(&base, "http://other.example/x").unwrap();
+        assert_eq!(absolute.scheme, "http");
+        assert_eq!(absolute.host, "other.example");
+
+        let scheme_relative = resolve_location(&base, "//cdn.example/y").unwrap();
+        assert_eq!(scheme_relative.scheme, "https");
+        assert_eq!(scheme_relative.host, "cdn.example");
+
+        let root_relative = resolve_location(&base, "/new").unwrap();
+        assert_eq!(root_relative.host, "example.com");
+        assert_eq!(root_relative.path_and_query.as_str(), "/new");
+
+        let path_relative = resolve_location(&base, "c").unwrap();
+        assert_eq!(path_relative.path_and_query.as_str(), "/a/c");
+
+        assert!(resolve_location(&base, "   ").is_err());
+    }
+
+    #[test]
+    fn redirect_statuses_are_in_range() {
+        // The proxy path decides on the numeric status alone.
+        for status in [301u16, 302, 303, 307, 308] {
+            assert!((300..400).contains(&status) && status != 304);
+        }
+        assert!(!(300..400).contains(&200));
     }
 
     #[test]

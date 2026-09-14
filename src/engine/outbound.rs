@@ -2,7 +2,7 @@
 //!
 //! The [`OutboundProxy`] trait is the synchronous contract every outbound
 //! protocol implements: `relay_tcp` accepts a client
-//! [`BoxStream`](crate::common::stream::BoxStream) and a target, establishes
+//! [`crate::common::stream::BoxStream`] and a target, establishes
 //! the upstream connection, and returns once the relay finishes.
 //!
 //! Concurrency model: every method is blocking; long-lived relays run on

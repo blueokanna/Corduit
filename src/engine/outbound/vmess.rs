@@ -1,8 +1,7 @@
 use crate::common::stream::BoxStream;
 use crate::crypto::aead::{Aead, Aes128Gcm, ChaCha20Poly1305};
 use crate::crypto::digest::Digest;
-use crate::crypto::encoding::{encode as b64_encode, Config as B64Config};
-use crate::crypto::hash::{Md5, Sha1, Sha256};
+use crate::crypto::hash::{Md5, Sha256};
 use crate::crypto::uuid::Uuid;
 use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::TrackedConnection;
@@ -17,9 +16,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const VMESS_VERSION: u8 = 1;
 const VMESS_AEAD_AUTH_LEN: usize = 16;
 const VMESS_AEAD_NONCE_LEN: usize = 12;
-
-#[allow(dead_code)]
-const VMESS_AEAD_KEY_LEN: usize = 16;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,339 +170,11 @@ impl VmessUdpSession {
     }
 }
 
-pub struct WebSocketStream<S: crate::common::stream::SyncStream> {
-    inner: parking_lot::Mutex<S>,
-    read_buffer: Vec<u8>,
-    read_pos: usize,
-}
-
-/// Largest WebSocket payload `read_frame` will accept. The length field is a
-/// 64-bit integer straight from the wire, so without a cap a malicious peer
-/// could request a multi-gigabyte allocation and abort the process.
-const MAX_WS_FRAME_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
-
-impl<S: crate::common::stream::SyncStream> WebSocketStream<S> {
-    pub fn new(inner: S) -> Self {
-        Self {
-            inner: parking_lot::Mutex::new(inner),
-            read_buffer: Vec::new(),
-            read_pos: 0,
-        }
-    }
-}
-
-impl<S: crate::common::stream::SyncStream> WebSocketStream<S> {
-    /// Perform WebSocket handshake
-    pub fn handshake(
-        stream: S,
-        host: &str,
-        path: &str,
-        extra_headers: &std::collections::HashMap<String, String>,
-    ) -> Result<Self> {
-        let ws = Self::new(stream);
-
-        let mut key_bytes = [0u8; 16];
-        getrandom::fill(&mut key_bytes)
-            .map_err(|e| Error::protocol(format!("Failed to generate WebSocket key: {}", e)))?;
-        let ws_key = b64_encode(&key_bytes, B64Config::STANDARD);
-        let mut request = format!(
-            "GET {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Key: {}\r\n\
-             Sec-WebSocket-Version: 13\r\n",
-            path, host, ws_key
-        );
-
-        // Add extra headers
-        for (key, value) in extra_headers {
-            if key.to_lowercase() != "host" {
-                request.push_str(&format!("{}: {}\r\n", key, value));
-            }
-        }
-        request.push_str("\r\n");
-        ws.inner
-            .lock()
-            .write_all(request.as_bytes())
-            .map_err(|e| Error::network(format!("Failed to send WebSocket handshake: {}", e)))?;
-        ws.inner.lock().flush().ok();
-
-        let mut response = Vec::with_capacity(1024);
-        let mut buf = [0u8; 1];
-        let mut found_end = false;
-
-        while response.len() < 4096 {
-            ws.inner
-                .lock()
-                .read_exact(&mut buf)
-                .map_err(|e| Error::network(format!("Failed to read WebSocket response: {}", e)))?;
-            response.push(buf[0]);
-
-            // Check for \r\n\r\n
-            if response.len() >= 4 && &response[response.len() - 4..] == b"\r\n\r\n" {
-                found_end = true;
-                break;
-            }
-        }
-
-        if !found_end {
-            return Err(Error::protocol(
-                "WebSocket handshake response too long or incomplete",
-            ));
-        }
-
-        let response_str = String::from_utf8_lossy(&response);
-
-        // Verify response status
-        if !response_str.starts_with("HTTP/1.1 101") {
-            return Err(Error::protocol(format!(
-                "WebSocket handshake failed: {}",
-                response_str.lines().next().unwrap_or("unknown")
-            )));
-        }
-
-        // Verify Sec-WebSocket-Accept
-        let expected_accept = compute_websocket_accept(&ws_key);
-        let accept_found = response_str.lines().any(|line| {
-            let lower = line.to_lowercase();
-            if lower.starts_with("sec-websocket-accept:") {
-                let value = line.split(':').nth(1).map(|s| s.trim()).unwrap_or("");
-                value == expected_accept
-            } else {
-                false
-            }
-        });
-
-        if !accept_found {
-            tracing::warn!(
-                "WebSocket Sec-WebSocket-Accept header mismatch or missing, continuing anyway"
-            );
-        }
-
-        tracing::debug!("WebSocket handshake completed successfully");
-        Ok(ws)
-    }
-
-    #[allow(dead_code)]
-    pub fn write_frame(&self, data: &[u8]) -> std::io::Result<()> {
-        let mut frame = Vec::with_capacity(14 + data.len());
-
-        frame.push(0x82);
-        let len = data.len();
-        if len < 126 {
-            frame.push(0x80 | len as u8);
-        } else if len < 65536 {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            frame.push(0x80 | 127);
-            frame.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-
-        let mut mask = [0u8; 4];
-        getrandom::fill(&mut mask)
-            .map_err(|e| std::io::Error::other(format!("Failed to generate mask: {}", e)))?;
-        frame.extend_from_slice(&mask);
-
-        // Masked payload
-        for (i, byte) in data.iter().enumerate() {
-            frame.push(byte ^ mask[i % 4]);
-        }
-
-        self.inner
-            .lock()
-            .write_all(&frame)
-            .map_err(|e| Error::network(format!("Failed to write WebSocket frame: {}", e)))
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
-    /// Read a WebSocket frame, returns the payload data
-    #[allow(dead_code)]
-    pub fn read_frame(&self) -> std::io::Result<Vec<u8>> {
-        let mut inner = self.inner.lock();
-
-        // Read first 2 bytes
-        let mut header = [0u8; 2];
-        inner.read_exact(&mut header)?;
-
-        let _fin = (header[0] & 0x80) != 0;
-        let opcode = header[0] & 0x0F;
-        let masked = (header[1] & 0x80) != 0;
-        let mut payload_len = (header[1] & 0x7F) as u64;
-
-        if opcode == 0x08 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "WebSocket connection closed by server",
-            ));
-        }
-
-        // Handle ping frame - read payload and continue (non-recursive)
-        if opcode == 0x09 {
-            if payload_len > MAX_WS_FRAME_SIZE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "WebSocket ping frame too large",
-                ));
-            }
-            if payload_len > 0 {
-                let mut ping_data = vec![0u8; payload_len as usize];
-                inner.read_exact(&mut ping_data).ok();
-            }
-            // Return empty to signal caller should retry
-            return Ok(Vec::new());
-        }
-
-        // Extended payload length
-        if payload_len == 126 {
-            let mut ext = [0u8; 2];
-            inner.read_exact(&mut ext)?;
-            payload_len = u16::from_be_bytes(ext) as u64;
-        } else if payload_len == 127 {
-            let mut ext = [0u8; 8];
-            inner.read_exact(&mut ext)?;
-            payload_len = u64::from_be_bytes(ext);
-        }
-
-        // Reject oversized frames before allocating any buffer.
-        if payload_len > MAX_WS_FRAME_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("WebSocket frame too large: {} bytes", payload_len),
-            ));
-        }
-
-        let mask = if masked {
-            let mut m = [0u8; 4];
-            inner.read_exact(&mut m)?;
-            Some(m)
-        } else {
-            None
-        };
-
-        // Read payload
-        let mut payload = vec![0u8; payload_len as usize];
-        inner.read_exact(&mut payload)?;
-
-        // Unmask if needed
-        if let Some(m) = mask {
-            for (i, byte) in payload.iter_mut().enumerate() {
-                *byte ^= m[i % 4];
-            }
-        }
-
-        Ok(payload)
-    }
-
-    /// Read frame with retry for control frames
-    #[allow(dead_code)]
-    pub fn read_frame_data(&self) -> std::io::Result<Vec<u8>> {
-        loop {
-            let data = self.read_frame()?;
-            if !data.is_empty() {
-                return Ok(data);
-            }
-        }
-    }
-}
-
-fn compute_websocket_accept(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let result = hasher.finalize();
-    b64_encode(&result, B64Config::STANDARD)
-}
-
-impl<S: crate::common::stream::SyncStream> Read for WebSocketStream<S> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            // Serve buffered frame payload first.
-            if self.read_pos < self.read_buffer.len() {
-                let n = (self.read_buffer.len() - self.read_pos).min(buf.len());
-                buf[..n].copy_from_slice(&self.read_buffer[self.read_pos..self.read_pos + n]);
-                self.read_pos += n;
-                if self.read_pos >= self.read_buffer.len() {
-                    self.read_buffer.clear();
-                    self.read_pos = 0;
-                }
-                return Ok(n);
-            }
-            // Pull the next non-empty frame (pings yield empty payloads and
-            // are skipped). Errors (including read timeouts) propagate with
-            // their io kind so the relay treats idle as "nothing happened".
-            let data = self.read_frame()?;
-            if !data.is_empty() {
-                self.read_buffer = data;
-                self.read_pos = 0;
-            }
-        }
-    }
-}
-
-impl<S: crate::common::stream::SyncStream> Write for WebSocketStream<S> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Build and send one masked binary frame.
-        let mut frame = Vec::with_capacity(14 + buf.len());
-        frame.push(0x82);
-
-        let len = buf.len();
-        if len < 126 {
-            frame.push(0x80 | len as u8);
-        } else if len < 65536 {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            frame.push(0x80 | 127);
-            frame.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-
-        let mask: [u8; 4] = crate::engine::random::bytes();
-        frame.extend_from_slice(&mask);
-
-        for (i, byte) in buf.iter().enumerate() {
-            frame.push(byte ^ mask[i % 4]);
-        }
-
-        self.inner.lock().write_all(&frame)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.lock().flush()
-    }
-}
-
-impl<S: crate::common::stream::SyncStream> crate::common::stream::SyncStream
-    for WebSocketStream<S>
-{
-    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        self.inner.lock().shutdown(how)
-    }
-
-    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        self.inner.lock().peer_addr()
-    }
-
-    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
-        self.inner.lock().set_read_timeout(timeout)
-    }
-
-    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
-        self.inner.lock().set_write_timeout(timeout)
-    }
-}
-
 pub struct VmessOutbound {
     config: OutboundConfig,
     server: String,
     port: u16,
-    #[allow(dead_code)]
-    uuid: Uuid,
     uuid_bytes: [u8; 16],
-    #[allow(dead_code)]
-    alter_id: u16,
     cipher: VmessCipher,
     udp_enabled: bool,
     cmd_key: [u8; 16],
@@ -568,12 +236,17 @@ impl VmessOutbound {
 
         let uuid_bytes = *uuid.as_bytes();
 
+        // Legacy (alterId > 0) VMess is not implemented: this outbound speaks
+        // AEAD only, so the option is reported instead of quietly ignored.
         let alter_id = config
             .options
             .get("alterId")
             .or_else(|| config.options.get("alter-id"))
             .and_then(|v| v.as_i64())
-            .unwrap_or(0) as u16;
+            .unwrap_or(0);
+        if alter_id != 0 {
+            tracing::warn!("VMess alterId={alter_id} is not supported (AEAD only); ignoring it");
+        }
 
         let cipher_str = config
             .options
@@ -684,9 +357,7 @@ impl VmessOutbound {
             config,
             server,
             port,
-            uuid,
             uuid_bytes,
-            alter_id,
             cipher,
             udp_enabled,
             cmd_key,
@@ -905,19 +576,19 @@ impl VmessOutbound {
                 let default_ws_opts = VmessWsOptions::default();
                 let ws_opts = self.ws_opts.as_ref().unwrap_or(&default_ws_opts);
                 let host = ws_opts.host.as_deref().unwrap_or(&self.server);
-                let path = &ws_opts.path;
-
-                if self.tls_enabled {
-                    let tls_stream = self.connect_tls()?;
-                    let ws_stream =
-                        WebSocketStream::handshake(tls_stream, host, path, &ws_opts.headers)?;
-                    Ok(Box::new(ws_stream) as BoxStream)
+                let stream: BoxStream = if self.tls_enabled {
+                    self.connect_tls()?
                 } else {
-                    let tcp_stream = self.connect_tcp()?;
-                    let ws_stream =
-                        WebSocketStream::handshake(tcp_stream, host, path, &ws_opts.headers)?;
-                    Ok(Box::new(ws_stream) as BoxStream)
-                }
+                    Box::new(self.connect_tcp()?)
+                };
+                let ws = crate::protocol::ws::WebSocket::connect(
+                    stream,
+                    host,
+                    &ws_opts.path,
+                    &ws_opts.headers,
+                )
+                .map_err(|e| Error::network(format!("WebSocket handshake failed: {e}")))?;
+                Ok(Box::new(ws) as BoxStream)
             }
             _ => {
                 if self.tls_enabled {

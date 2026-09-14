@@ -7,7 +7,6 @@
 //! is at most 65535 bytes, so anything larger is a misbehaving server.
 
 use crate::common::roots::system_root_store;
-use crate::crypto::encoding::{encode as b64_encode, Config as B64Config};
 use crate::dns::error::{DnsError, Result};
 use crate::dns::util::random_id;
 use crate::dns::wire::{
@@ -196,7 +195,7 @@ impl DohClient {
         // The per-request timeout is baked into the client config.
         let url = match self.method {
             DohMethod::Get => {
-                let encoded = b64_encode(query, B64Config::URL_SAFE_NO_PAD);
+                let encoded = courierust::courierust_crypto::base64::encode_url_no_pad(query);
                 let mut u = self.url.clone();
                 u.push(if u.contains('?') { '&' } else { '?' });
                 u.push_str("dns=");

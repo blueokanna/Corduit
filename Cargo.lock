@@ -218,9 +218,9 @@ dependencies = [
 
 [[package]]
 name = "courierust"
-version = "1.0.4"
+version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88a241d0e493782b57ec530cfeb3335cabb6228bde7372f24b3e56e99835cf12"
+checksum = "b57345c776abf8625aa86c3aa7d1395ca2e970b79040ab1c6e5e67930589cd22"
 
 [[package]]
 name = "crc32fast"
@@ -1133,7 +1133,6 @@ dependencies = [
  "cfg-if",
  "defmt 0.3.100",
  "heapless",
- "log",
  "managed",
 ]
 

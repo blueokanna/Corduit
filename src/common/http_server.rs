@@ -13,11 +13,11 @@
 //!   deliberate, documented trade of the blocking model.
 //!
 //! So this module owns a tiny accept loop and speaks HTTP/1.1 through
-//! courierust's public building blocks: [`courierust_h1`] for framing and
-//! [`courierust_tls::TlsAcceptor`] for TLS. Keep-alive is honoured (a
-//! `Connection: close` from either side ends the connection); bodies are
-//! materialized in memory with a hard cap, matching the engine's other
-//! bounded-buffer guarantees.
+//! courierust's public building blocks: [`courierust::courierust_h1`] for
+//! framing and [`courierust::courierust_tls::TlsAcceptor`] for TLS. Keep-alive
+//! is honoured (a `Connection: close` from either side ends the connection);
+//! bodies are materialized in memory with a hard cap, matching the engine's
+//! other bounded-buffer guarantees.
 
 use courierust::courierust_error::{Error as CourierError, ErrorKind as CourierErrorKind};
 use courierust::courierust_h1 as h1;

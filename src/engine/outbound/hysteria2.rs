@@ -44,7 +44,6 @@ use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::engine::tls::yaml_value_to_string;
-use crate::protocol::qpack::{decode_block, encode_literal_fields};
 use crate::protocol::quic::{
     ClientConfig as QuicClientConfig, ClientConnection, QuicClient, QuicRecvStream, QuicSendStream,
     Salamander,
@@ -176,18 +175,19 @@ impl Hysteria2Connection {
             .map(|m| (m as u64) * 1024 * 1024 / 8)
             .unwrap_or(0);
 
-        let fields: Vec<(&[u8], Vec<u8>)> = vec![
-            (b":method", b"POST".to_vec()),
-            (b":scheme", b"https".to_vec()),
-            (b":authority", b"hysteria".to_vec()),
-            (b":path", b"/auth".to_vec()),
-            (b"hysteria-auth", self.password.as_bytes().to_vec()),
-            (b"hysteria-cc-rx", rx_bps.to_string().into_bytes()),
-            (b"hysteria-padding", padding),
+        let fields: Vec<(&str, Vec<u8>)> = vec![
+            (":method", b"POST".to_vec()),
+            (":scheme", b"https".to_vec()),
+            (":authority", b"hysteria".to_vec()),
+            (":path", b"/auth".to_vec()),
+            ("hysteria-auth", self.password.as_bytes().to_vec()),
+            ("hysteria-cc-rx", rx_bps.to_string().into_bytes()),
+            ("hysteria-padding", padding),
         ];
-        let field_refs: Vec<(&[u8], &[u8])> =
-            fields.iter().map(|(n, v)| (*n, v.as_slice())).collect();
-        let qpack = encode_literal_fields(&field_refs);
+        // QPACK field section with no dynamic references: the prefix is
+        // Required Insert Count 0 / Base 0, then one field line per header
+        // (courierust picks the static-table form when it applies).
+        let qpack = encode_auth_field_section(&fields);
 
         let mut msg = Vec::with_capacity(qpack.len() + 8);
         write_varint(&mut msg, H3_FRAME_HEADERS);
@@ -206,24 +206,18 @@ impl Hysteria2Connection {
             let (frame_type, payload) = read_h3_frame(&mut recv, 16384, deadline)
                 .map_err(|e| Error::network(format!("Failed to read auth response: {e}")))?;
             if frame_type == H3_FRAME_HEADERS {
-                let fields = decode_block(&payload)
+                let fields = decode_auth_field_section(&payload)
                     .map_err(|e| Error::protocol(format!("QPACK decode failed: {e}")))?;
                 let mut status_ok = false;
                 for (name, value) in &fields {
-                    if name.eq_ignore_ascii_case(b":status") {
+                    if name.eq_ignore_ascii_case(":status") {
                         status_ok = value == b"233";
                     }
                 }
                 if !status_ok {
                     let detail: Vec<String> = fields
                         .iter()
-                        .map(|(n, v)| {
-                            format!(
-                                "{}: {}",
-                                String::from_utf8_lossy(n),
-                                String::from_utf8_lossy(v)
-                            )
-                        })
+                        .map(|(n, v)| format!("{}: {}", n, String::from_utf8_lossy(v)))
                         .collect();
                     return Err(Error::protocol(format!(
                         "Hysteria2 authentication rejected (status != 233): {}",
@@ -403,6 +397,44 @@ fn read_varint<R: Read>(r: &mut R, deadline: Instant) -> std::io::Result<u64> {
         value = (value << 8) | b[0] as u64;
     }
     Ok(value)
+}
+
+/// Encode one HTTP/3 field section with no dynamic references — the auth
+/// exchange advertises a zero-size QPACK dynamic table, so every field line
+/// is static-indexed or literal.
+fn encode_auth_field_section(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    use courierust::courierust_h3::qpack::{
+        encode_field_line, encode_field_section_prefix, DynamicTable,
+    };
+
+    let table = DynamicTable::new(0);
+    let mut out = Vec::with_capacity(64);
+    encode_field_section_prefix(0, 0, 0, &mut out);
+    for (name, value) in fields {
+        encode_field_line(name, value, &table, 0, &mut out);
+    }
+    out
+}
+
+/// Decode one HTTP/3 field section into `(name, value)` pairs. A dynamic
+/// reference fails: this connection never advertises table capacity, so a
+/// peer that emits one is violating the setting it accepted.
+fn decode_auth_field_section(block: &[u8]) -> courierust::Result<Vec<(String, Vec<u8>)>> {
+    use courierust::courierust_h3::qpack::{
+        decode_field_line, decode_field_section_prefix, DynamicTable,
+    };
+    use courierust::courierust_hpack::huffman::HuffmanDecoder;
+
+    let table = DynamicTable::new(0);
+    let huff = HuffmanDecoder::new();
+    let mut pos = 0usize;
+    let (_, base) = decode_field_section_prefix(block, &mut pos, 0, 0)?;
+    let mut fields = Vec::new();
+    while pos < block.len() {
+        let line = decode_field_line(block, &mut pos, &table, base, &huff)?;
+        fields.push((line.name, line.value));
+    }
+    Ok(fields)
 }
 
 /// Read one HTTP/3 frame: `[frame_type varint][length varint][payload]`.
@@ -1197,5 +1229,36 @@ mod tests {
         a.add(1, 1, 0, 2, TargetAddr::Domain("a".into(), 1), b"x".to_vec());
         let out = a.add(1, 2, 0, 1, TargetAddr::Domain("b".into(), 2), b"y".to_vec());
         assert_eq!(out.unwrap().1, b"y");
+    }
+
+    #[test]
+    fn test_auth_field_section_roundtrip() {
+        let fields = vec![
+            (":method", b"POST".to_vec()),
+            (":scheme", b"https".to_vec()),
+            (":authority", b"hysteria".to_vec()),
+            (":path", b"/auth".to_vec()),
+            ("hysteria-auth", b"secret-password".to_vec()),
+            ("hysteria-cc-rx", b"12500000".to_vec()),
+        ];
+        let block = encode_auth_field_section(&fields);
+        let decoded = decode_auth_field_section(&block).unwrap();
+        let pairs: Vec<(String, Vec<u8>)> = fields
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.clone()))
+            .collect();
+        assert_eq!(decoded, pairs);
+    }
+
+    #[test]
+    fn test_auth_field_section_dynamic_reference_is_refused() {
+        // A field line that references a dynamic-table entry (index 8 below
+        // Base 0) must fail: this connection advertises capacity 0.
+        let block = [
+            // Required Insert Count = 0, Base = 0.
+            0x00, 0x00, // Indexed Field Line: `1` + T=0 + index 8 -> dynamic.
+            0x88,
+        ];
+        assert!(decode_auth_field_section(&block).is_err());
     }
 }

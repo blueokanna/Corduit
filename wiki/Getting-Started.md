@@ -91,12 +91,12 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer my-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.1.3"}
+# {"code":0,"data":"Corduit v0.1.5"}
 ```
 
 WebSocket 版（浏览器友好，token 放查询串）：
 
 ```bash
 # 用任意 WS 客户端连接 ws://127.0.0.1:8765/ws?token=my-secret-token
-# 然后发送 {"method":"get_version"}，收到 {"code":0,"data":"Corduit v0.1.3"}
+# 然后发送 {"method":"get_version"}，收到 {"code":0,"data":"Corduit v0.1.5"}
 ```

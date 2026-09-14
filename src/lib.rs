@@ -26,7 +26,7 @@
 //!
 //! With `default-features = false` the crate compiles on `no_std + alloc`
 //! targets: the [`crypto`] primitives, [`common::url`], and the pure wire
-//! codecs in [`protocol`] (`address`, `qpack`, `error`) have zero OS
+//! codecs in [`protocol`] (`address`, `error`) have zero OS
 //! dependencies. The threaded networking layer (engine, netstack, DNS
 //! servers, RPC, HTTP/TLS/QUIC transports) is gated behind the `std`
 //! feature.
@@ -55,7 +55,7 @@
 //! (listed in the docs sidebar on docs.rs):
 //!
 //! * `minimal` — smallest real proxy: one mixed inbound + DIRECT outbound.
-//! * `typed_config` — full [`Config`] built in Rust, with proxy groups, rules
+//! * `typed_config` — full [`Config`](engine::Config) built in Rust, with proxy groups, rules
 //!   and hot reload via [`engine::Corduit::reload`].
 //! * `json_api` — the JSON-string facade ([`api::start_proxy_from_yaml`] and
 //!   friends) with runtime status queries.

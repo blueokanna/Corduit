@@ -122,7 +122,7 @@ req = urllib.request.Request(
              "Authorization": "Bearer my-secret-token"},
 )
 print(json.load(urllib.request.urlopen(req)))
-# {'code': 0, 'data': 'Corduit v0.1.0'}
+# {'code': 0, 'data': 'Corduit v0.1.5'}
 ```
 
 ## 限制与安全
@@ -131,6 +131,9 @@ print(json.load(urllib.request.urlopen(req)))
 - token 比较是常数时间（`ct_eq`），抗时序侧信道；
 - 请求体 / WebSocket 消息上限 16 MiB，超出返回 `413`；
 - 连接生命周期上限 600 秒，空闲连接自动回收；
+- WebSocket 升级按 RFC 6455 校验：`Sec-WebSocket-Key` 必须是 16 字节 base64 的 24 字符形式，
+  应答的 `Sec-WebSocket-Accept` 由 `courierust_ws::handshake` 计算；随后的分帧、掩码方向、
+  分片重组、UTF-8 校验与关闭握手由 `courierust_ws` 会话（服务端角色）负责；
 - CORS 全放开（本地服务 + token 门控），允许 `Authorization` 头；
 - 响应里的错误消息由 `nextjson` 转义，不会破坏 JSON。
 

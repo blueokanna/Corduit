@@ -15,8 +15,8 @@ flowchart TB
     ROOT --> TYPES["types.rs<br/>共享 DTO"]
     ROOT --> COMMON["common/<br/>同步调度器 + socket 原语 + 双向中继<br/>+ 定时器 + 取消 + URL 解析<br/>+ courierust HTTP 客户端/服务端 + 根证书"]
     ROOT --> ENGINE["engine/<br/>代理引擎核心"]
-    ROOT --> CRYPTO["crypto/<br/>加密原语"]
-    ROOT --> PROTOCOL["protocol/<br/>线缆协议（QUIC v1 客户端、TLS 1.2/1.3、TLS 1.3+REALITY、QPACK/HPACK）"]
+    ROOT --> CRYPTO["crypto/<br/>加密原语 + 文本编解码"]
+    ROOT --> PROTOCOL["protocol/<br/>线缆协议（QUIC v1 客户端、TLS 1.2/1.3、TLS 1.3+REALITY、WebSocket、WireGuard）"]
     ROOT --> DNS["dns/<br/>DNS 解析与服务器"]
     ROOT --> NETSTACK["netstack/<br/>用户态 TCP/IP + TUN"]
 
@@ -30,6 +30,41 @@ flowchart TB
     ENGINE --> EPP["proxy_provider.rs<br/>ProxyProviderManager（订阅节点）"]
     ENGINE --> ET["traffic_stats.rs<br/>流量统计"]
 ```
+
+## 与 courierust 的分工
+
+Corduit 只实现 courierust 有意不暴露的层；协议本身的编解码不在仓库内重复实现。
+
+```mermaid
+flowchart LR
+    subgraph CR["courierust（零依赖协议套件）"]
+        H1["courierust_h1 / h2 / h3<br/>HTTP 分帧"]
+        QP["courierust_h3::qpack<br/>QPACK 字段段"]
+        WS["courierust_ws<br/>RFC 6455 会话"]
+        TLSc["courierust_tls<br/>TLS 1.2/1.3 + X.509"]
+        QC["courierust_quic<br/>QUIC 线缆编解码"]
+        POOL["courierust_pool<br/>work-stealing"]
+        B64["courierust_crypto::base64"]
+    end
+
+    subgraph CT["Corduit（仓库内）"]
+        QRT["protocol::quic<br/>QUIC v1 连接运行时"]
+        T13["protocol::tls13<br/>数据驱动 ClientHello"]
+        REAL["protocol::reality<br/>REALITY 认证"]
+        WSM["protocol::ws<br/>WS 封装（唯一入口）"]
+        OB["engine::outbound<br/>SS/VMess/VLESS/Trojan/TUIC/Hysteria2/WireGuard"]
+        DNS["dns/<br/>wire 编解码 + 解析器"]
+        NS["netstack/<br/>用户态 TCP/IP"]
+    end
+
+    QC --> QRT
+    TLSc --> T13 --> REAL
+    WS --> WSM
+    B64 -.-> CT
+    POOL -.-> CT
+```
+
+准则：**一个职责只保留一份实现**——第二套 RFC 6455 状态机、第二份 QPACK 编解码或第二份 base64 都是缺陷。
 
 ## 同步并发模型
 
@@ -134,7 +169,7 @@ ProviderUpdater 在 `Corduit::start` 时启动、`stop` 时停止，默认 60 �
 ## no_std 核心
 
 `default-features = false` 时 crate 以 `no_std + alloc` 编译：`crypto/`、`common/url`、
-`protocol/{address,qpack,error}` 零 OS 依赖；线程化网络层（engine、DNS 服务器、
+`protocol/{address,error}` 零 OS 依赖；线程化网络层（engine、DNS 服务器、
 netstack、RPC、传输）由 `std` feature 门控。
 
 可选 feature：`quic`（仓库内自研 QUIC v1 传输）、`tuic`、`hysteria2`（两者隐含 `quic`）——
@@ -171,10 +206,9 @@ flowchart LR
 
 | 模块 | 状态 |
 |---|---|
-| `crypto/`（哈希/MAC/流密码/AEAD/KDF/X25519/Base64/Hex/UUID） | ✅ no_std：全模块只用 `core` + `alloc`，零外部依赖 |
+| `crypto/`（哈希/MAC/流密码/AEAD/KDF/X25519/Hex/UUID；base64 走 courierust） | ✅ no_std：全模块只用 `core` + `alloc` |
 | `common/url`（URL 解析） | ✅ no_std + alloc |
 | `protocol/address`（SOCKS 地址编解码） | ✅ no_std + alloc |
-| `protocol/qpack`（QPACK/HPACK 头编解码） | ✅ no_std + alloc |
 | `protocol/error`（协议错误类型） | ✅ no_std + alloc |
 | `engine` / `rpc` / `api` / `ffi` / `netstack` / `dns` / 传输层 | ❌ 依赖 std（线程、socket、文件系统、平台 API），随 `std` feature 编译 |
 

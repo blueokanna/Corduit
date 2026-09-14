@@ -13,9 +13,11 @@
 //! * HTTP/1.1 framing comes from [`crate::common::http_server`], a blocking
 //!   server over courierust's H/1 codec (one thread per connection);
 //! * WebSocket upgrades ride the server's raw-connection handoff: the
-//!   handler returns a `101 Switching Protocols` carrying an internal marker
-//!   header, and the connection is handed to a blocking RFC 6455 codec
-//!   ([`WsServer`]) that speaks the protocol from scratch;
+//!   handler answers `101 Switching Protocols` (accept value from
+//!   `courierust_ws::handshake`) carrying an internal marker header, and
+//!   the connection is handed to [`crate::protocol::ws::WebSocket`] — the
+//!   same `courierust_ws` session the VMess transport uses, in the server
+//!   role;
 //! * RPC dispatch is synchronous: each WebSocket message (and each `POST
 //!   /rpc` request) is handled inline on the connection thread with a direct
 //!   call to [`crate::rpc::dispatch`].
@@ -28,7 +30,7 @@
 //!   - HTTP: `Authorization: Bearer <token>` header;
 //!   - WebSocket: `?token=<token>` query parameter (browsers cannot set
 //!     headers on WebSocket connections).
-//! * Token comparison is constant-time ([`ct_eq`]).
+//! * Token comparison is constant-time ([`crate::crypto::util::ct_eq`]).
 //! * Request bodies and WebSocket messages are size-bounded; oversized
 //!   payloads are rejected with `413`.
 //! * Responses carry permissive CORS headers so a locally-hosted dashboard
@@ -53,11 +55,12 @@ use std::sync::Arc;
 use courierust::courierust_http::{
     Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
 };
-use courierust::courierust_io::{Read as CRead, Write as CWrite};
 use courierust::courierust_tls::TlsVersion;
+use courierust::courierust_ws::handshake::{accept_key, is_valid_key, is_websocket_upgrade};
 
 use crate::common::http_server::{HttpServer, HttpServerConfig, RawConnection, TUNNEL_MARKER};
 use crate::crypto::util::ct_eq;
+use crate::protocol::ws::{Message as WsMessage, WebSocket};
 
 /// Maximum accepted JSON-RPC request body (config uploads can be large).
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024; // 16 MiB
@@ -200,7 +203,7 @@ fn handle_http_request(req: Request<Body>, token: &str) -> Response<Body> {
 
     // WebSocket upgrade — the 101 carries the internal handoff marker so the
     // connection thread hands the raw socket to the WS loop.
-    if is_websocket_upgrade(&req) {
+    if is_websocket_request(&req) {
         return websocket_upgrade_response(&req, token);
     }
 
@@ -270,7 +273,8 @@ fn websocket_upgrade_response(req: &Request<Body>, token: &str) -> Response<Body
         );
     }
 
-    // RFC 6455 requires the client key to compute the accept value.
+    // RFC 6455 requires a 16-byte base64 key; a malformed one is refused
+    // before any state is created.
     let ws_key = req
         .headers
         .get("sec-websocket-key")
@@ -282,7 +286,19 @@ fn websocket_upgrade_response(req: &Request<Body>, token: &str) -> Response<Body
             r#"{"code":1,"error":"missing Sec-WebSocket-Key"}"#,
         );
     };
+    if !is_valid_key(&ws_key) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"code":1,"error":"malformed Sec-WebSocket-Key"}"#,
+        );
+    }
 
+    let Ok(accept) = accept_key(&ws_key) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"code":1,"error":"malformed Sec-WebSocket-Key"}"#,
+        );
+    };
     let mut resp = Response::new(StatusCode::SWITCHING_PROTOCOLS);
     resp.headers.insert(
         HeaderName::from_static("connection"),
@@ -294,7 +310,7 @@ fn websocket_upgrade_response(req: &Request<Body>, token: &str) -> Response<Body
     );
     resp.headers.insert(
         HeaderName::from_static("sec-websocket-accept"),
-        HeaderValue::from(websocket_accept(&ws_key)),
+        HeaderValue::from(accept),
     );
     // Internal marker: after this response is written, the connection thread
     // hands the raw socket to the tunnel handler (the WS message loop).
@@ -305,218 +321,44 @@ fn websocket_upgrade_response(req: &Request<Body>, token: &str) -> Response<Body
     resp
 }
 
-/// Compute the RFC 6455 `Sec-WebSocket-Accept` value for a client key:
-/// `base64(SHA-1(key || "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`.
-fn websocket_accept(client_key: &str) -> String {
-    use crate::crypto::digest::Digest;
-    use crate::crypto::hash::Sha1;
-
-    const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    let mut hasher = Sha1::new();
-    hasher.update(client_key.as_bytes());
-    hasher.update(WS_GUID);
-    let digest = hasher.finalize();
-    crate::crypto::encoding::encode(&digest, crate::crypto::encoding::Config::STANDARD)
-}
-
-fn is_websocket_upgrade(req: &Request<Body>) -> bool {
-    let upgrade = req
-        .headers
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let connection = req
-        .headers
-        .get("connection")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-        });
-    upgrade && connection
-}
-
-// ---------------------------------------------------------------------------
-// Blocking RFC 6455 server-side WebSocket codec
-// ---------------------------------------------------------------------------
-
-/// A message yielded by the server-side WebSocket codec.
-enum WsMsg {
-    Text(Vec<u8>),
-    Binary(Vec<u8>),
-    Ping(Vec<u8>),
-    Pong,
-    Close,
-}
-
-/// A blocking RFC 6455 server over a [`RawConnection`].
-///
-/// Server-to-client frames are unmasked; client-to-server frames MUST be
-/// masked (RFC 6455 §5.1) — an unmasked client frame is a protocol
-/// violation and closes the connection. Fragmented data messages are
-/// reassembled; control frames (ping/pong/close) are never fragmented and
-/// are returned to the caller as they arrive.
-struct WsServer {
-    conn: RawConnection,
-    /// Opcode of the in-progress fragmented data message (`None` = idle).
-    frag_opcode: Option<u8>,
-    /// Payload accumulated so far for the fragmented message.
-    frag_payload: Vec<u8>,
-    /// Hard cap for a single (possibly fragmented) message.
-    max_message: usize,
-}
-
-impl WsServer {
-    fn new(conn: RawConnection, max_message: usize) -> Self {
-        Self {
-            conn,
-            frag_opcode: None,
-            frag_payload: Vec::new(),
-            max_message,
-        }
-    }
-
-    /// Read one complete message. Fragmented data messages are reassembled;
-    /// control frames are returned as-is.
-    fn read(&mut self) -> Result<WsMsg, String> {
-        loop {
-            let (fin, opcode, payload) = self.read_frame()?;
-            match opcode {
-                0x0 => {
-                    // Continuation of a fragmented data message.
-                    let op = self
-                        .frag_opcode
-                        .ok_or("continuation frame without a started message")?;
-                    if self.frag_payload.len() + payload.len() > self.max_message {
-                        return Err("websocket message too large".to_string());
-                    }
-                    self.frag_payload.extend_from_slice(&payload);
-                    if fin {
-                        let msg = if op == 0x1 {
-                            WsMsg::Text(std::mem::take(&mut self.frag_payload))
-                        } else {
-                            WsMsg::Binary(std::mem::take(&mut self.frag_payload))
-                        };
-                        self.frag_opcode = None;
-                        return Ok(msg);
-                    }
-                }
-                0x1 | 0x2 => {
-                    // New data message. A fresh one while a fragmented
-                    // message is in flight is a protocol violation.
-                    if self.frag_opcode.is_some() {
-                        return Err("new data frame during fragmented message".to_string());
-                    }
-                    if fin {
-                        return Ok(if opcode == 0x1 {
-                            WsMsg::Text(payload)
-                        } else {
-                            WsMsg::Binary(payload)
-                        });
-                    }
-                    self.frag_opcode = Some(opcode);
-                    self.frag_payload = payload;
-                }
-                0x8 => return Ok(WsMsg::Close),
-                0x9 => return Ok(WsMsg::Ping(payload)),
-                0xA => return Ok(WsMsg::Pong),
-                _ => return Err(format!("unsupported websocket opcode 0x{opcode:x}")),
-            }
-        }
-    }
-
-    /// Read one raw frame: header, extended length, mask, unmasked payload.
-    fn read_frame(&mut self) -> Result<(bool, u8, Vec<u8>), String> {
-        let mut hdr = [0u8; 2];
-        read_exact(&mut self.conn, &mut hdr)?;
-        let fin = hdr[0] & 0x80 != 0;
-        let opcode = hdr[0] & 0x0F;
-        let masked = hdr[1] & 0x80 != 0;
-        let mut len = (hdr[1] & 0x7F) as u64;
-        if len == 126 {
-            let mut ext = [0u8; 2];
-            read_exact(&mut self.conn, &mut ext)?;
-            len = u16::from_be_bytes(ext) as u64;
-        } else if len == 127 {
-            let mut ext = [0u8; 8];
-            read_exact(&mut self.conn, &mut ext)?;
-            len = u64::from_be_bytes(ext);
-        }
-        // Reject oversized frames before allocating any buffer.
-        if len > self.max_message as u64 {
-            return Err(format!("websocket frame too large: {len} bytes"));
-        }
-        if !masked {
-            return Err("client-to-server frames must be masked".to_string());
-        }
-        let mut mask = [0u8; 4];
-        read_exact(&mut self.conn, &mut mask)?;
-        let mut payload = vec![0u8; len as usize];
-        read_exact(&mut self.conn, &mut payload)?;
-        for (i, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[i % 4];
-        }
-        Ok((fin, opcode, payload))
-    }
-
-    fn send_text(&mut self, data: &[u8]) -> Result<(), String> {
-        self.send_frame(0x1, data)
-    }
-
-    fn send_pong(&mut self, data: &[u8]) -> Result<(), String> {
-        self.send_frame(0xA, data)
-    }
-
-    fn send_close(&mut self) -> Result<(), String> {
-        // 1000 = normal closure.
-        self.send_frame(0x8, &[0x03, 0xe8])
-    }
-
-    /// Write one unmasked server frame (FIN always set — the server never
-    /// fragments its own messages here).
-    fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
-        let mut out = Vec::with_capacity(payload.len() + 10);
-        out.push(0x80 | opcode);
-        let len = payload.len();
-        if len < 126 {
-            out.push(len as u8);
-        } else if len <= u16::MAX as usize {
-            out.push(126);
-            out.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            out.push(127);
-            out.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-        out.extend_from_slice(payload);
-        write_all(&mut self.conn, &out)?;
-        CWrite::flush(&mut self.conn).map_err(|e| e.to_string())?;
-        Ok(())
-    }
+fn is_websocket_request(req: &Request<Body>) -> bool {
+    is_websocket_upgrade(&req.headers)
 }
 
 /// Run the WebSocket message loop: every message is one JSON-RPC request.
-/// The token was already validated during the upgrade handshake. Runs on
-/// the connection thread; dispatch is synchronous.
+/// The token was already validated during the upgrade handshake, and the
+/// framing is courierust's session state machine
+/// ([`WebSocket`] wraps it in the server role). Runs on the connection
+/// thread; dispatch is synchronous.
 fn run_ws_tunnel(conn: RawConnection) {
-    let mut ws = WsServer::new(conn, MAX_WS_MESSAGE);
+    let mut ws = WebSocket::accepted(conn, MAX_WS_MESSAGE);
     loop {
-        match ws.read() {
-            Ok(WsMsg::Text(data)) | Ok(WsMsg::Binary(data)) => {
-                let resp = process_payload(&data);
-                if let Err(e) = ws.send_text(resp.as_bytes()) {
+        match ws.read_message() {
+            Ok(WsMessage::Text(text)) => {
+                let resp = process_payload(text.as_bytes());
+                if let Err(e) = ws.send_text(&resp) {
                     tracing::debug!("RPC WebSocket write failed: {e}");
                     break;
                 }
             }
-            Ok(WsMsg::Ping(payload)) => {
-                if ws.send_pong(&payload).is_err() {
+            Ok(WsMessage::Binary(data)) => {
+                let resp = process_payload(&data);
+                if let Err(e) = ws.send_text(&resp) {
+                    tracing::debug!("RPC WebSocket write failed: {e}");
                     break;
                 }
             }
-            Ok(WsMsg::Pong) => {}
-            Ok(WsMsg::Close) => {
-                let _ = ws.send_close();
+            Ok(WsMessage::Close) => {
+                let _ = ws.close();
                 break;
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
             }
             Err(e) => {
                 tracing::debug!("RPC WebSocket closed: {e}");
@@ -524,30 +366,6 @@ fn run_ws_tunnel(conn: RawConnection) {
             }
         }
     }
-}
-
-/// Read a buffer in full over a courierust reader.
-fn read_exact<R: CRead>(reader: &mut R, mut buf: &mut [u8]) -> Result<(), String> {
-    while !buf.is_empty() {
-        match CRead::read(reader, buf) {
-            Ok(0) => return Err("connection closed mid-read".to_string()),
-            Ok(n) => buf = &mut buf[n..],
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(())
-}
-
-/// Write a buffer in full over a courierust writer.
-fn write_all<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<(), String> {
-    while !data.is_empty() {
-        match CWrite::write(writer, data) {
-            Ok(0) => return Err("write returned 0 bytes".to_string()),
-            Ok(n) => data = &data[n..],
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

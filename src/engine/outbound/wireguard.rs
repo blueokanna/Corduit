@@ -590,8 +590,7 @@ impl OutboundProxy for WireguardOutbound {
 
 fn decode_base64_key(s: &str) -> std::result::Result<[u8; 32], String> {
     let bytes =
-        crate::crypto::encoding::decode(s.as_bytes(), crate::crypto::encoding::Config::STANDARD)
-            .map_err(|e| format!("Base64 decode error: {:?}", e))?;
+        crate::crypto::codec::base64_decode(s).ok_or_else(|| "Base64 decode error".to_string())?;
 
     if bytes.len() != 32 {
         return Err(format!("Key must be 32 bytes, got {}", bytes.len()));
@@ -667,10 +666,8 @@ mod tests {
         let (priv_key, _) = generate_keypair();
         let (_, peer_pub) = generate_keypair();
 
-        let priv_key_b64 =
-            crate::crypto::encoding::encode(&priv_key, crate::crypto::encoding::Config::STANDARD);
-        let peer_pub_b64 =
-            crate::crypto::encoding::encode(&peer_pub, crate::crypto::encoding::Config::STANDARD);
+        let priv_key_b64 = courierust::courierust_crypto::base64::encode(&priv_key);
+        let peer_pub_b64 = courierust::courierust_crypto::base64::encode(&peer_pub);
 
         let mut options = std::collections::HashMap::new();
         options.insert(
@@ -728,17 +725,11 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert(
             "private-key".to_string(),
-            nextjson::Value::String(crate::crypto::encoding::encode(
-                &priv_key,
-                crate::crypto::encoding::Config::STANDARD,
-            )),
+            nextjson::Value::String(courierust::courierust_crypto::base64::encode(&priv_key)),
         );
         options.insert(
             "public-key".to_string(),
-            nextjson::Value::String(crate::crypto::encoding::encode(
-                &peer_pub,
-                crate::crypto::encoding::Config::STANDARD,
-            )),
+            nextjson::Value::String(courierust::courierust_crypto::base64::encode(&peer_pub)),
         );
 
         let config = OutboundConfig {

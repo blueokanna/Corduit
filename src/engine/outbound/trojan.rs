@@ -1,6 +1,6 @@
 use crate::common::stream::BoxStream;
+use crate::crypto::codec::hex_encode;
 use crate::crypto::digest::Digest;
-use crate::crypto::encoding::hex_encode;
 use crate::crypto::hash::Sha224;
 use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::TrackedConnection;

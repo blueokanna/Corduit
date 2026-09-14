@@ -1,7 +1,6 @@
 use crate::common::stream::BoxStream;
 use crate::crypto::aead::{Aead, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305};
 use crate::crypto::digest::Digest;
-use crate::crypto::encoding::{decode as b64_decode, Config as B64Config};
 use crate::crypto::hash::{Blake3, Md5, Sha1};
 use crate::crypto::kdf::Hkdf;
 use crate::engine::config::OutboundConfig;
@@ -723,8 +722,8 @@ fn derive_subkey(password: &str, salt: &[u8], key_len: usize) -> Result<Vec<u8>>
 /// and derives session keys using BLAKE3
 fn derive_subkey_2022(password: &str, salt: &[u8], key_len: usize) -> Result<Vec<u8>> {
     // For 2022 ciphers, the password is a base64-encoded key
-    let master_key = b64_decode(password.as_bytes(), B64Config::STANDARD)
-        .map_err(|e| Error::config(format!("Invalid 2022 cipher key (must be base64): {:?}", e)))?;
+    let master_key = crate::crypto::codec::base64_decode(password)
+        .ok_or_else(|| Error::config("Invalid 2022 cipher key (must be base64)"))?;
 
     if master_key.len() != key_len {
         return Err(Error::config(format!(

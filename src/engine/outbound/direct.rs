@@ -207,8 +207,8 @@ impl DirectOutbound {
 /// opposite direction's writes for seconds (seen on Linux: a 13-byte echo
 /// took 2.1 s). When a poll comes back idle (`WouldBlock`/`TimedOut`) each
 /// thread therefore drops the source stream's lock and yields for
-/// [`RELAY_POLL_YIELD`] so the other direction can write through within a
-/// bounded time.
+/// [`RELAY_POLL_YIELD`](crate::common::stream::RELAY_POLL_YIELD) so the other
+/// direction can write through within a bounded time.
 pub fn relay_bidirectional_with_connection(
     a: crate::common::stream::BoxStream,
     b: crate::common::stream::BoxStream,
