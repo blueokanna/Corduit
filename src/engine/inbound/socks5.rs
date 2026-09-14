@@ -1,4 +1,25 @@
-use crate::common::cancel::CancellationToken;
+//! SOCKS5 inbound (RFC 1928, RFC 1929 authentication), synchronous.
+//!
+//! This module owns the workspace's **only** SOCKS5 implementation:
+//! [`serve_connection`] is the whole protocol path for one accepted socket —
+//! greeting and authentication, the request, then either a `CONNECT` relay
+//! through the matched outbound or a `UDP ASSOCIATE` relay — and two callers
+//! share it:
+//!
+//! * [`Socks5Inbound`] (the `socks5` inbound) wraps it in a listener;
+//! * [`MixedInbound`](super::mixed::MixedInbound) sniffs the first byte of
+//!   every connection and forwards SOCKS5 traffic here.
+//!
+//! Relays run on the connection's own thread (bounded by the listener's
+//! connection budget), because a relay blocks for as long as the session
+//! lives — the UDP relay gets a thread of its own for the same reason.
+//!
+//! `UDP ASSOCIATE` forwards each datagram as a one-shot request/reply through
+//! the matched outbound and rebuilds the SOCKS5 UDP envelope on the way back.
+//! Only the client that owns the TCP control connection may use its relay
+//! socket (source-IP check), so the bound UDP port is never an open relay.
+
+use crate::common::listener::ConnectionListener;
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
@@ -6,45 +27,532 @@ use crate::engine::inbound::auth::{socks5_userpass, InboundAuth, SOCKS5_AUTH_USE
 use crate::engine::inbound::{bind_tcp_listener, InboundListener};
 use crate::engine::outbound::{OutboundManager, TargetAddr};
 use crate::engine::routing::Router;
-use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// UDP session timeout for QUIC/gRPC long-lived connections
-const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+/// UDP ASSOCIATE lifetime: the relay socket gives up after this much
+/// silence, so a client that vanishes without closing its control
+/// connection cannot hold a UDP port forever.
+const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Handshake read/write timeout (a silent client is dropped after this).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Read/write timeout applied once a connection enters the relay phase. The
 /// relay treats `WouldBlock`/`TimedOut` as "idle" and keeps the connection
-/// alive, so this only bounds each blocking read/write call.
+/// alive, so this only bounds each blocking call.
 const RELAY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Accept-loop poll interval while the listener is idle.
-const ACCEPT_POLL: Duration = Duration::from_millis(10);
+/// Upper bound on concurrently served SOCKS5 connections.
+const MAX_CONNECTIONS: usize = 2048;
 
-/// UDP session for tracking UDP ASSOCIATE connections
-#[allow(dead_code)]
-struct UdpSession {
-    client_addr: SocketAddr,
-    last_activity: Instant,
+/// SOCKS5 protocol version byte.
+const SOCKS5_VERSION: u8 = 0x05;
+/// SOCKS5 `CONNECT` command.
+const SOCKS5_CMD_CONNECT: u8 = 0x01;
+/// SOCKS5 `UDP ASSOCIATE` command.
+const SOCKS5_CMD_UDP_ASSOCIATE: u8 = 0x03;
+/// SOCKS5 "no authentication required" method.
+const SOCKS5_AUTH_NONE: u8 = 0x00;
+/// SOCKS5 reply: succeeded.
+const SOCKS5_REPLY_SUCCESS: u8 = 0x00;
+/// SOCKS5 reply: general failure.
+const SOCKS5_REPLY_FAILURE: u8 = 0x01;
+/// SOCKS5 reply: command not supported.
+const SOCKS5_REPLY_UNSUPPORTED: u8 = 0x07;
+/// SOCKS5 reply: address type not supported.
+const SOCKS5_REPLY_BAD_ADDRESS: u8 = 0x08;
+
+/// Address forms of a SOCKS5 request.
+#[derive(Debug)]
+enum Socks5Addr {
+    Domain(String),
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
 }
 
-/// SOCKS5 proxy inbound listener with UDP ASSOCIATE support (synchronous).
+/// Serve one accepted SOCKS5 connection.
+///
+/// `kind` labels the connection in the traffic tracker (`socks5` / `mixed`).
+/// Returns after the relay finishes; the caller owns the socket until then.
+pub(crate) fn serve_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    router: Arc<Router>,
+    outbound_manager: Arc<OutboundManager>,
+    auth: Arc<InboundAuth>,
+    kind: &'static str,
+) -> Result<()> {
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+
+    if !perform_handshake(&mut stream, &auth)? {
+        return Err(Error::protocol_with_info(
+            "SOCKS5 handshake failed",
+            "SOCKS5",
+        ));
+    }
+    let (target_addr, target_port, command) = read_request(&mut stream)?;
+
+    match command {
+        SOCKS5_CMD_CONNECT => handle_connect(
+            stream,
+            peer_addr,
+            target_addr,
+            target_port,
+            router,
+            outbound_manager,
+            kind,
+        ),
+        SOCKS5_CMD_UDP_ASSOCIATE => {
+            handle_udp_associate(stream, peer_addr, router, outbound_manager)
+        }
+        _ => {
+            send_reply(&mut stream, SOCKS5_REPLY_UNSUPPORTED)?;
+            Err(Error::protocol_with_info(
+                "Unsupported SOCKS5 command",
+                "SOCKS5",
+            ))
+        }
+    }
+}
+
+/// RFC 1928 §3: greeting, method selection, optional RFC 1929 credentials.
+///
+/// Returns `Ok(false)` when the connection is not (or cannot be) a SOCKS5
+/// session; the caller closes it.
+fn perform_handshake(stream: &mut TcpStream, auth: &InboundAuth) -> Result<bool> {
+    let mut header = [0u8; 2];
+    stream
+        .read_exact(&mut header)
+        .map_err(|e| Error::network(format!("Failed to read SOCKS5 greeting: {e}")))?;
+    if header[0] != SOCKS5_VERSION {
+        return Ok(false);
+    }
+
+    let mut methods = vec![0u8; header[1] as usize];
+    stream
+        .read_exact(&mut methods)
+        .map_err(|e| Error::network(format!("Failed to read SOCKS5 methods: {e}")))?;
+
+    if auth.required() {
+        // Credentials configured: only RFC 1929 user/pass is acceptable.
+        if !methods.contains(&SOCKS5_AUTH_USERPASS) {
+            let _ = stream.write_all(&[SOCKS5_VERSION, 0xFF]);
+            return Ok(false);
+        }
+        stream
+            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_USERPASS])
+            .map_err(|e| Error::network(format!("Failed to send method selection: {e}")))?;
+        return socks5_userpass(stream, auth);
+    }
+
+    if !methods.contains(&SOCKS5_AUTH_NONE) {
+        let _ = stream.write_all(&[SOCKS5_VERSION, 0xFF]);
+        return Ok(false);
+    }
+    stream
+        .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
+        .map_err(|e| Error::network(format!("Failed to send method selection: {e}")))?;
+    Ok(true)
+}
+
+/// RFC 1928 §4: `VER CMD RSV ATYP DST.ADDR DST.PORT`.
+///
+/// Every field is length-prefixed or fixed-width, so a request is read with a
+/// bounded number of bytes and no allocation the client can steer.
+fn read_request(stream: &mut TcpStream) -> Result<(Socks5Addr, u16, u8)> {
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .map_err(|e| Error::network(format!("Failed to read SOCKS5 request: {e}")))?;
+    if head[0] != SOCKS5_VERSION {
+        return Err(Error::protocol("Invalid SOCKS5 version in request"));
+    }
+    if head[2] != 0x00 {
+        // The reserved byte must be zero (RFC 1928 §4); anything else is a
+        // malformed request rather than a message to interpret.
+        return Err(Error::protocol("Non-zero reserved byte in SOCKS5 request"));
+    }
+    let command = head[1];
+
+    let (addr, port) = match head[3] {
+        0x01 => {
+            let mut addr = [0u8; 4];
+            stream
+                .read_exact(&mut addr)
+                .map_err(|e| Error::network(format!("Failed to read IPv4 address: {e}")))?;
+            (Socks5Addr::Ipv4(Ipv4Addr::from(addr)), read_port(stream)?)
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream
+                .read_exact(&mut len)
+                .map_err(|e| Error::network(format!("Failed to read domain length: {e}")))?;
+            let mut domain = vec![0u8; len[0] as usize];
+            stream
+                .read_exact(&mut domain)
+                .map_err(|e| Error::network(format!("Failed to read domain: {e}")))?;
+            let domain = String::from_utf8(domain)
+                .map_err(|_| Error::protocol("Invalid domain encoding"))?;
+            (Socks5Addr::Domain(domain), read_port(stream)?)
+        }
+        0x04 => {
+            let mut addr = [0u8; 16];
+            stream
+                .read_exact(&mut addr)
+                .map_err(|e| Error::network(format!("Failed to read IPv6 address: {e}")))?;
+            (Socks5Addr::Ipv6(Ipv6Addr::from(addr)), read_port(stream)?)
+        }
+        _ => {
+            send_reply(stream, SOCKS5_REPLY_BAD_ADDRESS)?;
+            return Err(Error::protocol("Unsupported SOCKS5 address type"));
+        }
+    };
+    Ok((addr, port, command))
+}
+
+/// The two-byte big-endian port of a SOCKS5 request.
+fn read_port(stream: &mut TcpStream) -> Result<u16> {
+    let mut port = [0u8; 2];
+    stream
+        .read_exact(&mut port)
+        .map_err(|e| Error::network(format!("Failed to read port: {e}")))?;
+    Ok(u16::from_be_bytes(port))
+}
+
+/// Relay a `CONNECT` request through the matched outbound.
+fn handle_connect(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    target_addr: Socks5Addr,
+    target_port: u16,
+    router: Arc<Router>,
+    outbound_manager: Arc<OutboundManager>,
+    kind: &'static str,
+) -> Result<()> {
+    let (domain, ip) = match &target_addr {
+        Socks5Addr::Domain(domain) => (Some(domain.clone()), None),
+        Socks5Addr::Ipv4(ip) => (None, Some(IpAddr::V4(*ip))),
+        Socks5Addr::Ipv6(ip) => (None, Some(IpAddr::V6(*ip))),
+    };
+    let target = match &target_addr {
+        Socks5Addr::Domain(domain) => TargetAddr::new_domain(domain.clone(), target_port),
+        Socks5Addr::Ipv4(ip) => TargetAddr::new_ip(SocketAddr::new(IpAddr::V4(*ip), target_port)),
+        Socks5Addr::Ipv6(ip) => TargetAddr::new_ip(SocketAddr::new(IpAddr::V6(*ip), target_port)),
+    };
+
+    let outbound_tag = router.match_outbound(domain.as_deref(), ip, Some(target_port), None);
+    tracing::info!("SOCKS5 CONNECT {target} -> {outbound_tag} (from {peer_addr})");
+
+    let Some(outbound) = outbound_manager.get_proxy(&outbound_tag) else {
+        tracing::error!("Outbound '{}' not found", outbound_tag);
+        send_reply(&mut stream, SOCKS5_REPLY_FAILURE)?;
+        return Err(Error::config(format!(
+            "Outbound '{outbound_tag}' not found"
+        )));
+    };
+
+    // The relay is established through an outbound proxy, so no local socket
+    // is bound for it: the reply carries the unspecified address, which is
+    // what RFC 1928 expects a client to ignore.
+    let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    send_reply_with_addr(&mut stream, SOCKS5_REPLY_SUCCESS, unspecified)?;
+
+    let destination_ip = match &target {
+        TargetAddr::Ip(addr) => Some(addr.ip().to_string()),
+        TargetAddr::Domain(domain, _) => {
+            crate::common::socket::resolve_host(domain, target.port(), Duration::from_secs(3))
+                .ok()
+                .and_then(|addrs| addrs.into_iter().next())
+                .map(|addr| addr.ip().to_string())
+        }
+    };
+
+    let tracker = global_tracker();
+    let tracked = tracker.track(TrackedConnection::new_with_ip(
+        kind.to_string(),
+        outbound_tag.clone(),
+        target.host(),
+        destination_ip,
+        target.port(),
+        "SOCKS5".to_string(),
+        "tcp".to_string(),
+        "SOCKS5".to_string(),
+        target.to_string(),
+    ));
+
+    let _ = stream.set_read_timeout(Some(RELAY_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(RELAY_TIMEOUT));
+
+    let result = outbound.relay_tcp_with_connection(
+        Box::new(stream),
+        target.clone(),
+        Some(Arc::clone(&tracked)),
+    );
+    tracker.untrack(&tracked.id);
+    if let Err(e) = result {
+        tracing::debug!(
+            "SOCKS5 relay error via '{}' to {}: {}",
+            outbound.tag(),
+            target,
+            e
+        );
+    }
+    Ok(())
+}
+
+/// `UDP ASSOCIATE`: bind a relay socket, tell the client where it is, and
+/// keep the association alive for as long as the TCP control connection is.
+fn handle_udp_associate(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    router: Arc<Router>,
+    outbound_manager: Arc<OutboundManager>,
+) -> Result<()> {
+    tracing::info!("SOCKS5 UDP ASSOCIATE from {peer_addr}");
+
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let udp_socket = crate::common::socket::udp_bind(bind_addr, UDP_SESSION_TIMEOUT)
+        .map_err(|e| Error::network(format!("Failed to bind UDP relay socket: {e}")))?;
+    let _ = udp_socket.set_write_timeout(Some(UDP_SESSION_TIMEOUT));
+    let local_addr = udp_socket
+        .local_addr()
+        .map_err(|e| Error::network(format!("Failed to read UDP relay address: {e}")))?;
+
+    tracing::info!("UDP relay listening on {local_addr} for {peer_addr}");
+    send_reply_with_addr(&mut stream, SOCKS5_REPLY_SUCCESS, local_addr)?;
+
+    // The relay lives exactly as long as the control connection: it runs on a
+    // thread of its own (a session, not a short task) and this thread watches
+    // the TCP side for the client's disconnect.
+    let cancel = crate::common::cancel::CancellationToken::new();
+    let relay_cancel = cancel.clone();
+    let relay_thread = std::thread::Builder::new()
+        .name("corduit-socks5-udp".into())
+        .spawn(move || {
+            if let Err(e) = run_udp_relay(
+                udp_socket,
+                peer_addr,
+                router,
+                outbound_manager,
+                relay_cancel,
+            ) {
+                tracing::debug!("UDP relay error for {peer_addr}: {e}");
+            }
+        })
+        .map_err(|e| Error::network(format!("Failed to spawn UDP relay thread: {e}")))?;
+
+    // A UDP association carries no data on the TCP connection: the client
+    // keeps it open and closes it to end the association (RFC 1928 §7).
+    let _ = stream.set_read_timeout(Some(RELAY_TIMEOUT));
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,    // client closed
+            Ok(_) => continue, // nothing defined on this half
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(e) => {
+                tracing::debug!("UDP ASSOCIATE control connection from {peer_addr} failed: {e}");
+                break;
+            }
+        }
+    }
+
+    cancel.cancel();
+    let _ = relay_thread.join();
+    tracing::info!("UDP ASSOCIATE with {peer_addr} ended");
+    Ok(())
+}
+
+/// Forward datagrams between the client and the matched outbound.
+///
+/// Only datagrams whose source IP matches the association's client are
+/// relayed: without that check the bound UDP port would be an open relay for
+/// anyone who can reach it.
+fn run_udp_relay(
+    udp_socket: UdpSocket,
+    client_addr: SocketAddr,
+    router: Arc<Router>,
+    outbound_manager: Arc<OutboundManager>,
+    cancel: crate::common::cancel::CancellationToken,
+) -> Result<()> {
+    let mut buf = vec![0u8; 65535];
+
+    while !cancel.is_cancelled() {
+        let (len, src_addr) = match udp_socket.recv_from(&mut buf) {
+            Ok(result) => result,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!("UDP relay receive error: {e}");
+                continue;
+            }
+        };
+
+        if src_addr.ip() != client_addr.ip() {
+            tracing::debug!(
+                "Dropping UDP datagram from {src_addr} (association client is {client_addr})"
+            );
+            continue;
+        }
+
+        // RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
+        if len < 10 {
+            continue;
+        }
+        if buf[2] != 0 {
+            // A fragmented datagram cannot be forwarded as one packet; the
+            // only honest answer is to drop it (RFC 1928 §7).
+            tracing::debug!("Dropping fragmented SOCKS5 UDP datagram");
+            continue;
+        }
+
+        let (target, header_len) = match buf[3] {
+            0x01 if len >= 10 => {
+                let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+                let port = u16::from_be_bytes([buf[8], buf[9]]);
+                (
+                    TargetAddr::new_ip(SocketAddr::new(IpAddr::V4(ip), port)),
+                    10,
+                )
+            }
+            0x03 => {
+                let domain_len = buf[4] as usize;
+                if len < 7 + domain_len {
+                    continue;
+                }
+                let Ok(domain) = String::from_utf8(buf[5..5 + domain_len].to_vec()) else {
+                    continue;
+                };
+                let port = u16::from_be_bytes([buf[5 + domain_len], buf[6 + domain_len]]);
+                (TargetAddr::new_domain(domain, port), 7 + domain_len)
+            }
+            0x04 if len >= 22 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&buf[4..20]);
+                let port = u16::from_be_bytes([buf[20], buf[21]]);
+                (
+                    TargetAddr::new_ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)),
+                    22,
+                )
+            }
+            _ => continue,
+        };
+
+        let payload = &buf[header_len..len];
+        if payload.is_empty() {
+            continue;
+        }
+
+        let (domain, ip) = match &target {
+            TargetAddr::Domain(domain, _) => (Some(domain.clone()), None),
+            TargetAddr::Ip(addr) => (None, Some(addr.ip())),
+        };
+        let outbound_tag = router.match_outbound(domain.as_deref(), ip, Some(target.port()), None);
+        let Some(outbound) = outbound_manager.get_proxy(&outbound_tag) else {
+            tracing::warn!("Outbound '{}' not found for UDP", outbound_tag);
+            continue;
+        };
+        if !outbound.supports_udp() {
+            tracing::debug!("Outbound '{}' does not support UDP", outbound_tag);
+            continue;
+        }
+
+        match outbound.relay_udp_packet(&target, payload) {
+            Ok(response) if !response.is_empty() => {
+                let packet = build_udp_reply(&target, &response);
+                if let Err(e) = udp_socket.send_to(&packet, src_addr) {
+                    tracing::debug!("Failed to send UDP reply: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!("UDP relay error via '{}': {}", outbound.tag(), e),
+        }
+    }
+    Ok(())
+}
+
+/// Wrap an outbound reply in the SOCKS5 UDP response envelope.
+fn build_udp_reply(target: &TargetAddr, payload: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(payload.len() + 22);
+    packet.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV, FRAG
+    match target {
+        TargetAddr::Ip(addr) => {
+            match addr.ip() {
+                IpAddr::V4(ip) => {
+                    packet.push(0x01);
+                    packet.extend_from_slice(&ip.octets());
+                }
+                IpAddr::V6(ip) => {
+                    packet.push(0x04);
+                    packet.extend_from_slice(&ip.octets());
+                }
+            }
+            packet.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        TargetAddr::Domain(domain, port) => {
+            let len = domain.len().min(u8::MAX as usize);
+            packet.push(0x03);
+            packet.push(len as u8);
+            packet.extend_from_slice(&domain.as_bytes()[..len]);
+            packet.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// Send a reply with the unspecified IPv4 address.
+fn send_reply(stream: &mut TcpStream, reply: u8) -> Result<()> {
+    let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    send_reply_with_addr(stream, reply, unspecified)
+}
+
+/// Send a reply carrying `addr` as `BND.ADDR` / `BND.PORT`.
+fn send_reply_with_addr(stream: &mut TcpStream, reply: u8, addr: SocketAddr) -> Result<()> {
+    let mut packet = Vec::with_capacity(22);
+    packet.extend_from_slice(&[SOCKS5_VERSION, reply, 0x00]);
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            packet.push(0x01);
+            packet.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            packet.push(0x04);
+            packet.extend_from_slice(&ip.octets());
+        }
+    }
+    packet.extend_from_slice(&addr.port().to_be_bytes());
+    stream
+        .write_all(&packet)
+        .map_err(|e| Error::network(format!("Failed to write SOCKS5 reply: {e}")))
+}
+
+/// SOCKS5 proxy inbound listener.
 pub struct Socks5Inbound {
     config: InboundConfig,
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
     auth: Arc<InboundAuth>,
-    cancel_token: CancellationToken,
     running: Arc<AtomicBool>,
-    /// Handle of the dedicated accept thread; joined by `stop()`.
-    accept_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// UDP sessions for UDP ASSOCIATE
-    #[allow(dead_code)]
-    udp_sessions: Arc<DashMap<u16, UdpSession>>,
+    server: Mutex<Option<ConnectionListener>>,
 }
 
 impl InboundListener for Socks5Inbound {
@@ -62,6 +570,7 @@ impl InboundListener for Socks5Inbound {
 }
 
 impl Socks5Inbound {
+    /// Build the inbound. No socket is bound until [`start`](Self::start).
     pub fn new(
         config: InboundConfig,
         router: Arc<Router>,
@@ -73,10 +582,8 @@ impl Socks5Inbound {
             router,
             outbound_manager,
             auth,
-            cancel_token: CancellationToken::new(),
             running: Arc::new(AtomicBool::new(false)),
-            accept_thread: Mutex::new(None),
-            udp_sessions: Arc::new(DashMap::new()),
+            server: Mutex::new(None),
         }
     }
 
@@ -91,33 +598,31 @@ impl Socks5Inbound {
         }
 
         let (listener, addr) = bind_tcp_listener(&self.config.listen, self.config.port, "SOCKS5")?;
-
         let router = Arc::clone(&self.router);
         let outbound_manager = Arc::clone(&self.outbound_manager);
         let auth = Arc::clone(&self.auth);
-        let cancel_token = self.cancel_token.clone();
-        let running = Arc::clone(&self.running);
 
-        running.store(true, Ordering::Relaxed);
-
-        let handle = std::thread::Builder::new()
-            .name("corduit-socks5-accept".into())
-            .spawn(move || {
-                accept_loop(
-                    listener,
-                    addr,
-                    cancel_token,
-                    running,
-                    router,
-                    outbound_manager,
-                    auth,
-                );
+        let mut server = ConnectionListener::new(listener, addr, MAX_CONNECTIONS);
+        server
+            .start("corduit-socks5-conn", move |stream, peer| {
+                if let Err(e) = serve_connection(
+                    stream,
+                    peer,
+                    Arc::clone(&router),
+                    Arc::clone(&outbound_manager),
+                    Arc::clone(&auth),
+                    "socks5",
+                ) {
+                    tracing::debug!("SOCKS5 connection error from {peer}: {e}");
+                }
             })
-            .map_err(|e| Error::network(format!("Failed to spawn SOCKS5 accept thread: {e}")))?;
+            .map_err(|e| {
+                Error::network(format!("Failed to serve SOCKS5 inbound on {addr}: {e}"))
+            })?;
 
-        *self.accept_thread.lock() = Some(handle);
-
-        tracing::info!("SOCKS5 inbound listening on {}", addr);
+        *self.server.lock() = Some(server);
+        self.running.store(true, Ordering::Relaxed);
+        tracing::info!("SOCKS5 inbound listening on {addr}");
         Ok(())
     }
 
@@ -127,649 +632,122 @@ impl Socks5Inbound {
             self.config.listen,
             self.config.port
         );
-        self.cancel_token.cancel();
-
-        // The accept thread polls the token and exits promptly; joining it
-        // also drops the listener (releasing the bound port). Take the handle
-        // first so the lock is released before the (potentially blocking) join.
-        let handle = self.accept_thread.lock().take();
-        if let Some(handle) = handle {
-            let _ = handle.join();
+        // Take the listener out first so the lock is released before the
+        // (blocking) join of the accept loop.
+        let mut server = self.server.lock().take();
+        if let Some(server) = server.as_mut() {
+            server.stop();
         }
-
         self.running.store(false, Ordering::Relaxed);
         tracing::info!("SOCKS5 inbound stopped");
         Ok(())
     }
-
-    fn handle_connection(
-        mut stream: TcpStream,
-        peer_addr: SocketAddr,
-        router: Arc<Router>,
-        outbound_manager: Arc<OutboundManager>,
-        auth: Arc<InboundAuth>,
-    ) -> Result<()> {
-        // The handshake is bounded by the socket read timeout
-        // (HANDSHAKE_TIMEOUT) applied in the accept loop.
-        if !Self::perform_handshake(&mut stream, &auth)? {
-            return Err(Error::protocol_with_info(
-                "SOCKS5 handshake failed",
-                "SOCKS5",
-            ));
-        }
-        let (target_addr, target_port, command) = Self::read_request(&mut stream)?;
-
-        // Handle different SOCKS5 commands
-        match command {
-            0x01 => {
-                // CONNECT command - TCP proxy
-                Self::handle_connect(
-                    stream,
-                    peer_addr,
-                    target_addr,
-                    target_port,
-                    router,
-                    outbound_manager,
-                )
-            }
-            0x03 => {
-                // UDP ASSOCIATE command - UDP proxy for QUIC/gRPC
-                Self::handle_udp_associate(stream, peer_addr, router, outbound_manager)
-            }
-            _ => {
-                Self::send_reply(&mut stream, 0x07)?; // Command not supported
-                Err(Error::protocol_with_info(
-                    "Unsupported SOCKS5 command",
-                    "SOCKS5",
-                ))
-            }
-        }
-    }
-
-    /// Handle SOCKS5 CONNECT command (TCP proxy)
-    fn handle_connect(
-        mut stream: TcpStream,
-        peer_addr: SocketAddr,
-        target_addr: Socks5Addr,
-        target_port: u16,
-        router: Arc<Router>,
-        outbound_manager: Arc<OutboundManager>,
-    ) -> Result<()> {
-        // Extract domain/IP and port for routing
-        let (domain, ip) = match &target_addr {
-            Socks5Addr::Domain(domain) => (Some(domain.clone()), None),
-            Socks5Addr::Ipv4(ip) => (None, Some(IpAddr::V4(*ip))),
-            Socks5Addr::Ipv6(ip) => (None, Some(IpAddr::V6(*ip))),
-        };
-
-        // Match outbound using router
-        let outbound_tag = router.match_outbound(domain.as_deref(), ip, Some(target_port), None);
-
-        // Build target address
-        let target = match &target_addr {
-            Socks5Addr::Domain(d) => TargetAddr::new_domain(d.clone(), target_port),
-            Socks5Addr::Ipv4(ip) => {
-                TargetAddr::new_ip(SocketAddr::new(IpAddr::V4(*ip), target_port))
-            }
-            Socks5Addr::Ipv6(ip) => {
-                TargetAddr::new_ip(SocketAddr::new(IpAddr::V6(*ip), target_port))
-            }
-        };
-
-        tracing::info!(
-            "SOCKS5 CONNECT {} -> {} from {}",
-            target,
-            outbound_tag,
-            peer_addr
-        );
-
-        // Get the outbound proxy
-        let outbound = match outbound_manager.get_proxy(&outbound_tag) {
-            Some(proxy) => proxy,
-            None => {
-                tracing::error!("Outbound '{}' not found", outbound_tag);
-                Self::send_reply(&mut stream, 0x01)?; // General failure
-                return Err(Error::config(format!(
-                    "Outbound '{}' not found",
-                    outbound_tag
-                )));
-            }
-        };
-
-        // Send success reply with dummy bound address (we don't know the actual bind address)
-        let dummy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
-        Self::send_reply_with_addr(&mut stream, 0x00, dummy_addr)?;
-
-        // Try to resolve the destination IP for display
-        let destination_ip = match &target {
-            TargetAddr::Ip(addr) => Some(addr.ip().to_string()),
-            TargetAddr::Domain(domain, _) => {
-                crate::common::socket::resolve_host(domain, target.port(), Duration::from_secs(3))
-                    .ok()
-                    .and_then(|addrs| addrs.into_iter().next())
-                    .map(|addr| addr.ip().to_string())
-            }
-        };
-
-        // Track the connection with IP address
-        let tracked_conn = TrackedConnection::new_with_ip(
-            "socks5".to_string(),
-            outbound_tag.clone(),
-            target.host(),
-            destination_ip,
-            target.port(),
-            "SOCKS5".to_string(),
-            "tcp".to_string(),
-            "SOCKS5".to_string(),
-            target.to_string(),
-        );
-        let tracker = global_tracker();
-        let tracked = tracker.track(tracked_conn);
-        let conn_arc = Arc::clone(&tracked);
-
-        // The relay phase uses longer read/write timeouts.
-        let _ = stream.set_read_timeout(Some(RELAY_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(RELAY_TIMEOUT));
-
-        // Relay data through the outbound proxy with connection tracking
-        if let Err(e) =
-            outbound.relay_tcp_with_connection(Box::new(stream), target.clone(), Some(conn_arc))
-        {
-            tracing::debug!(
-                "SOCKS5 relay error via '{}' to {}: {}",
-                outbound.tag(),
-                target,
-                e
-            );
-        }
-
-        // Untrack the connection
-        tracker.untrack(&tracked.id);
-
-        Ok(())
-    }
-
-    /// Handle SOCKS5 UDP ASSOCIATE command for QUIC/gRPC protocols
-    fn handle_udp_associate(
-        mut stream: TcpStream,
-        peer_addr: SocketAddr,
-        router: Arc<Router>,
-        outbound_manager: Arc<OutboundManager>,
-    ) -> Result<()> {
-        tracing::info!("SOCKS5 UDP ASSOCIATE request from {}", peer_addr);
-
-        // Bind a UDP socket for the client
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let udp_socket = crate::common::socket::udp_bind(bind_addr, UDP_SESSION_TIMEOUT)
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
-        let _ = udp_socket.set_write_timeout(Some(UDP_SESSION_TIMEOUT));
-
-        let local_addr = udp_socket
-            .local_addr()
-            .map_err(|e| Error::network(format!("Failed to get UDP socket address: {}", e)))?;
-
-        tracing::info!(
-            "UDP relay socket bound to {} for client {}",
-            local_addr,
-            peer_addr
-        );
-
-        // Send success reply with the UDP relay address
-        Self::send_reply_with_addr(&mut stream, 0x00, local_addr)?;
-
-        // Start the UDP relay on a pool worker; it is stopped when the TCP
-        // control connection below ends.
-        let token = CancellationToken::new();
-        let relay_token = token.clone();
-        let router_clone = Arc::clone(&router);
-        let outbound_manager_clone = Arc::clone(&outbound_manager);
-        crate::common::exec::spawn(move || {
-            if let Err(e) = Self::run_udp_relay(
-                udp_socket,
-                peer_addr,
-                router_clone,
-                outbound_manager_clone,
-                relay_token,
-            ) {
-                tracing::debug!("UDP relay error for {}: {}", peer_addr, e);
-            }
-        });
-
-        // Keep TCP connection alive - UDP ASSOCIATE is valid while TCP
-        // connection is open. Read from TCP stream to detect when the client
-        // disconnects; the read timeout acts as a keep-alive poll.
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
-        let mut buf = [0u8; 1];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => {
-                    // Client disconnected
-                    tracing::info!("UDP ASSOCIATE client {} disconnected", peer_addr);
-                    break;
-                }
-                Ok(_) => {
-                    // Unexpected data, ignore
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    // Timeout, check if still connected
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!("UDP ASSOCIATE TCP error for {}: {}", peer_addr, e);
-                    break;
-                }
-            }
-        }
-        token.cancel();
-
-        Ok(())
-    }
-
-    /// Run UDP relay for SOCKS5 UDP ASSOCIATE
-    ///
-    /// Only the client that established the TCP UDP-ASSOCIATE connection may
-    /// use this relay socket. Datagrams from any other source IP are dropped;
-    /// otherwise any host that can reach the bound UDP port would get a free
-    /// open proxy (a classic SOCKS5 amplification / open-proxy vector).
-    fn run_udp_relay(
-        udp_socket: std::net::UdpSocket,
-        client_addr: SocketAddr,
-        router: Arc<Router>,
-        outbound_manager: Arc<OutboundManager>,
-        token: CancellationToken,
-    ) -> Result<()> {
-        let mut buf = vec![0u8; 65535];
-
-        while !token.is_cancelled() {
-            let (n, src_addr) = match udp_socket.recv_from(&mut buf) {
-                Ok(result) => result,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!("UDP recv error: {}", e);
-                    continue;
-                }
-            };
-
-            // Reject datagrams that do not originate from the authenticated
-            // UDP-ASSOCIATE client (same source IP). This prevents third
-            // parties from abusing the relay as an open proxy.
-            if src_addr.ip() != client_addr.ip() {
-                tracing::debug!(
-                    "Dropping UDP datagram from unexpected source {} (associate client {})",
-                    src_addr,
-                    client_addr
-                );
-                continue;
-            }
-
-            if n < 10 {
-                continue; // Too short for SOCKS5 UDP header
-            }
-
-            // Parse SOCKS5 UDP request header
-            // +----+------+------+----------+----------+----------+
-            // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
-            // +----+------+------+----------+----------+----------+
-            // | 2  |  1   |  1   | Variable |    2     | Variable |
-            // +----+------+------+----------+----------+----------+
-
-            let frag = buf[2];
-            if frag != 0 {
-                // Fragmentation not supported
-                tracing::debug!("UDP fragmentation not supported");
-                continue;
-            }
-
-            let atyp = buf[3];
-            let (target_addr, target_port, header_len) = match atyp {
-                0x01 => {
-                    // IPv4
-                    if n < 10 {
-                        continue;
-                    }
-                    let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-                    let port = u16::from_be_bytes([buf[8], buf[9]]);
-                    (
-                        TargetAddr::new_ip(SocketAddr::new(IpAddr::V4(ip), port)),
-                        port,
-                        10,
-                    )
-                }
-                0x03 => {
-                    // Domain
-                    let domain_len = buf[4] as usize;
-                    if n < 7 + domain_len {
-                        continue;
-                    }
-                    let domain = match String::from_utf8(buf[5..5 + domain_len].to_vec()) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    let port = u16::from_be_bytes([buf[5 + domain_len], buf[6 + domain_len]]);
-                    (TargetAddr::new_domain(domain, port), port, 7 + domain_len)
-                }
-                0x04 => {
-                    // IPv6
-                    if n < 22 {
-                        continue;
-                    }
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&buf[4..20]);
-                    let ip = Ipv6Addr::from(octets);
-                    let port = u16::from_be_bytes([buf[20], buf[21]]);
-                    (
-                        TargetAddr::new_ip(SocketAddr::new(IpAddr::V6(ip), port)),
-                        port,
-                        22,
-                    )
-                }
-                _ => continue,
-            };
-
-            let payload = &buf[header_len..n];
-            if payload.is_empty() {
-                continue;
-            }
-
-            // Route the UDP packet
-            let (domain, ip) = match &target_addr {
-                TargetAddr::Domain(d, _) => (Some(d.clone()), None),
-                TargetAddr::Ip(addr) => (None, Some(addr.ip())),
-            };
-
-            let outbound_tag =
-                router.match_outbound(domain.as_deref(), ip, Some(target_port), None);
-
-            tracing::debug!(
-                "UDP relay: {} -> {} via {} ({} bytes)",
-                src_addr,
-                target_addr,
-                outbound_tag,
-                payload.len()
-            );
-
-            // Get the outbound proxy
-            let outbound = match outbound_manager.get_proxy(&outbound_tag) {
-                Some(proxy) => proxy,
-                None => {
-                    tracing::warn!("Outbound '{}' not found for UDP", outbound_tag);
-                    continue;
-                }
-            };
-
-            // Check if outbound supports UDP
-            if !outbound.supports_udp() {
-                tracing::debug!("Outbound '{}' does not support UDP, skipping", outbound_tag);
-                continue;
-            }
-
-            // Forward the UDP packet (one-shot request/reply, blocking).
-            let payload_vec = payload.to_vec();
-            match outbound.relay_udp_packet(&target_addr, &payload_vec) {
-                Ok(response) => {
-                    if !response.is_empty() {
-                        // Build SOCKS5 UDP response
-                        let mut response_packet = Vec::with_capacity(response.len() + 22);
-                        response_packet.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV, FRAG
-
-                        match &target_addr {
-                            TargetAddr::Ip(addr) => {
-                                match addr.ip() {
-                                    IpAddr::V4(ip) => {
-                                        response_packet.push(0x01);
-                                        response_packet.extend_from_slice(&ip.octets());
-                                    }
-                                    IpAddr::V6(ip) => {
-                                        response_packet.push(0x04);
-                                        response_packet.extend_from_slice(&ip.octets());
-                                    }
-                                }
-                                response_packet.extend_from_slice(&addr.port().to_be_bytes());
-                            }
-                            TargetAddr::Domain(domain, port) => {
-                                response_packet.push(0x03);
-                                response_packet.push(domain.len() as u8);
-                                response_packet.extend_from_slice(domain.as_bytes());
-                                response_packet.extend_from_slice(&port.to_be_bytes());
-                            }
-                        }
-                        response_packet.extend_from_slice(&response);
-
-                        if let Err(e) = udp_socket.send_to(&response_packet, src_addr) {
-                            tracing::debug!("Failed to send UDP response: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("UDP relay error via '{}': {}", outbound.tag(), e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn perform_handshake(stream: &mut TcpStream, auth: &InboundAuth) -> Result<bool> {
-        let mut buf = [0u8; 2];
-        stream
-            .read_exact(&mut buf)
-            .map_err(|e| Error::network(format!("Failed to read SOCKS5 handshake: {}", e)))?;
-
-        if buf[0] != 0x05 {
-            return Ok(false); // Not SOCKS5
-        }
-
-        let num_methods = buf[1] as usize;
-        let mut methods = vec![0u8; num_methods];
-        stream
-            .read_exact(&mut methods)
-            .map_err(|e| Error::network(format!("Failed to read SOCKS5 methods: {}", e)))?;
-
-        if auth.required() {
-            // Credentials configured: only RFC 1929 user/pass is acceptable.
-            if !methods.contains(&SOCKS5_AUTH_USERPASS) {
-                stream.write_all(&[0x05, 0xFF]).map_err(|e| {
-                    Error::network(format!("Failed to write SOCKS5 response: {}", e))
-                })?;
-                return Ok(false);
-            }
-            stream
-                .write_all(&[0x05, SOCKS5_AUTH_USERPASS])
-                .map_err(|e| Error::network(format!("Failed to write SOCKS5 response: {}", e)))?;
-            if !socks5_userpass(stream, auth)? {
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-
-        // Check if no authentication is supported
-        let supports_no_auth = methods.contains(&0x00);
-        if !supports_no_auth {
-            // Send "no acceptable methods" reply
-            stream
-                .write_all(&[0x05, 0xFF])
-                .map_err(|e| Error::network(format!("Failed to write SOCKS5 response: {}", e)))?;
-            return Ok(false);
-        }
-
-        // Send response: version 5, no authentication
-        stream
-            .write_all(&[0x05, 0x00])
-            .map_err(|e| Error::network(format!("Failed to write SOCKS5 response: {}", e)))?;
-
-        Ok(true)
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Result<(Socks5Addr, u16, u8)> {
-        let mut buf = [0u8; 4];
-        stream
-            .read_exact(&mut buf)
-            .map_err(|e| Error::network(format!("Failed to read SOCKS5 request: {}", e)))?;
-
-        if buf[0] != 0x05 {
-            return Err(Error::protocol("Invalid SOCKS5 version"));
-        }
-
-        let command = buf[1];
-        let addr_type = buf[3];
-
-        let (addr, port) = match addr_type {
-            0x01 => {
-                // IPv4
-                let mut addr_buf = [0u8; 4];
-                stream.read_exact(&mut addr_buf)?;
-                let ipv4 = Ipv4Addr::from(addr_buf);
-                let mut port_buf = [0u8; 2];
-                stream.read_exact(&mut port_buf)?;
-                let port = u16::from_be_bytes(port_buf);
-                (Socks5Addr::Ipv4(ipv4), port)
-            }
-            0x03 => {
-                // Domain
-                let mut len_buf = [0u8; 1];
-                stream.read_exact(&mut len_buf)?;
-                let len = len_buf[0] as usize;
-                let mut domain_buf = vec![0u8; len];
-                stream.read_exact(&mut domain_buf)?;
-                let domain = String::from_utf8(domain_buf)
-                    .map_err(|_| Error::protocol("Invalid domain encoding"))?;
-                let mut port_buf = [0u8; 2];
-                stream.read_exact(&mut port_buf)?;
-                let port = u16::from_be_bytes(port_buf);
-                (Socks5Addr::Domain(domain), port)
-            }
-            0x04 => {
-                // IPv6
-                let mut addr_buf = [0u8; 16];
-                stream.read_exact(&mut addr_buf)?;
-                let ipv6 = Ipv6Addr::from(addr_buf);
-                let mut port_buf = [0u8; 2];
-                stream.read_exact(&mut port_buf)?;
-                let port = u16::from_be_bytes(port_buf);
-                (Socks5Addr::Ipv6(ipv6), port)
-            }
-            _ => return Err(Error::protocol("Unsupported address type")),
-        };
-
-        Ok((addr, port, command))
-    }
-
-    fn send_reply(stream: &mut TcpStream, reply: u8) -> Result<()> {
-        let reply_packet = [
-            0x05,  // Version
-            reply, // Reply code
-            0x00,  // Reserved
-            0x01,  // IPv4 address type
-            0x00, 0x00, 0x00, 0x00, // IPv4 address (0.0.0.0)
-            0x00, 0x00, // Port (0)
-        ];
-
-        stream
-            .write_all(&reply_packet)
-            .map_err(|e| Error::network(format!("Failed to write SOCKS5 reply: {}", e)))?;
-
-        Ok(())
-    }
-
-    fn send_reply_with_addr(stream: &mut TcpStream, reply: u8, addr: SocketAddr) -> Result<()> {
-        let mut reply_packet = Vec::with_capacity(22);
-        reply_packet.push(0x05); // Version
-        reply_packet.push(reply); // Reply code
-        reply_packet.push(0x00); // Reserved
-
-        match addr.ip() {
-            IpAddr::V4(ipv4) => {
-                reply_packet.push(0x01); // IPv4
-                reply_packet.extend_from_slice(&ipv4.octets());
-            }
-            IpAddr::V6(ipv6) => {
-                reply_packet.push(0x04); // IPv6
-                reply_packet.extend_from_slice(&ipv6.octets());
-            }
-        }
-
-        reply_packet.extend_from_slice(&addr.port().to_be_bytes());
-
-        stream
-            .write_all(&reply_packet)
-            .map_err(|e| Error::network(format!("Failed to write SOCKS5 reply: {}", e)))?;
-
-        Ok(())
-    }
 }
 
-/// Dedicated accept loop: polls a non-blocking listener for connections and
-/// dispatches each to the work-stealing pool. Exits on cancellation (which
-/// also drops the listener and releases the bound port).
-fn accept_loop(
-    listener: std::net::TcpListener,
-    addr: SocketAddr,
-    cancel_token: CancellationToken,
-    running: Arc<AtomicBool>,
-    router: Arc<Router>,
-    outbound_manager: Arc<OutboundManager>,
-    auth: Arc<InboundAuth>,
-) {
-    loop {
-        if cancel_token.is_cancelled() {
-            tracing::info!("SOCKS5 inbound on {} shutting down", addr);
-            break;
-        }
-        match listener.accept() {
-            Ok((stream, peer_addr)) => {
-                // Windows: accepted sockets inherit the listener's
-                // non-blocking mode; force blocking so the read/write
-                // timeouts below actually bound each operation.
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
-                let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
-                let router = Arc::clone(&router);
-                let outbound_manager = Arc::clone(&outbound_manager);
-                let auth = Arc::clone(&auth);
-                crate::common::exec::spawn(move || {
-                    if let Err(err) = Socks5Inbound::handle_connection(
-                        stream,
-                        peer_addr,
-                        router,
-                        outbound_manager,
-                        auth,
-                    ) {
-                        tracing::debug!("SOCKS5 connection error from {}: {}", peer_addr, err);
-                    }
-                });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL);
-            }
-            Err(e) => {
-                if !cancel_token.is_cancelled() {
-                    tracing::error!("SOCKS5 accept error: {}", e);
-                }
-                break;
-            }
-        }
-    }
-    running.store(false, Ordering::Relaxed);
-    tracing::info!("SOCKS5 inbound on {} stopped", addr);
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::config::AuthenticationConfig;
+    use std::net::TcpListener;
 
-#[derive(Debug)]
-enum Socks5Addr {
-    Domain(String),
-    Ipv4(Ipv4Addr),
-    Ipv6(Ipv6Addr),
+    /// Run `f` against a connected socket pair: the returned handle is the
+    /// server side, the caller drives the client side.
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (server, client)
+    }
+
+    fn auth_with(user: &str, pass: &str) -> InboundAuth {
+        InboundAuth::new(Some(&[AuthenticationConfig {
+            username: user.to_string(),
+            password: pass.to_string(),
+        }]))
+    }
+
+    #[test]
+    fn no_auth_handshake_is_accepted_when_open() {
+        let (mut server, mut client) = socket_pair();
+        client.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        assert!(perform_handshake(&mut server, &InboundAuth::default()).unwrap());
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, [0x05, 0x00]);
+    }
+
+    #[test]
+    fn no_auth_only_client_is_refused_when_credentials_are_configured() {
+        let (mut server, mut client) = socket_pair();
+        client.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        assert!(!perform_handshake(&mut server, &auth_with("user", "pass")).unwrap());
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, [0x05, 0xFF], "no acceptable methods");
+    }
+
+    #[test]
+    fn userpass_handshake_validates_the_credentials() {
+        let (mut server, mut client) = socket_pair();
+        client
+            .write_all(&[0x05, 0x01, SOCKS5_AUTH_USERPASS])
+            .unwrap();
+        let mut selection = [0u8; 2];
+        // Drive the sub-negotiation from a thread: the server writes its
+        // method selection before reading the credentials.
+        let auth = auth_with("user", "pass");
+        let handle = std::thread::spawn(move || perform_handshake(&mut server, &auth));
+        client.read_exact(&mut selection).unwrap();
+        assert_eq!(selection, [0x05, SOCKS5_AUTH_USERPASS]);
+        client
+            .write_all(&[0x01, 4, b'u', b's', b'e', b'r', 4, b'p', b'a', b's', b's'])
+            .unwrap();
+        let mut status = [0u8; 2];
+        client.read_exact(&mut status).unwrap();
+        assert_eq!(status, [0x01, 0x00]);
+        assert!(handle.join().unwrap().unwrap());
+    }
+
+    #[test]
+    fn a_non_zero_reserved_byte_is_refused() {
+        let (mut server, mut client) = socket_pair();
+        client
+            .write_all(&[0x05, SOCKS5_CMD_CONNECT, 0x01, 0x01])
+            .unwrap();
+        assert!(read_request(&mut server).is_err());
+    }
+
+    #[test]
+    fn replies_carry_the_announced_address() {
+        let (mut server, mut client) = socket_pair();
+        let relay: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        send_reply_with_addr(&mut server, SOCKS5_REPLY_SUCCESS, relay).unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply[..4], &[0x05, 0x00, 0x00, 0x01]);
+        assert_eq!(&reply[4..8], &[127, 0, 0, 1]);
+        assert_eq!(u16::from_be_bytes([reply[8], reply[9]]), 1080);
+    }
+
+    #[test]
+    fn udp_reply_envelope_round_trips_ipv4() {
+        let target = TargetAddr::new_ip("127.0.0.1:53".parse().unwrap());
+        let packet = build_udp_reply(&target, b"dns");
+        assert_eq!(&packet[..4], &[0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(&packet[4..8], &[127, 0, 0, 1]);
+        assert_eq!(u16::from_be_bytes([packet[8], packet[9]]), 53);
+        assert_eq!(&packet[10..], b"dns");
+    }
+
+    #[test]
+    fn udp_reply_envelope_round_trips_a_domain() {
+        let target = TargetAddr::new_domain("example.com".to_string(), 443);
+        let packet = build_udp_reply(&target, b"x");
+        assert_eq!(packet[3], 0x03);
+        assert_eq!(packet[4], 11);
+        assert_eq!(&packet[5..16], b"example.com");
+        assert_eq!(u16::from_be_bytes([packet[16], packet[17]]), 443);
+        assert_eq!(&packet[18..], b"x");
+    }
 }

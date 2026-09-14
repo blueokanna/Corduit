@@ -117,8 +117,6 @@ struct CompiledRule {
     /// compile time so matching never allocates or re-parses.
     pattern: String,
     outbound: String,
-    #[allow(dead_code)]
-    process_name: Option<String>,
     regex: Option<Regex>,
     /// Pre-parsed CIDR for `IpCidr` / `SrcIpCidr` rules.
     ipnet: Option<IpNet>,
@@ -553,7 +551,6 @@ impl Router {
                 rule_type: rule.rule_type,
                 pattern,
                 outbound: rule.outbound.clone(),
-                process_name: rule.process_name.clone(),
                 regex,
                 ipnet,
                 port_ranges,
@@ -1173,7 +1170,6 @@ mod property_tests {
                 rule_type: RuleType::Domain,
                 pattern: lower.clone(),
                 outbound: "proxy".to_string(),
-                process_name: None,
                 regex: None,
                 ipnet: None,
                 port_ranges: Vec::new(),
@@ -1221,7 +1217,6 @@ mod property_tests {
                 rule_type: RuleType::DomainSuffix,
                 pattern: base_domain.clone(),
                 outbound: "proxy".to_string(),
-                process_name: None,
                 regex: None,
                 ipnet: None,
                 port_ranges: Vec::new(),
@@ -1262,7 +1257,6 @@ mod property_tests {
                 rule_type: RuleType::DomainKeyword,
                 pattern: keyword.clone(),
                 outbound: "proxy".to_string(),
-                process_name: None,
                 regex: None,
                 ipnet: None,
                 port_ranges: Vec::new(),
@@ -1364,7 +1358,6 @@ mod property_tests {
                 rule_type: RuleType::Match,
                 pattern: String::new(),
                 outbound: "proxy".to_string(),
-                process_name: None,
                 regex: None,
                 ipnet: None,
                 port_ranges: Vec::new(),

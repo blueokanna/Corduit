@@ -108,8 +108,8 @@
 | VMess | `vmess` | `uuid`, `alter_id`, `cipher`, `tls` 等 |
 | VLESS | `vless` | `uuid`, `flow`, `tls` 等 |
 | Trojan | `trojan` | `password`, `sni` |
-| WireGuard | `wireguard` | `private_key`, `public_key`, `endpoint`, `allowed_ips` |
-| TUIC（需 `tuic` feature） | `tuic` | `uuid`, `password`, `alpn`（默认 `["h3"]`）, `sni`, `skip-cert-verify`, `congestion-controller`（`cubic`/`new_reno`/`bbr`，均驱动 NewReno 控制器）, `udp-relay-mode`（`native`/`quic`）, `heartbeat-interval` |
+| WireGuard | `wireguard` | `private-key`（或 `privateKey`）, `public-key`/`peer-public-key`（对端公钥）, `preshared-key?`, `local-address?`（默认 `10.0.0.2`）, `mtu?`（默认 1420）；`reserved` 不支持：出现即报错，不会被静默忽略 |
+| TUIC（需 `tuic` feature） | `tuic` | `uuid`, `password`, `alpn`（默认 `["h3"]`）, `sni`, `skip-cert-verify`, `congestion-controller`（`cubic`/`new_reno`/`bbr`，均驱动 NewReno 控制器）, `udp-relay-mode`（`native`/`quic`）, `heartbeat-interval`（驱动 QUIC 传输保活，而非独立心跳流） |
 | Hysteria2（需 `hysteria2` feature） | `hysteria2` / `hy2` | `password`/`auth`, `obfs`（`salamander` + `obfs-password`）, `sni`, `skip-cert-verify`, `alpn`, `up`/`down`（Mbps，仅用于 `hysteria-cc-rx` 速率提示）, `fingerprint`（解析但忽略）, `ports`/`hop-interval`（解析但忽略） |
 | VLESS / Trojan / VMess + REALITY（需 `reality` feature） | `vless` / `trojan` / `vmess` | 在这些出站的 options 里加 `security: "reality"`, `public-key`（服务端 X25519 公钥，base64 或 64 位 hex）, `short-id`（hex，≤8 字节）, `server-name`（伪装 SNI）, `fingerprint`（`chrome`/`randomized`/`off`，默认 `chrome`） |
 | SOCKS5 | `socks5` / `socks` | `username`, `password`, `udp` |

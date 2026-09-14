@@ -3,7 +3,7 @@ use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
-use crate::protocol::wireguard::{public_key_from_private, WireGuardTunnel};
+use crate::protocol::wireguard::WireGuardTunnel;
 use parking_lot::Mutex;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -20,14 +20,10 @@ pub struct WireguardOutbound {
     server: String,
     port: u16,
     private_key: [u8; 32],
-    #[allow(dead_code)]
-    public_key: [u8; 32],
     peer_public_key: [u8; 32],
     preshared_key: Option<[u8; 32]>,
     local_address: IpAddr,
     mtu: u16,
-    #[allow(dead_code)]
-    reserved: Option<[u8; 3]>,
     tunnel: Arc<Mutex<Option<WireGuardTunnel>>>,
     socket: Arc<Mutex<Option<UdpSocket>>>,
 }
@@ -52,8 +48,6 @@ impl WireguardOutbound {
 
         let private_key = decode_base64_key(private_key_str)
             .map_err(|e| Error::config(format!("Invalid private-key: {}", e)))?;
-
-        let public_key = public_key_from_private(&private_key);
 
         let peer_public_key_str = config
             .options
@@ -90,33 +84,24 @@ impl WireguardOutbound {
             .map(|n| n as u16)
             .unwrap_or(1420);
 
-        let reserved = config
-            .options
-            .get("reserved")
-            .and_then(|v| v.as_array())
-            .and_then(|seq| {
-                if seq.len() >= 3 {
-                    Some([
-                        seq[0].as_i64()? as u8,
-                        seq[1].as_i64()? as u8,
-                        seq[2].as_i64()? as u8,
-                    ])
-                } else {
-                    None
-                }
-            });
+        // WARP-style `reserved` asks the client to write three bytes into
+        // its handshake packets; this outbound never rewrites them, so the
+        // option is refused rather than accepted and ignored.
+        if config.options.contains_key("reserved") {
+            return Err(Error::config(
+                "WireGuard 'reserved' is not supported by this outbound",
+            ));
+        }
 
         Ok(Self {
             config,
             server,
             port,
             private_key,
-            public_key,
             peer_public_key,
             preshared_key,
             local_address,
             mtu,
-            reserved,
             tunnel: Arc::new(Mutex::new(None)),
             socket: Arc::new(Mutex::new(None)),
         })
@@ -244,55 +229,6 @@ impl WireguardOutbound {
             .map_err(|e| std::io::Error::other(format!("Failed to decrypt packet: {}", e)))?;
 
         Ok(decrypted)
-    }
-
-    #[allow(dead_code)]
-    fn build_tcp_syn_packet(&self, target: &TargetAddr, seq: u32) -> Vec<u8> {
-        let dst_ip = match target {
-            TargetAddr::Ip(addr) => addr.ip(),
-            TargetAddr::Domain(_, _) => return vec![],
-        };
-        let dst_port = target.port();
-
-        let src_ip = match self.local_address {
-            IpAddr::V4(ip) => ip,
-            IpAddr::V6(_) => return vec![],
-        };
-        let src_port = 40000 + (seq % 20000) as u16;
-
-        let mut packet = vec![0u8; IP_HEADER_SIZE + TCP_HEADER_SIZE];
-
-        packet[0] = 0x45;
-        packet[1] = 0x00;
-        let total_len = (IP_HEADER_SIZE + TCP_HEADER_SIZE) as u16;
-        packet[2..4].copy_from_slice(&total_len.to_be_bytes());
-        packet[4..6].copy_from_slice(&(seq as u16).to_be_bytes());
-        packet[6] = 0x40;
-        packet[7] = 0x00;
-        packet[8] = 64;
-        packet[9] = 6;
-        packet[10..12].copy_from_slice(&[0, 0]);
-        packet[12..16].copy_from_slice(&src_ip.octets());
-
-        if let IpAddr::V4(dst) = dst_ip {
-            packet[16..20].copy_from_slice(&dst.octets());
-        }
-
-        let ip_checksum = calculate_ip_checksum(&packet[..IP_HEADER_SIZE]);
-        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
-        let tcp_offset = IP_HEADER_SIZE;
-        packet[tcp_offset..tcp_offset + 2].copy_from_slice(&src_port.to_be_bytes());
-        packet[tcp_offset + 2..tcp_offset + 4].copy_from_slice(&dst_port.to_be_bytes());
-        packet[tcp_offset + 4..tcp_offset + 8].copy_from_slice(&seq.to_be_bytes());
-        packet[tcp_offset + 8..tcp_offset + 12].copy_from_slice(&0u32.to_be_bytes());
-        packet[tcp_offset + 12] = 0x50;
-        packet[tcp_offset + 13] = 0x02;
-        packet[tcp_offset + 14..tcp_offset + 16].copy_from_slice(&65535u16.to_be_bytes());
-        packet[tcp_offset + 16..tcp_offset + 18].copy_from_slice(&[0, 0]);
-        packet[tcp_offset + 18..tcp_offset + 20].copy_from_slice(&[0, 0]);
-
-        packet
     }
 
     pub fn relay_udp(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {

@@ -1074,13 +1074,14 @@ fn generate_rpc_token() -> String {
 /// Binds to `127.0.0.1` only. When `token` is omitted a fresh random token is
 /// generated; the caller is responsible for delivering it to the frontend.
 pub fn start_rpc_server(port: u16, token: Option<String>) -> std::result::Result<(), String> {
-    // Never hold the (non-`Send`) parking_lot guard across a blocking call.
-    {
-        let guard = RPC_SERVER.lock();
-        if let Some(handle) = guard.as_ref() {
-            if handle.is_running() {
-                return Err("RPC server is already running".to_string());
-            }
+    // Check and install under one lock: `bind` + `spawn` only touch the
+    // socket and start the accept thread, so holding the guard across them
+    // neither blocks nor risks a deadlock, and two concurrent callers cannot
+    // both be told they started the server.
+    let mut guard = RPC_SERVER.lock();
+    if let Some(handle) = guard.as_ref() {
+        if handle.is_running() {
+            return Err("RPC server is already running".to_string());
         }
     }
 
@@ -1092,7 +1093,7 @@ pub fn start_rpc_server(port: u16, token: Option<String>) -> std::result::Result
     let handle = server.spawn();
 
     tracing::info!("RPC server listening on {bound} (token required)");
-    *RPC_SERVER.lock() = Some(handle);
+    *guard = Some(handle);
     Ok(())
 }
 

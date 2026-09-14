@@ -373,29 +373,3 @@ pub fn relay_bidirectional_with_connection(
         }
     }
 }
-
-/// Bidirectional relay between two streams (without stats).
-#[allow(dead_code)]
-pub fn relay_bidirectional(
-    a: crate::common::stream::BoxStream,
-    b: crate::common::stream::BoxStream,
-) -> Result<()> {
-    let result = relay_bidirectional_with_connection(
-        a,
-        b,
-        crate::engine::connection_tracker::global_tracker(),
-        None,
-        CancellationToken::new(),
-    );
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let msg = e.to_string().to_lowercase();
-            if msg.contains("reset") || msg.contains("broken pipe") || msg.contains("connection") {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
-    }
-}

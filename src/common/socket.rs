@@ -66,25 +66,36 @@ pub fn connect_host(host: &str, port: u16, timeout: Duration) -> io::Result<TcpS
     Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses")))
 }
 
-/// Resolve a hostname to socket addresses on a dedicated thread, so a slow
-/// system resolver cannot stall the calling pool worker for its full
-/// (often multi-second) hang time; the caller always sees an answer within
-/// `timeout`.
+/// Resolve a hostname to socket addresses with a bounded wait.
+///
+/// The system resolver is a blocking call that cannot be interrupted, so the
+/// lookup runs on a thread of its own and the caller waits at most `timeout`:
+/// a resolver that stalls (a dead DNS server, retried a few times) produces
+/// `TimedOut` instead of pinning the calling worker for the resolver's whole
+/// retry budget. The lookup thread is detached — whatever it finds after the
+/// caller gave up is dropped with the channel.
 pub fn resolve_host(host: &str, port: u16, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
-    // Resolution runs on a dedicated thread so a slow system resolver cannot
-    // stall the calling pool worker; the caller's budget is approximated by
-    // the thread's lifetime (std threads cannot be timed out directly).
-    let _ = timeout;
-    let host = host.to_owned();
-    let handle = std::thread::spawn(move || -> io::Result<Vec<SocketAddr>> {
-        (host.as_str(), port)
-            .to_socket_addrs()
-            .map(|iter| iter.collect())
-    });
-    match handle.join() {
-        Ok(Ok(addrs)) => Ok(addrs),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(io::Error::other("resolver thread panicked")),
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host_owned = host.to_owned();
+    std::thread::Builder::new()
+        .name("corduit-resolve".into())
+        .spawn(move || {
+            let result = (host_owned.as_str(), port)
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<SocketAddr>>());
+            let _ = tx.send(result);
+        })
+        .map_err(|e| io::Error::other(format!("failed to spawn the resolver thread: {e}")))?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("resolving {host}:{port} timed out"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("resolver thread panicked"))
+        }
     }
 }
 
@@ -192,6 +203,16 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn resolve_host_resolves_localhost() {
+        let addrs = resolve_host("localhost", 8080, Duration::from_secs(5)).expect("localhost");
+        assert!(
+            !addrs.is_empty(),
+            "localhost must resolve to at least one address"
+        );
+        assert!(addrs.iter().all(|addr| addr.port() == 8080));
     }
 
     #[test]

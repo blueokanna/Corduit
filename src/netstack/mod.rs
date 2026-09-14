@@ -2,14 +2,17 @@
 //!
 //! A userspace TCP/IP stack for TUN-based transparent proxying.
 //!
-//! This crate provides:
+//! This module provides:
 //! - TUN device management (cross-platform, using wintun on Windows)
-//! - TCP connection handling with NAT
-//! - UDP session handling with NAT
-//! - IP packet parsing and generation using smoltcp
-//! - DNS resolution with DoH/DoT support (via corduit-dns)
-//! - Fake-IP mode for transparent proxying
-//! - SolidTCP: High-performance user-space TCP/IP stack (merged from corduit-solidtcp)
+//! - the userspace TCP/IP stack ([`solidtcp`]): TCP connections and UDP
+//!   sessions with NAT, fake-IP DNS interception, and per-connection
+//!   proxying through the local SOCKS5 inbound
+//! - the platform bridges ([`vpn`], `android_vpn`, `windows_vpn`) that move
+//!   packets between a TUN descriptor and that stack
+//! - routing helpers ([`route`], `windows_route`) for capturing traffic
+//!
+//! Packet parsing and construction use `smoltcp`'s wire types throughout;
+//! there is no second, parallel stack implementation.
 //!
 //! # Platform Requirements
 //!
@@ -30,32 +33,17 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use corduit::netstack::{NetStack, NetStackBuilder};
+//! use corduit::netstack::TunPacketProcessor;
 //!
-//! fn run() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create network stack
-//!     let mut stack = NetStackBuilder::new()
-//!         .tun_name("Corduit")
-//!         .tun_address("198.18.0.1".parse()?)
-//!         .tun_netmask("255.255.0.0".parse()?)
-//!         .enable_tcp(true)
-//!         .enable_udp(true)
-//!         .build()?;
+//! fn run(packet: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+//!     // `tun_tx` receives the bytes to write back into the TUN device.
+//!     let (tun_tx, tun_rx) = std::sync::mpsc::channel::<bytes::BytesMut>();
+//!     let processor = TunPacketProcessor::new(17890, 1500, tun_tx);
 //!
-//!     // Create TUN device
-//!     stack.create_tun("Corduit", "198.18.0.1", "255.255.0.0")?;
-//!
-//!     // Start the stack
-//!     stack.start()?;
-//!
-//!     // Get TCP listener
-//!     if let Some(mut tcp_listener) = stack.tcp_listener() {
-//!         while let Some(conn) = tcp_listener.accept() {
-//!             // Handle TCP connection
-//!             println!("New TCP connection: {} -> {}", conn.src_addr(), conn.dst_addr());
-//!         }
-//!     }
-//!
+//!     // Read a packet from the TUN descriptor and hand it to the stack;
+//!     // its connections leave through the local SOCKS5 inbound on 17890.
+//!     processor.process_packet(packet)?;
+//!     let _ = tun_rx;
 //!     Ok(())
 //! }
 //! ```
@@ -65,10 +53,7 @@ pub mod android_vpn;
 pub mod error;
 pub mod route;
 pub mod solidtcp;
-pub mod stack;
-pub mod tcp;
 pub mod tun;
-pub mod udp;
 pub mod vpn;
 #[cfg(windows)]
 pub mod windows_route;
@@ -80,10 +65,7 @@ pub mod wintun_embed;
 // Re-exports
 pub use error::{NetStackError, Result};
 pub use route::RouteManager;
-pub use stack::{NetStack, NetStackBuilder, StackConfig, StackStats};
-pub use tcp::{TcpConnection, TcpConnectionId, TcpListener, TcpStack, TcpState, TcpStream};
 pub use tun::{TunConfig, TunDevice};
-pub use udp::{UdpListener, UdpNatTable, UdpPacket, UdpSession, UdpSocket, UdpStack};
 pub use vpn::{TunPacketProcessor, TunTrafficStats};
 
 // Re-export DNS types from corduit-dns crate
@@ -199,41 +181,5 @@ mod tests {
         assert_eq!(config.name, "Corduit");
         assert_eq!(config.address, std::net::Ipv4Addr::new(198, 18, 0, 1));
         assert_eq!(config.mtu, 1500);
-    }
-
-    #[test]
-    fn test_stack_config_default() {
-        let config = StackConfig::default();
-        assert!(config.enable_tcp);
-        assert!(config.enable_udp);
-        assert_eq!(config.tcp_buffer_size, 64 * 1024);
-    }
-
-    #[test]
-    fn test_tcp_connection_id() {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let id = TcpConnectionId {
-            src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345),
-            dst_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443),
-        };
-
-        assert_eq!(id.src_addr.port(), 12345);
-        assert_eq!(id.dst_addr.port(), 443);
-    }
-
-    #[test]
-    fn test_udp_nat_table() {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let nat = UdpNatTable::new(30000);
-        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
-        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
-
-        let port1 = nat.get_or_create(src, dst).unwrap();
-        let port2 = nat.get_or_create(src, dst).unwrap();
-
-        assert_eq!(port1, port2); // Same mapping should return same port
-        assert!(port1 >= 30000);
     }
 }

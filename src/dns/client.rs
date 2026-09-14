@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// DNS protocol type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +65,7 @@ impl DnsClient {
             now: unix_now(),
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
+            identity: None,
         }))
     }
 
@@ -292,12 +293,33 @@ impl DnsClient {
     }
 }
 
-/// Create DNS clients from configuration strings
+/// Create DNS clients from configuration strings.
+///
+/// An upstream that cannot be used is dropped **loudly**: a silently skipped
+/// nameserver would leave the resolver querying the remaining ones with no
+/// trace of the misconfiguration. DoQ is refused here rather than accepted
+/// and failed per query.
 pub fn create_clients(servers: &[String], timeout: Duration) -> Vec<DnsClient> {
     servers
         .iter()
-        .filter_map(|s| {
-            UpstreamConfig::parse(s).and_then(|config| DnsClient::new(config, timeout).ok())
+        .filter_map(|server| {
+            let Some(config) = UpstreamConfig::parse(server) else {
+                warn!("ignoring DNS upstream {server}: unsupported address or scheme");
+                return None;
+            };
+            if matches!(config.protocol, UpstreamProtocol::DoQ) {
+                warn!(
+                    "ignoring DNS upstream {server}: DoQ is not implemented (use tls:// or https://)"
+                );
+                return None;
+            }
+            match DnsClient::new(config, timeout) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    warn!("ignoring DNS upstream {server}: {e}");
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -314,6 +336,7 @@ fn build_doh_client(timeout: Duration) -> courierust::courierust_client::Client 
         now: unix_now(),
         min_version: TlsVersion::Tls12,
         max_version: TlsVersion::Tls13,
+        identity: None,
     };
     courierust::courierust_client::Client::with_config(ClientConfig {
         http2: true,

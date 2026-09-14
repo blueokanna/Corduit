@@ -61,9 +61,24 @@ struct Core {
 /// A timer wheel. Drop stops the scheduler thread (joins it).
 pub struct Timer {
     core: Arc<Core>,
-    /// Held to keep the scheduler thread alive; joined on drop.
-    #[allow(dead_code)]
+    /// The scheduler thread; joined by [`Drop`].
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Timer {
+    /// Stop the scheduler and wait for it to exit. The thread parks on the
+    /// condvar until `shutdown` is set, so the join returns promptly rather
+    /// than waiting for the next deadline.
+    fn drop(&mut self) {
+        {
+            let mut inner = self.core.inner.lock();
+            inner.shutdown = true;
+        }
+        self.core.wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Default for Timer {

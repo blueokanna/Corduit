@@ -127,13 +127,15 @@ print(json.load(urllib.request.urlopen(req)))
 
 ## 限制与安全
 
-- 只绑 `127.0.0.1`（`::1` 也支持，见 `bind` 参数），**不绑 `0.0.0.0`**；
+- 只绑 `127.0.0.1`（`::1` 也支持，见 `bind` 参数），**不绑 `0.0.0.0`**——非回环地址在 `bind` 处直接拒绝；
 - token 比较是常数时间（`ct_eq`），抗时序侧信道；
-- 请求体 / WebSocket 消息上限 16 MiB，超出返回 `413`；
+- 请求体 / WebSocket 消息上限 16 MiB，超出返回 `413`（`Content-Length` 声明超限时一个字节都不读）；
 - 连接生命周期上限 600 秒，空闲连接自动回收；
-- WebSocket 升级按 RFC 6455 校验：`Sec-WebSocket-Key` 必须是 16 字节 base64 的 24 字符形式，
-  应答的 `Sec-WebSocket-Accept` 由 `courierust_ws::handshake` 计算；随后的分帧、掩码方向、
-  分片重组、UTF-8 校验与关闭握手由 `courierust_ws` 会话（服务端角色）负责；
+- 每个连接由 courierust 的 per-connection 引擎（`serve_connection`）在独占线程上驱动：
+  HTTP/1.1 帧、keep-alive、分块体、`413` 都由服务端处理，没有手写解析器；
+- WebSocket 升级按 RFC 6455 校验（方法、`Upgrade`/`Connection`令牌、`Sec-WebSocket-Key` 形状、
+  `Sec-WebSocket-Version: 13`、`Origin` 策略），由 `courierust_server::ws` 阻塞驱动运行：
+  分帧、掩码方向、分片重组、UTF-8 校验、保活 `Ping`（30 秒）与关闭握手全在驱动内完成；
 - CORS 全放开（本地服务 + token 门控），允许 `Authorization` 头；
 - 响应里的错误消息由 `nextjson` 转义，不会破坏 JSON。
 

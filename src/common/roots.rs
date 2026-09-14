@@ -106,7 +106,7 @@ fn collect_root_der() -> Vec<Vec<u8>> {
 }
 
 /// Extract every `-----BEGIN CERTIFICATE-----` DER block from a PEM bundle.
-/// (Also used by the TLS identity loader in [`crate::common::http_server`].)
+#[cfg(not(windows))]
 pub(crate) fn parse_pem_bundle(pem: &str) -> std::io::Result<Vec<Vec<u8>>> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
@@ -129,6 +129,7 @@ pub(crate) fn parse_pem_bundle(pem: &str) -> std::io::Result<Vec<Vec<u8>>> {
 /// Decode standard base64 without pulling in a dependency (roots.rs stays
 /// self-contained; the base64 alphabet is fixed and length-bounded by the
 /// PEM input).
+#[cfg(not(windows))]
 pub(crate) fn base64_decode(input: &str) -> std::io::Result<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -161,9 +162,11 @@ pub(crate) fn base64_decode(input: &str) -> std::io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
     use super::*;
 
     #[test]
+    #[cfg(not(windows))]
     fn parses_pem_bundle() {
         // A real (public) root: the ISRG Root X1 certificate, base64 body
         // truncated to the header + a couple of lines to keep the test
@@ -181,11 +184,13 @@ TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn rejects_garbage_base64() {
         assert!(base64_decode("!!!not-base64!!!").is_err());
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn decodes_empty_and_padding() {
         assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
         // "aGVsbG8=" == b"hello"

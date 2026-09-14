@@ -924,7 +924,8 @@ impl Drop for TunDevice {
     }
 }
 
-#[allow(dead_code)]
+/// Convert a dotted netmask to a prefix length (`netsh` wants the length).
+#[cfg(any(windows, test))]
 fn netmask_to_prefix(netmask: Ipv4Addr) -> u8 {
     netmask.octets().iter().map(|o| o.count_ones() as u8).sum()
 }

@@ -98,14 +98,3 @@ pub mod ws;
 
 pub use address::{Address, AddressType};
 pub use error::{ProtocolError, Result};
-
-pub mod prelude {
-    pub use crate::protocol::address::{Address, AddressType};
-    pub use crate::protocol::error::{ProtocolError, Result};
-
-    #[cfg(all(feature = "std", feature = "tls"))]
-    pub use crate::protocol::tls::{TlsAcceptor, TlsConnector, TlsStream as TlsModuleStream};
-
-    #[cfg(all(feature = "std", feature = "wireguard"))]
-    pub use crate::protocol::wireguard::{WireGuardError, WireGuardTunnel};
-}

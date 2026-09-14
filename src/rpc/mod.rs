@@ -23,7 +23,6 @@ use nextjson::NsonSerialize;
 
 use crate::api;
 
-/// The HTTP/WebSocket JSON-RPC server transport.
 pub mod server;
 
 // ---------------------------------------------------------------------------

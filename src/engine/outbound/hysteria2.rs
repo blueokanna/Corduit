@@ -343,11 +343,6 @@ impl Hysteria2Connection {
     pub fn close(&self) {
         self.connection.close();
     }
-
-    #[allow(dead_code)]
-    pub fn remote_address(&self) -> SocketAddr {
-        self.connection.remote_address()
-    }
 }
 
 // ---------------------------------------------------------------------------

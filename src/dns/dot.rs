@@ -101,6 +101,7 @@ impl DotClient {
             now: unix_now(),
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
+            identity: None,
         }))
     }
 

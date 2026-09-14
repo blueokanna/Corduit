@@ -23,8 +23,9 @@
 //! overall deadline instead of treating a transient timeout as fatal.
 
 use crate::engine::error::{Error, Result};
+use courierust::courierust_body::Body;
 use courierust::courierust_http::{
-    Body, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Version,
+    HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Version,
 };
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -314,7 +315,6 @@ fn parse_head(head: &[u8]) -> Result<(StatusCode, HeaderMap, bool, Option<u64>)>
                     .trim()
                     .parse::<u64>()
                     .map_err(|_| Error::network("Malformed Content-Length"))?;
-                // Conflicting Content-Length values are a smuggling vector.
                 if let Some(existing) = content_length {
                     if existing != len {
                         return Err(Error::network("Conflicting Content-Length values"));
@@ -410,7 +410,6 @@ fn read_chunked<R: Read>(
             .map_err(|_| Error::network("Invalid chunk size"))?;
 
         if size == 0 {
-            // Trailer section up to the final CRLF.
             loop {
                 if buf.starts_with(b"\r\n") {
                     buf.drain(..2);

@@ -10,9 +10,12 @@
 //!                           [frag_id u8][len u16][ADDR][payload]
 //!   (or uni-stream in "quic" UDP relay mode)
 //! dissociate    uni-stream [VER=0x05][CMD=0x03][assoc_id u16]
-//! heartbeat     uni-stream [VER=0x05][CMD=0x04]
 //! ADDR          = 0x01 IPv4 | 0x03 domain | 0x04 IPv6, BE u16 port
 //! ```
+//!
+//! Keep-alive is the QUIC transport's own idle/PING path (the
+//! `heartbeat-interval` option feeds the transport keep-alive), not a
+//! separate heartbeat stream.
 //!
 //! All the codecs below are transport-independent; the only QUIC surface
 //! used is [`crate::protocol::quic::ClientConnection`] (streams + RFC 9221
@@ -46,8 +49,6 @@ const TUIC_CMD_AUTHENTICATE: u8 = 0x00;
 const TUIC_CMD_CONNECT: u8 = 0x01;
 const TUIC_CMD_PACKET: u8 = 0x02;
 const TUIC_CMD_DISSOCIATE: u8 = 0x03;
-#[allow(dead_code)]
-const TUIC_CMD_HEARTBEAT: u8 = 0x04;
 
 const TUIC_ADDR_TYPE_IPV4: u8 = 0x01;
 const TUIC_ADDR_TYPE_DOMAIN: u8 = 0x03;
@@ -309,35 +310,12 @@ impl TuicConnection {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn heartbeat(&self) -> Result<()> {
-        let mut stream = self
-            .connection
-            .open_uni()
-            .map_err(|e| Error::network(format!("Failed to open heartbeat stream: {e}")))?;
-
-        let mut buf = BytesMut::with_capacity(2);
-        buf.put_u8(TUIC_VERSION);
-        buf.put_u8(TUIC_CMD_HEARTBEAT);
-
-        stream
-            .write_all(&buf)
-            .map_err(|e| Error::network(format!("Failed to send heartbeat: {e}")))?;
-        stream.finish().ok();
-        Ok(())
-    }
-
     pub fn is_closed(&self) -> bool {
         self.connection.is_closed()
     }
 
     pub fn close(&self) {
         self.connection.close();
-    }
-
-    #[allow(dead_code)]
-    pub fn remote_address(&self) -> SocketAddr {
-        self.connection.remote_address()
     }
 }
 

@@ -237,3 +237,131 @@ fn echo_server_roundtrips_directly() {
     stream.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"probe-echo");
 }
+
+/// A minimal HTTP/1.1 origin: one request in, one fixed response out.
+fn spawn_http_origin(body: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                // Read the request head only; `Connection: close` (sent by
+                // the proxy) means no body is expected.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read_exact(&mut byte).is_ok() {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+    addr
+}
+
+/// Send one raw HTTP/1.1 request over a fresh connection and return the full
+/// response.
+fn http_exchange(proxy: SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(proxy).expect("connect to proxy");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// The `mixed` inbound's HTTP half is the shared proxy handler: a plain
+/// (absolute-form) request is forwarded through the matched outbound and the
+/// origin's response is re-framed back to the client.
+#[test]
+fn http_proxy_forwards_plain_requests() {
+    let origin = spawn_http_origin("proxied-body");
+    let port = free_port();
+    let engine = engine_with_mixed_inbound(port);
+    engine.start().expect("engine starts");
+
+    let proxy = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+    let response = http_exchange(
+        proxy,
+        &format!(
+            "GET http://127.0.0.1:{}/plain HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            origin.port(),
+            origin.port()
+        ),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        response.ends_with("proxied-body"),
+        "body not forwarded: {response}"
+    );
+    engine.stop().expect("engine stops");
+}
+
+/// `CONNECT` through the same inbound: the server answers `200`, hands the
+/// raw connection to the tunnel, and the tunnel relays it through the
+/// outbound — bytes in both directions, including the pipelined case.
+#[test]
+fn http_proxy_tunnels_connect() {
+    let echo = spawn_echo_server();
+    let port = free_port();
+    let engine = engine_with_mixed_inbound(port);
+    engine.start().expect("engine starts");
+
+    let proxy = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+    let mut stream = TcpStream::connect(proxy).expect("connect to proxy");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    // The first payload travels with the CONNECT request: the handoff must
+    // keep the bytes the request parser already read.
+    let request = format!(
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\nfirst",
+        echo.port(),
+        echo.port()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+
+    // Read the handshake response (ends at the blank line), then the
+    // echoed payload that followed it.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read_exact(&mut byte).is_ok() {
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "got: {head}");
+
+    let mut echoed = [0u8; 5];
+    stream.read_exact(&mut echoed).unwrap();
+    assert_eq!(
+        &echoed, b"first",
+        "pipelined payload must survive the handoff"
+    );
+
+    // And a second round-trip proves the relay is bidirectional.
+    stream.write_all(b"second").unwrap();
+    let mut second = [0u8; 6];
+    stream.read_exact(&mut second).unwrap();
+    assert_eq!(&second, b"second");
+
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    engine.stop().expect("engine stops");
+}

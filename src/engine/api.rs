@@ -2,9 +2,8 @@ use crate::engine::config::Config;
 use crate::engine::health_check::{HealthMonitor, HealthStatus};
 use crate::engine::proxy::ProxyManager;
 use crate::engine::traffic_stats::TrafficStatsManager;
-use courierust::courierust_http::{
-    Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
-};
+use courierust::courierust_body::Body;
+use courierust::courierust_http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use nextjson::{NsonDeserialize, NsonSerialize};
 use std::sync::Arc;
 
@@ -99,7 +98,7 @@ fn json_response<T: NsonSerialize>(status: StatusCode, value: &T) -> Response<Bo
             format!(r#"{{"success":false,"error":"response encode failed: {e}"}}"#),
         ),
     };
-    let mut response = Response::new(status);
+    let mut response = Response::with_status(status);
     response.headers.insert(
         HeaderName::from_static("content-type"),
         HeaderValue::from_static("application/json"),
@@ -323,8 +322,9 @@ impl ApiServer {
         &self.state
     }
 
-    /// Serve one HTTP request. Wire this into any courierust-based server
-    /// (e.g. [`crate::common::http_server::HttpServer`]) by adapting the
+    /// Serve one HTTP request. Wire this into any courierust server
+    /// ([`courierust::courierust_server::Server`] via a
+    /// [`Handler`](courierust::courierust_server::Handler)) by adapting the
     /// request/response pair.
     pub fn serve(&self, req: Request<Body>) -> Response<Body> {
         let method = req.method.clone();

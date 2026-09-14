@@ -234,6 +234,9 @@ fn build_client(timeout: Duration) -> Client {
         now: unix_now(),
         min_version: TlsVersion::Tls12,
         max_version: TlsVersion::Tls13,
+        // No client certificate: the proxy's HTTP client authenticates the
+        // server, never itself.
+        identity: None,
     };
     Client::with_config(ClientConfig {
         http2: true,
@@ -260,6 +263,7 @@ fn shared_tls_connector() -> &'static TlsConnector {
             now: unix_now(),
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
+            identity: None,
         })
     })
 }

@@ -1,34 +1,455 @@
-//! HTTP proxy inbound on courierust's H/1 codec (synchronous engine).
+//! HTTP proxy inbound on courierust's server engine.
 //!
-//! The listener is [`crate::common::http_server::HttpServer`]: a blocking
-//! H/1 server where each connection runs on its own thread. The synchronous
-//! handler:
+//! This module owns the **single** HTTP proxy implementation of the
+//! workspace: [`HttpProxyHandler`] is a [`Handler`], so both listeners in the
+//! engine — [`HttpInbound`] (the `http` inbound) and
+//! [`MixedInbound`](super::mixed::MixedInbound) (the `mixed` inbound, which
+//! owns its accept loop to sniff SOCKS5) — run exactly the same request path
+//! through [`serve_proxy_connection`]:
 //!
-//! * plain HTTP proxy requests (absolute-form URI) are forwarded through the
-//!   matched outbound with correct re-framing ([`super::forward`]);
-//! * CONNECT requests answer `200 OK` and hand the raw connection to the
-//!   tunnel handler, which relays it through the outbound.
+//! * a plain proxy request (absolute-form URI, or origin-form with `Host`)
+//!   reaches [`Handler::handle`] through courierust's HTTP/1.1 (and h2c)
+//!   engine and is forwarded with correct re-framing ([`super::forward`]);
+//! * a `CONNECT` request is answered `200` and the connection is relayed
+//!   through the matched outbound.
 //!
-//! Inbound authentication is enforced on every request (CWE-306) before any
-//! proxying happens.
+//! Framing, keep-alive, chunked bodies, the oversized-body `413` and the
+//! hop-by-hop handling all come from courierust's server — there is no
+//! hand-written HTTP parser here.
+//!
+//! # Why `CONNECT` is answered before the server engine sees it
+//!
+//! RFC 9110 §9.3.6 gives `CONNECT` an *authority-form* request target
+//! (`host:port`). courierust's request-line parser accepts origin-form,
+//! asterisk-form and absolute-form only, and answers `400` to anything else,
+//! so the engine never reaches a handler for a `CONNECT` request. The
+//! listener therefore peeks the first bytes of every connection without
+//! consuming them: a `CONNECT` prologue is served by the bounded path below
+//! (head parsed with courierust's own H/1 codec, then a raw relay), and
+//! everything else is handed to [`serve_connection`] with the peeked bytes
+//! untouched.
+//!
+//! Inbound authentication is enforced on every request **and** every
+//! `CONNECT` tunnel (CWE-306) before anything is proxied.
 
-use crate::common::http_server::{RawConnection, TUNNEL_MARKER};
+use crate::common::listener::ConnectionListener;
 use crate::common::stream::{BoxStream, SyncStream};
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
 use crate::engine::inbound::auth::{check_proxy_authorization, InboundAuth};
 use crate::engine::inbound::forward;
-use crate::engine::inbound::InboundListener;
-use crate::engine::outbound::{OutboundManager, TargetAddr};
+use crate::engine::inbound::{bind_tcp_listener, InboundListener};
+use crate::engine::outbound::{OutboundManager, OutboundProxy, TargetAddr};
 use crate::engine::routing::Router;
+use courierust::courierust_body::Body;
+use courierust::courierust_h1 as h1;
 use courierust::courierust_http::{
-    Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version,
 };
+use courierust::courierust_io::{BufReader, SliceReader};
+use courierust::courierust_server::{serve_connection, Handler, ServerConfig};
 use parking_lot::Mutex;
-use std::net::Shutdown;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Cap for a single request head (status line + header list).
+pub(crate) const PROXY_MAX_HEAD: usize = 64 * 1024;
+/// Cap for a single request body: what a proxy must be able to carry. A
+/// larger body is answered `413` by the server before the handler runs.
+pub(crate) const PROXY_MAX_BODY: usize = 64 * 1024 * 1024;
+/// Read timeout for a proxy connection (request head and body).
+pub(crate) const PROXY_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// Budget for the first bytes of a connection (the protocol prologue).
+pub(crate) const PROXY_PROLOGUE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on concurrently open proxy connections: every `CONNECT`
+/// tunnel occupies a thread of its own, so this bound is what keeps a herd
+/// of idle clients from exhausting the process.
+pub(crate) const PROXY_MAX_CONNECTIONS: usize = 2048;
+
+/// The server configuration both proxy listeners run with.
+pub(crate) fn proxy_server_config() -> ServerConfig {
+    ServerConfig {
+        read_timeout: Some(PROXY_READ_TIMEOUT),
+        max_header_list: PROXY_MAX_HEAD,
+        max_body: PROXY_MAX_BODY,
+        http2: true,
+        tls: None,
+        handshake_timeout: None,
+        idle_timeout: Some(Duration::from_secs(120)),
+        max_connections: PROXY_MAX_CONNECTIONS,
+        ..ServerConfig::default()
+    }
+}
+
+/// Serve one accepted proxy connection.
+///
+/// The first bytes decide which engine runs: `CONNECT` needs the proxy to
+/// answer a request form courierust's parser refuses, everything else is the
+/// server's business.
+pub(crate) fn serve_proxy_connection(
+    stream: TcpStream,
+    handler: &HttpProxyHandler,
+    config: &ServerConfig,
+) -> std::result::Result<(), String> {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(PROXY_PROLOGUE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(PROXY_PROLOGUE_TIMEOUT));
+
+    match peek_connect_head(&stream)? {
+        Some(head_len) => {
+            let _ = stream.set_read_timeout(Some(PROXY_READ_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(PROXY_READ_TIMEOUT));
+            serve_connect(stream, handler, head_len)
+        }
+        None => serve_connection(stream, handler, config).map_err(|e| e.to_string()),
+    }
+}
+
+/// The `CONNECT` method with its separating space — the shortest prologue
+/// that identifies one.
+const CONNECT_PREFIX: &[u8] = b"CONNECT ";
+
+/// Peek the connection's head without consuming a byte.
+///
+/// Returns the head length (through the blank line) when the request is a
+/// `CONNECT`, or `None` as soon as the prologue proves it is something else
+/// — the server engine then reads the same bytes from the start, including
+/// anything the client pipelined behind them.
+fn peek_connect_head(stream: &TcpStream) -> std::result::Result<Option<usize>, String> {
+    let mut probe = vec![0u8; PROXY_MAX_HEAD];
+    let deadline = Instant::now() + PROXY_PROLOGUE_TIMEOUT;
+    loop {
+        let available = match stream.peek(&mut probe) {
+            Ok(0) => return Ok(None), // the peer closed before saying anything
+            Ok(n) => n,
+            Err(e) => return Err(format!("failed to peek the request head: {e}")),
+        };
+        let prefix = &probe[..available];
+        if prefix.starts_with(CONNECT_PREFIX) {
+            if let Some(end) = find_subsequence(prefix, b"\r\n\r\n") {
+                return Ok(Some(end + 4));
+            }
+        } else if available >= CONNECT_PREFIX.len() {
+            // Any other method differs within the prefix, so the decision is
+            // final even if the rest of the head has not arrived yet.
+            return Ok(None);
+        }
+        if Instant::now() > deadline {
+            return Err("timed out waiting for the request head".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Answer a `CONNECT` request and relay the connection.
+///
+/// The head is the only thing consumed, so payload the client pipelined
+/// behind it (a TLS `ClientHello`, typically) reaches the relay untouched.
+fn serve_connect(
+    mut stream: TcpStream,
+    handler: &HttpProxyHandler,
+    head_len: usize,
+) -> std::result::Result<(), String> {
+    let mut head = vec![0u8; head_len];
+    stream
+        .read_exact(&mut head)
+        .map_err(|e| format!("failed to read the CONNECT head: {e}"))?;
+    let (authority, headers) = match parse_connect_head(&head) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            tracing::warn!("Malformed CONNECT request: {e}");
+            return write_text(&mut stream, StatusCode::BAD_REQUEST, "Bad Request");
+        }
+    };
+
+    if !check_proxy_authorization(&headers, &handler.auth) {
+        tracing::info!("Rejecting unauthenticated CONNECT request");
+        return write_head(&mut stream, StatusCode::PROXY_AUTHENTICATION_REQUIRED, &[]);
+    }
+    let Some((host, port)) = parse_authority(authority) else {
+        tracing::warn!("Invalid CONNECT target: {authority}");
+        return write_text(
+            &mut stream,
+            StatusCode::BAD_REQUEST,
+            "Invalid CONNECT request",
+        );
+    };
+
+    let outbound_tag = handler
+        .router
+        .match_outbound(Some(&host), None, Some(port), None);
+    let Some(outbound) = handler.outbound_manager.get_proxy(&outbound_tag) else {
+        tracing::error!("Outbound '{outbound_tag}' not found");
+        return write_text(
+            &mut stream,
+            StatusCode::BAD_GATEWAY,
+            &format!("Outbound '{outbound_tag}' not found"),
+        );
+    };
+
+    tracing::info!("CONNECT {host}:{port} -> {outbound_tag}");
+    // `200 OK` and nothing else: from here on the connection carries opaque
+    // bytes (RFC 9110 §9.3.6).
+    write_head(&mut stream, StatusCode::OK, &[])?;
+
+    ConnectRelay {
+        outbound,
+        outbound_tag,
+        host,
+        port,
+        kind: handler.kind,
+    }
+    .relay(Box::new(stream));
+    Ok(())
+}
+
+/// Parse a `CONNECT` request head: the authority-form request line plus the
+/// header list.
+///
+/// The request line is split here rather than handed to
+/// [`h1::parse_request_line`] because that parser accepts origin-, asterisk-
+/// and absolute-form targets only — the reason this fast path exists at all.
+/// Everything after the request line (the header block) is courierust's
+/// parser.
+fn parse_connect_head(head: &[u8]) -> std::result::Result<(&str, HeaderMap), String> {
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or_else(|| "malformed request line".to_string())?;
+    let line = trim_ows(&head[..line_end]);
+
+    let mut parts = line.split(|&b| b == b' ');
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    if method != b"CONNECT" || target.is_empty() || parts.next().is_some() {
+        return Err("malformed CONNECT request line".to_string());
+    }
+    let version = h1::parse_version(version).map_err(|e| format!("malformed version: {e}"))?;
+    if version != Version::HTTP_11 && version != Version::HTTP_10 {
+        return Err("CONNECT requires HTTP/1.x".to_string());
+    }
+    let authority =
+        std::str::from_utf8(target).map_err(|_| "non-ASCII CONNECT target".to_string())?;
+    if authority.bytes().any(|b| b < 0x21 || b == 0x7f) {
+        return Err("control character in the CONNECT target".to_string());
+    }
+
+    let mut reader = BufReader::new(SliceReader::new(&head[line_end + 1..]), head.len());
+    let headers = h1::read_headers(&mut reader).map_err(|e| format!("malformed headers: {e}"))?;
+    Ok((authority, headers))
+}
+
+/// Trim trailing CR/LF and optional whitespace from a line.
+fn trim_ows(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && matches!(line[end - 1], b'\r' | b'\n' | b' ' | b'\t') {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// Write a response head (no body).
+fn write_head(
+    stream: &mut TcpStream,
+    status: StatusCode,
+    headers: &[(&'static str, &str)],
+) -> std::result::Result<(), String> {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        map.append(
+            HeaderName::from_static(name),
+            HeaderValue::from_bytes(value.as_bytes())
+                .map_err(|e| format!("invalid response header: {e}"))?,
+        );
+    }
+    let mut out = Vec::with_capacity(128);
+    h1::write_response_head(&mut out, status, Version::HTTP_11, &map)
+        .map_err(|e| format!("failed to serialize the response head: {e}"))?;
+    stream
+        .write_all(&out)
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("failed to write the response head: {e}"))
+}
+
+/// Answer with a plain-text body and close.
+fn write_text(
+    stream: &mut TcpStream,
+    status: StatusCode,
+    message: &str,
+) -> std::result::Result<(), String> {
+    let length = message.len().to_string();
+    write_head(
+        stream,
+        status,
+        &[
+            ("content-type", "text/plain; charset=utf-8"),
+            ("content-length", &length),
+            // Every failure answers on a short-lived connection: the client
+            // may have a request in flight behind this one, and a reused
+            // connection would leave it unanswered.
+            ("connection", "close"),
+        ],
+    )?;
+    stream
+        .write_all(message.as_bytes())
+        .map_err(|e| format!("failed to write the response body: {e}"))
+}
+
+/// Relay one `CONNECT` tunnel through its outbound.
+///
+/// The blocking relay is the tunnel's whole lifetime on this thread.
+struct ConnectRelay {
+    outbound: Arc<dyn OutboundProxy>,
+    outbound_tag: String,
+    host: String,
+    port: u16,
+    kind: &'static str,
+}
+
+impl ConnectRelay {
+    fn relay(&self, client: BoxStream) {
+        // Resolve the destination for the traffic dashboard. Informational
+        // only (the relay itself is routed by name) and bounded, so a slow
+        // resolver cannot delay the tunnel indefinitely.
+        let destination_ip =
+            crate::common::socket::resolve_host(&self.host, self.port, Duration::from_secs(3))
+                .ok()
+                .and_then(|addrs| addrs.into_iter().next())
+                .map(|addr| addr.ip().to_string());
+
+        let tracker = global_tracker();
+        let tracked = tracker.track(TrackedConnection::new_with_ip(
+            self.kind.to_string(),
+            self.outbound_tag.clone(),
+            self.host.clone(),
+            destination_ip,
+            self.port,
+            "HTTPS".to_string(),
+            "tcp".to_string(),
+            "HTTP-CONNECT".to_string(),
+            format!("{}:{}", self.host, self.port),
+        ));
+
+        let result = self.outbound.relay_tcp_with_connection(
+            client,
+            TargetAddr::new_domain(self.host.clone(), self.port),
+            Some(Arc::clone(&tracked)),
+        );
+        tracker.untrack(&tracked.id);
+        if let Err(e) = result {
+            tracing::debug!(
+                "CONNECT relay error via '{}' to {}:{}: {}",
+                self.outbound_tag,
+                self.host,
+                self.port,
+                e
+            );
+        }
+    }
+}
+
+/// The HTTP proxy surface: authenticate, route, then forward.
+///
+/// Shared by the `http` and `mixed` inbounds; `kind` only labels the
+/// connections they report to the tracker (`http` / `mixed`).
+pub(crate) struct HttpProxyHandler {
+    kind: &'static str,
+    router: Arc<Router>,
+    outbound_manager: Arc<OutboundManager>,
+    auth: Arc<InboundAuth>,
+}
+
+impl HttpProxyHandler {
+    /// Build the handler for one listener.
+    pub(crate) fn new(
+        kind: &'static str,
+        router: Arc<Router>,
+        outbound_manager: Arc<OutboundManager>,
+        auth: Arc<InboundAuth>,
+    ) -> Self {
+        Self {
+            kind,
+            router,
+            outbound_manager,
+            auth,
+        }
+    }
+
+    /// Forward a plain proxy request and return the origin's response.
+    fn forward(&self, req: Request<Body>) -> Result<Response<Body>> {
+        let (host, port) = parse_http_target(&req)
+            .ok_or_else(|| Error::protocol("Invalid HTTP proxy request: missing host"))?;
+
+        let outbound_tag = self
+            .router
+            .match_outbound(Some(&host), None, Some(port), None);
+        tracing::info!("HTTP {} -> {}", req.uri.as_str(), outbound_tag);
+
+        let outbound = self
+            .outbound_manager
+            .get_proxy(&outbound_tag)
+            .ok_or_else(|| Error::config(format!("Outbound '{outbound_tag}' not found")))?;
+
+        let method = req.method.clone();
+        let path = req.uri.as_str().to_string();
+        let is_head = method == Method::HEAD;
+
+        let target = TargetAddr::new_domain(host.clone(), port);
+        let (mut client_side, server_side) = forward::mem_duplex(64 * 1024);
+
+        // Relay the server end to the origin on a dedicated thread; the
+        // client end carries the request and the response below.
+        let relay_handle = std::thread::Builder::new()
+            .name("corduit-http-relay".into())
+            .spawn(move || outbound.relay_tcp(Box::new(server_side) as BoxStream, target))
+            .map_err(|e| Error::network(format!("Failed to spawn relay thread: {e}")))?;
+
+        // The request body is materialized (bounded); re-serialize it with
+        // the hop-by-hop headers stripped and an explicit Content-Length
+        // (CWE-444).
+        let body = req.body.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
+
+        forward::send_request(
+            &mut client_side,
+            &method,
+            &path,
+            &req.headers,
+            &host,
+            port,
+            &body,
+        )?;
+
+        client_side
+            .shutdown(Shutdown::Write)
+            .map_err(|e| Error::network(format!("Failed to shutdown write: {e}")))?;
+
+        let response = forward::read_http_response(&mut client_side, is_head)?;
+        let _ = relay_handle.join();
+        Ok(response)
+    }
+}
+
+impl Handler for HttpProxyHandler {
+    fn handle(&self, req: Request<Body>) -> Response<Body> {
+        if !check_proxy_authorization(&req.headers, &self.auth) {
+            tracing::info!("Rejecting unauthenticated HTTP request");
+            return proxy_auth_required();
+        }
+
+        match self.forward(req) {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("HTTP proxy error: {}", e);
+                error_response(StatusCode::BAD_GATEWAY, &format!("Proxy error: {e}"))
+            }
+        }
+    }
+}
 
 /// HTTP proxy inbound listener.
 pub struct HttpInbound {
@@ -36,9 +457,8 @@ pub struct HttpInbound {
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
     auth: Arc<InboundAuth>,
-    cancel_token: crate::common::cancel::CancellationToken,
-    running: Arc<std::sync::atomic::AtomicBool>,
-    server: Mutex<Option<crate::common::http_server::HttpServer>>,
+    running: Arc<AtomicBool>,
+    server: Mutex<Option<ConnectionListener>>,
 }
 
 impl InboundListener for HttpInbound {
@@ -56,6 +476,7 @@ impl InboundListener for HttpInbound {
 }
 
 impl HttpInbound {
+    /// Build the inbound. No socket is bound until [`start`](Self::start).
     pub fn new(
         config: InboundConfig,
         router: Arc<Router>,
@@ -67,14 +488,13 @@ impl HttpInbound {
             router,
             outbound_manager,
             auth,
-            cancel_token: crate::common::cancel::CancellationToken::new(),
-            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
             server: Mutex::new(None),
         }
     }
 
     fn start_listener(&self) -> Result<()> {
-        if self.running.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.running.load(Ordering::Relaxed) {
             tracing::warn!(
                 "HTTP inbound already running on {}:{}",
                 self.config.listen,
@@ -83,58 +503,31 @@ impl HttpInbound {
             return Ok(());
         }
 
-        let addr = super::parse_listen_addr(&self.config.listen, self.config.port)?;
+        // Bind here rather than inside courierust: the listener needs
+        // SO_REUSEADDR and, for a wildcard IPv6 address, the dual-stack
+        // option, so IPv4 loopback clients of a TUN / system proxy reach it.
+        let (listener, addr) = bind_tcp_listener(&self.config.listen, self.config.port, "HTTP")?;
 
-        let router = Arc::clone(&self.router);
-        let outbound_manager = Arc::clone(&self.outbound_manager);
-        let auth = Arc::clone(&self.auth);
+        let handler = Arc::new(HttpProxyHandler::new(
+            "http",
+            Arc::clone(&self.router),
+            Arc::clone(&self.outbound_manager),
+            Arc::clone(&self.auth),
+        ));
+        let server_config = Arc::new(proxy_server_config());
 
-        // Shared slot for the CONNECT tunnel handoff: the handler fills it
-        // (target + outbound), the tunnel handler consumes it. Per connection
-        // this is strictly sequential (handler then tunnel on the same thread).
-        let tunnel_job: Arc<Mutex<Option<TunnelJob>>> = Arc::new(Mutex::new(None));
-
-        let handler = {
-            let router = router.clone();
-            let outbound_manager = outbound_manager.clone();
-            let auth = auth.clone();
-            let tunnel_job = tunnel_job.clone();
-            Arc::new(move |req: Request<Body>| {
-                handle_request(req, &router, &outbound_manager, &auth, &tunnel_job)
+        let mut server = ConnectionListener::new(listener, addr, PROXY_MAX_CONNECTIONS);
+        server
+            .start("corduit-http-conn", move |stream, peer| {
+                if let Err(e) = serve_proxy_connection(stream, &handler, &server_config) {
+                    tracing::debug!("HTTP connection from {peer} ended: {e}");
+                }
             })
-        };
+            .map_err(|e| Error::network(format!("Failed to serve HTTP inbound on {addr}: {e}")))?;
 
-        let tunnel = {
-            let outbound_manager = outbound_manager.clone();
-            let tunnel_job = tunnel_job.clone();
-            Arc::new(move |conn: RawConnection| {
-                let Some(job) = tunnel_job.lock().take() else {
-                    tracing::warn!("CONNECT tunnel handoff without a job");
-                    return;
-                };
-                handle_tunnel(conn, job, &outbound_manager);
-            })
-        };
-
-        let cfg = crate::common::http_server::HttpServerConfig {
-            listen: addr,
-            tls: None,
-            min_version: courierust::courierust_tls::TlsVersion::Tls12,
-            max_version: courierust::courierust_tls::TlsVersion::Tls13,
-            max_head: 64 * 1024,
-            max_body: 64 * 1024 * 1024,
-            read_timeout: Some(std::time::Duration::from_secs(300)),
-            tunnel_handler: Some(tunnel),
-            handler,
-        };
-
-        let mut server = crate::common::http_server::HttpServer::bind(cfg)?;
-        server.start()?;
         *self.server.lock() = Some(server);
-
-        self.running
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!("HTTP inbound listening on {}", addr);
+        self.running.store(true, Ordering::Relaxed);
+        tracing::info!("HTTP inbound listening on {addr}");
         Ok(())
     }
 
@@ -144,218 +537,46 @@ impl HttpInbound {
             self.config.listen,
             self.config.port
         );
-        // Take the server out first so the lock is released before shutdown
-        // (which joins the accept loop).
-        let server = self.server.lock().take();
-        if let Some(mut server) = server {
-            server.shutdown();
+        // Take the listener out first so the lock is released before the
+        // (blocking) join of the accept loop.
+        let mut server = self.server.lock().take();
+        if let Some(server) = server.as_mut() {
+            server.stop();
         }
-        self.running
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.cancel_token.cancel();
+        self.running.store(false, Ordering::Relaxed);
         Ok(())
     }
 }
 
-/// A pending CONNECT tunnel: the destination and the outbound that will
-/// relay it.
-struct TunnelJob {
-    target: TargetAddr,
-    host: String,
-    port: u16,
-    outbound_tag: String,
-}
-
-/// The synchronous HTTP handler (runs on a server connection thread).
-fn handle_request(
-    req: Request<Body>,
-    router: &Router,
-    outbound_manager: &OutboundManager,
-    auth: &InboundAuth,
-    tunnel_job: &Mutex<Option<TunnelJob>>,
-) -> Response<Body> {
-    // Enforce configured inbound credentials before serving anything
-    // (CWE-306): without a valid `Proxy-Authorization` the request is
-    // rejected with 407, including CONNECT tunnels.
-    if !check_proxy_authorization(&req.headers, auth) {
-        tracing::info!("Rejecting unauthenticated HTTP request");
-        let mut resp = Response::new(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
-        resp.headers.insert(
-            HeaderName::from_static("proxy-authenticate"),
-            HeaderValue::from_static("Basic realm=\"corduit\""),
-        );
-        resp.body = Body::from(b"Proxy authentication required".to_vec());
-        return resp;
-    }
-
-    if req.method == Method::CONNECT {
-        return handle_connect(&req, router, outbound_manager, tunnel_job);
-    }
-
-    match handle_http_proxy(req, router, outbound_manager) {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::error!("HTTP proxy error: {}", e);
-            let mut resp = Response::new(StatusCode::BAD_GATEWAY);
-            resp.body = Body::from(format!("Proxy error: {e}"));
-            resp
-        }
-    }
-}
-
-/// CONNECT: parse the authority, pick an outbound, answer 200 and queue the
-/// tunnel job for the tunnel handler.
-fn handle_connect(
-    req: &Request<Body>,
-    router: &Router,
-    outbound_manager: &OutboundManager,
-    tunnel_job: &Mutex<Option<TunnelJob>>,
-) -> Response<Body> {
-    let authority = req.uri.as_str();
-    let (host, port) = match parse_authority(authority) {
-        Some(hp) => hp,
-        None => {
-            tracing::warn!("Invalid CONNECT URI: {}", authority);
-            return error_response(StatusCode::BAD_REQUEST, "Invalid CONNECT request");
-        }
-    };
-
-    let outbound_tag = router.match_outbound(Some(&host), None, Some(port), None);
-    tracing::info!("CONNECT {}:{} -> {}", host, port, outbound_tag);
-
-    let outbound = match outbound_manager.get_proxy(&outbound_tag) {
-        Some(proxy) => proxy,
-        None => {
-            tracing::error!("Outbound '{}' not found", outbound_tag);
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("Outbound '{outbound_tag}' not found"),
-            );
-        }
-    };
-
-    *tunnel_job.lock() = Some(TunnelJob {
-        target: TargetAddr::new_domain(host.clone(), port),
-        host: host.clone(),
-        port,
-        outbound_tag: outbound.tag().to_string(),
-    });
-
-    // 200 OK marks the tunnel as established; the marker header hands the
-    // raw connection to the tunnel handler (stripped before sending).
-    let mut resp = Response::new(StatusCode::OK);
+/// `407 Proxy Authentication Required`, with the challenge a client needs to
+/// retry with credentials.
+fn proxy_auth_required() -> Response<Body> {
+    let mut resp = Response::with_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
     resp.headers.insert(
-        HeaderName::from_static(TUNNEL_MARKER),
-        HeaderValue::from_static("1"),
+        HeaderName::from_static("proxy-authenticate"),
+        HeaderValue::from_static("Basic realm=\"corduit\""),
     );
+    resp.headers.insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    resp.body = Body::from(b"Proxy authentication required".to_vec());
     resp
 }
 
-/// Relay a CONNECT tunnel: push the raw client connection through the
-/// matched outbound with connection tracking. Runs on the connection thread
-/// for the tunnel's lifetime.
-fn handle_tunnel(conn: RawConnection, job: TunnelJob, outbound_manager: &OutboundManager) {
-    let outbound = match outbound_manager.get_proxy(&job.outbound_tag) {
-        Some(proxy) => proxy,
-        None => {
-            tracing::error!("Outbound '{}' not found", job.outbound_tag);
-            return;
-        }
-    };
-
-    // `RawConnection` implements `SyncStream` directly (plain TCP or TLS).
-    let client: BoxStream = Box::new(conn);
-    let target = job.target;
-    let host = job.host.clone();
-    let port = job.port;
-
-    // Connection tracking.
-    let destination_ip = crate::common::socket::resolve_host(&host, port, Duration::from_secs(3))
-        .ok()
-        .and_then(|addrs| addrs.into_iter().next())
-        .map(|addr| addr.ip().to_string());
-    let tracked_conn = TrackedConnection::new_with_ip(
-        "http".to_string(),
-        job.outbound_tag.clone(),
-        host.clone(),
-        destination_ip,
-        port,
-        "HTTPS".to_string(),
-        "tcp".to_string(),
-        "HTTP-CONNECT".to_string(),
-        format!("{host}:{port}"),
+/// Build a plain-text response.
+pub(crate) fn error_response(status: StatusCode, message: &str) -> Response<Body> {
+    let mut resp = Response::with_status(status);
+    resp.headers.insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("text/plain; charset=utf-8"),
     );
-    let tracker = global_tracker();
-    let tracked = tracker.track(tracked_conn);
-    let conn_arc = Arc::clone(&tracked);
-    let tag = job.outbound_tag.clone();
-
-    let result = outbound.relay_tcp_with_connection(client, target, Some(conn_arc));
-
-    tracker.untrack(&tracked.id);
-    if let Err(e) = result {
-        if !e.to_string().contains("connection") {
-            tracing::debug!("CONNECT relay error via '{}': {}", tag, e);
-        }
-    }
-}
-
-/// Forward a plain HTTP proxy request (absolute-form URI) through the
-/// matched outbound and return the origin's response.
-fn handle_http_proxy(
-    req: Request<Body>,
-    router: &Router,
-    outbound_manager: &OutboundManager,
-) -> Result<Response<Body>> {
-    let (host, port) = parse_http_target(&req)
-        .ok_or_else(|| Error::protocol("Invalid HTTP proxy request: missing host"))?;
-
-    let outbound_tag = router.match_outbound(Some(&host), None, Some(port), None);
-    tracing::info!("HTTP {} -> {}", req.uri.as_str(), outbound_tag);
-
-    let outbound = outbound_manager
-        .get_proxy(&outbound_tag)
-        .ok_or_else(|| Error::config(format!("Outbound '{outbound_tag}' not found")))?;
-
-    let method = req.method.clone();
-    let path = req.uri.as_str().to_string();
-    let is_head = method == Method::HEAD;
-
-    let target = TargetAddr::new_domain(host.clone(), port);
-    let (mut client_side, server_side) = forward::mem_duplex(64 * 1024);
-
-    // Relay the server end to the origin on a dedicated thread; the client
-    // end is used below to send the request and read the response.
-    let relay_handle = std::thread::Builder::new()
-        .name("corduit-http-relay".into())
-        .spawn(move || outbound.relay_tcp(Box::new(server_side) as BoxStream, target))
-        .map_err(|e| Error::network(format!("Failed to spawn relay thread: {e}")))?;
-
-    // The request body is materialized (bounded); re-serialize it with the
-    // hop-by-hop headers stripped and an explicit Content-Length (CWE-444).
-    let body = req.body.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
-
-    forward::send_request(
-        &mut client_side,
-        &method,
-        &path,
-        &req.headers,
-        &host,
-        port,
-        &body,
-    )?;
-
-    client_side
-        .shutdown(Shutdown::Write)
-        .map_err(|e| Error::network(format!("Failed to shutdown write: {e}")))?;
-
-    let response = forward::read_http_response(&mut client_side, is_head)?;
-    let _ = relay_handle.join();
-    Ok(response)
+    resp.body = Body::from(message.as_bytes().to_vec());
+    resp
 }
 
 /// Parse a CONNECT authority (`host:port` or `[v6]:port`).
-fn parse_authority(authority: &str) -> Option<(String, u16)> {
+pub(crate) fn parse_authority(authority: &str) -> Option<(String, u16)> {
     let authority = authority.trim_start_matches('/');
     if let Some(rest) = authority.strip_prefix('[') {
         if let Some((host, suffix)) = rest.split_once(']') {
@@ -373,7 +594,7 @@ fn parse_authority(authority: &str) -> Option<(String, u16)> {
                 return Some((host.to_string(), port));
             }
         }
-        // Bare IPv6 without brackets is invalid.
+        // A bare IPv6 address without brackets is invalid.
         return None;
     }
     if !authority.is_empty() {
@@ -382,21 +603,18 @@ fn parse_authority(authority: &str) -> Option<(String, u16)> {
     None
 }
 
-/// Parse an absolute-form HTTP proxy request target (scheme://host[:port]/
-/// path or origin-form with a Host header).
+/// Parse an absolute-form proxy request target (`scheme://host[:port]/path`)
+/// or fall back to the `Host` header of an origin-form request.
 fn parse_http_target(req: &Request<Body>) -> Option<(String, u16)> {
     let target = req.uri.as_str();
     if let Some(rest) = target.strip_prefix("http://") {
         let (authority, _path) = split_authority_path(rest);
-        let (host, port) = split_host_port(authority, 80)?;
-        return Some((host, port));
+        return split_host_port(authority, 80);
     }
     if let Some(rest) = target.strip_prefix("https://") {
         let (authority, _path) = split_authority_path(rest);
-        let (host, port) = split_host_port(authority, 443)?;
-        return Some((host, port));
+        return split_host_port(authority, 443);
     }
-    // Origin-form: rely on the Host header.
     if let Some(host_header) = req.headers.get("host").and_then(|v| v.to_str().ok()) {
         return split_host_port(host_header.trim(), 80);
     }
@@ -435,12 +653,92 @@ fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> 
     Some((authority.to_string(), default_port))
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response<Body> {
-    let mut resp = Response::new(status);
-    resp.headers.insert(
-        HeaderName::from_static("content-type"),
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    resp.body = Body::from(message.as_bytes().to_vec());
-    resp
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_connect_authority_forms() {
+        assert_eq!(
+            parse_authority("example.com:443"),
+            Some(("example.com".to_string(), 443))
+        );
+        assert_eq!(
+            parse_authority("example.com"),
+            Some(("example.com".to_string(), 443))
+        );
+        assert_eq!(
+            parse_authority("[2001:db8::1]:8443"),
+            Some(("2001:db8::1".to_string(), 8443))
+        );
+        assert_eq!(
+            parse_authority("[2001:db8::1]"),
+            Some(("2001:db8::1".to_string(), 443))
+        );
+        assert_eq!(parse_authority("2001:db8::1"), None);
+        assert_eq!(parse_authority(""), None);
+    }
+
+    #[test]
+    fn parses_absolute_and_origin_form_targets() {
+        let abs = Request::new(Method::GET, "http://example.com:8080/a?b=1");
+        assert_eq!(
+            parse_http_target(&abs),
+            Some(("example.com".to_string(), 8080))
+        );
+
+        let mut origin = Request::new(Method::GET, "/a?b=1");
+        origin.headers.insert(
+            HeaderName::from_static("host"),
+            HeaderValue::from_static("example.com"),
+        );
+        assert_eq!(
+            parse_http_target(&origin),
+            Some(("example.com".to_string(), 80))
+        );
+
+        let bare = Request::new(Method::GET, "/a");
+        assert_eq!(parse_http_target(&bare), None);
+    }
+
+    #[test]
+    fn parses_a_connect_head_with_the_codec() {
+        let head = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic x\r\n\r\n";
+        let (authority, headers) = parse_connect_head(head).expect("head parses");
+        assert_eq!(authority, "example.com:443");
+        assert_eq!(
+            headers.get("host").and_then(|v| v.to_str().ok()),
+            Some("example.com:443")
+        );
+        assert!(headers.contains_key("proxy-authorization"));
+    }
+
+    #[test]
+    fn refuses_malformed_connect_heads() {
+        assert!(parse_connect_head(b"GET / HTTP/1.1\r\n\r\n").is_err());
+        assert!(parse_connect_head(b"CONNECT a:1 HTTP/1.1 extra\r\n\r\n").is_err());
+        assert!(parse_connect_head(b"CONNECT a:1 HTTP/1.1\r\n\r\n").is_ok());
+        assert!(parse_connect_head(b"CONNECT a:1 HTTP/1.1\r\n").is_err());
+        assert!(parse_connect_head(b"CONNECT \x00a HTTP/1.1\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn finds_the_head_terminator() {
+        // "CONNECT a:443 HTTP/1.1" is 22 bytes: the blank line starts at 22.
+        assert_eq!(
+            find_subsequence(b"CONNECT a:443 HTTP/1.1\r\n\r\n", b"\r\n\r\n"),
+            Some(22)
+        );
+        assert_eq!(find_subsequence(b"partial", b"\r\n\r\n"), None);
+    }
 }

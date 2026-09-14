@@ -13,7 +13,7 @@ flowchart TB
     ROOT --> FFI["ffi.rs<br/>手写 C ABI"]
     ROOT --> RPC["rpc/<br/>分发表 + HTTP/WebSocket 服务"]
     ROOT --> TYPES["types.rs<br/>共享 DTO"]
-    ROOT --> COMMON["common/<br/>同步调度器 + socket 原语 + 双向中继<br/>+ 定时器 + 取消 + URL 解析<br/>+ courierust HTTP 客户端/服务端 + 根证书"]
+    ROOT --> COMMON["common/<br/>同步调度器 + socket 原语 + 双向中继<br/>+ 定时器 + 取消 + URL 解析<br/>+ 阻塞监听器 + courierust HTTP 客户端 + 根证书"]
     ROOT --> ENGINE["engine/<br/>代理引擎核心"]
     ROOT --> CRYPTO["crypto/<br/>加密原语 + 文本编解码"]
     ROOT --> PROTOCOL["protocol/<br/>线缆协议（QUIC v1 客户端、TLS 1.2/1.3、TLS 1.3+REALITY、WebSocket、WireGuard）"]

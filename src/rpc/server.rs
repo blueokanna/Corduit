@@ -7,25 +7,25 @@
 //!
 //! # Implementation
 //!
-//! The transport is built entirely on `courierust` — no `hyper`, no
-//! `tokio-tungstenite`:
+//! Every connection is driven by [`serve_connection`] — courierust's
+//! per-connection engine — on a thread of its own (bounded, see
+//! [`crate::common::listener`]). Nothing about HTTP is hand-written:
 //!
-//! * HTTP/1.1 framing comes from [`crate::common::http_server`], a blocking
-//!   server over courierust's H/1 codec (one thread per connection);
-//! * WebSocket upgrades ride the server's raw-connection handoff: the
-//!   handler answers `101 Switching Protocols` (accept value from
-//!   `courierust_ws::handshake`) carrying an internal marker header, and
-//!   the connection is handed to [`crate::protocol::ws::WebSocket`] — the
-//!   same `courierust_ws` session the VMess transport uses, in the server
-//!   role;
-//! * RPC dispatch is synchronous: each WebSocket message (and each `POST
-//!   /rpc` request) is handled inline on the connection thread with a direct
-//!   call to [`crate::rpc::dispatch`].
+//! * framing, keep-alive, body caps and the `413` for an oversized request
+//!   come from the server;
+//! * a WebSocket upgrade is validated by the server's WebSocket policy
+//!   (method, `Upgrade`/`Connection` tokens, key shape, version 13, origin)
+//!   and then served by the **blocking** WebSocket driver, which owns the
+//!   framing, the limits, the keepalive pings and the closing handshake.
+//!
+//! The dispatch itself is synchronous and may block for as long as an
+//! operation takes (`start_proxy`, a config reload); that is why each
+//! connection has a thread of its own instead of sharing a scheduler.
 //!
 //! # Security model
 //!
-//! * Binds to a loopback address only (never `0.0.0.0`) — the server is not
-//!   reachable from other machines.
+//! * [`RpcServer::bind`] **refuses any address that is not loopback** — the
+//!   server is not reachable from other machines even by misconfiguration.
 //! * Every call requires a bearer token:
 //!   - HTTP: `Authorization: Bearer <token>` header;
 //!   - WebSocket: `?token=<token>` query parameter (browsers cannot set
@@ -34,7 +34,9 @@
 //! * Request bodies and WebSocket messages are size-bounded; oversized
 //!   payloads are rejected with `413`.
 //! * Responses carry permissive CORS headers so a locally-hosted dashboard
-//!   served from a different port can talk to the engine.
+//!   served from a different port can talk to the engine. That is also why
+//!   the WebSocket origin policy is [`OriginPolicy::Any`]: the token in the
+//!   URL is the authentication, and `Origin` is not.
 //!
 //! # Endpoints
 //!
@@ -48,95 +50,88 @@
 //! * success:  `{ "code": 0, "data": <value> }`;
 //! * error:    `{ "code": 1, "error": "<message>" }`.
 
-use std::fmt;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
-use courierust::courierust_http::{
-    Body, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
-};
-use courierust::courierust_tls::TlsVersion;
-use courierust::courierust_ws::handshake::{accept_key, is_valid_key, is_websocket_upgrade};
+use courierust::courierust_body::Body;
+use courierust::courierust_http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
+use courierust::courierust_server::ws::{WsConfig, WsConn, WsData, WsService, WsUpgradeReply};
+use courierust::courierust_server::{serve_connection, Handler, ServerConfig};
+use courierust::courierust_ws::{OriginPolicy, PmDeflatePolicy};
 
-use crate::common::http_server::{HttpServer, HttpServerConfig, RawConnection, TUNNEL_MARKER};
+use crate::common::listener::ConnectionListener;
 use crate::crypto::util::ct_eq;
-use crate::protocol::ws::{Message as WsMessage, WebSocket};
 
 /// Maximum accepted JSON-RPC request body (config uploads can be large).
-const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024; // 16 MiB
+const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 /// Maximum accepted WebSocket message size.
-const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024; // 16 MiB
-/// Upper bound on a single connection's read idle time. Bounds idle
-/// keep-alive / WebSocket connections (resource hygiene); a dashboard never
-/// needs longer between requests.
+const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024;
+/// Cap for a request head (status line + header list).
+const MAX_REQUEST_HEAD: usize = 64 * 1024;
+/// Upper bound on concurrently open connections: a local dashboard needs a
+/// handful, and the bound is what keeps a stuck client from pinning threads.
+const MAX_CONNECTIONS: usize = 64;
+/// Upper bound on a connection's read idle time (keep-alive and WebSocket).
 const CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+/// Server-side keepalive: a Ping goes out after this much inbound silence,
+/// and a peer that stays silent for twice as long is dropped.
+const WS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Error produced by the RPC server.
-#[derive(Debug)]
-pub struct ServerError(pub String);
-
-impl fmt::Display for ServerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ServerError {}
-
-impl From<std::io::Error> for ServerError {
-    fn from(e: std::io::Error) -> Self {
-        ServerError(e.to_string())
-    }
-}
-
-/// A bound (not yet started) RPC server.
+/// A bound (not yet serving) RPC server.
 pub struct RpcServer {
-    server: HttpServer,
+    listener: Option<TcpListener>,
     addr: SocketAddr,
+    token: Arc<str>,
+    config: Arc<ServerConfig>,
 }
 
-/// A running RPC server. Call [`stop`](Self::stop) or [`join`](Self::join) to
-/// shut it down gracefully.
+/// A serving RPC server. [`stop`](Self::stop) shuts it down; dropping the
+/// handle does the same (the listener is never left behind).
 pub struct RpcServerHandle {
     addr: SocketAddr,
     token_set: bool,
-    server: std::sync::Mutex<Option<HttpServer>>,
+    server: parking_lot::Mutex<Option<ConnectionListener>>,
 }
 
 impl RpcServer {
-    /// Bind a TCP listener at `addr`. Use a loopback address (`127.0.0.1`,
-    /// `::1`) — the server deliberately never binds to all interfaces.
+    /// Bind a TCP listener at `addr`.
+    ///
+    /// Only loopback addresses are accepted (`127.0.0.0/8`, `::1`): the
+    /// server exposes engine control and must never be reachable from the
+    /// network, so a non-loopback address is refused here rather than
+    /// documented as a rule.
     pub fn bind(addr: SocketAddr, token: String) -> std::io::Result<Self> {
-        let token: Arc<str> = Arc::from(token.as_str());
+        if !addr.ip().is_loopback() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("RPC server refuses non-loopback address {addr}"),
+            ));
+        }
 
-        // Synchronous HTTP handler: routes /health and /rpc, and converts a
-        // WebSocket upgrade into a 101 + raw-connection handoff.
-        let handler_token = token.clone();
-        let handler = Arc::new(move |req: Request<Body>| -> Response<Body> {
-            handle_http_request(req, &handler_token)
-        });
+        let listener = TcpListener::bind(addr)?;
+        let addr = listener.local_addr()?;
+        // The accept loop polls the listener so it can observe a stop
+        // request without waiting for a connection.
+        listener.set_nonblocking(true)?;
 
-        // WebSocket tunnel: runs the RFC 6455 message loop on the blocking
-        // raw connection after the 101 has been written.
-        let tunnel_handler = Arc::new(move |conn: RawConnection| {
-            run_ws_tunnel(conn);
-        });
-
-        let config = HttpServerConfig {
-            listen: addr,
-            tls: None,
-            min_version: TlsVersion::Tls12,
-            max_version: TlsVersion::Tls13,
-            max_head: 64 * 1024,
-            max_body: MAX_REQUEST_BODY,
+        let config = ServerConfig {
             read_timeout: Some(CONNECTION_LIFETIME),
-            tunnel_handler: Some(tunnel_handler),
-            handler,
+            max_header_list: MAX_REQUEST_HEAD,
+            max_body: MAX_REQUEST_BODY,
+            http2: false,
+            tls: None,
+            handshake_timeout: None,
+            max_connections: MAX_CONNECTIONS,
+            websocket: ws_config(),
+            ..ServerConfig::default()
         };
 
-        let server = HttpServer::bind(config)?;
-        let addr = server.local_addr()?;
-        Ok(Self { server, addr })
+        Ok(Self {
+            listener: Some(listener),
+            addr,
+            token: Arc::from(token.as_str()),
+            config: Arc::new(config),
+        })
     }
 
     /// The actual bound address (useful when binding to port `0`).
@@ -144,14 +139,30 @@ impl RpcServer {
         self.addr
     }
 
-    /// Start the accept loop on a background thread and return a controller
-    /// handle.
+    /// Start serving on a background thread and return a controller handle.
     pub fn spawn(mut self) -> RpcServerHandle {
-        self.server.start().expect("start RPC server accept loop");
+        let listener = self
+            .listener
+            .take()
+            .expect("RPC server listener consumed before spawn");
+        let handler = RpcHandler {
+            token: Arc::clone(&self.token),
+        };
+        let config = Arc::clone(&self.config);
+
+        let mut server = ConnectionListener::new(listener, self.addr, MAX_CONNECTIONS);
+        server
+            .start("corduit-rpc-conn", move |stream, peer| {
+                if let Err(e) = serve_connection(stream, &handler, config.as_ref()) {
+                    tracing::debug!("RPC connection from {peer} ended: {e}");
+                }
+            })
+            .expect("start RPC server accept loop");
+
         RpcServerHandle {
             addr: self.addr,
             token_set: true,
-            server: std::sync::Mutex::new(Some(self.server)),
+            server: parking_lot::Mutex::new(Some(server)),
         }
     }
 }
@@ -167,32 +178,111 @@ impl RpcServerHandle {
         self.token_set
     }
 
-    /// Whether the accept loop is currently running.
+    /// Whether the accept loop is still running.
     pub fn is_running(&self) -> bool {
         self.server
             .lock()
-            .unwrap()
             .as_ref()
-            .map(HttpServer::is_running)
+            .map(ConnectionListener::is_running)
             .unwrap_or(false)
     }
 
-    /// Request a graceful shutdown of the accept loop.
+    /// Request a graceful shutdown and wait for the accept loop to exit.
+    /// Idempotent. Connections already being served finish on their own
+    /// threads.
     pub fn stop(&self) {
-        if let Some(server) = self.server.lock().unwrap().as_ref() {
+        // Take the listener out first so the lock is released before the
+        // (blocking) join of the accept loop.
+        let mut server = self.server.lock().take();
+        if let Some(server) = server.as_mut() {
             server.stop();
         }
     }
 
-    /// Stop the accept loop and wait for it to exit.
+    /// Stop in one call (the handle is consumed).
     pub fn join(self) {
-        if let Some(mut server) = self.server.lock().unwrap().take() {
-            server.shutdown();
+        self.stop();
+    }
+}
+
+impl Drop for RpcServerHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The HTTP/WebSocket handler behind the server.
+struct RpcHandler {
+    token: Arc<str>,
+}
+
+impl Handler for RpcHandler {
+    fn handle(&self, req: Request<Body>) -> Response<Body> {
+        handle_http_request(req, &self.token)
+    }
+
+    /// Route a WebSocket upgrade: authenticate, then hand the connection to
+    /// the JSON-RPC service. The framing, the limits, the keepalive and the
+    /// closing handshake are the server's business.
+    fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
+        // Browsers cannot set the Authorization header on a WebSocket
+        // connection, so the token travels as `?token=...`.
+        let presented = req
+            .uri
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")));
+        let Some(presented) = presented else {
+            return WsUpgradeReply::Refuse(unauthorized("missing token"));
+        };
+        if !ct_eq(presented.as_bytes(), self.token.as_bytes()) {
+            return WsUpgradeReply::Refuse(unauthorized("unauthorized"));
+        }
+        WsUpgradeReply::Accept(Arc::new(RpcWsService))
+    }
+}
+
+/// One WebSocket connection: every message is one JSON-RPC request.
+///
+/// `on_message` runs on the connection's own thread, so a blocking dispatch
+/// call delays only this connection.
+struct RpcWsService;
+
+impl WsService for RpcWsService {
+    fn on_message(&self, conn: &mut WsConn, message: WsData) {
+        let response = match message {
+            WsData::Text(text) => process_payload(text.as_bytes()),
+            WsData::Binary(data) => process_payload(&data),
+        };
+        if let Err(e) = conn.send_text(&response) {
+            tracing::debug!("RPC WebSocket write failed: {e}");
+            let _ = conn.close(1011, "send failed");
         }
     }
 }
 
-/// Route a single HTTP request (or WebSocket upgrade).
+/// The WebSocket policy the server enforces.
+fn ws_config() -> WsConfig {
+    WsConfig {
+        enabled: true,
+        // Token in the URL is the authentication; a dashboard served from
+        // another local port presents a foreign `Origin` by design.
+        origin: OriginPolicy::Any,
+        trusted_proxies: Vec::new(),
+        subprotocols: Vec::new(),
+        // JSON-RPC payloads are small and the peer is on loopback:
+        // `permessage-deflate` would cost CPU and buy nothing.
+        compression: PmDeflatePolicy {
+            enabled: false,
+            ..PmDeflatePolicy::default()
+        },
+        max_message: MAX_WS_MESSAGE,
+        max_frame: MAX_WS_MESSAGE,
+        ping_interval: Some(WS_PING_INTERVAL),
+        ..WsConfig::default()
+    }
+}
+
+/// Route a single HTTP request.
 fn handle_http_request(req: Request<Body>, token: &str) -> Response<Body> {
     // CORS preflight for browser dashboards served from another origin.
     if req.method == Method::OPTIONS {
@@ -200,12 +290,6 @@ fn handle_http_request(req: Request<Body>, token: &str) -> Response<Body> {
     }
 
     let path = req.uri.path().to_string();
-
-    // WebSocket upgrade — the 101 carries the internal handoff marker so the
-    // connection thread hands the raw socket to the WS loop.
-    if is_websocket_request(&req) {
-        return websocket_upgrade_response(&req, token);
-    }
 
     // Unauthenticated health probe (no sensitive data).
     if req.method == Method::GET && path == "/health" {
@@ -232,10 +316,9 @@ fn handle_http_request(req: Request<Body>, token: &str) -> Response<Body> {
         );
     }
 
-    // The blocking server caps the body at `max_body` and answers oversized
-    // requests with 413 before the handler runs; the `Some(_)` arm below is
-    // defensive only. An empty body flows through and is reported as a
-    // logical JSON-RPC error ("missing 'method'").
+    // The server caps the body at `MAX_REQUEST_BODY` and answers an
+    // oversized request with `413` before the handler runs; the check below
+    // is the same bound expressed on the materialized body.
     let body = match req.body.as_bytes() {
         Some(b) if b.len() <= MAX_REQUEST_BODY => b.to_vec(),
         Some(_) => {
@@ -247,125 +330,15 @@ fn handle_http_request(req: Request<Body>, token: &str) -> Response<Body> {
         None => Vec::new(),
     };
 
-    let response = process_payload(&body);
-    json_response(StatusCode::OK, &response)
+    json_response(StatusCode::OK, &process_payload(&body))
 }
 
-/// Handle a WebSocket upgrade request after token validation.
-fn websocket_upgrade_response(req: &Request<Body>, token: &str) -> Response<Body> {
-    // Browsers cannot set the Authorization header on WebSocket connections,
-    // so the token is carried as `?token=...` in the request URI.
-    let query_token = req
-        .uri
-        .query()
-        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")))
-        .map(str::to_string);
-    let Some(query_token) = query_token else {
-        return json_response(
-            StatusCode::UNAUTHORIZED,
-            r#"{"code":1,"error":"missing token"}"#,
-        );
-    };
-    if !ct_eq(query_token.as_bytes(), token.as_bytes()) {
-        return json_response(
-            StatusCode::UNAUTHORIZED,
-            r#"{"code":1,"error":"unauthorized"}"#,
-        );
-    }
-
-    // RFC 6455 requires a 16-byte base64 key; a malformed one is refused
-    // before any state is created.
-    let ws_key = req
-        .headers
-        .get("sec-websocket-key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let Some(ws_key) = ws_key else {
-        return json_response(
-            StatusCode::BAD_REQUEST,
-            r#"{"code":1,"error":"missing Sec-WebSocket-Key"}"#,
-        );
-    };
-    if !is_valid_key(&ws_key) {
-        return json_response(
-            StatusCode::BAD_REQUEST,
-            r#"{"code":1,"error":"malformed Sec-WebSocket-Key"}"#,
-        );
-    }
-
-    let Ok(accept) = accept_key(&ws_key) else {
-        return json_response(
-            StatusCode::BAD_REQUEST,
-            r#"{"code":1,"error":"malformed Sec-WebSocket-Key"}"#,
-        );
-    };
-    let mut resp = Response::new(StatusCode::SWITCHING_PROTOCOLS);
-    resp.headers.insert(
-        HeaderName::from_static("connection"),
-        HeaderValue::from_static("Upgrade"),
-    );
-    resp.headers.insert(
-        HeaderName::from_static("upgrade"),
-        HeaderValue::from_static("websocket"),
-    );
-    resp.headers.insert(
-        HeaderName::from_static("sec-websocket-accept"),
-        HeaderValue::from(accept),
-    );
-    // Internal marker: after this response is written, the connection thread
-    // hands the raw socket to the tunnel handler (the WS message loop).
-    resp.headers.insert(
-        HeaderName::from_static(TUNNEL_MARKER),
-        HeaderValue::from_static("1"),
-    );
-    resp
-}
-
-fn is_websocket_request(req: &Request<Body>) -> bool {
-    is_websocket_upgrade(&req.headers)
-}
-
-/// Run the WebSocket message loop: every message is one JSON-RPC request.
-/// The token was already validated during the upgrade handshake, and the
-/// framing is courierust's session state machine
-/// ([`WebSocket`] wraps it in the server role). Runs on the connection
-/// thread; dispatch is synchronous.
-fn run_ws_tunnel(conn: RawConnection) {
-    let mut ws = WebSocket::accepted(conn, MAX_WS_MESSAGE);
-    loop {
-        match ws.read_message() {
-            Ok(WsMessage::Text(text)) => {
-                let resp = process_payload(text.as_bytes());
-                if let Err(e) = ws.send_text(&resp) {
-                    tracing::debug!("RPC WebSocket write failed: {e}");
-                    break;
-                }
-            }
-            Ok(WsMessage::Binary(data)) => {
-                let resp = process_payload(&data);
-                if let Err(e) = ws.send_text(&resp) {
-                    tracing::debug!("RPC WebSocket write failed: {e}");
-                    break;
-                }
-            }
-            Ok(WsMessage::Close) => {
-                let _ = ws.close();
-                break;
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue
-            }
-            Err(e) => {
-                tracing::debug!("RPC WebSocket closed: {e}");
-                break;
-            }
-        }
-    }
+/// A `401` for a WebSocket upgrade the client is not allowed to make.
+fn unauthorized(reason: &str) -> Response<Body> {
+    json_response(
+        StatusCode::UNAUTHORIZED,
+        &format!(r#"{{"code":1,"error":"{reason}"}}"#),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +388,7 @@ fn encode_response(result: Result<nextjson::Value, String>) -> String {
 /// Build a JSON response with permissive CORS headers (localhost-only
 /// service, token-gated).
 fn json_response(status: StatusCode, body: &str) -> Response<Body> {
-    let mut resp = Response::new(status);
+    let mut resp = Response::with_status(status);
     resp.headers.insert(
         HeaderName::from_static("content-type"),
         HeaderValue::from_static("application/json"),
@@ -427,7 +400,7 @@ fn json_response(status: StatusCode, body: &str) -> Response<Body> {
 
 /// Build a CORS preflight response.
 fn cors_response(status: StatusCode) -> Response<Body> {
-    let mut resp = Response::new(status);
+    let mut resp = Response::with_status(status);
     add_cors(&mut resp);
     resp
 }
@@ -492,7 +465,11 @@ mod tests {
         stream.write_all(req.as_bytes()).unwrap();
 
         let mut resp = Vec::new();
-        stream.read_to_end(&mut resp).unwrap();
+        // A request the server refuses (an oversized body) is answered and
+        // then closed, so a client still streaming may see its connection
+        // reset after the response: whatever arrived is what this helper
+        // reports.
+        let _ = stream.read_to_end(&mut resp);
         let text = String::from_utf8_lossy(&resp);
         let status: u16 = text
             .lines()
@@ -526,6 +503,12 @@ mod tests {
         );
         stream.write_all(req.as_bytes()).unwrap();
 
+        let status = read_handshake_head(&mut stream);
+        (stream, status)
+    }
+
+    /// Read an HTTP response head, returning its status code.
+    fn read_handshake_head(stream: &mut std::net::TcpStream) -> u16 {
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         loop {
@@ -538,17 +521,16 @@ mod tests {
                 panic!("handshake response too large");
             }
         }
-        let status: u16 = String::from_utf8_lossy(&head)
+        String::from_utf8_lossy(&head)
             .lines()
             .next()
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        (stream, status)
+            .unwrap_or(0)
     }
 
-    /// Send one masked text frame (client side).
-    fn ws_send_text(stream: &mut std::net::TcpStream, data: &[u8]) {
+    /// Encode one masked client text frame.
+    fn masked_text_frame(data: &[u8]) -> Vec<u8> {
         let mut frame = vec![0x81];
         let len = data.len();
         if len < 126 {
@@ -565,7 +547,12 @@ mod tests {
         for (i, byte) in data.iter().enumerate() {
             frame.push(byte ^ mask[i % 4]);
         }
-        stream.write_all(&frame).unwrap();
+        frame
+    }
+
+    /// Send one masked text frame (client side).
+    fn ws_send_text(stream: &mut std::net::TcpStream, data: &[u8]) {
+        stream.write_all(&masked_text_frame(data)).unwrap();
     }
 
     /// Read one server frame; returns `(opcode, payload)` (server frames are
@@ -606,8 +593,18 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("\"ok\":true"));
         h.stop();
-        std::thread::sleep(Duration::from_millis(50));
         assert!(!h.is_running());
+    }
+
+    #[test]
+    fn non_loopback_bind_is_refused() {
+        let err = RpcServer::bind(
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            "test-token-123".to_string(),
+        )
+        .err()
+        .expect("a wildcard bind must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -653,15 +650,25 @@ mod tests {
         h.stop();
     }
 
+    /// A declared body larger than the cap is refused before a byte of it is
+    /// read, so the client gets its `413` (and no body is buffered).
     #[test]
     fn oversize_body_is_rejected() {
         let h = spawn_test_server();
-        let big = format!(
-            r#"{{"method":"x","params":{{"pad":"{}"}}}}"#,
-            "a".repeat(MAX_REQUEST_BODY + 1)
+        let mut stream = std::net::TcpStream::connect(h.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let head = format!(
+            "POST /rpc HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-token-123\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            h.addr(),
+            MAX_REQUEST_BODY + 1
         );
-        let (status, _) = post_rpc(h.addr(), Some("test-token-123"), &big);
-        assert_eq!(status, 413);
+        stream.write_all(head.as_bytes()).unwrap();
+
+        assert_eq!(read_handshake_head(&mut stream), 413);
         h.stop();
     }
 
@@ -678,7 +685,7 @@ mod tests {
         let parsed: nextjson::Value = nextjson::from_str(&text).unwrap();
         assert_eq!(parsed.get("code").and_then(|v| v.as_i64()), Some(0));
 
-        // Graceful close: server replies with a close frame.
+        // Graceful close: the server completes the handshake.
         ws_send_close(&mut ws);
         let (opcode, _) = ws_read_frame(&mut ws);
         assert_eq!(opcode, 0x8);
@@ -690,6 +697,41 @@ mod tests {
         let h = spawn_test_server();
         let (_ws, status) = ws_handshake(h.addr(), "wrong");
         assert_eq!(status, 401, "connection with a bad token must be refused");
+        h.stop();
+    }
+
+    /// A frame pipelined with the upgrade request (sent in the same write)
+    /// must be delivered — the reader keeps the bytes the handshake parser
+    /// already buffered.
+    #[test]
+    fn pipelined_frame_after_upgrade_is_served() {
+        let h = spawn_test_server();
+        let mut stream = std::net::TcpStream::connect(h.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let head = format!(
+            "GET /ws?token=test-token-123 HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: {key}\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+            h.addr()
+        );
+
+        let mut request = head.into_bytes();
+        request.extend_from_slice(&masked_text_frame(br#"{"method":"get_version"}"#));
+        stream.write_all(&request).unwrap();
+
+        // Consume the 101 head, then read the response frame.
+        assert_eq!(read_handshake_head(&mut stream), 101);
+        let (opcode, payload) = ws_read_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        let parsed: nextjson::Value =
+            nextjson::from_str(&String::from_utf8(payload).unwrap()).unwrap();
+        assert_eq!(parsed.get("code").and_then(|v| v.as_i64()), Some(0));
         h.stop();
     }
 }

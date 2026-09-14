@@ -470,7 +470,6 @@ impl SolidStack {
             proxy_addr: self.config.proxy_addr,
             tun_tx: self.tun_tx.clone(),
             tcp_manager: self.tcp_manager.clone(),
-            nat_table: self.nat_table.clone(),
             stats: self.stats.clone(),
             running: self.running.clone(),
         }
@@ -774,26 +773,12 @@ impl SolidStack {
             self.fake_ip_pool.cleanup_expired();
         }
     }
-
-    #[allow(dead_code)]
-    fn establish_proxy_connection(
-        &self,
-        src_addr: SocketAddr,
-        dst_addr: SocketAddr,
-        domain: Option<String>,
-        conn: Arc<RwLock<TcpConnection>>,
-    ) -> Result<()> {
-        let proxy = self.clone_for_proxy();
-        proxy.establish_proxy_connection(src_addr, dst_addr, domain, conn)
-    }
 }
 
 struct StackProxy {
     proxy_addr: SocketAddr,
     tun_tx: Option<mpsc::Sender<BytesMut>>,
     tcp_manager: Arc<TcpManager>,
-    #[allow(dead_code)]
-    nat_table: Arc<NatTable>,
     stats: Arc<StackStats>,
     running: Arc<AtomicBool>,
 }

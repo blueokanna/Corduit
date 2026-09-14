@@ -4,20 +4,22 @@
 //! * [`TlsConnector`] — client connector; [`TlsConnector::connect`] performs
 //!   the handshake synchronously over a `std::net::TcpStream` and returns a
 //!   boxed [`SyncStream`](crate::common::stream::SyncStream).
-//! * [`TlsAcceptor`] — server acceptor; same model.
 //! * [`TlsStream`] — the synchronous TLS stream (std `Read`/`Write` +
 //!   half-close).
+//!
+//! Server-side TLS is courierust's own acceptor
+//! ([`courierust::courierust_tls::TlsAcceptor`]) plus its identity type:
+//! the DoT server and the HTTP servers build on those directly, so there is
+//! no second acceptor in this workspace.
 
 mod client;
 mod config;
 mod error;
-mod server;
 mod stream;
 
 pub use client::TlsConnector;
-pub use config::{ClientConfig, ServerConfig};
+pub use config::ClientConfig;
 pub use error::{Result, TlsError};
-pub use server::TlsAcceptor;
 pub use stream::TlsStream;
 
 /// A boxed synchronous duplex stream (the engine's canonical relay stream

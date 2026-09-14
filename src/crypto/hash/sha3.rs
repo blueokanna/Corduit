@@ -132,8 +132,6 @@ impl Sha3 {
 /// Multi-rate padding domain suffixes (FIPS 202 §6).
 mod private {
     pub const DOMAIN_SHA3: u8 = 0x06;
-    #[allow(dead_code)]
-    pub const DOMAIN_SHAKE: u8 = 0x1f;
 }
 
 impl Digest for Sha3 {

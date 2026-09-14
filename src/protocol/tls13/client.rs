@@ -927,23 +927,17 @@ mod tests {
     }
 
     /// Spawn a courierust TLS 1.3 server on loopback that echoes one message.
-    fn spawn_server(
-        cert: &'static [u8],
-        key: &'static [u8],
-        is_rsa: bool,
-    ) -> (u16, thread::JoinHandle<()>) {
+    fn spawn_server(cert: &'static [u8], key: &'static [u8]) -> (u16, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let acceptor = TlsAcceptor::new(ServerConfig {
-            identity: Identity {
-                cert_chain: vec![cert.to_vec()],
-                private_key: key.to_vec(),
-                is_rsa,
-            },
+            identity: Identity::from_der(vec![cert.to_vec()], key.to_vec())
+                .expect("test identity matches its certificate"),
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             min_version: TlsVersion::Tls13,
             max_version: TlsVersion::Tls13,
             session_ticket_key: None,
+            client_auth: None,
         });
         let handle = thread::spawn(move || {
             let (sock, _) = listener.accept().expect("accept");
@@ -963,11 +957,10 @@ mod tests {
     fn run_roundtrip(
         cert: &'static [u8],
         key: &'static [u8],
-        is_rsa: bool,
         fingerprint: Fingerprint,
         label: &str,
     ) {
-        let (port, server) = spawn_server(cert, key, is_rsa);
+        let (port, server) = spawn_server(cert, key);
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1020,17 +1013,17 @@ mod tests {
     /// minimal `ClientHello`s.
     #[test]
     fn handshake_roundtrips_all_combinations() {
-        run_roundtrip(RSA_CERT, RSA_KEY, true, Fingerprint::Chrome, "rsa/chrome");
-        run_roundtrip(RSA_CERT, RSA_KEY, true, Fingerprint::Off, "rsa/off");
-        run_roundtrip(EC_CERT, EC_KEY, false, Fingerprint::Chrome, "ec/chrome");
-        run_roundtrip(EC_CERT, EC_KEY, false, Fingerprint::Off, "ec/off");
+        run_roundtrip(RSA_CERT, RSA_KEY, Fingerprint::Chrome, "rsa/chrome");
+        run_roundtrip(RSA_CERT, RSA_KEY, Fingerprint::Off, "rsa/off");
+        run_roundtrip(EC_CERT, EC_KEY, Fingerprint::Chrome, "ec/chrome");
+        run_roundtrip(EC_CERT, EC_KEY, Fingerprint::Off, "ec/off");
     }
 
     /// A server certificate that does not match the requested name is
     /// rejected by the default authentication.
     #[test]
     fn wrong_server_name_is_rejected() {
-        let (port, server) = spawn_server(RSA_CERT, RSA_KEY, true);
+        let (port, server) = spawn_server(RSA_CERT, RSA_KEY);
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1083,7 +1076,7 @@ mod tests {
         }
 
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (port, server) = spawn_server(RSA_CERT, RSA_KEY, true);
+        let (port, server) = spawn_server(RSA_CERT, RSA_KEY);
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))

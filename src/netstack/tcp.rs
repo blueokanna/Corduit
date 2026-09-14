@@ -6,7 +6,7 @@
 use crate::common::stream::SyncStream;
 use crate::common::sync::Notify;
 use crate::netstack::error::{NetStackError, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -136,29 +136,6 @@ impl TcpConnection {
         inner.download_bytes += data.len() as u64;
         drop(inner);
         self.inner.lock().notify.notify_waiters();
-    }
-
-    /// Take data to be sent to the network
-    #[allow(dead_code)]
-    pub(crate) fn take_send_data(&self) -> Option<Bytes> {
-        let mut inner = self.inner.lock();
-        if inner.send_buffer.is_empty() {
-            None
-        } else {
-            Some(inner.send_buffer.split().freeze())
-        }
-    }
-
-    /// Set the connection state
-    #[allow(dead_code)]
-    pub(crate) fn set_state(&self, state: TcpState) {
-        let mut inner = self.inner.lock();
-        inner.state = state;
-        if state == TcpState::Closed {
-            inner.closed = true;
-            drop(inner);
-            self.inner.lock().notify.notify_waiters();
-        }
     }
 
     /// Close the connection

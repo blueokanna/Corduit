@@ -45,7 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # --- HTTP / TLS / QUIC / multithreading --
-courierust = { version = "1.0.6" }
+courierust = { version = "1.0.7" }
 
 # --- DNS ---------------------------------------------------------------------
 ipnet = "2.12.2"
@@ -63,8 +63,10 @@ smoltcp = { version = "0.11.0", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
     "proto-ipv6",
-    "socket-udp",
+    # `smoltcp`'s `std` feature turns on its socket layer, which refuses to
+    # build without at least one socket family enabled.
     "socket-tcp",
+    "socket-udp",
 ] }
 socket2 = { version = "0.6", features = ["all"] }
 sysinfo = "=0.36.1"
@@ -86,7 +88,7 @@ windows = { version = "0.61.3", features = [
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.22"
+jni = "0.21"
 tracing-android = "0.2"
 
 [dev-dependencies]

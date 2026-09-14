@@ -137,15 +137,20 @@ sequenceDiagram
     participant C as Corduit（客户端）
     participant S as QUIC 服务端
 
-    C->>S: Initial — CRYPTO[ClientHello]
-    Note over C,S: 密钥由 DCID 推导（RFC 9001 §5.2）；<br/>Initial / Handshake 密钥来自 TLS 秘密
-    S->>C: Initial — CRYPTO[ServerHello] + ACK
-    S->>C: Handshake — CRYPTO[EncryptedExtensions, Certificate, CertificateVerify, Finished]
+    C->>S: Initial - CRYPTO ClientHello
+    Note over C,S: 密钥由 DCID 推导（RFC 9001 section 5.2）<br/>Initial / Handshake 密钥来自 TLS 秘密
+
+    S->>C: Initial - CRYPTO ServerHello + ACK
+    S->>C: Handshake - CRYPTO EncryptedExtensions, Certificate, CertificateVerify, Finished
+
     C->>C: 校验证书链（courierust_tls::x509）与 CertificateVerify 签名
-    C->>S: Handshake — CRYPTO[Finished] + ACK
-    Note over C,S: 1-RTT：安装应用密钥，<br/>三个包号空间、PTO 丢包恢复、NewReno、流控
-    C->>S: 1-RTT — STREAM / DATAGRAM（RFC 9221）
-    S->>C: 1-RTT — STREAM / DATAGRAM
+
+    C->>S: Handshake - CRYPTO Finished + ACK
+
+    Note over C,S: 1-RTT：安装应用密钥<br/>三个包号空间、PTO 丢包恢复、NewReno、流控
+
+    C->>S: 1-RTT - STREAM / DATAGRAM（RFC 9221）
+    S->>C: 1-RTT - STREAM / DATAGRAM
 ```
 
 该传输之上承载 TUIC v5（`tuic`）与 Hysteria2（`hysteria2`）。Hysteria2 按官方规范实现：客户端初始化的双向流上的 HTTP/3 `POST /auth`（QPACK 字段段，期望 `:status 233`）、`0x401` TCP 请求帧、自有的 UDP 会话 / 分片组帧，以及 Salamander 包混淆（以每包 8 字节盐为密钥的 BLAKE2b-256，作用于 socket 层）。
@@ -257,8 +262,8 @@ src/
 ├── ffi.rs          # 手写 C ABI
 ├── rpc/            # 共享分发表 + 本地 HTTP/WebSocket JSON-RPC
 ├── types.rs        # 共享 DTO
-├── common/         # 线程池封装、socket、中继、定时器、取消、URL、
-│                   #   courierust HTTP 客户端/服务端、根证书
+├── common/         # 线程池封装、socket、中继、监听器、定时器、取消、URL、
+│                   #   courierust HTTP 客户端、根证书
 ├── engine/         # 配置、路由、入站、出站、代理集、统计
 ├── crypto/         # 加密原语 + 文本编解码（no_std）
 ├── protocol/       # 线缆协议：QUIC v1、TLS 1.3、REALITY、WebSocket、WireGuard

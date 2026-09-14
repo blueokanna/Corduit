@@ -3,21 +3,25 @@
 //! Each accepted connection is handled on a dedicated thread: a courierust
 //! TLS handshake, then the RFC 7858 2-byte length-prefixed DNS exchange
 //! against the engine's synchronous DNS resolver.
+//!
+//! The acceptor is built **once** for the listener's lifetime: it holds the
+//! session-ticket key, so a client that asks for TLS resumption actually gets
+//! it (a per-connection acceptor could never resume).
 
 use crate::common::cancel::CancellationToken;
-use crate::common::http_server::TlsIdentity;
+use crate::common::listener::ConnectionListener;
 use crate::dns::error::{DnsError, Result};
 use crate::dns::resolver::DnsResolver;
 use crate::dns::wire::{BinDecodable, BinEncodable, Message};
 use courierust::courierust_io::{Read as CRead, Write as CWrite};
-use courierust::courierust_tls::{ServerConfig, TlsAcceptor, TlsVersion};
+use courierust::courierust_tls::{Identity, ServerConfig, TlsAcceptor, TlsVersion};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
-/// Poll interval of the accept loop while idle.
-const ACCEPT_POLL: Duration = Duration::from_millis(5);
+/// Upper bound on concurrently served DoT connections (one thread each).
+const MAX_CONNECTIONS: usize = 512;
 
 /// DoT server configuration.
 #[derive(Debug, Clone)]
@@ -49,8 +53,9 @@ pub struct DotServer {
     config: DotServerConfig,
     /// DNS resolver.
     resolver: Arc<DnsResolver>,
-    /// TLS identity (cert chain + key).
-    identity: TlsIdentity,
+    /// TLS acceptor (identity validated at construction, ticket key stable
+    /// for the listener's lifetime).
+    acceptor: Arc<TlsAcceptor>,
     /// Shutdown signal.
     shutdown: CancellationToken,
 }
@@ -64,13 +69,22 @@ impl DotServer {
             ));
         }
 
-        let identity = TlsIdentity::from_pem_files(&config.cert_path, &config.key_path)
-            .map_err(|e| DnsError::Config(format!("Failed to load TLS identity: {e}")))?;
+        // `Identity::from_pem_file` proves that the key matches the leaf
+        // certificate, so a misconfigured pair fails here instead of failing
+        // every handshake later.
+        let identity = Identity::from_pem_file(&config.cert_path, &config.key_path)
+            .map_err(|e| DnsError::Config(format!("Failed to load DoT TLS identity: {e}")))?;
+        let acceptor = Arc::new(TlsAcceptor::new(ServerConfig {
+            identity,
+            min_version: TlsVersion::Tls12,
+            max_version: TlsVersion::Tls13,
+            ..ServerConfig::default()
+        }));
 
         Ok(Self {
             config,
             resolver,
-            identity,
+            acceptor,
             shutdown: CancellationToken::new(),
         })
     }
@@ -80,49 +94,25 @@ impl DotServer {
     pub fn start(&self) -> Result<()> {
         let listener = TcpListener::bind(self.config.listen).map_err(DnsError::Io)?;
         listener.set_nonblocking(true).map_err(DnsError::Io)?;
-        info!("DoT server listening on {}", self.config.listen);
 
-        let resolver = self.resolver.clone();
-        let identity = self.identity.clone();
+        let resolver = Arc::clone(&self.resolver);
+        let acceptor = Arc::clone(&self.acceptor);
         let timeout = Duration::from_secs(self.config.timeout_secs);
-        let shutdown = self.shutdown.clone();
 
-        // Accept loop on a dedicated thread (non-blocking poll + token).
-        let accept_thread = std::thread::Builder::new()
-            .name("corduit-dot-accept".into())
-            .spawn(move || {
-                while !shutdown.is_cancelled() {
-                    match listener.accept() {
-                        Ok((stream, addr)) => {
-                            // Windows: accepted sockets inherit the
-                            // listener's non-blocking mode; switch back so
-                            // the blocking TLS exchange + timeouts work.
-                            let _ = stream.set_nonblocking(false);
-                            let resolver = resolver.clone();
-                            let identity = identity.clone();
-                            std::thread::Builder::new()
-                                .name("corduit-dot-conn".into())
-                                .spawn(move || {
-                                    if let Err(e) = handle_connection(
-                                        stream, addr, &resolver, &identity, timeout,
-                                    ) {
-                                        debug!("DoT connection error from {}: {}", addr, e);
-                                    }
-                                })
-                                .ok();
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            shutdown.wait(ACCEPT_POLL);
-                        }
-                        Err(_) => break,
-                    }
+        let mut server = ConnectionListener::new(listener, self.config.listen, MAX_CONNECTIONS);
+        server
+            .start("corduit-dot-conn", move |stream, addr| {
+                if let Err(e) = handle_connection(stream, addr, &resolver, &acceptor, timeout) {
+                    debug!("DoT connection error from {}: {}", addr, e);
                 }
             })
             .map_err(DnsError::Io)?;
+        info!("DoT server listening on {}", self.config.listen);
 
-        // Wait for shutdown, then join the accept thread.
-        self.shutdown.wait(std::time::Duration::from_secs(u64::MAX));
-        let _ = accept_thread.join();
+        // Serve until `stop` is called, then tear the listener down; the
+        // token is the only cross-thread signal this server needs.
+        self.shutdown.wait(Duration::from_secs(u64::MAX));
+        server.stop();
         info!("DoT server stopped");
         Ok(())
     }
@@ -144,7 +134,7 @@ fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     resolver: &DnsResolver,
-    identity: &TlsIdentity,
+    acceptor: &Arc<TlsAcceptor>,
     timeout: Duration,
 ) -> Result<()> {
     trace!("DoT connection from {}", addr);
@@ -152,17 +142,6 @@ fn handle_connection(
     let _ = stream.set_write_timeout(Some(timeout));
 
     let stream = Arc::new(stream);
-    let acceptor = TlsAcceptor::new(ServerConfig {
-        identity: courierust::courierust_tls::Identity {
-            cert_chain: identity.cert_chain.clone(),
-            private_key: identity.private_key.clone(),
-            is_rsa: identity.is_rsa,
-        },
-        alpn: Vec::new(),
-        min_version: TlsVersion::Tls12,
-        max_version: TlsVersion::Tls13,
-        session_ticket_key: None,
-    });
     let mut tls = acceptor
         .accept(stream.clone(), stream.clone())
         .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {e}")))?;

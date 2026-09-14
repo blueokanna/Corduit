@@ -98,10 +98,6 @@ pub struct TcpConnection {
     is_websocket: bool,
     recv_window: u32,
     last_window_update: u32,
-    #[allow(dead_code)]
-    cwnd: u32,
-    #[allow(dead_code)]
-    ssthresh: u32,
     dup_ack_count: u32,
 }
 
@@ -111,14 +107,13 @@ impl TcpConnection {
         their_seq: u32,
         their_mss: Option<u16>,
         domain: Option<String>,
+        config: TcpConfig,
     ) -> Self {
-        let config = TcpConfig::default();
         let mut iss = [0u8; 4];
         getrandom::fill(&mut iss).expect("OS RNG unavailable");
         let iss = u32::from_le_bytes(iss);
         let mss = their_mss.unwrap_or(DEFAULT_MSS_V4).min(config.mss);
         let is_websocket = matches!(key.dst.port(), 80 | 443 | 8080 | 8443 | 9000);
-        let initial_cwnd = (10 * mss as u32).min(64 * 1024);
 
         Self {
             key,
@@ -143,8 +138,6 @@ impl TcpConnection {
             is_websocket,
             recv_window: 65535 * 4,
             last_window_update: 65535 * 4,
-            cwnd: initial_cwnd,
-            ssthresh: 65535 * 2,
             dup_ack_count: 0,
         }
     }
@@ -562,7 +555,7 @@ impl TcpConnection {
 /// TCP connection manager
 pub struct TcpManager {
     connections: DashMap<NatKey, Arc<RwLock<TcpConnection>>>,
-    #[allow(dead_code)]
+    /// Applied to every connection the manager opens.
     config: TcpConfig,
 }
 
@@ -591,7 +584,13 @@ impl TcpManager {
             return Ok(conn.clone());
         }
 
-        let conn = TcpConnection::new_passive(key, tcp_info.seq, tcp_info.mss, domain);
+        let conn = TcpConnection::new_passive(
+            key,
+            tcp_info.seq,
+            tcp_info.mss,
+            domain,
+            self.config.clone(),
+        );
         let conn = Arc::new(RwLock::new(conn));
         self.connections.insert(key, conn.clone());
 

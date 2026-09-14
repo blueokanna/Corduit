@@ -34,8 +34,6 @@ pub enum UdpSessionState {
 pub struct UdpSession {
     pub key: NatKey,
     state: UdpSessionState,
-    #[allow(dead_code)]
-    created_at: Instant,
     last_activity: Instant,
     bytes_sent: u64,
     bytes_recv: u64,
@@ -51,7 +49,6 @@ impl UdpSession {
         Self {
             key,
             state: UdpSessionState::Active,
-            created_at: now,
             last_activity: now,
             bytes_sent: 0,
             bytes_recv: 0,

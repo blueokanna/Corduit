@@ -89,8 +89,6 @@ impl DohClient {
 
     /// Create a new DoH client with configuration.
     pub fn with_config(config: DohClientConfig) -> Result<Self> {
-        // Strict URL validation (courierust's parser rejects bad ports,
-        // forbidden authority bytes, and non-http(s) schemes).
         let parsed = Url::parse(&config.url)
             .map_err(|e| DnsError::Config(format!("Invalid DoH URL: {}", e)))?;
         if parsed.scheme != "https" {
@@ -100,13 +98,11 @@ impl DohClient {
         let tls = TlsSettings {
             roots: system_root_store().clone(),
             verify: true,
-            // DoH benefits from HTTP/2 (one connection, multiplexed
-            // queries); fall back to HTTP/1.1 when the server only
-            // supports it.
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             now: unix_now(),
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
+            identity: None,
         };
         let client = Client::with_config(ClientConfig {
             http2: config.http2,

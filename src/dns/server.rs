@@ -2,6 +2,7 @@
 
 use crate::common::cancel::CancellationToken;
 use crate::common::exec;
+use crate::common::listener::ConnectionListener;
 use crate::common::socket;
 use crate::dns::config::DnsConfig;
 use crate::dns::error::{DnsError, Result};
@@ -16,8 +17,8 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Idle poll interval for the UDP receive loop.
 const UDP_POLL: Duration = Duration::from_millis(50);
-/// Idle poll interval for the TCP accept loop.
-const ACCEPT_POLL: Duration = Duration::from_millis(20);
+/// Upper bound on concurrently served TCP DNS connections (one thread each).
+const MAX_TCP_CONNECTIONS: usize = 512;
 
 /// DNS server
 pub struct DnsServer {
@@ -49,12 +50,17 @@ impl DnsServer {
         self.start_udp_server()?;
 
         // Start TCP server if enabled
-        if self.config.tcp_enable {
-            self.start_tcp_server()?;
-        }
+        let tcp = if self.config.tcp_enable {
+            Some(self.start_tcp_server()?)
+        } else {
+            None
+        };
 
-        // Wait for shutdown
+        // Wait for shutdown, then tear the TCP listener down.
         self.shutdown.wait(Duration::from_secs(u64::MAX));
+        if let Some(mut tcp) = tcp {
+            tcp.stop();
+        }
         info!("DNS server shutting down");
         Ok(())
     }
@@ -112,51 +118,23 @@ impl DnsServer {
         Ok(())
     }
 
-    /// Start TCP DNS server on a dedicated accept thread.
-    fn start_tcp_server(&self) -> Result<()> {
+    /// Start the TCP DNS server; returns the listener handle for shutdown.
+    fn start_tcp_server(&self) -> Result<ConnectionListener> {
         let listener = TcpListener::bind(self.config.listen).map_err(DnsError::Io)?;
         listener.set_nonblocking(true).map_err(DnsError::Io)?;
-        let resolver = self.resolver.clone();
-        let shutdown = self.shutdown.clone();
+        let resolver = Arc::clone(&self.resolver);
 
-        info!("TCP DNS server listening on {}", self.config.listen);
-
-        std::thread::Builder::new()
-            .name("corduit-dns-tcp".into())
-            .spawn(move || {
-                loop {
-                    if shutdown.is_cancelled() {
-                        break;
-                    }
-
-                    match listener.accept() {
-                        Ok((stream, addr)) => {
-                            // Windows: accepted sockets inherit the
-                            // listener's non-blocking mode; switch back so
-                            // read timeouts work on the connection.
-                            let _ = stream.set_nonblocking(false);
-                            let resolver = resolver.clone();
-
-                            exec::spawn(move || {
-                                if let Err(e) = handle_tcp_connection(stream, &resolver) {
-                                    debug!("TCP connection error from {}: {}", addr, e);
-                                }
-                            });
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // Idle — poll again shortly (also wakes on cancel).
-                            shutdown.wait(ACCEPT_POLL);
-                        }
-                        Err(e) => {
-                            error!("TCP accept error: {}", e);
-                            shutdown.wait(ACCEPT_POLL);
-                        }
-                    }
+        let mut server = ConnectionListener::new(listener, self.config.listen, MAX_TCP_CONNECTIONS);
+        server
+            .start("corduit-dns-tcp-conn", move |stream, addr| {
+                if let Err(e) = handle_tcp_connection(stream, &resolver) {
+                    debug!("TCP connection error from {}: {}", addr, e);
                 }
             })
             .map_err(DnsError::Io)?;
 
-        Ok(())
+        info!("TCP DNS server listening on {}", self.config.listen);
+        Ok(server)
     }
 
     /// Stop the DNS server

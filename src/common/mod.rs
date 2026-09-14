@@ -21,8 +21,8 @@
 //! * [`http`] — an HTTP client built on `courierust` (replacing `hyper` +
 //!   `rustls`): GET with timeout, redirect following, optional HTTP proxy,
 //!   bounded bodies.
-//! * [`http_server`] — a small blocking HTTP/1.1 server on courierust's H/1
-//!   codec and TLS, with graceful stop and per-connection threads.
+//! * [`listener`] — the accept loop and connection budget shared by the
+//!   in-process servers, on top of courierust's per-connection engine.
 //! * [`roots`] — system root-certificate loading for courierust's TLS stack
 //!   (Windows cert store, Linux bundle, Android cacerts).
 //!
@@ -56,7 +56,7 @@ pub mod exec;
 #[cfg(feature = "std")]
 pub mod http;
 #[cfg(feature = "std")]
-pub mod http_server;
+pub mod listener;
 #[cfg(feature = "std")]
 pub mod lru;
 #[cfg(feature = "std")]

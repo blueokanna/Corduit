@@ -6,8 +6,6 @@ use crate::crypto::hash::Blake2s;
 pub const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 pub const IDENTIFIER: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
 pub const LABEL_MAC1: &[u8] = b"mac1----";
-#[allow(dead_code)]
-pub const LABEL_COOKIE: &[u8] = b"cookie--";
 
 pub const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);

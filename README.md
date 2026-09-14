@@ -103,23 +103,24 @@ chosen for what it is measurably good at:
 
 ```mermaid
 flowchart TB
-    L["accept loop<br/>one thread per listener"] -->|accepted socket| P["courierust work-stealing pool<br/>short tasks: handshake, routing, DNS, control plane"]
-    P -->|dial + handshake done| G{"SessionGate<br/>admission control"}
+    L["accept loop<br/>one thread per listener"] -->|accepted socket| S["connection thread<br/>courierust's per-connection engine<br/>HTTP/1.1 · h2c · CONNECT tunnels"]
+    S -->|dial + handshake| G{"connection budget<br/>admission control"}
     G -->|admitted| R["relay threads<br/>2 per connection, one per direction"]
     R -->|EOF| HC["half-close the opposite transport"]
     R -->|cancel token| SD["shutdown both transports"]
-    P -->|timers| T["timer wheel<br/>health checks · provider refresh"]
+    P["courierust work-stealing pool<br/>short tasks: DNS · control plane · timers"] -->|timers| T["timer wheel<br/>health checks · provider refresh"]
 ```
 
-1. **Short tasks** — accept dispatch, handshakes, DNS lookups, control plane,
-   periodic refresh — run on **courierust's work-stealing thread pool**
-   (per-worker LIFO caches, a global FIFO, cross-worker stealing, zero CPU when
-   idle).
+1. **Short tasks** — DNS lookups, control plane, periodic refresh, timer
+   callbacks — run on **courierust's work-stealing thread pool** (per-worker
+   LIFO caches, a global FIFO, cross-worker stealing, zero CPU when idle).
 2. **Long-lived relays** run on **dedicated threads**, two per connection, one
    per direction, with proper half-close semantics. Their number is bounded by
    a `SessionGate`, so relays can never starve the pool of handshake capacity.
-3. **Accept loops** run one thread per listener and hand each accepted socket
-   to the pool.
+3. **Accept loops** run one thread per listener and serve each accepted socket
+   with **courierust's per-connection engine** on a thread of its own; the
+   listener's connection budget applies backpressure to the accept loop, so a
+   herd of idle clients cannot grow unbounded threads.
 
 Blocking is bounded by socket timeouts (`SO_RCVTIMEO` / `SO_SNDTIMEO`).
 `WouldBlock` / `TimedOut` mean *nothing happened yet*, and each loop re-checks a
@@ -216,18 +217,22 @@ handshake runs the TLS 1.3 key schedule itself, and streams are synchronous
 
 ```mermaid
 sequenceDiagram
-    participant C as Corduit (client)
+    participant C as Corduit client
     participant S as QUIC server
 
-    C->>S: Initial — CRYPTO[ClientHello]
-    Note over C,S: Keys from the DCID (RFC 9001 §5.2);<br/>Initial/Handshake keys derived from the TLS secrets
-    S->>C: Initial — CRYPTO[ServerHello] + ACK
-    S->>C: Handshake — CRYPTO[EncryptedExtensions, Certificate, CertificateVerify, Finished]
-    C->>C: verify chain (courierust_tls::x509) + CertificateVerify signature
-    C->>S: Handshake — CRYPTO[Finished] + ACK
-    Note over C,S: 1-RTT: application keys installed,<br/>three packet-number spaces, PTO loss recovery, NewReno, flow control
-    C->>S: 1-RTT — STREAM / DATAGRAM (RFC 9221)
-    S->>C: 1-RTT — STREAM / DATAGRAM
+    C->>S: Initial - CRYPTO ClientHello
+    Note over C,S: Keys derived from DCID<br/>Initial and Handshake keys from TLS secrets
+
+    S->>C: Initial - CRYPTO ServerHello + ACK
+    S->>C: Handshake - CRYPTO EncryptedExtensions, Certificate, CertificateVerify, Finished
+
+    C->>C: Verify certificate chain and CertificateVerify signature
+    C->>S: Handshake - CRYPTO Finished + ACK
+
+    Note over C,S: 1-RTT application keys installed<br/>Three packet number spaces<br/>PTO loss recovery, NewReno, flow control
+
+    C->>S: 1-RTT - STREAM or DATAGRAM
+    S->>C: 1-RTT - STREAM or DATAGRAM
 ```
 
 On top of that transport sit TUIC v5 (`tuic`) and Hysteria2 (`hysteria2`).
@@ -353,8 +358,8 @@ src/
 ├── ffi.rs          # hand-written C ABI
 ├── rpc/            # shared dispatch + localhost HTTP/WebSocket JSON-RPC
 ├── types.rs        # shared DTOs
-├── common/         # pool overlay, sockets, relay, timers, cancellation, URL,
-│                   #   courierust HTTP client/server, root certificates
+├── common/         # pool overlay, sockets, relay, listener, timers,
+│                   #   cancellation, URL, courierust HTTP client, root certificates
 ├── engine/         # config, routing, inbounds, outbounds, providers, stats
 ├── crypto/         # crypto primitives + text codecs (no_std)
 ├── protocol/       # wire protocols: QUIC v1, TLS 1.3, REALITY, WebSocket, WireGuard

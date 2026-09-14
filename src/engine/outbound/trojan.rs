@@ -20,23 +20,10 @@ pub enum TrojanCommand {
     UdpAssociate = 0x03,
 }
 
-impl TrojanCommand {
-    #[allow(dead_code)]
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0x01 => Some(TrojanCommand::Connect),
-            0x03 => Some(TrojanCommand::UdpAssociate),
-            _ => None,
-        }
-    }
-}
-
 pub struct TrojanOutbound {
     config: OutboundConfig,
     server: String,
     port: u16,
-    #[allow(dead_code)]
-    password: String,
     password_hash: [u8; 56],
     sni: String,
     skip_cert_verify: bool,
@@ -106,7 +93,6 @@ impl TrojanOutbound {
             config,
             server,
             port,
-            password,
             password_hash,
             sni,
             skip_cert_verify,
@@ -560,18 +546,6 @@ mod tests {
         let expected = hex_encode(&hasher.finalize());
 
         assert_eq!(hash_str, expected);
-    }
-
-    #[test]
-    fn test_trojan_command_from_u8() {
-        assert_eq!(TrojanCommand::from_u8(0x01), Some(TrojanCommand::Connect));
-        assert_eq!(
-            TrojanCommand::from_u8(0x03),
-            Some(TrojanCommand::UdpAssociate)
-        );
-        assert_eq!(TrojanCommand::from_u8(0x00), None);
-        assert_eq!(TrojanCommand::from_u8(0x02), None);
-        assert_eq!(TrojanCommand::from_u8(0xFF), None);
     }
 
     #[test]

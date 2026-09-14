@@ -16,20 +16,6 @@ const VLESS_VERSION: u8 = 0x00;
 pub enum VlessCommand {
     Tcp = 0x01,
     Udp = 0x02,
-    #[allow(dead_code)]
-    Mux = 0x03,
-}
-
-impl VlessCommand {
-    #[allow(dead_code)]
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0x01 => Some(VlessCommand::Tcp),
-            0x02 => Some(VlessCommand::Udp),
-            0x03 => Some(VlessCommand::Mux),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,31 +58,10 @@ pub enum VlessAddressType {
     Ipv6 = 0x03,
 }
 
-#[allow(dead_code)]
-pub struct VlessRequest {
-    pub version: u8,
-    pub uuid: [u8; 16],
-    pub addons_len: u8,
-    pub addons: Vec<u8>,
-    pub command: VlessCommand,
-    pub port: u16,
-    pub address_type: VlessAddressType,
-    pub address: Vec<u8>,
-}
-
-#[allow(dead_code)]
-pub struct VlessResponse {
-    pub version: u8,
-    pub addons_len: u8,
-    pub addons: Vec<u8>,
-}
-
 pub struct VlessOutbound {
     config: OutboundConfig,
     server: String,
     port: u16,
-    #[allow(dead_code)]
-    uuid: Uuid,
     uuid_bytes: [u8; 16],
     flow: VlessFlow,
     sni: String,
@@ -176,7 +141,6 @@ impl VlessOutbound {
             config,
             server,
             port,
-            uuid,
             uuid_bytes,
             flow,
             sni,
@@ -620,15 +584,6 @@ fn read_http_response(stream: &mut dyn Read, deadline: Instant) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_vless_command_from_u8() {
-        assert_eq!(VlessCommand::from_u8(0x01), Some(VlessCommand::Tcp));
-        assert_eq!(VlessCommand::from_u8(0x02), Some(VlessCommand::Udp));
-        assert_eq!(VlessCommand::from_u8(0x03), Some(VlessCommand::Mux));
-        assert_eq!(VlessCommand::from_u8(0x00), None);
-        assert_eq!(VlessCommand::from_u8(0xFF), None);
-    }
 
     #[test]
     fn test_vless_flow_from_str() {

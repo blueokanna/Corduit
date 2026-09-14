@@ -18,20 +18,3 @@ impl Default for ClientConfig {
         }
     }
 }
-
-#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
-pub struct ServerConfig {
-    pub certificate: String,
-    pub private_key: String,
-    pub alpn: Vec<String>,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            certificate: String::new(),
-            private_key: String::new(),
-            alpn: vec!["h2".into(), "http/1.1".into()],
-        }
-    }
-}

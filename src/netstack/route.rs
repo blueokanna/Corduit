@@ -25,7 +25,13 @@ pub struct RouteEntry {
     pub metric: u32,
 }
 
-/// Route manager for TUN mode
+/// Route manager for TUN mode.
+///
+/// Windows keeps routes in a table addressed by *interface index* and takes
+/// index-based `route.exe` commands; Unix shells out to `ip route` / `route`
+/// with *interface names*. Half of the configuration is therefore only read
+/// on one platform, which is why the struct as a whole is exempt from the
+/// dead-code lint.
 #[allow(dead_code)]
 pub struct RouteManager {
     /// TUN interface index
@@ -449,8 +455,8 @@ impl Drop for RouteManager {
     }
 }
 
-/// Convert prefix length to netmask string
-#[allow(dead_code)]
+/// Convert a prefix length to a dotted netmask (`route.exe` wants a mask).
+#[cfg(any(windows, test))]
 fn prefix_to_netmask(prefix: u8) -> String {
     if prefix == 0 {
         return "0.0.0.0".to_string();

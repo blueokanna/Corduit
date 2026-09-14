@@ -58,28 +58,4 @@ pub enum NetStackError {
     InvalidConfig(String),
 }
 
-impl From<smoltcp::socket::tcp::RecvError> for NetStackError {
-    fn from(e: smoltcp::socket::tcp::RecvError) -> Self {
-        NetStackError::TcpError(format!("TCP recv error: {:?}", e))
-    }
-}
-
-impl From<smoltcp::socket::tcp::SendError> for NetStackError {
-    fn from(e: smoltcp::socket::tcp::SendError) -> Self {
-        NetStackError::TcpError(format!("TCP send error: {:?}", e))
-    }
-}
-
-impl From<smoltcp::socket::udp::RecvError> for NetStackError {
-    fn from(e: smoltcp::socket::udp::RecvError) -> Self {
-        NetStackError::UdpError(format!("UDP recv error: {:?}", e))
-    }
-}
-
-impl From<smoltcp::socket::udp::SendError> for NetStackError {
-    fn from(e: smoltcp::socket::udp::SendError) -> Self {
-        NetStackError::UdpError(format!("UDP send error: {:?}", e))
-    }
-}
-
 pub type Result<T> = std::result::Result<T, NetStackError>;
