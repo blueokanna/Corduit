@@ -212,6 +212,12 @@ pub struct VmessOutbound {
     cipher: VmessCipher,
     udp_enabled: bool,
     cmd_key: [u8; 16],
+    /// `alterId > 0` asks for the pre-AEAD handshake (what Clash-family
+    /// clients send and what legacy-configured servers accept).
+    legacy: bool,
+    /// The alter-ID chain a legacy server accepts, primary UUID last. One
+    /// entry is picked per connection, exactly like the reference client.
+    alter_uuids: Vec<[u8; 16]>,
     transport: VmessTransport,
     tls_enabled: bool,
     skip_cert_verify: bool,
@@ -267,10 +273,17 @@ impl VmessOutbound {
             .get("alterId")
             .or_else(|| config.options.get("alter-id"))
             .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        if alter_id != 0 {
+            .unwrap_or(0)
+            .clamp(0, u16::MAX as i64) as u16;
+        let legacy = alter_id > 0;
+        let alter_uuids = if legacy {
+            build_alter_list(uuid_bytes, alter_id)
+        } else {
+            Vec::new()
+        };
+        if legacy {
             tracing::info!(
-                "VMess '{}' declares alterId={alter_id}; the AEAD handshake does not use it",
+                "VMess '{}': alterId={alter_id}, using the pre-AEAD handshake (legacy mode)",
                 config.tag
             );
         }
@@ -400,6 +413,8 @@ impl VmessOutbound {
             cipher,
             udp_enabled,
             cmd_key,
+            legacy,
+            alter_uuids,
             transport,
             tls_enabled,
             skip_cert_verify,
@@ -445,6 +460,11 @@ impl VmessOutbound {
     }
 
     fn generate_response_key(&self, request_key: &[u8; 16]) -> [u8; 16] {
+        if self.legacy {
+            let mut hasher = Md5::new();
+            hasher.update(request_key);
+            return hasher.finalize();
+        }
         let mut hasher = Sha256::new();
         hasher.update(request_key);
         let result = hasher.finalize();
@@ -454,6 +474,11 @@ impl VmessOutbound {
     }
 
     fn generate_response_iv(&self, request_iv: &[u8; 16]) -> [u8; 16] {
+        if self.legacy {
+            let mut hasher = Md5::new();
+            hasher.update(request_iv);
+            return hasher.finalize();
+        }
         let mut hasher = Sha256::new();
         hasher.update(request_iv);
         let result = hasher.finalize();
@@ -462,7 +487,11 @@ impl VmessOutbound {
         iv
     }
 
-    pub fn seal_header(&self, header: &VmessHeader, timestamp: i64) -> Result<Vec<u8>> {
+    /// The plaintext request header body shared by both handshakes: version,
+    /// body keys, option, command, target and the FNV-1a checksum the server
+    /// verifies (against the CFB-decrypted bytes in legacy mode, against the
+    /// plaintext it opens in AEAD mode).
+    fn build_header_plaintext(&self, header: &VmessHeader) -> Vec<u8> {
         let mut header_buf = Vec::with_capacity(128);
 
         header_buf.push(header.version);
@@ -489,6 +518,41 @@ impl VmessOutbound {
 
         let fnv_hash = fnv1a_hash(&header_buf);
         header_buf.extend_from_slice(&fnv_hash.to_be_bytes());
+
+        header_buf
+    }
+
+    /// The pre-AEAD request header, wire-compatible with Clash-family
+    /// clients (`transport/vmess` of mihomo / Clash.Meta:
+    /// `HMAC-MD5(alterUUID, timestamp)` followed by the whole header
+    /// encrypted with AES-128-CFB keyed by `MD5(uuid ‖ salt)` and the
+    /// timestamp-derived IV). Legacy servers reject the AEAD handshake and
+    /// close the connection before any error can surface, which is exactly
+    /// the "silent quarter-second disconnect" this path removes.
+    fn seal_header_legacy(&self, header: &VmessHeader, timestamp: i64) -> Result<Vec<u8>> {
+        if self.alter_uuids.is_empty() {
+            return Err(Error::config(
+                "legacy VMess requires an alter-ID list; none was derived",
+            ));
+        }
+
+        let selected =
+            self.alter_uuids[(crate::engine::random::u32() as usize) % self.alter_uuids.len()];
+
+        let mut auth = [0u8; 16];
+        crate::crypto::mac::Hmac::<Md5>::mac_into(&selected, &timestamp.to_be_bytes(), &mut auth);
+
+        let mut body = self.build_header_plaintext(header);
+        aes128_cfb_encrypt(&self.cmd_key, &legacy_timestamp_iv(timestamp), &mut body)?;
+
+        let mut result = Vec::with_capacity(16 + body.len());
+        result.extend_from_slice(&auth);
+        result.extend_from_slice(&body);
+        Ok(result)
+    }
+
+    pub fn seal_header(&self, header: &VmessHeader, timestamp: i64) -> Result<Vec<u8>> {
+        let header_buf = self.build_header_plaintext(header);
 
         let auth_id = self.generate_auth_id(timestamp);
         let connection_nonce = generate_connection_nonce();
@@ -554,6 +618,24 @@ impl VmessOutbound {
         expected_response_header: u8,
         deadline: Option<Instant>,
     ) -> Result<()> {
+        if self.legacy {
+            let mut block = [0u8; 4];
+            read_exact_with_deadline(stream, &mut block, deadline)?;
+            aes128_cfb_decrypt(response_key, response_iv, &mut block)?;
+            if block[0] != expected_response_header {
+                return Err(Error::protocol(format!(
+                    "Unexpected response header byte: expected {expected_response_header}, got {}",
+                    block[0]
+                )));
+            }
+            if block[2] != 0 {
+                return Err(Error::protocol(
+                    "legacy VMess response carries a dynamic port, which is not supported",
+                ));
+            }
+            return Ok(());
+        }
+
         let mut encrypted_length = [0u8; 2 + VMESS_AEAD_AUTH_LEN];
         read_exact_with_deadline(stream, &mut encrypted_length, deadline)?;
         let length = open_response_header_length(response_key, response_iv, &encrypted_length)
@@ -596,7 +678,6 @@ impl VmessOutbound {
     /// Connect with TLS if enabled (courierust TLS, boxed sync stream).
     fn connect_tls(&self) -> Result<BoxStream> {
         let tcp_stream = self.connect_tcp()?;
-
         let sni = self.sni.as_deref().unwrap_or(&self.server).to_string();
         if !self.advanced.is_empty() {
             return crate::engine::tls::connect_advanced_tls(
@@ -711,7 +792,11 @@ impl VmessOutbound {
             .unwrap()
             .as_secs() as i64;
 
-        let sealed_header = self.seal_header(&header, timestamp)?;
+        let sealed_header = if self.legacy {
+            self.seal_header_legacy(&header, timestamp)?
+        } else {
+            self.seal_header(&header, timestamp)?
+        };
 
         stream
             .write_all(&sealed_header)
@@ -750,7 +835,6 @@ impl VmessOutbound {
 
         let response_key = self.generate_response_key(&request_key);
         let response_iv = self.generate_response_iv(&request_iv);
-
         let session = Arc::new(VmessUdpSession::new(
             stream,
             request_key,
@@ -802,7 +886,6 @@ impl VmessOutbound {
 
         let encrypted_data = self.encrypt_chunk(data, &request_key, &request_iv, chunk_count)?;
         if let Err(e) = stream_guard.write_all(&encrypted_data) {
-            // Session might be broken, remove it
             drop(stream_guard);
             self.udp_sessions.remove(&target_str);
             return Err(Error::network(format!("Failed to send UDP data: {}", e)));
@@ -861,9 +944,7 @@ impl VmessOutbound {
         let chunk_count = session.next_chunk_count();
         let request_key = session.request_key;
         let request_iv = session.request_iv;
-
         let encrypted_data = self.encrypt_chunk(data, &request_key, &request_iv, chunk_count)?;
-
         let mut stream_guard = session.stream.lock();
         stream_guard
             .write_all(&encrypted_data)
@@ -1195,9 +1276,7 @@ impl OutboundProxy for VmessOutbound {
 
         let start = Instant::now();
 
-        // Use connect_stream to support TLS
         let mut stream = self.connect_stream()?;
-
         let target = TargetAddr::Domain(host.clone(), url_port);
         let (request_key, request_iv, response_header) =
             self.handshake(&mut *stream, &target, VmessCommand::Tcp)?;
@@ -1215,8 +1294,6 @@ impl OutboundProxy for VmessOutbound {
 
         let response_key = self.generate_response_key(&request_key);
         let response_iv = self.generate_response_iv(&request_iv);
-
-        // Bounded response read: retry transient timeouts up to the deadline.
         let deadline = Instant::now() + timeout;
         self.read_response_header(
             &mut *stream,
@@ -1249,21 +1326,12 @@ impl OutboundProxy for VmessOutbound {
         target: TargetAddr,
         connection: Option<Arc<TrackedConnection>>,
     ) -> Result<()> {
-        // Use connect_stream to support TLS / WebSocket
         let mut stream = self.connect_stream()?;
         let (request_key, request_iv, response_header) =
             self.handshake(&mut *stream, &target, VmessCommand::Tcp)?;
 
         let response_key = self.generate_response_key(&request_key);
         let response_iv = self.generate_response_iv(&request_iv);
-
-        // The response header is *not* read here. The reference server
-        // buffers it and only flushes it together with the first target
-        // payload (v2ray `transferResponse`), so waiting for it before the
-        // request body has been forwarded deadlocks the connection: the
-        // target never answers a request that is still parked in this
-        // thread. The downlink reader consumes it lazily instead, once the
-        // relay has pushed the request out.
         let vmess_stream = VmessStream::new(
             stream,
             self.cipher,
@@ -1272,6 +1340,7 @@ impl OutboundProxy for VmessOutbound {
             response_key,
             response_iv,
             response_header,
+            self.legacy,
         );
 
         tracing::debug!(
@@ -1282,8 +1351,6 @@ impl OutboundProxy for VmessOutbound {
             self.tls_enabled
         );
 
-        // Wrap the stream with the VMess chunked-encryption codec and let the
-        // bidirectional relay drive both directions concurrently.
         relay_streams!(inbound, vmess_stream, connection)
     }
 }
@@ -1299,6 +1366,8 @@ impl OutboundProxy for VmessOutbound {
 /// count across calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownlinkStage {
+    /// Assembling the four-byte legacy response header (CFB-encrypted).
+    LegacyHeader,
     /// Assembling the 18-byte encrypted length block of the response header.
     HeaderLength,
     /// Assembling the response header payload (`length + 16` bytes).
@@ -1360,7 +1429,16 @@ impl VmessStream {
         dec_key: [u8; 16],
         dec_iv: [u8; 16],
         expected_response_header: u8,
+        legacy: bool,
     ) -> Self {
+        let (stage, fill) = if legacy {
+            (DownlinkStage::LegacyHeader, vec![0u8; 4])
+        } else {
+            (
+                DownlinkStage::HeaderLength,
+                vec![0u8; 2 + VMESS_AEAD_AUTH_LEN],
+            )
+        };
         Self {
             inner: parking_lot::Mutex::new(inner),
             cipher,
@@ -1370,8 +1448,8 @@ impl VmessStream {
             dec_iv,
             enc_count: AtomicU16::new(0),
             dec_count: 0,
-            stage: DownlinkStage::HeaderLength,
-            fill: vec![0u8; 2 + VMESS_AEAD_AUTH_LEN],
+            stage,
+            fill,
             filled: 0,
             expected_response_header: Some(expected_response_header),
             read_buffer: Vec::new(),
@@ -1421,6 +1499,27 @@ impl VmessStream {
     /// Never blocks and never reads.
     fn advance_stage(&mut self) -> std::io::Result<()> {
         match self.stage {
+            DownlinkStage::LegacyHeader => {
+                let mut block = [0u8; 4];
+                block.copy_from_slice(&self.fill);
+                aes128_cfb_decrypt(&self.dec_key, &self.dec_iv, &mut block)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                if let Some(expected) = self.expected_response_header {
+                    if block[0] != expected {
+                        return Err(std::io::Error::other(format!(
+                            "vmess: response header byte mismatch (expected {expected}, got {})",
+                            block[0]
+                        )));
+                    }
+                    self.expected_response_header = None;
+                }
+                if block[2] != 0 {
+                    return Err(std::io::Error::other(
+                        "vmess: legacy response carries a dynamic port, which is not supported",
+                    ));
+                }
+                self.begin_chunk_length();
+            }
             DownlinkStage::HeaderLength => {
                 let length = open_response_header_length(&self.dec_key, &self.dec_iv, &self.fill)?;
                 if length > VMESS_RESPONSE_HEADER_MAX {
@@ -1492,7 +1591,6 @@ impl VmessStream {
 impl Read for VmessStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            // Serve buffered plaintext first.
             if self.read_pos < self.read_buffer.len() {
                 let n = (self.read_buffer.len() - self.read_pos).min(buf.len());
                 buf[..n].copy_from_slice(&self.read_buffer[self.read_pos..self.read_pos + n]);
@@ -1580,6 +1678,95 @@ fn generate_cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
     hasher.update(uuid);
     hasher.update(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
     hasher.finalize()
+}
+
+/// First salt of the alter-ID chain (v2ray `proxy/vmess/encoding/auth.go`).
+const ALTER_NEXT_SALT: &[u8] = b"16167dc8-16b6-4e6d-b8bb-65dd68113a81";
+/// Second salt, folded in only in the (practically impossible) case the
+/// chain maps an ID onto itself.
+const ALTER_NEXT_RETRY_SALT: &[u8] = b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2";
+
+/// One step of the alter-ID chain: `MD5(uuid ‖ "16167dc8-…")`, retrying
+/// with the second salt appended when the digest equals the input.
+fn next_alter_uuid(uuid_bytes: &[u8; 16]) -> [u8; 16] {
+    let mut input = Vec::with_capacity(52);
+    input.extend_from_slice(uuid_bytes);
+    input.extend_from_slice(ALTER_NEXT_SALT);
+    loop {
+        let mut hasher = Md5::new();
+        hasher.update(&input);
+        let next = hasher.finalize();
+        if next != *uuid_bytes {
+            return next;
+        }
+        input.extend_from_slice(ALTER_NEXT_RETRY_SALT);
+    }
+}
+
+/// The list a legacy server accepts: every chained alter ID, the primary
+/// UUID last (mihomo `newAlterIDs`). The client picks one per connection.
+fn build_alter_list(primary: [u8; 16], count: u16) -> Vec<[u8; 16]> {
+    let mut list = Vec::with_capacity(count as usize + 1);
+    let mut prev = primary;
+    for _ in 0..count {
+        let next = next_alter_uuid(&prev);
+        list.push(next);
+        prev = next;
+    }
+    list.push(primary);
+    list
+}
+
+/// The legacy AES-128-CFB IV for a timestamp: `MD5(u64be(ts) × 4)`.
+fn legacy_timestamp_iv(timestamp: i64) -> [u8; 16] {
+    let ts = timestamp.to_be_bytes();
+    let mut input = [0u8; 32];
+    input[..8].copy_from_slice(&ts);
+    input[8..16].copy_from_slice(&ts);
+    input[16..24].copy_from_slice(&ts);
+    input[24..].copy_from_slice(&ts);
+    let mut hasher = Md5::new();
+    hasher.update(&input);
+    hasher.finalize()
+}
+
+/// AES-128-CFB (CFB-128) encryption in place.
+fn aes128_cfb_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) -> Result<()> {
+    aes128_cfb_xor(key, iv, data, true)
+}
+
+/// AES-128-CFB (CFB-128) decryption in place.
+fn aes128_cfb_decrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) -> Result<()> {
+    aes128_cfb_xor(key, iv, data, false)
+}
+
+/// `c = p ⊕ E(feedback)` with the **ciphertext** block feeding the next
+/// keystream block; `encrypting` only selects where that ciphertext is taken
+/// from (after the XOR when writing, before it when reading), because the
+/// buffer is transformed in place and CFB's feedback is always ciphertext.
+fn aes128_cfb_xor(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8], encrypting: bool) -> Result<()> {
+    let cipher = crate::crypto::stream::Aes::new(key)
+        .map_err(|e| Error::protocol(format!("AES-128-CFB key setup failed: {e:?}")))?;
+    let mut feedback = *iv;
+    for chunk in data.chunks_mut(16) {
+        let mut next_feedback = [0u8; 16];
+        let complete = chunk.len() == 16;
+        if complete && !encrypting {
+            next_feedback.copy_from_slice(chunk);
+        }
+        let mut keystream = feedback;
+        cipher.encrypt_block(&mut keystream);
+        for (index, byte) in chunk.iter_mut().enumerate() {
+            *byte ^= keystream[index];
+        }
+        if complete {
+            if encrypting {
+                next_feedback.copy_from_slice(chunk);
+            }
+            feedback = next_feedback;
+        }
+    }
+    Ok(())
 }
 
 /// The 32-byte ChaCha20-Poly1305 key of the reference implementation
@@ -2321,6 +2508,248 @@ mod property_tests {
         VmessOutbound::new(config).unwrap()
     }
 
+    fn create_legacy_test_outbound(alter_id: i64) -> VmessOutbound {
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "uuid".to_string(),
+            nextjson::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+        );
+        options.insert(
+            "cipher".to_string(),
+            nextjson::Value::String("aes-128-gcm".to_string()),
+        );
+        options.insert(
+            "alterId".to_string(),
+            nextjson::Value::Number(nextjson::Number::from(alter_id as i32)),
+        );
+
+        let config = OutboundConfig {
+            tag: "vmess-legacy-test".to_string(),
+            outbound_type: crate::engine::config::OutboundType::Vmess,
+            server: Some("server.example.com".to_string()),
+            port: Some(443),
+            options,
+        };
+
+        VmessOutbound::new(config).unwrap()
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            s.push_str(&format!("{byte:02x}"));
+        }
+        s
+    }
+
+    fn bytes16(hex: &str) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// CFB-128 against the published NIST SP 800-38A F.3.13 vector: the
+    /// legacy handshake seals the whole request header with AES-128-CFB, so
+    /// this mode has to be bit-exact.
+    #[test]
+    fn aes128_cfb_matches_the_fips_197_vector() {
+        let key = bytes16("2b7e151628aed2a6abf7158809cf4f3c");
+        let iv = bytes16("000102030405060708090a0b0c0d0e0f");
+        let plain = bytes16("6bc1bee22e409f96e93d7e117393172a")
+            .into_iter()
+            .chain(bytes16("ae2d8a571e03ac9c9eb76fac45af8e51"))
+            .collect::<Vec<u8>>();
+
+        let mut data = plain.clone();
+        aes128_cfb_encrypt(&key, &iv, &mut data).unwrap();
+        assert_eq!(
+            hex_of(&data),
+            "3b3fd92eb72dad20333449f8e83cfb4ac8a64537a0b3a93fcde3cdad9f1ce58b"
+        );
+
+        // Decryption is the same XOR against the ciphertext-fed keystream.
+        aes128_cfb_decrypt(&key, &iv, &mut data).unwrap();
+        assert_eq!(data, plain);
+    }
+
+    /// `MD5(u64be(ts) × 4)`, pinned against an independent .NET MD5 for the
+    /// same input: this IV keys the CFB seal of every legacy request.
+    #[test]
+    fn legacy_timestamp_iv_matches_the_reference_construction() {
+        assert_eq!(
+            hex_of(&legacy_timestamp_iv(1700000000)),
+            "7a29d7bdc972aaefb1f54e5205589e78"
+        );
+    }
+
+    /// `MD5(uuid ‖ "16167dc8-16b6-4e6d-b8bb-65dd68113a81")`, pinned against an
+    /// independent .NET MD5. The subscription's alter chain starts here.
+    #[test]
+    fn next_alter_uuid_matches_the_reference_construction() {
+        let uuid = bytes16("43aaa740881d3f31957d4fe83afcffc1");
+        assert_eq!(
+            hex_of(&next_alter_uuid(&uuid)),
+            "da5dedc876ba864bc121d9b6a5725810"
+        );
+    }
+
+    /// A legacy request has to decode with the algorithm a legacy server
+    /// runs: verify the HMAC against the alter IDs, CFB-open the header,
+    /// then walk the fields and the FNV-1a trailer.
+    #[test]
+    fn the_legacy_handshake_decodes_like_the_reference_server() {
+        let outbound = create_legacy_test_outbound(1);
+        let header = VmessHeader {
+            version: VMESS_VERSION,
+            request_body_iv: [0x11u8; 16],
+            request_body_key: [0x22u8; 16],
+            response_header: 0x5a,
+            option: VmessOption::CHUNK_STREAM,
+            padding_length: 0,
+            security: VmessCipher::Aes128Gcm,
+            command: VmessCommand::Tcp,
+            port: 443,
+            address_type: VmessAddressType::Domain,
+            address: {
+                let mut address = vec![11u8];
+                address.extend_from_slice(b"example.com");
+                address
+            },
+        };
+
+        let timestamp = 1700000000i64;
+        let sealed = outbound.seal_header_legacy(&header, timestamp).unwrap();
+
+        let auth: [u8; 16] = sealed[..16].try_into().unwrap();
+        let mut body = sealed[16..].to_vec();
+
+        // A legacy server tries every alter ID it derived (primary last).
+        let timestamp_bytes = timestamp.to_be_bytes();
+        let verified = outbound.alter_uuids.iter().any(|uuid| {
+            let mut expected = [0u8; 16];
+            crate::crypto::mac::Hmac::<Md5>::mac_into(uuid, &timestamp_bytes, &mut expected);
+            expected == auth
+        });
+        assert!(verified, "the auth tag must match one of the alter IDs");
+
+        aes128_cfb_decrypt(
+            &outbound.cmd_key,
+            &legacy_timestamp_iv(timestamp),
+            &mut body,
+        )
+        .unwrap();
+
+        assert_eq!(body[0], VMESS_VERSION);
+        assert_eq!(&body[1..17], &header.request_body_iv);
+        assert_eq!(&body[17..33], &header.request_body_key);
+        assert_eq!(body[33], 0x5a);
+        assert_eq!(body[34], VmessOption::CHUNK_STREAM.bits());
+        assert_eq!(body[35] >> 4, 0, "padding length");
+        assert_eq!(body[35] & 0x0f, VmessCipher::Aes128Gcm.as_byte());
+        assert_eq!(body[36], 0);
+        assert_eq!(body[37], VmessCommand::Tcp as u8);
+        assert_eq!(u16::from_be_bytes([body[38], body[39]]), 443);
+        assert_eq!(body[40], VmessAddressType::Domain as u8);
+        assert_eq!(body[41] as usize, "example.com".len());
+        assert_eq!(&body[42..53], b"example.com");
+
+        let trailer = fnv1a_hash(&body[..body.len() - 4]).to_be_bytes();
+        assert_eq!(&body[body.len() - 4..], &trailer);
+    }
+
+    /// The legacy response header is a four-byte CFB block whose first byte
+    /// echoes the request and whose third byte must be zero (no dynamic
+    /// port); the blocking reader has to open and validate it.
+    #[test]
+    fn the_legacy_response_header_round_trips_through_the_blocking_reader() {
+        let outbound = create_legacy_test_outbound(1);
+        let response_key = outbound.generate_response_key(&[0x33u8; 16]);
+        let response_iv = outbound.generate_response_iv(&[0x44u8; 16]);
+
+        let mut block = [0x5au8, VmessOption::CHUNK_STREAM.bits(), 0, 0];
+        aes128_cfb_encrypt(&response_key, &response_iv, &mut block).unwrap();
+
+        let mut reader = std::io::Cursor::new(block.to_vec());
+        outbound
+            .read_response_header(&mut reader, &response_key, &response_iv, 0x5a, None)
+            .expect("the legacy header opens and validates");
+
+        let mut reader = std::io::Cursor::new(block.to_vec());
+        assert!(outbound
+            .read_response_header(&mut reader, &response_key, &response_iv, 0x99, None)
+            .is_err());
+
+        let mut dynamic_port = [0x5au8, 0x01, 0x01, 0x00];
+        aes128_cfb_encrypt(&response_key, &response_iv, &mut dynamic_port).unwrap();
+        let mut reader = std::io::Cursor::new(dynamic_port.to_vec());
+        assert!(outbound
+            .read_response_header(&mut reader, &response_key, &response_iv, 0x5a, None)
+            .is_err());
+    }
+
+    /// The legacy downlink consumes the CFB header lazily on its first read,
+    /// then decrypts ordinary GCM chunks keyed by the MD5-derived response
+    /// keys.
+    #[test]
+    fn the_legacy_downlink_opens_the_cfb_header_then_chunks() {
+        use crate::common::stream::SyncStream;
+
+        let outbound = create_legacy_test_outbound(1);
+        let dec_key = outbound.generate_response_key(&[0x11u8; 16]);
+        let dec_iv = outbound.generate_response_iv(&[0x22u8; 16]);
+
+        let mut wire = Vec::new();
+        let mut header = [0x5au8, VmessOption::CHUNK_STREAM.bits(), 0, 0];
+        aes128_cfb_encrypt(&dec_key, &dec_iv, &mut header).unwrap();
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(
+            &encrypt_chunk_static(VmessCipher::Aes128Gcm, b"backend", &dec_key, &dec_iv, 0)
+                .unwrap(),
+        );
+        wire.extend_from_slice(
+            &encrypt_chunk_static(VmessCipher::Aes128Gcm, &[], &dec_key, &dec_iv, 1).unwrap(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.write_all(&wire).unwrap();
+
+        let mut stream = VmessStream::new(
+            Box::new(client) as BoxStream,
+            VmessCipher::Aes128Gcm,
+            [0x00u8; 16],
+            [0x00u8; 16],
+            dec_key,
+            dec_iv,
+            0x5a,
+            true,
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        let mut collected = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while collected.len() < b"backend".len() && Instant::now() < deadline {
+            let mut buf = [0u8; 64];
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => collected.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("legacy downlink read failed: {e}"),
+            }
+        }
+        assert_eq!(collected, b"backend");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -2743,6 +3172,7 @@ mod property_tests {
             dec_key,
             dec_iv,
             0x00,
+            false,
         );
 
         stream.write_all(b"hello").unwrap();
@@ -2823,6 +3253,7 @@ mod property_tests {
             [0x33u8; 16],
             [0x44u8; 16],
             0x00,
+            false,
         );
 
         stream.write_all(b"hello").unwrap();
@@ -2906,6 +3337,7 @@ mod property_tests {
             dec_key,
             dec_iv,
             echoed,
+            false,
         );
         stream
             .set_read_timeout(Some(Duration::from_millis(25)))
