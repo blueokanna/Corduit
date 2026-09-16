@@ -82,6 +82,20 @@ dns:
 
 同批打磨：HTTP CONNECT 中继失败从 `debug` 提到 **WARN**（写明出站/目标/原因，与 SOCKS5 入站一致）；`Proxy->App: EOF` 这类"对端正常关闭"的通知从 INFO 降到 DEBUG——浏览网页时每个 `Connection: close` 都会触发，挂在 INFO 只会把正常关闭刷成"看起来像错误"。
 
+**Q: 节点在 Clash / Clash Verge 里能用（延迟测试正常），在引擎里却"秒连秒断"，日志同样没有任何错误？**
+
+这是 **legacy（pre-AEAD）VMess 服务器**的典型特征。订阅里的 `alterId > 0` 不是历史包袱——它意味着服务器（多为老版本 v2ray 或兼容配置）只接受**旧版握手**：客户端发送 `HMAC-MD5` 鉴权块 + AES-128-CFB 封装的请求头，服务器才认；而纯 AEAD 握手（现代客户端默认）会被服务器**直接关闭连接**，不回任何错误——表现就是零点几秒的静默断开，连参考实现 Xray 的最新版（同样只发 AEAD）打不通这类节点，只有 Clash 系客户端（对 `alterId>0` 走 legacy）能连。
+
+引擎现在与 Clash 行为对齐：**`alterId > 0` 自动选择 legacy 握手**，`alterId = 0` 走 AEAD：
+
+- 鉴权块 = `HMAC-MD5(选中的 alter UUID, u64be(时间戳))`；
+- 请求头 = 版本/密钥/指令/目标/校验和整体用 **AES-128-CFB** 加密，key = `MD5(uuid ‖ "c48619fe-…")`（即 cmd_key），IV = `MD5(u64be(ts) × 4)`；
+- alter 链 = `MD5(uuid ‖ "16167dc8-…")` 迭代 N 次、主 UUID 兜底，每个连接随机选一个（服务器按同样的链逐一验证）；
+- 响应头 = 4 字节 CFB 解密块（key/IV 为请求密钥/IV 的 MD5），首字节回显请求、第三字节必须为 0；
+- 数据帧两种模式共用（GCM 分块，nonce = 计数器 ‖ IV 切片），只有响应密钥派生由 SHA-256 改为 MD5。
+
+日志里会看到 `alterId=N, using the pre-AEAD handshake (legacy mode)` 的启动提示。验证：NIST SP 800-38A 的 CFB 向量、独立钉死的 MD5 向量（时间戳 IV / alter 链首跳）、按服务端视角解码 legacy 头的回归测试、legacy 下行分帧测试，以及针对真实 legacy 订阅的端到端实测（curl 返回节点出口 IP）。
+
 ## FFI
 
 **Q: `corduit_call` 返回 `code != 0`？**

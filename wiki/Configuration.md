@@ -105,7 +105,7 @@
 | 直连 | `direct` | — |
 | 拒绝 | `reject` | — |
 | Shadowsocks | `shadowsocks` / `ss` | `password`, `cipher`（如 `aes-256-gcm`、`chacha20-poly1305`） |
-| VMess | `vmess` | `uuid`, `alter_id`, `cipher`, `tls`, `network`（`tcp`/`ws`；`h2`/`grpc`/`kcp`/`quic` 尚未实现——创建出站时会显式报错，不会静默按裸 TCP 连接）, `ws-opts`（`path`/`headers.Host`）, `alpn`（可选；缺省时 WebSocket 传输只宣告 `http/1.1`，其余传输宣告 `h2` + `http/1.1`）, `sni`, `skip-cert-verify` |
+| VMess | `vmess` | `uuid`, `alter_id`/`alterId`（**`> 0` 自动使用 legacy（pre-AEAD）握手**，与 Clash 系客户端一致；`= 0` 使用 AEAD）, `cipher`, `tls`, `network`（`tcp`/`ws`；`h2`/`grpc`/`kcp`/`quic` 尚未实现——创建出站时会显式报错，不会静默按裸 TCP 连接）, `ws-opts`（`path`/`headers.Host`）, `alpn`（可选；缺省时 WebSocket 传输只宣告 `http/1.1`，其余传输宣告 `h2` + `http/1.1`）, `sni`, `skip-cert-verify` |
 | VLESS | `vless` | `uuid`, `flow`, `tls` 等 |
 | Trojan | `trojan` | `password`, `sni` |
 | WireGuard | `wireguard` | `private-key`（或 `privateKey`）, `public-key`/`peer-public-key`（对端公钥）, `preshared-key?`, `local-address?`（默认 `10.0.0.2`）, `mtu?`（默认 1420）；`reserved` 不支持：出现即报错，不会被静默忽略 |
