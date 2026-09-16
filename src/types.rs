@@ -46,6 +46,10 @@ pub struct DnsConfig {
     pub nameservers: Vec<String>,
     pub fallback: Vec<String>,
     pub enhanced_mode: String,
+    /// Per-suffix resolver overrides (`nameserver-policy`): keys like
+    /// `+.example.com`, values are upstream server strings (`tcp://host:port`).
+    #[serde(default)]
+    pub nameserver_policy: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Inbound configuration for FFI
@@ -291,6 +295,8 @@ pub struct DnsConfigDto {
     pub enhanced_mode: String,
     pub nameservers: Vec<String>,
     pub fallback: Vec<String>,
+    #[serde(default)]
+    pub nameserver_policy: std::collections::HashMap<String, Vec<String>>,
 }
 
 // ============== From Trait Implementations for DTO Types ==============
@@ -458,6 +464,7 @@ impl DnsConfigDto {
             enhanced_mode,
             nameservers,
             fallback,
+            nameserver_policy: std::collections::HashMap::new(),
         }
     }
 }
@@ -470,6 +477,7 @@ impl Default for DnsConfigDto {
             enhanced_mode: "normal".to_string(),
             nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
             fallback: vec!["8.8.4.4".to_string(), "1.0.0.1".to_string()],
+            nameserver_policy: std::collections::HashMap::new(),
         }
     }
 }
@@ -572,6 +580,7 @@ impl DnsConfigDto {
             enhanced_mode: format!("{:?}", config.enhanced_mode).to_lowercase(),
             nameservers: config.nameservers.clone(),
             fallback: config.fallback.clone(),
+            nameserver_policy: config.nameserver_policy.clone(),
         }
     }
 }

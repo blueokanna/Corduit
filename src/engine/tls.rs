@@ -2,6 +2,31 @@ use crate::engine::error::{Error, Result};
 
 pub use crate::protocol::tls::{ClientConfig, TlsConnector};
 
+/// The default ALPN offer by transport shape.
+///
+/// A WebSocket upgrade is HTTP/1.1 by definition: offering `h2` lets the
+/// peer negotiate HTTP/2 and then every HTTP/1.1 upgrade byte is an HTTP/2
+/// protocol error (a reference Xray server answers with an h2 SETTINGS
+/// frame and closes the connection). Raw TLS transports keep the
+/// browser-shaped `h2` + `http/1.1` offer, matching v2ray/Xray clients.
+pub fn default_alpn(websocket: bool) -> Vec<String> {
+    if websocket {
+        vec!["http/1.1".to_string()]
+    } else {
+        vec!["h2".to_string(), "http/1.1".to_string()]
+    }
+}
+
+/// Resolve the ALPN offer: an explicit list wins, otherwise the default
+/// for the transport shape applies.
+pub fn effective_alpn(explicit: &[String], websocket: bool) -> Vec<String> {
+    if explicit.is_empty() {
+        default_alpn(websocket)
+    } else {
+        explicit.to_vec()
+    }
+}
+
 pub fn yaml_value_to_string(value: &nextjson::Value) -> String {
     match value {
         nextjson::Value::String(s) => s.clone(),
@@ -108,11 +133,7 @@ pub fn connect_advanced_tls(
 ) -> Result<crate::common::stream::BoxStream> {
     #[cfg(feature = "reality")]
     if let Some(reality) = options.reality.clone() {
-        let alpn = if alpn.is_empty() {
-            vec!["h2".to_string(), "http/1.1".to_string()]
-        } else {
-            alpn.to_vec()
-        };
+        let alpn = effective_alpn(alpn, false);
         return crate::protocol::reality::connect(stream, reality, alpn).map_err(|e| Error::Tls {
             message: format!("REALITY handshake failed: {e}"),
             source: None,
@@ -126,11 +147,7 @@ pub fn connect_advanced_tls(
             message: e.to_string(),
             source: None,
         })?;
-        let alpn = if alpn.is_empty() {
-            vec!["h2".to_string(), "http/1.1".to_string()]
-        } else {
-            alpn.to_vec()
-        };
+        let alpn = effective_alpn(alpn, false);
         let socket = crate::common::shared_socket::SharedTcpStream::new(stream);
         let reader = socket.clone();
         let writer = socket.clone();
@@ -180,4 +197,38 @@ fn unix_now_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_offers_http11_only() {
+        assert_eq!(default_alpn(true), vec!["http/1.1".to_string()]);
+    }
+
+    #[test]
+    fn raw_tls_keeps_the_browser_default() {
+        assert_eq!(
+            default_alpn(false),
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn explicit_alpn_wins_over_any_default() {
+        let explicit = vec!["custom/1".to_string()];
+        assert_eq!(effective_alpn(&explicit, false), explicit);
+        assert_eq!(effective_alpn(&explicit, true), explicit.clone());
+    }
+
+    #[test]
+    fn empty_alpn_falls_back_to_the_transport_default() {
+        assert_eq!(effective_alpn(&[], true), vec!["http/1.1".to_string()]);
+        assert_eq!(
+            effective_alpn(&[], false),
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+    }
 }

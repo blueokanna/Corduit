@@ -50,7 +50,7 @@
 | `domain-suffix` | 域名后缀 | 匹配**自身 + 所有子域**，且带点边界：`example.com` 命中 `example.com` 和 `a.example.com`，但**不**命中 `notexample.com` |
 | `domain-keyword` | 域名子串 | 域名包含该子串即命中（大小写不敏感） |
 | `domain-regex` | 正则 | 对整个域名跑正则；编译期校验，非法正则直接报配置错误 |
-| `geoip` | 国家/地区码 | 目标 IP 属于该国家/地区即命中（GeoIP 库） |
+| `geoip` | 国家/地区码，或定制库里的提供商标签 | 目标 IP 属于该国家/地区即命中（GeoIP 库）；大小写不敏感，`A-Z{2,16}` |
 | `ip-cidr` | 目标 IP 段 | 目标 IP 在 CIDR 内（支持 IPv4/IPv6） |
 | `src-ip-cidr` | 源 IP 段 | 连接发起方 IP 在 CIDR 内 |
 | `src-port` | 源端口 | 端口或端口范围，见下 |

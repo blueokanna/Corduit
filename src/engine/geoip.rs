@@ -5,95 +5,76 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A two-letter ISO 3166-1 alpha-2 country code, stored as raw uppercase bytes.
+/// Longest [`CountryCode`] accepted, in bytes.
 ///
-/// Parsing, storage and comparison are all allocation-free: the code is always
-/// exactly two ASCII letters, so a packed `[u8; 2]` is both the canonical form
-/// and the fastest one.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct CountryCode([u8; 2]);
+/// A GeoLite2-family database ships two-letter ISO 3166-1 alpha-2 codes, but
+/// customized builds also label provider networks with names such as
+/// `GOOGLE`, `NETFLIX` or `CLOUDFRONT`. Sixteen covers those naming schemes
+/// while keeping the type `Copy`, inline and allocation-free.
+pub const MAX_COUNTRY_CODE_LEN: usize = 16;
+
+/// A GeoIP code: an ISO 3166-1 alpha-2 country code, or the provider label a
+/// customized database carries in the same `country.iso_code` field.
+///
+/// The code is stored inline and uppercased, so parsing, storage and comparison
+/// stay allocation-free. Only `A-Z{2,16}` is accepted — the shapes databases and
+/// rule payloads legitimately use — and anything else is rejected instead of
+/// being normalized into something that could match by accident.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CountryCode {
+    bytes: [u8; MAX_COUNTRY_CODE_LEN],
+    len: u8,
+}
 
 impl CountryCode {
-    /// Parse a country code, uppercasing on the fly. Anything that is not
-    /// exactly two ASCII letters is rejected.
+    /// Parse a rule payload such as `CN`, `LAN` or `GOOGLE`.
     pub fn parse(code: &str) -> Option<Self> {
-        let b = code.as_bytes();
-        if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1].is_ascii_alphabetic() {
-            Some(Self([b[0].to_ascii_uppercase(), b[1].to_ascii_uppercase()]))
-        } else {
-            None
-        }
+        Self::from_bytes(code.as_bytes())
     }
 
-    /// The two raw uppercase bytes.
-    pub const fn as_bytes(&self) -> &[u8; 2] {
-        &self.0
+    /// Canonicalize raw bytes coming from a rule payload or a database field.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 2 || bytes.len() > MAX_COUNTRY_CODE_LEN {
+            return None;
+        }
+        let mut out = [0u8; MAX_COUNTRY_CODE_LEN];
+        for (slot, byte) in out.iter_mut().zip(bytes) {
+            if !byte.is_ascii_alphabetic() {
+                return None;
+            }
+            *slot = byte.to_ascii_uppercase();
+        }
+        Some(Self {
+            bytes: out,
+            len: bytes.len() as u8,
+        })
+    }
+
+    /// The raw uppercase bytes, without the unused tail of the inline buffer.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    /// The code as a string slice; always ASCII.
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).unwrap_or_default()
     }
 
     /// Byte-exact comparison against another code.
     pub fn matches(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.as_bytes() == other.as_bytes()
     }
 }
 
 impl core::fmt::Display for CountryCode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(core::str::from_utf8(&self.0).expect("two ASCII bytes"))
+        f.write_str(self.as_str())
     }
 }
 
-/// Number of `u64` words needed to hold all 26×26 alpha-2 combinations.
-const COUNTRY_MASK_WORDS: usize = (26usize * 26).div_ceil(64);
-
-/// A set of [`CountryCode`]s packed into a 676-bit mask.
-///
-/// Membership is a single index computation plus a bit test: no hashing, no
-/// allocation, no collisions. Built for rule groups such as
-/// `GEOIP,CN` / `GEOIP,HK`-style batches that must be evaluated per packet.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct CountryCodeSet([u64; COUNTRY_MASK_WORDS]);
-
-impl Default for CountryCodeSet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CountryCodeSet {
-    pub const fn new() -> Self {
-        Self([0; COUNTRY_MASK_WORDS])
-    }
-
-    pub fn insert(&mut self, code: CountryCode) {
-        let idx = Self::index(code.as_bytes());
-        self.0[idx / 64] |= 1u64 << (idx % 64);
-    }
-
-    pub fn insert_str(&mut self, code: &str) -> bool {
-        if let Some(code) = CountryCode::parse(code) {
-            self.insert(code);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn contains(&self, code: CountryCode) -> bool {
-        let idx = Self::index(code.as_bytes());
-        (self.0[idx / 64] >> (idx % 64)) & 1 == 1
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.iter().map(|w| w.count_ones() as usize).sum()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|w| *w == 0)
-    }
-
-    #[inline]
-    const fn index(bytes: &[u8; 2]) -> usize {
-        ((bytes[0] - b'A') as usize) * 26 + ((bytes[1] - b'A') as usize)
+impl core::fmt::Debug for CountryCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "CountryCode({self})")
     }
 }
 
@@ -140,7 +121,7 @@ impl GeoIpDatabase {
     }
 
     pub fn lookup_country(&self, ip: IpAddr) -> Option<CountryCode> {
-        self.reader.as_ref()?.lookup_country(ip).map(CountryCode)
+        self.reader.as_ref()?.lookup_country(ip)
     }
 
     pub fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
@@ -357,35 +338,26 @@ mod tests {
             .unwrap()
             .matches(&CountryCode::parse("JP").unwrap()));
         assert!(CountryCode::parse("C").is_none());
-        assert!(CountryCode::parse("CHN").is_none());
         assert!(CountryCode::parse("").is_none());
         assert!(CountryCode::parse("12").is_none());
+        assert!(CountryCode::parse("C1").is_none());
+        assert!(CountryCode::parse("CN-").is_none());
         assert_eq!(CountryCode::parse("cn").unwrap().to_string(), "CN");
     }
 
+    /// Customized GeoLite2 builds label provider networks instead of countries;
+    /// those labels are first-class codes, not silently dropped lookups.
     #[test]
-    fn test_country_code_set_bitmask() {
-        let mut set = CountryCodeSet::new();
-        assert!(set.is_empty());
-        assert!(set.insert_str("cn"));
-        assert!(set.insert_str("HK"));
-        assert!(set.insert_str("tw"));
-        assert!(!set.insert_str("not-a-code"));
-        assert_eq!(set.len(), 3);
-        assert!(set.contains(CountryCode::parse("CN").unwrap()));
-        assert!(set.contains(CountryCode::parse("hk").unwrap()));
-        assert!(!set.contains(CountryCode::parse("JP").unwrap()));
-        // Boundary bits land in different u64 words and must all be set.
-        let mut all = CountryCodeSet::new();
-        for hi in b'A'..=b'Z' {
-            for lo in b'A'..=b'Z' {
-                let code = CountryCode::parse(core::str::from_utf8(&[hi, lo]).unwrap()).unwrap();
-                all.insert(code);
-            }
-        }
-        assert_eq!(all.len(), 26 * 26);
-        assert!(all.contains(CountryCode::parse("ZZ").unwrap()));
-        assert!(all.contains(CountryCode::parse("AA").unwrap()));
+    fn test_country_code_accepts_provider_labels() {
+        let google = CountryCode::parse("google").unwrap();
+        assert_eq!(google.as_str(), "GOOGLE");
+        assert_eq!(CountryCode::parse("GOOGLE").unwrap(), google);
+        assert!(CountryCode::parse("cloudfront")
+            .unwrap()
+            .matches(&CountryCode::parse("CLOUDFRONT").unwrap()));
+        assert!(!google.matches(&CountryCode::parse("CLOUDFLARE").unwrap()));
+        assert!(CountryCode::parse(&"A".repeat(MAX_COUNTRY_CODE_LEN)).is_some());
+        assert!(CountryCode::parse(&"A".repeat(MAX_COUNTRY_CODE_LEN + 1)).is_none());
     }
 
     #[test]

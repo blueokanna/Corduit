@@ -335,9 +335,6 @@ pub fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, String> {
                 _ => continue,
             };
 
-            // Member tags live under the canonical `outbounds` key (the same
-            // key the engine's selector/url-test/… groups read). `proxies`
-            // is tolerated as a legacy alias.
             let mut proxies: Vec<String> = outbound
                 .options
                 .get("outbounds")
@@ -350,8 +347,6 @@ pub fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, String> {
                 })
                 .unwrap_or_default();
 
-            // Expand `use: [provider, …]` into the provider's current proxy
-            // tags so the reported members match what the group can select.
             if let Some(use_value) = outbound.options.get("use") {
                 let use_names: Vec<String> = if let Some(arr) = use_value.as_array() {
                     arr.iter()
@@ -375,7 +370,6 @@ pub fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, String> {
                 }
             }
 
-            // Report the live selection if one was made at runtime.
             let selected = outbound_manager
                 .get_selector_proxy(&outbound.tag)
                 .unwrap_or_else(|| proxies.first().cloned().unwrap_or_default());
@@ -524,6 +518,7 @@ pub fn get_dns_config() -> std::result::Result<DnsConfigDto, String> {
             enhanced_mode: format!("{:?}", config.dns.enhanced_mode).to_lowercase(),
             nameservers: config.dns.nameservers.clone(),
             fallback: config.dns.fallback.clone(),
+            nameserver_policy: config.dns.nameserver_policy.clone(),
         })
     } else {
         Err("Proxy not initialized".to_string())
@@ -1074,10 +1069,6 @@ fn generate_rpc_token() -> String {
 /// Binds to `127.0.0.1` only. When `token` is omitted a fresh random token is
 /// generated; the caller is responsible for delivering it to the frontend.
 pub fn start_rpc_server(port: u16, token: Option<String>) -> std::result::Result<(), String> {
-    // Check and install under one lock: `bind` + `spawn` only touch the
-    // socket and start the accept thread, so holding the guard across them
-    // neither blocks nor risks a deadlock, and two concurrent callers cannot
-    // both be told they started the server.
     let mut guard = RPC_SERVER.lock();
     if let Some(handle) = guard.as_ref() {
         if handle.is_running() {
@@ -1309,7 +1300,10 @@ fn convert_ffi_config_to_core(ffi_config: CorduitConfig) -> Result<Config> {
             "fake-ip" => DnsMode::FakeIp,
             _ => DnsMode::Normal,
         },
+        nameserver_policy: ffi_config.dns.nameserver_policy,
     };
+
+    crate::dns::engine_resolver::configure(&dns.nameservers, &dns.nameserver_policy);
 
     let inbounds = ffi_config
         .inbounds

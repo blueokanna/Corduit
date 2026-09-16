@@ -72,6 +72,7 @@ pub mod doh;
 pub mod doh_server;
 pub mod dot;
 pub mod dot_server;
+pub mod engine_resolver;
 pub mod error;
 pub mod fake_ip;
 pub mod hosts;

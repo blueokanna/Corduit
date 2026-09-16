@@ -1,6 +1,6 @@
 [package]
 name = "corduit"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.78"
 license-file = "LICENSE"
@@ -63,8 +63,6 @@ smoltcp = { version = "0.11.0", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
     "proto-ipv6",
-    # `smoltcp`'s `std` feature turns on its socket layer, which refuses to
-    # build without at least one socket family enabled.
     "socket-tcp",
     "socket-udp",
 ] }

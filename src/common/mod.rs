@@ -25,6 +25,8 @@
 //!   in-process servers, on top of courierust's per-connection engine.
 //! * [`roots`] — system root-certificate loading for courierust's TLS stack
 //!   (Windows cert store, Linux bundle, Android cacerts).
+//! * [`throttle`] — [`LogThrottle`], for conditions that are expected but can
+//!   repeat thousands of times per second.
 //!
 //! # The synchronous model
 //!
@@ -70,6 +72,8 @@ pub mod stream;
 #[cfg(feature = "std")]
 pub mod sync;
 #[cfg(feature = "std")]
+pub mod throttle;
+#[cfg(feature = "std")]
 pub mod timer;
 
 #[cfg(feature = "std")]
@@ -80,4 +84,6 @@ pub use http::{HttpClient, HttpError, HttpResponse};
 pub use socket::{connect, connect_host, udp_exchange};
 #[cfg(feature = "std")]
 pub use stream::{relay, BoxStream, RelayStats, SyncStream};
+#[cfg(feature = "std")]
+pub use throttle::LogThrottle;
 pub use url::{Url, UrlError};

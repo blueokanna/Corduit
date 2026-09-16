@@ -57,6 +57,11 @@ impl QuicClient {
             .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
         let udp = std::net::UdpSocket::bind(local)
             .map_err(|e| QuicError::Io(format!("bind UDP: {e}")))?;
+        #[cfg(target_os = "android")]
+        {
+            use std::os::fd::AsRawFd;
+            crate::common::socket::protect_outbound_fd(udp.as_raw_fd());
+        }
         udp.connect(self.config.server_addr)
             .map_err(|e| QuicError::Io(format!("connect UDP: {e}")))?;
 

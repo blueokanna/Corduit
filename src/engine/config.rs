@@ -153,6 +153,12 @@ pub struct DnsConfig {
     /// Enhanced mode
     #[serde(default)]
     pub enhanced_mode: DnsMode,
+
+    /// Per-suffix resolver overrides (`nameserver-policy`): keys like
+    /// `+.example.com`, values are upstream server strings. Used for the
+    /// engine's own outbound server names (node domains).
+    #[serde(default)]
+    pub nameserver_policy: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for DnsConfig {
@@ -163,6 +169,7 @@ impl Default for DnsConfig {
             nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
             fallback: vec!["8.8.4.4".to_string(), "1.0.0.1".to_string()],
             enhanced_mode: DnsMode::default(),
+            nameserver_policy: std::collections::HashMap::new(),
         }
     }
 }

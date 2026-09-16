@@ -18,6 +18,37 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
+/// Exempt an outbound socket from the engine's own tunnel (Android).
+///
+/// The engine **is** the VPN. On the OEM builds that route the VPN app's
+/// own traffic into its own TUN, an unprotected outbound socket loops
+/// straight back into the netstack — `VpnService.protect` must be called
+/// before `connect`/`bind` for the routing decision to stick. A no-op on
+/// every other platform.
+#[cfg(target_os = "android")]
+pub fn protect_outbound_fd(fd: i32) {
+    if crate::netstack::has_protect_callback() && !crate::netstack::protect_socket(fd) {
+        tracing::warn!(
+            "failed to protect outbound socket fd={fd}; it may be routed into the tunnel"
+        );
+    }
+}
+
+/// See [`protect_outbound_fd`]; this variant is a no-op.
+#[cfg(not(target_os = "android"))]
+pub fn protect_outbound_fd(_fd: i32) {}
+
+/// Exempt a `socket2` socket from the engine's own tunnel.
+fn protect_socket2(sock: &socket2::Socket) {
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        protect_outbound_fd(sock.as_raw_fd());
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = sock;
+}
+
 /// Establish a TCP connection to `addr` within `timeout`.
 ///
 /// Uses a non-blocking connect polled by the OS (`socket2`'s
@@ -30,6 +61,8 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         socket2::Domain::IPV6
     };
     let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // The tunnel exemption must precede `connect` for the OS to honour it.
+    protect_socket2(&sock);
     sock.set_nonblocking(true)?;
     sock.connect_timeout(&(*addr).into(), timeout)?;
     // `connect_timeout` requires a non-blocking socket but leaves it that
@@ -45,8 +78,20 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
 
 /// Resolve `host:port` and connect to the first reachable address within
 /// `timeout`. Resolution itself is bounded via [`resolve_host`].
+///
+/// The engine's own DNS settings win over the system resolver: subscription
+/// profiles frequently make their node domains resolvable only through a
+/// private `nameserver-policy` resolver, and the system resolver would
+/// answer NXDOMAIN — or worse, a decoy address — for them.
 pub fn connect_host(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
-    let addrs = resolve_host(host, port, timeout)?;
+    let addrs = match crate::dns::engine_resolver::resolve(host, port) {
+        Some(Ok(addrs)) => addrs,
+        Some(Err(e)) => {
+            tracing::debug!("engine DNS could not resolve {host}: {e}; trying the system resolver");
+            resolve_host(host, port, timeout)?
+        }
+        None => resolve_host(host, port, timeout)?,
+    };
     if addrs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -119,6 +164,8 @@ pub fn udp_bind(bind: SocketAddr, read_timeout: Duration) -> io::Result<UdpSocke
         socket2::Domain::IPV6
     };
     let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    // Outbound DNS and relay datagrams bypass the tunnel as well.
+    protect_socket2(&sock);
     sock.set_reuse_address(true)?;
     sock.bind(&bind.into())?;
     let udp: UdpSocket = sock.into();

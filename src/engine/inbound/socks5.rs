@@ -40,9 +40,7 @@ use std::time::Duration;
 const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Handshake read/write timeout (a silent client is dropped after this).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Read/write timeout applied once a connection enters the relay phase. The
-/// relay treats `WouldBlock`/`TimedOut` as "idle" and keeps the connection
-/// alive, so this only bounds each blocking call.
+/// Read/write timeout applied once a connection enters the relay phase.
 const RELAY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Upper bound on concurrently served SOCKS5 connections.
 const MAX_CONNECTIONS: usize = 2048;
@@ -137,7 +135,6 @@ fn perform_handshake(stream: &mut TcpStream, auth: &InboundAuth) -> Result<bool>
         .map_err(|e| Error::network(format!("Failed to read SOCKS5 methods: {e}")))?;
 
     if auth.required() {
-        // Credentials configured: only RFC 1929 user/pass is acceptable.
         if !methods.contains(&SOCKS5_AUTH_USERPASS) {
             let _ = stream.write_all(&[SOCKS5_VERSION, 0xFF]);
             return Ok(false);
@@ -171,8 +168,6 @@ fn read_request(stream: &mut TcpStream) -> Result<(Socks5Addr, u16, u8)> {
         return Err(Error::protocol("Invalid SOCKS5 version in request"));
     }
     if head[2] != 0x00 {
-        // The reserved byte must be zero (RFC 1928 §4); anything else is a
-        // malformed request rather than a message to interpret.
         return Err(Error::protocol("Non-zero reserved byte in SOCKS5 request"));
     }
     let command = head[1];
@@ -254,9 +249,6 @@ fn handle_connect(
         )));
     };
 
-    // The relay is established through an outbound proxy, so no local socket
-    // is bound for it: the reply carries the unspecified address, which is
-    // what RFC 1928 expects a client to ignore.
     let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     send_reply_with_addr(&mut stream, SOCKS5_REPLY_SUCCESS, unspecified)?;
 
@@ -293,12 +285,20 @@ fn handle_connect(
     );
     tracker.untrack(&tracked.id);
     if let Err(e) = result {
-        tracing::debug!(
-            "SOCKS5 relay error via '{}' to {}: {}",
-            outbound.tag(),
-            target,
-            e
-        );
+        if e.to_string().contains("cancel") {
+            tracing::debug!(
+                "SOCKS5 relay cancelled via '{}' to {}",
+                outbound.tag(),
+                target
+            );
+        } else {
+            tracing::warn!(
+                "SOCKS5 relay via '{}' to {} failed: {}",
+                outbound.tag(),
+                target,
+                e
+            );
+        }
     }
     Ok(())
 }
@@ -324,9 +324,6 @@ fn handle_udp_associate(
     tracing::info!("UDP relay listening on {local_addr} for {peer_addr}");
     send_reply_with_addr(&mut stream, SOCKS5_REPLY_SUCCESS, local_addr)?;
 
-    // The relay lives exactly as long as the control connection: it runs on a
-    // thread of its own (a session, not a short task) and this thread watches
-    // the TCP side for the client's disconnect.
     let cancel = crate::common::cancel::CancellationToken::new();
     let relay_cancel = cancel.clone();
     let relay_thread = std::thread::Builder::new()
@@ -344,8 +341,6 @@ fn handle_udp_associate(
         })
         .map_err(|e| Error::network(format!("Failed to spawn UDP relay thread: {e}")))?;
 
-    // A UDP association carries no data on the TCP connection: the client
-    // keeps it open and closes it to end the association (RFC 1928 §7).
     let _ = stream.set_read_timeout(Some(RELAY_TIMEOUT));
     let mut byte = [0u8; 1];
     loop {
@@ -413,13 +408,10 @@ fn run_udp_relay(
             continue;
         }
 
-        // RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
         if len < 10 {
             continue;
         }
         if buf[2] != 0 {
-            // A fragmented datagram cannot be forwarded as one packet; the
-            // only honest answer is to drop it (RFC 1928 §7).
             tracing::debug!("Dropping fragmented SOCKS5 UDP datagram");
             continue;
         }
@@ -632,8 +624,7 @@ impl Socks5Inbound {
             self.config.listen,
             self.config.port
         );
-        // Take the listener out first so the lock is released before the
-        // (blocking) join of the accept loop.
+
         let mut server = self.server.lock().take();
         if let Some(server) = server.as_mut() {
             server.stop();
@@ -694,8 +685,6 @@ mod tests {
             .write_all(&[0x05, 0x01, SOCKS5_AUTH_USERPASS])
             .unwrap();
         let mut selection = [0u8; 2];
-        // Drive the sub-negotiation from a thread: the server writes its
-        // method selection before reading the credentials.
         let auth = auth_with("user", "pass");
         let handle = std::thread::spawn(move || perform_handshake(&mut server, &auth));
         client.read_exact(&mut selection).unwrap();

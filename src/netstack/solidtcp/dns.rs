@@ -11,6 +11,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+/// TTL of a fake-IP answer, in seconds.
+///
+/// Deliberately tiny. The mapping behind a fake address lives only in this
+/// process, while the client may keep dialling the address for as long as its
+/// resolver honours the TTL. After a restart — or an explicit pool reset —
+/// every previously handed-out address is unmappable, so the window in which a
+/// client can still hold a stale one has to stay short enough to matter less
+/// than the re-resolution it costs.
+pub const FAKE_IP_TTL_SECS: u32 = 10;
+
 /// Fake-IP configuration
 #[derive(Debug, Clone)]
 pub struct FakeIpConfig {
@@ -271,7 +281,7 @@ impl DnsHandler {
         r.extend_from_slice(&0xC00Cu16.to_be_bytes());
         r.extend_from_slice(&1u16.to_be_bytes());
         r.extend_from_slice(&1u16.to_be_bytes());
-        r.extend_from_slice(&60u32.to_be_bytes());
+        r.extend_from_slice(&FAKE_IP_TTL_SECS.to_be_bytes());
         r.extend_from_slice(&4u16.to_be_bytes());
         r.extend_from_slice(&ip.octets());
         r

@@ -551,6 +551,7 @@ mod tests {
                     enhanced_mode,
                     nameservers,
                     fallback,
+                    nameserver_policy: std::collections::HashMap::new(),
                 }
             })
     }
@@ -645,6 +646,7 @@ mod tests {
             prop_assert_eq!(dto.enhanced_mode, deserialized.enhanced_mode);
             prop_assert_eq!(dto.nameservers, deserialized.nameservers);
             prop_assert_eq!(dto.fallback, deserialized.fallback);
+            prop_assert_eq!(dto.nameserver_policy, deserialized.nameserver_policy);
         }
     }
 }

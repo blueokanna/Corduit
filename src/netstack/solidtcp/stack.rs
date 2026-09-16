@@ -1,5 +1,6 @@
 //! Main TCP/IP stack coordinator
 
+use crate::common::LogThrottle;
 use crate::netstack::solidtcp::device::DeviceConfig;
 use crate::netstack::solidtcp::dns::{DnsHandler, FakeIpConfig, FakeIpPool};
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
@@ -17,13 +18,40 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Timeout used for SOCKS5 handshake / UDP associate reads.
 const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long proxy worker threads poll their queues between checks.
 const PROXY_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+const PROXY_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const FAKE_IP_MISS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether a socket error just means "nothing happened yet".
+///
+/// A socket read/write timeout surfaces as `EAGAIN` on Unix (Android, Linux,
+/// macOS — decoded as [`io::ErrorKind::WouldBlock`], textually "Try again")
+/// and as `WSAETIMEDOUT` ([`io::ErrorKind::TimedOut`]) on Windows, so a relay
+/// that only tolerates one of the two drops healthy connections the moment they
+/// go quiet. `Interrupted` belongs here as well: `EINTR` is a signal artefact,
+/// not a failure.
+fn is_transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
+/// Whether the peer is simply gone. Relays end quietly on these instead of
+/// warning, because browsers abort half of their connections on purpose.
+fn is_peer_gone(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
+}
 
 #[cfg(target_os = "android")]
 use std::os::unix::io::AsRawFd;
@@ -51,13 +79,12 @@ pub fn clear_protect_callback() {
 
 #[cfg(target_os = "android")]
 pub fn protect_socket(fd: i32) -> bool {
-    info!("=== protect_socket called for fd={} ===", fd);
+    debug!("protect_socket called for fd={}", fd);
     let guard = PROTECT_CALLBACK.read();
     if let Some(ref callback) = *guard {
-        info!("Calling protect callback for fd={}", fd);
         let result = callback(fd);
         if result {
-            info!("Socket fd={} protected successfully", fd);
+            debug!("Socket fd={} protected successfully", fd);
         } else {
             warn!("Socket fd={} protection FAILED", fd);
         }
@@ -172,6 +199,7 @@ pub struct SolidStack {
     stats: Arc<StackStats>,
     running: Arc<AtomicBool>,
     tun_tx: Option<mpsc::Sender<BytesMut>>,
+    fake_ip_miss_log: Arc<LogThrottle>,
 }
 
 impl SolidStack {
@@ -188,6 +216,7 @@ impl SolidStack {
             stats: Arc::new(StackStats::new()),
             running: Arc::new(AtomicBool::new(false)),
             tun_tx: None,
+            fake_ip_miss_log: Arc::new(LogThrottle::new(FAKE_IP_MISS_LOG_INTERVAL)),
             config,
         }
     }
@@ -373,47 +402,39 @@ impl SolidStack {
         tcp_info: &TcpInfo,
         _parsed: &ParsedPacket,
     ) -> Result<()> {
-        let domain = if let IpAddr::V4(ip) = dst_addr.ip() {
-            let d = self.fake_ip_pool.lookup(ip);
-            if d.is_none() && self.fake_ip_pool.is_fake_ip(ip) {
-                warn!("TCP SYN to Fake-IP {} but no domain mapping found!", ip);
-            }
-            d
-        } else {
-            None
+        let fake_ip = match dst_addr.ip() {
+            IpAddr::V4(ip) if self.fake_ip_pool.is_fake_ip(ip) => Some(ip),
+            _ => None,
         };
+        let domain = fake_ip.and_then(|ip| self.fake_ip_pool.lookup(ip));
 
         info!(
             "=== TCP SYN received: {} -> {} (domain: {:?}, is_fake_ip: {}) ===",
             src_addr,
             dst_addr,
             domain,
-            if let IpAddr::V4(ip) = dst_addr.ip() {
-                self.fake_ip_pool.is_fake_ip(ip)
-            } else {
-                false
-            }
+            fake_ip.is_some()
         );
 
-        if domain.is_none() {
-            if let IpAddr::V4(ip) = dst_addr.ip() {
-                if self.fake_ip_pool.is_fake_ip(ip) {
-                    warn!(
-                        "Cannot proxy connection to Fake-IP {} without domain mapping",
-                        ip
-                    );
-                    self.send_tcp_packet(
-                        dst_addr,
-                        src_addr,
-                        0,
-                        tcp_info.seq.wrapping_add(1),
-                        TcpFlags::rst_ack(),
-                        &[],
-                        None,
-                    )?;
-                    return Ok(());
-                }
+        if let (Some(ip), None) = (fake_ip, &domain) {
+            if let Some(suppressed) = self.fake_ip_miss_log.admit() {
+                warn!(
+                    address = %ip,
+                    suppressed,
+                    "fake-IP address has no domain mapping; resetting connection \
+                     (client holds a stale DNS answer and should re-resolve)"
+                );
             }
+            self.send_tcp_packet(
+                dst_addr,
+                src_addr,
+                0,
+                tcp_info.seq.wrapping_add(1),
+                TcpFlags::rst_ack(),
+                &[],
+                None,
+            )?;
+            return Ok(());
         }
 
         let conn = self
@@ -445,7 +466,6 @@ impl SolidStack {
         let stack = self.clone_for_proxy();
         let conn_clone = conn.clone();
 
-        // Long-lived per-connection relay runs on a dedicated thread.
         if let Err(e) = std::thread::Builder::new()
             .name("tun-proxy-tcp".into())
             .spawn(move || {
@@ -642,10 +662,24 @@ impl SolidStack {
         dst_addr: SocketAddr,
         payload: &[u8],
     ) -> Result<()> {
-        let domain = if let IpAddr::V4(ip) = dst_addr.ip() {
-            self.fake_ip_pool.lookup(ip)
-        } else {
-            None
+        let domain = match dst_addr.ip() {
+            IpAddr::V4(ip) if self.fake_ip_pool.is_fake_ip(ip) => {
+                match self.fake_ip_pool.lookup(ip) {
+                    Some(domain) => Some(domain),
+                    None => {
+                        if let Some(suppressed) = self.fake_ip_miss_log.admit() {
+                            warn!(
+                                address = %dst_addr,
+                                suppressed,
+                                "dropping UDP to a fake-IP address with no domain mapping \
+                                 (client holds a stale DNS answer and should re-resolve)"
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            _ => None,
         };
 
         debug!(
@@ -664,9 +698,6 @@ impl SolidStack {
 
         let stack = self.clone_for_proxy();
         let payload_vec = payload.to_vec();
-
-        // The UDP relay performs a single exchange with a timeout; run it on
-        // a dedicated thread so packet processing never blocks on the proxy.
         if let Err(e) = std::thread::Builder::new()
             .name("tun-proxy-udp".into())
             .spawn(move || {
@@ -787,7 +818,13 @@ impl StackProxy {
     /// Write the entire buffer to the shared TCP stream, looping on partial
     /// writes. `Write` is implemented for `&TcpStream`, so the same stream
     /// can be shared between the reader and writer threads.
+    ///
+    /// Transient errors (an expired write timeout, `EINTR`) are retried instead
+    /// of failing the connection — a peer that is merely slow to drain its
+    /// socket is not a broken peer. Only when no byte at all has been accepted
+    /// for [`PROXY_WRITE_STALL_TIMEOUT`] does the write give up.
     fn write_all_sync(mut stream: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+        let mut stalled_since: Option<Instant> = None;
         while !data.is_empty() {
             match stream.write(data) {
                 Ok(0) => {
@@ -796,8 +833,19 @@ impl StackProxy {
                         "failed to write whole buffer",
                     ));
                 }
-                Ok(n) => data = &data[n..],
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Ok(n) => {
+                    data = &data[n..];
+                    stalled_since = None;
+                }
+                Err(e) if is_transient(&e) => {
+                    let since = *stalled_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= PROXY_WRITE_STALL_TIMEOUT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "peer stopped reading",
+                        ));
+                    }
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -936,9 +984,6 @@ impl StackProxy {
             payload.len()
         );
 
-        // Wait for the single response with the socket read timeout, then
-        // send it back to the TUN device. Dropping the TCP control stream
-        // afterwards closes the UDP association.
         let mut buf = vec![0u8; 65535];
         match udp_socket.recv_from(&mut buf) {
             Ok((n, _)) => {
@@ -1058,10 +1103,6 @@ impl StackProxy {
 
                             write_buffer.extend_from_slice(&data);
 
-                            // std mpsc has no `is_empty`; probe for
-                            // immediately-available data with `try_recv` and
-                            // batch it in, then flush when the buffer is
-                            // large or nothing more is queued.
                             let mut has_pending = false;
                             while let Ok(more) = rx.try_recv() {
                                 write_buffer.extend_from_slice(&more);
@@ -1069,24 +1110,36 @@ impl StackProxy {
                             }
                             if write_buffer.len() >= 16384 || !has_pending {
                                 if let Err(e) = Self::write_all_sync(&write_stream, &write_buffer) {
-                                    warn!(
-                                        "App->Proxy write error: {} for {} -> {}",
-                                        e, src_clone, dst_clone
-                                    );
+                                    if is_peer_gone(&e) {
+                                        debug!(
+                                            "App->Proxy: peer closed ({}) for {} -> {}",
+                                            e, src_clone, dst_clone
+                                        );
+                                    } else {
+                                        warn!(
+                                            "App->Proxy write error: {} for {} -> {}",
+                                            e, src_clone, dst_clone
+                                        );
+                                    }
                                     break;
                                 }
                                 write_buffer.clear();
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Idle: flush any partial buffer so data is not
-                            // held back indefinitely.
                             if !write_buffer.is_empty() {
                                 if let Err(e) = Self::write_all_sync(&write_stream, &write_buffer) {
-                                    warn!(
-                                        "App->Proxy flush error: {} for {} -> {}",
-                                        e, src_clone, dst_clone
-                                    );
+                                    if is_peer_gone(&e) {
+                                        debug!(
+                                            "App->Proxy: peer closed on flush ({}) for {} -> {}",
+                                            e, src_clone, dst_clone
+                                        );
+                                    } else {
+                                        warn!(
+                                            "App->Proxy flush error: {} for {} -> {}",
+                                            e, src_clone, dst_clone
+                                        );
+                                    }
                                     break;
                                 }
                                 write_buffer.clear();
@@ -1121,7 +1174,7 @@ impl StackProxy {
 
                     match (&*read_stream).read(&mut buf) {
                         Ok(0) => {
-                            info!("Proxy->App: EOF for {} -> {}", src_addr, dst_addr);
+                            debug!("Proxy->App: EOF for {} -> {}", src_addr, dst_addr);
                             break;
                         }
                         Ok(n) => {
@@ -1196,9 +1249,15 @@ impl StackProxy {
                                 }
                             }
                         }
-                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                            // Idle: re-check liveness and keep polling.
+                        Err(e) if is_transient(&e) => {
                             continue;
+                        }
+                        Err(e) if is_peer_gone(&e) => {
+                            debug!(
+                                "Proxy->App: peer closed ({}) for {} -> {}",
+                                e, src_addr, dst_addr
+                            );
+                            break;
                         }
                         Err(e) => {
                             warn!("Proxy read error: {} for {} -> {}", e, src_addr, dst_addr);
@@ -1328,5 +1387,186 @@ impl StackProxy {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn transient_socket_errors_are_recognized() {
+        // A stale timeout is not a broken connection: Unix reports `EAGAIN`
+        // ("Try again", `WouldBlock`), Windows `WSAETIMEDOUT` (`TimedOut`).
+        assert!(is_transient(&io::Error::from(io::ErrorKind::WouldBlock)));
+        assert!(is_transient(&io::Error::from(io::ErrorKind::TimedOut)));
+        assert!(is_transient(&io::Error::from(io::ErrorKind::Interrupted)));
+        assert!(!is_transient(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
+        assert!(!is_transient(&io::Error::from(io::ErrorKind::BrokenPipe)));
+
+        assert!(is_peer_gone(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
+        assert!(is_peer_gone(&io::Error::from(io::ErrorKind::BrokenPipe)));
+        assert!(!is_peer_gone(&io::Error::from(io::ErrorKind::WouldBlock)));
+        assert!(!is_peer_gone(&io::Error::from(io::ErrorKind::TimedOut)));
+    }
+
+    /// Regression for the relay killing live connections: a peer that stops
+    /// reading fills the send window, so the write timeout expires and the
+    /// error arrives as `WouldBlock`. The write must survive that and finish
+    /// once the peer drains again.
+    #[test]
+    fn write_all_sync_waits_out_a_stalled_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let writer = TcpStream::connect(addr).expect("connect loopback");
+        let (reader, _) = listener.accept().expect("accept loopback");
+
+        writer
+            .set_write_timeout(Some(Duration::from_millis(50)))
+            .expect("write timeout");
+
+        // Far beyond any default send buffer, so the write has to stall.
+        let payload = vec![0x5au8; 16 * 1024 * 1024];
+        let expected = payload.len();
+        let writer_thread =
+            std::thread::spawn(move || StackProxy::write_all_sync(&writer, &payload));
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut sink = vec![0u8; 256 * 1024];
+        let mut reader_ref = &reader;
+        let mut received = 0usize;
+        while received < expected {
+            match reader_ref.read(&mut sink) {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            received, expected,
+            "draining the peer sees the whole payload"
+        );
+        assert!(
+            writer_thread.join().expect("writer thread").is_ok(),
+            "a stalled peer must delay the write, not fail it"
+        );
+    }
+
+    fn start_stack_with_tun() -> (SolidStack, mpsc::Receiver<BytesMut>) {
+        let mut stack = SolidStack::with_defaults();
+        let (tx, rx) = mpsc::channel();
+        stack.set_tun_tx(tx);
+        stack.start();
+        (stack, rx)
+    }
+
+    /// A client dialling a fake address the pool never issued — or issued in a
+    /// previous session — must be reset at once. Ignoring the SYN leaves the app
+    /// hanging and retrying instead of re-resolving, which is what the log spam
+    /// in the field came from.
+    #[test]
+    fn a_fake_ip_without_a_mapping_is_reset() {
+        let (stack, rx) = start_stack_with_tun();
+        let client = Ipv4Addr::new(198, 18, 0, 1);
+        let stale = Ipv4Addr::new(198, 18, 0, 29);
+        let syn = build_ipv4_tcp(
+            client,
+            stale,
+            40000,
+            13861,
+            1000,
+            0,
+            TcpFlags::syn_only(),
+            64240,
+            &[],
+            Some(1460),
+        );
+
+        stack.process_packet(&syn).expect("the SYN is processed");
+
+        let reply = rx
+            .try_recv()
+            .expect("an unmapped fake address is answered, not ignored");
+        let parsed = parse_packet(&reply).expect("the reply parses");
+        assert_eq!(parsed.src_addr, IpAddr::V4(stale));
+        assert_eq!(parsed.dst_addr, IpAddr::V4(client));
+        match parsed.transport {
+            TransportInfo::Tcp(tcp) => {
+                assert!(tcp.flags.rst, "a stale fake address must be reset");
+                assert!(tcp.flags.ack);
+                assert_eq!((tcp.src_port, tcp.dst_port), (13861, 40000));
+            }
+            other => panic!("expected a TCP answer, got {other:?}"),
+        }
+    }
+
+    /// The mapped path still handshakes: an address that *is* in the pool gets a
+    /// SYN-ACK and a session keyed by the domain it stands for.
+    #[test]
+    fn a_mapped_fake_ip_is_answered_with_syn_ack() {
+        let (stack, rx) = start_stack_with_tun();
+        let fake = stack
+            .fake_ip_pool()
+            .allocate("example.com")
+            .expect("the pool has room");
+        let client = Ipv4Addr::new(198, 18, 0, 1);
+        let syn = build_ipv4_tcp(
+            client,
+            fake,
+            40001,
+            443,
+            2000,
+            0,
+            TcpFlags::syn_only(),
+            64240,
+            &[],
+            Some(1460),
+        );
+
+        stack.process_packet(&syn).expect("the SYN is processed");
+
+        let reply = rx.try_recv().expect("a mapped fake address is answered");
+        let parsed = parse_packet(&reply).expect("the reply parses");
+        match parsed.transport {
+            TransportInfo::Tcp(tcp) => assert!(
+                tcp.flags.syn && tcp.flags.ack,
+                "expected a SYN-ACK, got flags {:?}",
+                tcp.flags
+            ),
+            other => panic!("expected a TCP answer, got {other:?}"),
+        }
+        assert_eq!(stack.tcp_manager().connection_count(), 1);
+    }
+
+    /// UDP to an unmapped fake address is dropped: the destination cannot be
+    /// named, and forwarding it would ask a real proxy hop to dial a padding
+    /// address from 198.18.0.0/16.
+    #[test]
+    fn udp_to_an_unmapped_fake_ip_is_dropped() {
+        let (stack, rx) = start_stack_with_tun();
+        let client = Ipv4Addr::new(198, 18, 0, 1);
+        let stale = Ipv4Addr::new(198, 18, 0, 29);
+        let datagram = build_ipv4_udp(client, stale, 50000, 443, &[0u8; 32]);
+
+        stack
+            .process_packet(&datagram)
+            .expect("the datagram is processed");
+
+        assert_eq!(
+            stack.udp_manager().session_count(),
+            0,
+            "no UDP session is created for an unmapped fake address"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a dropped datagram emits nothing towards the TUN"
+        );
     }
 }

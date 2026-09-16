@@ -342,8 +342,8 @@ impl ConnectRelay {
         );
         tracker.untrack(&tracked.id);
         if let Err(e) = result {
-            tracing::debug!(
-                "CONNECT relay error via '{}' to {}:{}: {}",
+            tracing::warn!(
+                "CONNECT relay via '{}' to {}:{} failed: {}",
                 self.outbound_tag,
                 self.host,
                 self.port,

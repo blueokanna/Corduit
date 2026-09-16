@@ -250,6 +250,17 @@ impl UpstreamConfig {
                 port: Some(port),
                 path: None,
             })
+        } else if s.starts_with("udp://") {
+            // Plain UDP with an explicit scheme
+            let rest = s.strip_prefix("udp://")?;
+            let (host, port) = Self::parse_host_port(rest, 53);
+            Some(Self {
+                address: host,
+                protocol: UpstreamProtocol::Udp,
+                server_name: None,
+                port: Some(port),
+                path: None,
+            })
         } else if s.starts_with("quic://") {
             // DoQ
             let rest = s.strip_prefix("quic://")?;
