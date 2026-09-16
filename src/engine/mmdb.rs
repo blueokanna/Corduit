@@ -14,7 +14,7 @@
 //! * metadata is a data-section-format map starting at the **last** occurrence
 //!   of `\xab\xcd\xefMaxMind.com`.
 
-use crate::engine::geoip::{CountryCode, MAX_COUNTRY_CODE_LEN};
+use crate::engine::geoip::CountryCode;
 use std::cmp::Ordering;
 use std::net::IpAddr;
 
@@ -441,8 +441,7 @@ impl MmdbReader {
     /// The value is exactly what the record's `country.iso_code` field carries:
     /// an ISO 3166-1 alpha-2 code in a stock GeoLite2 layout, or a provider
     /// label (`GOOGLE`, `CLOUDFRONT`, …) in the customized builds the mobile
-    /// profiles ship. Fields that are empty, non-alphabetic or longer than
-    /// [`MAX_COUNTRY_CODE_LEN`] are reported as absent rather than guessed at.
+    /// profiles ship. 
     pub fn lookup_country(&self, ip: IpAddr) -> Option<CountryCode> {
         let data_off = self.lookup(ip)?;
         let (value, _) = self.read_value(data_off, self.data_start, &mut DecodeState::default())?;

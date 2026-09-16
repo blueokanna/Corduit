@@ -116,6 +116,7 @@ pub struct Corduit {
 impl Corduit {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
+        crate::dns::engine_resolver::configure(&config.dns.nameservers, &config.dns.nameserver_policy);
         logging::init_logging(config.general.log_level)?;
 
         let proxy_manager = ProxyManager::new(config.clone())?;
@@ -162,7 +163,6 @@ impl Corduit {
 
         match self.proxy_manager.stop() {
             Ok(()) => {
-                // Mark as not running and clear start time
                 self.running
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut start_time) = self.start_time.write() {
@@ -172,7 +172,6 @@ impl Corduit {
                 Ok(())
             }
             Err(e) => {
-                // Mark as not running even on error
                 self.running
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut start_time) = self.start_time.write() {
@@ -202,6 +201,7 @@ impl Corduit {
     /// Reload configuration
     pub fn reload(&mut self, config: Config) -> Result<()> {
         tracing::info!("Reloading Corduit configuration");
+        crate::dns::engine_resolver::configure(&config.dns.nameservers, &config.dns.nameserver_policy);
         self.proxy_manager.reload(config.clone())?;
         self.config = config;
         tracing::info!("Corduit configuration reloaded");

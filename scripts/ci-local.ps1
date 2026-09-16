@@ -12,12 +12,15 @@
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\ci-local.ps1 [-Filter <substring>]
 param(
-    [string]$Filter = ""
+    [string]$Filter = "",
+    [string]$LogPath = ""
 )
 
 $ErrorActionPreference = 'Continue'
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
-$log = "target\ci-local.log"
+# One log per run: two concurrent invocations must not interleave their
+# sections into the same file.
+$log = if ($LogPath) { $LogPath } else { "target\ci-local-$PID.log" }
 $env:RUSTFLAGS = "-D warnings"
 Set-Content -Path $log -Value "local CI replica (RUSTFLAGS=-D warnings)" -Encoding utf8
 

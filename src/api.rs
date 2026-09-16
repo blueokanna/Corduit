@@ -1303,8 +1303,6 @@ fn convert_ffi_config_to_core(ffi_config: CorduitConfig) -> Result<Config> {
         nameserver_policy: ffi_config.dns.nameserver_policy,
     };
 
-    crate::dns::engine_resolver::configure(&dns.nameservers, &dns.nameserver_policy);
-
     let inbounds = ffi_config
         .inbounds
         .into_iter()
