@@ -116,11 +116,11 @@ pub struct Corduit {
 impl Corduit {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
+        logging::init_logging(config.general.log_level)?;
         crate::dns::engine_resolver::configure(
             &config.dns.nameservers,
             &config.dns.nameserver_policy,
         );
-        logging::init_logging(config.general.log_level)?;
 
         let proxy_manager = ProxyManager::new(config.clone())?;
         let traffic_stats = TrafficStatsManager::new();

@@ -28,6 +28,10 @@ function Pin-Toolchain([string]$toolchain) {
     $dir = "$env:USERPROFILE\.rustup\toolchains\$toolchain-x86_64-pc-windows-msvc\bin"
     if (Test-Path "$dir\rustc.exe") { $env:RUSTC = "$dir\rustc.exe" } else { $env:RUSTC = "" }
     if (Test-Path "$dir\rustdoc.exe") { $env:RUSTDOC = "$dir\rustdoc.exe" } else { $env:RUSTDOC = "" }
+    # `cargo fmt` shells out to `rustfmt`, and the PATH here starts with a
+    # standalone 1.78 install whose rustfmt disagrees with the stable one CI
+    # uses about long call expressions.
+    if (Test-Path "$dir\rustfmt.exe") { $env:RUSTFMT = "$dir\rustfmt.exe" } else { $env:RUSTFMT = "" }
 }
 
 function Step {
