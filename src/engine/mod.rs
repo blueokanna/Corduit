@@ -116,7 +116,10 @@ pub struct Corduit {
 impl Corduit {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
-        crate::dns::engine_resolver::configure(&config.dns.nameservers, &config.dns.nameserver_policy);
+        crate::dns::engine_resolver::configure(
+            &config.dns.nameservers,
+            &config.dns.nameserver_policy,
+        );
         logging::init_logging(config.general.log_level)?;
 
         let proxy_manager = ProxyManager::new(config.clone())?;
@@ -201,7 +204,10 @@ impl Corduit {
     /// Reload configuration
     pub fn reload(&mut self, config: Config) -> Result<()> {
         tracing::info!("Reloading Corduit configuration");
-        crate::dns::engine_resolver::configure(&config.dns.nameservers, &config.dns.nameserver_policy);
+        crate::dns::engine_resolver::configure(
+            &config.dns.nameservers,
+            &config.dns.nameserver_policy,
+        );
         self.proxy_manager.reload(config.clone())?;
         self.config = config;
         tracing::info!("Corduit configuration reloaded");

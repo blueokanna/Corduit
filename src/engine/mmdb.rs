@@ -441,7 +441,7 @@ impl MmdbReader {
     /// The value is exactly what the record's `country.iso_code` field carries:
     /// an ISO 3166-1 alpha-2 code in a stock GeoLite2 layout, or a provider
     /// label (`GOOGLE`, `CLOUDFRONT`, …) in the customized builds the mobile
-    /// profiles ship. 
+    /// profiles ship.
     pub fn lookup_country(&self, ip: IpAddr) -> Option<CountryCode> {
         let data_off = self.lookup(ip)?;
         let (value, _) = self.read_value(data_off, self.data_start, &mut DecodeState::default())?;
