@@ -17,7 +17,7 @@ fn main() {
         .nth(2)
         .unwrap_or_else(|| "localhost".to_string());
 
-    let stream = TcpStream::connect(&addr).expect("tcp connect");
+    let stream = TcpStream::connect(addr).expect("tcp connect");
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     stream.set_nodelay(true).ok();
     let arc = Arc::new(stream);

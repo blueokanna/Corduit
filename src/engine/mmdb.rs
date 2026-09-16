@@ -14,7 +14,7 @@
 //! * metadata is a data-section-format map starting at the **last** occurrence
 //!   of `\xab\xcd\xefMaxMind.com`.
 
-use crate::engine::geoip::CountryCode;
+use crate::engine::geoip::{CountryCode, MAX_COUNTRY_CODE_LEN};
 use std::cmp::Ordering;
 use std::net::IpAddr;
 
@@ -147,9 +147,6 @@ impl MmdbReader {
             data_start: 0,
         };
 
-        // Metadata pointers are relative to the byte after the marker, which is
-        // where the metadata map itself begins — verified against the bundled
-        // GeoLite2 database, whose `languages` array stores "en" as a pointer.
         let (value, _) = reader
             .read_value(meta_start, meta_start, &mut DecodeState::default())
             .ok_or_else(|| "MMDB: metadata is corrupt".to_string())?;
@@ -227,7 +224,6 @@ impl MmdbReader {
                 (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2)
             }
             28 => {
-                // Node = 7 bytes: [left low24][mid hi4|hi4][right low24].
                 let mid = *self.data.get(base + 3)?;
                 if bit == 0 {
                     let b0 = *self.data.get(base)?;
@@ -274,12 +270,10 @@ impl MmdbReader {
                 match record.cmp(&self.meta.node_count) {
                     Ordering::Less => node = record,
                     Ordering::Greater => {
-                        // `$offset_in_file = record - node_count + tree_size`.
                         let off = (record - self.meta.node_count) as usize
                             + self.meta.search_tree_size as usize;
                         return Some(off);
                     }
-                    // record == node_count: not in database
                     Ordering::Equal => return None,
                 }
             }
@@ -448,7 +442,7 @@ impl MmdbReader {
     /// an ISO 3166-1 alpha-2 code in a stock GeoLite2 layout, or a provider
     /// label (`GOOGLE`, `CLOUDFRONT`, …) in the customized builds the mobile
     /// profiles ship. Fields that are empty, non-alphabetic or longer than
-    /// [`CountryCode::MAX_LEN`] are reported as absent rather than guessed at.
+    /// [`MAX_COUNTRY_CODE_LEN`] are reported as absent rather than guessed at.
     pub fn lookup_country(&self, ip: IpAddr) -> Option<CountryCode> {
         let data_off = self.lookup(ip)?;
         let (value, _) = self.read_value(data_off, self.data_start, &mut DecodeState::default())?;
@@ -564,7 +558,7 @@ mod tests {
         let Ok(path) = std::env::var("CORDUIT_MMDB_FILE") else {
             return;
         };
-        let data = std::fs::read(&path).expect("the database file is readable");
+        let data = std::fs::read(path).expect("the database file is readable");
         let reader = MmdbReader::open(data).expect("a real Country.mmdb parses");
 
         assert_eq!(

@@ -302,9 +302,7 @@ impl VmessOutbound {
                 )));
             }
         };
-        // Parsed-but-unimplemented transports must fail loudly: falling back
-        // to raw TCP would speak the wrong protocol on the wire and surface
-        // as an inscrutable EOF later.
+
         if matches!(transport, VmessTransport::H2 | VmessTransport::Grpc) {
             return Err(Error::config(format!(
                 "VMess transport '{transport_str}' is not implemented yet; supported transports: tcp, ws"
@@ -1547,14 +1545,6 @@ impl Write for VmessStream {
 impl crate::common::stream::SyncStream for VmessStream {
     fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
         let mut inner = self.inner.lock();
-        // Emit the end-of-stream chunk exactly once, and only when the write
-        // half is actually closing. The wire form is an *encrypted* empty
-        // chunk: the reference reader only treats a chunk whose length equals
-        // the authentication overhead as end-of-stream, and hands anything
-        // else to its AEAD open — where a bare `[0x00,0x00]` fails
-        // authentication and turns a clean close into a protocol error.
-        // Sealing zero bytes produces exactly that form: `[0x00,0x10]` plus a
-        // 16-byte tag (or `[0x00,0x00]` under a plaintext cipher).
         if matches!(how, std::net::Shutdown::Write | std::net::Shutdown::Both)
             && !self.end_chunk_sent.swap(true, Ordering::SeqCst)
         {
@@ -1569,7 +1559,7 @@ impl crate::common::stream::SyncStream for VmessStream {
                 }
             }
         }
-        inner.shutdown(how)
+        crate::common::stream::shutdown_lenient(&**inner, how)
     }
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
@@ -2789,6 +2779,60 @@ mod property_tests {
         assert!(opened.is_empty());
     }
 
+    /// A half-close whose transport already reports the socket as closed must
+    /// not fail the teardown: macOS answers a repeated `shutdown(Write)` with
+    /// `ENOTCONN`, which is what this stand-in transport returns on every
+    /// platform (CI: macos-latest).
+    #[test]
+    fn write_shutdown_tolerates_a_transport_that_is_already_closed() {
+        use crate::common::stream::SyncStream;
+
+        /// Stands in for a transport that is already half-closed.
+        struct ClosedTransport;
+
+        impl Read for ClosedTransport {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for ClosedTransport {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl SyncStream for ClosedTransport {
+            fn shutdown(&self, _how: std::net::Shutdown) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "Socket is not connected",
+                ))
+            }
+        }
+
+        let mut stream = VmessStream::new(
+            Box::new(ClosedTransport) as BoxStream,
+            VmessCipher::Aes128Gcm,
+            [0x11u8; 16],
+            [0x22u8; 16],
+            [0x33u8; 16],
+            [0x44u8; 16],
+            0x00,
+        );
+
+        stream.write_all(b"hello").unwrap();
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("an already-closed transport is not a teardown failure");
+        // And the repeated half-close stays a no-op.
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+    }
+
     /// The downlink has to consume the response header itself, on its first
     /// read: the reference server only flushes the header together with the
     /// first target payload, so a client that waits for it before forwarding
@@ -2904,7 +2948,14 @@ mod property_tests {
             0x0e, 0x0f,
         ];
         let key = chacha20_poly1305_key(&body);
-        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        let hex = |bytes: &[u8]| -> String {
+            let mut out = String::with_capacity(bytes.len() * 2);
+            for byte in bytes {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+            }
+            out
+        };
         assert_eq!(hex(&key[..16]), "1ac1ef01e96caf1be0d329331a4fc2a8");
         assert_eq!(hex(&key[16..]), "e0542db5418c43d256a6a643afa553fe");
     }

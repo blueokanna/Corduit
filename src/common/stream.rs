@@ -73,9 +73,46 @@ pub trait SyncStream: Read + Write + Send {
     }
 }
 
+/// Whether a failed half-close really left the half open.
+///
+/// Half-closing is idempotent by intent but not by API: macOS answers a
+/// repeated `shutdown(Write)` with `ENOTCONN` (`NotConnected`) where Linux and
+/// Windows return success, and a peer that vanished can surface a reset or a
+/// broken pipe instead. In all of those cases the half is already unusable —
+/// the state the caller asked for — so a relay teardown must not report them
+/// as failures.
+pub fn is_benign_shutdown_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
+/// [`SyncStream::shutdown`] that treats an already-closed half as success.
+///
+/// Streams that *wrap* a transport (VMess, Shadowsocks, WebSocket, TLS with a
+/// socket half-close hook) forward to something that does not necessarily go
+/// through [`SyncStream for TcpStream`], so they apply the same tolerance
+/// here instead of relying on the socket implementation.
+pub fn shutdown_lenient(stream: &dyn SyncStream, how: Shutdown) -> io::Result<()> {
+    match stream.shutdown(how) {
+        Err(error) if is_benign_shutdown_error(&error) => Ok(()),
+        other => other,
+    }
+}
+
 impl SyncStream for TcpStream {
+    /// Best-effort half-close, exactly as the trait promises: a repeated
+    /// `shutdown(Write)` is `ENOTCONN` on macOS and a vanished peer can answer
+    /// with a reset, but neither leaves the half usable.
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        TcpStream::shutdown(self, how)
+        match TcpStream::shutdown(self, how) {
+            Err(error) if is_benign_shutdown_error(&error) => Ok(()),
+            other => other,
+        }
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
@@ -216,7 +253,6 @@ pub fn relay(a: BoxStream, b: BoxStream, token: CancellationToken) -> io::Result
     let b = Arc::new(Mutex::new(b));
     let stats = Arc::new(Mutex::new(RelayStats::default()));
 
-    // Thread 1: a → b. On EOF of a, half-close b's write half.
     let ta = token.clone();
     let sa = stats.clone();
     let aa = a.clone();
@@ -246,9 +282,6 @@ pub fn relay(a: BoxStream, b: BoxStream, token: CancellationToken) -> io::Result
                                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                             ) =>
                         {
-                            // Release the source stream's lock BEFORE yielding
-                            // so the opposite direction can write through (the
-                            // std mutex handoff is not fair).
                             drop(guard);
                             std::thread::sleep(RELAY_POLL_YIELD);
                             continue;
@@ -270,7 +303,6 @@ pub fn relay(a: BoxStream, b: BoxStream, token: CancellationToken) -> io::Result
             }
         })?;
 
-    // Thread 2: b → a. On EOF of b, half-close a's write half.
     let tb = token.clone();
     let sd = stats.clone();
     let ab = a.clone();
@@ -328,8 +360,6 @@ pub fn relay(a: BoxStream, b: BoxStream, token: CancellationToken) -> io::Result
         .join()
         .map_err(|_| io::Error::other("relay thread panicked"))?;
 
-    // A cancelled relay or an error on either direction is a failure; EOF
-    // on both sides is a clean teardown.
     if token.is_cancelled() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -375,5 +405,44 @@ mod tests {
         let res = copy_one_way(&mut src, &mut dst, &mut hook, &token, &mut stats);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    }
+
+    /// Only errors that mean "this half is already closed" are tolerated:
+    /// a genuine failure still has to reach the caller.
+    #[test]
+    fn benign_shutdown_errors_are_the_already_closed_ones() {
+        for kind in [
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(
+                is_benign_shutdown_error(&io::Error::new(kind, "closed")),
+                "{kind:?} means the half is already closed"
+            );
+        }
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::InvalidInput] {
+            assert!(
+                !is_benign_shutdown_error(&io::Error::new(kind, "real failure")),
+                "{kind:?} must reach the caller"
+            );
+        }
+    }
+
+    /// A second `shutdown(Write)` must stay `Ok` (macOS: `ENOTCONN`) —
+    /// including after the peer is gone, which is the state a relay teardown
+    /// half-closes in.
+    #[test]
+    fn tcp_half_close_is_idempotent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        drop(server);
+
+        assert!(SyncStream::shutdown(&client, Shutdown::Write).is_ok());
+        assert!(SyncStream::shutdown(&client, Shutdown::Write).is_ok());
+        assert!(SyncStream::shutdown(&client, Shutdown::Both).is_ok());
     }
 }

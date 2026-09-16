@@ -538,7 +538,6 @@ impl ShadowsocksStream {
 impl std::io::Read for ShadowsocksStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            // Serve buffered decrypted data first.
             if self.read_pos < self.read_buffer.len() {
                 let n = (self.read_buffer.len() - self.read_pos).min(buf.len());
                 buf[..n].copy_from_slice(&self.read_buffer[self.read_pos..self.read_pos + n]);
@@ -555,7 +554,6 @@ impl std::io::Read for ShadowsocksStream {
             let chunk = {
                 let mut inner = self.inner.lock();
                 if self.dec.is_none() {
-                    // First read: consume the server salt and derive the key.
                     let mut server_salt = vec![0u8; self.cipher_spec.salt_len];
                     inner.read_exact(&mut server_salt)?;
                     let dec_subkey =
@@ -595,8 +593,11 @@ impl std::io::Write for ShadowsocksStream {
 }
 
 impl crate::common::stream::SyncStream for ShadowsocksStream {
+    /// Tolerant half-close: the inner stream may be a TLS session whose own
+    /// hook closes the socket, and macOS reports a repeated `shutdown(Write)`
+    /// as `ENOTCONN` — neither leaves the write half usable.
     fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        self.inner.lock().shutdown(how)
+        crate::common::stream::shutdown_lenient(&*self.inner.lock(), how)
     }
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {

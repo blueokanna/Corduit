@@ -40,7 +40,7 @@ use courierust::courierust_ws::{
     Event, FrameWriter, MaskSource, Role, Session, SessionConfig, StreamSink,
 };
 
-use crate::common::stream::SyncStream;
+use crate::common::stream::{shutdown_lenient, SyncStream};
 
 /// Largest single frame / message accepted from the peer (16 MiB). The
 /// wire length field is 64-bit, so an unbounded value would let a peer
@@ -374,9 +374,6 @@ impl<S: SyncStream> Write for WebSocket<S> {
 
 impl<S: SyncStream> SyncStream for WebSocket<S> {
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        // Half-closing the write side of a WebSocket is the closing
-        // handshake: the peer learns the tunnel ended before the socket
-        // goes away, which a bare TCP FIN would not tell it.
         if matches!(how, Shutdown::Write | Shutdown::Both)
             && !self.close_sent.swap(true, Ordering::AcqRel)
         {
@@ -386,10 +383,10 @@ impl<S: SyncStream> SyncStream for WebSocket<S> {
             }
         }
         if matches!(how, Shutdown::Read) {
-            return self.with_stream(|stream| stream.shutdown(Shutdown::Read));
+            return self.with_stream(|stream| shutdown_lenient(stream, Shutdown::Read));
         }
         if matches!(how, Shutdown::Both) {
-            return self.with_stream(|stream| stream.shutdown(Shutdown::Both));
+            return self.with_stream(|stream| shutdown_lenient(stream, Shutdown::Both));
         }
         Ok(())
     }
@@ -422,15 +419,12 @@ fn session_error(e: courierust::Error) -> io::Error {
     let kind = match e.kind {
         CourierKind::WouldBlock => io::ErrorKind::WouldBlock,
         CourierKind::Timeout => io::ErrorKind::TimedOut,
-        // A dead peer without a closing handshake, and an already
-        // finished session, are both end-of-stream to the relay.
         CourierKind::UnexpectedEof => return io::Error::new(io::ErrorKind::UnexpectedEof, ""),
         CourierKind::Protocol | CourierKind::InvalidHeader | CourierKind::Overflow => {
             io::ErrorKind::InvalidData
         }
         CourierKind::Canceled => io::ErrorKind::Interrupted,
         CourierKind::Io | CourierKind::Other => io::ErrorKind::Other,
-        // The HTTP/2 and gRPC kinds cannot reach a WebSocket session.
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, e.to_string())
