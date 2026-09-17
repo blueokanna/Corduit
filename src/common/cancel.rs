@@ -114,10 +114,6 @@ impl CancellationToken {
         }
         {
             let mut guard = self.inner.hooks.lock().unwrap_or_else(|e| e.into_inner());
-            // Re-check under the lock: `cancel()` takes this lock to empty the
-            // list, so either it has already taken the (absent) hook and this
-            // thread runs it below, or this thread pushes it and `cancel()`
-            // picks it up afterwards. Neither path can both run and drop it.
             if !self.is_cancelled() {
                 guard.push(Box::new(hook));
                 return;
@@ -158,9 +154,6 @@ impl CancellationToken {
         }
         let (lock, cond) = (&self.inner.wake, &self.inner.cond);
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        // Checked again with the wake lock held: `cancel()` takes the same
-        // lock before notifying, so a cancel that landed in between is either
-        // seen here or wakes the `wait` below.
         if self.is_cancelled() {
             return;
         }
@@ -216,10 +209,7 @@ mod tests {
     fn wait_wakes_on_cancel() {
         let t = Arc::new(CancellationToken::new());
         let t2 = t.clone();
-        let h = std::thread::spawn(move || {
-            // Long wait; must be interrupted by cancel().
-            t2.wait(Duration::from_secs(30))
-        });
+        let h = std::thread::spawn(move || t2.wait(Duration::from_secs(30)));
         std::thread::sleep(Duration::from_millis(50));
         t.cancel();
         assert!(h.join().unwrap());
@@ -285,8 +275,6 @@ mod tests {
 
     #[test]
     fn hook_registered_after_cancel_from_another_thread_style_race() {
-        // The cancellation is observed through a clone while the hook is being
-        // registered on the original: both orders must still run it once.
         for _ in 0..64 {
             let t = CancellationToken::new();
             let watcher = t.clone();
