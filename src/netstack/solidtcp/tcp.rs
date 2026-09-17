@@ -274,8 +274,7 @@ impl TcpConnection {
     /// until the SOCKS5 handshake finishes. A connection whose writer has
     /// exited is, and so is one whose channel rejected a send.
     fn proxy_is_gone(&self) -> bool {
-        self.proxy_dead
-            || (self.proxy_tx.is_some() && !self.proxy_alive.load(Ordering::Acquire))
+        self.proxy_dead || (self.proxy_tx.is_some() && !self.proxy_alive.load(Ordering::Acquire))
     }
 
     /// Whether one more segment of `len` bytes fits in the queued-data budget.
@@ -345,7 +344,10 @@ impl TcpConnection {
             }
         }
         self.proxy_alive.store(true, Ordering::Release);
-        ProxyWriter::new(Arc::clone(&self.proxy_inflight), Arc::clone(&self.proxy_alive))
+        ProxyWriter::new(
+            Arc::clone(&self.proxy_inflight),
+            Arc::clone(&self.proxy_alive),
+        )
     }
 
     pub fn snd_nxt(&self) -> u32 {
@@ -847,18 +849,20 @@ mod tests {
     /// A connection whose proxy writer never runs: the channel exists but
     /// nothing drains it, so every accepted byte stays queued.
     fn stalled_proxy(budget: usize) -> (TcpConnection, mpsc::Receiver<Vec<u8>>, ProxyWriter) {
-        let mut conn =
-            TcpConnection::new_passive(key(), THEIR_ISN, Some(SEGMENT as u16), None, config(budget));
+        let mut conn = TcpConnection::new_passive(
+            key(),
+            THEIR_ISN,
+            Some(SEGMENT as u16),
+            None,
+            config(budget),
+        );
         let (tx, rx) = mpsc::channel();
         let writer = conn.set_proxy_tx(tx);
         (conn, rx, writer)
     }
 
     /// Stand in for the writer thread draining the channel and writing it out.
-    fn drain_to_proxy(
-        rx: &mpsc::Receiver<Vec<u8>>,
-        writer: &mut ProxyWriter,
-    ) -> usize {
+    fn drain_to_proxy(rx: &mpsc::Receiver<Vec<u8>>, writer: &mut ProxyWriter) -> usize {
         let mut drained = 0;
         while let Ok(chunk) = rx.try_recv() {
             writer.take(chunk.len());
@@ -890,7 +894,11 @@ mod tests {
     fn the_window_shrinks_by_what_the_proxy_has_not_written() {
         let (mut conn, _rx, mut writer) = stalled_proxy(BUDGET);
         conn.update_recv_window();
-        assert_eq!(conn.recv_window() as usize, BUDGET, "empty queue: budget is free");
+        assert_eq!(
+            conn.recv_window() as usize,
+            BUDGET,
+            "empty queue: budget is free"
+        );
 
         let mut seq = conn.rcv_nxt();
         for _ in 0..2 {
@@ -938,8 +946,13 @@ mod tests {
 
     #[test]
     fn data_buffered_before_the_proxy_is_kept_up_to_the_budget() {
-        let mut conn =
-            TcpConnection::new_passive(key(), THEIR_ISN, Some(SEGMENT as u16), None, config(BUDGET));
+        let mut conn = TcpConnection::new_passive(
+            key(),
+            THEIR_ISN,
+            Some(SEGMENT as u16),
+            None,
+            config(BUDGET),
+        );
 
         let accepted = fill_until_refused(&mut conn);
         assert_eq!(accepted, BUDGET / SEGMENT);
@@ -950,7 +963,11 @@ mod tests {
         let mut writer = conn.set_proxy_tx(tx);
         assert!(conn.pending_data.is_empty());
         assert_eq!(conn.queued_bytes(), BUDGET);
-        assert_eq!(writer.held(), 0, "nothing taken yet: the window still holds it");
+        assert_eq!(
+            writer.held(),
+            0,
+            "nothing taken yet: the window still holds it"
+        );
         assert_eq!(rx.try_recv().unwrap().len(), BUDGET);
         conn.update_recv_window();
         assert_eq!(conn.recv_window(), 0);
@@ -981,12 +998,14 @@ mod tests {
         drop(rx);
 
         assert_eq!(
-            conn.process_data(conn.rcv_nxt(), &vec![0u8; SEGMENT]).unwrap(),
+            conn.process_data(conn.rcv_nxt(), &vec![0u8; SEGMENT])
+                .unwrap(),
             TcpAction::SendAck
         );
         assert!(conn.proxy_dead);
         assert_eq!(
-            conn.process_data(conn.rcv_nxt(), &vec![0u8; SEGMENT]).unwrap(),
+            conn.process_data(conn.rcv_nxt(), &vec![0u8; SEGMENT])
+                .unwrap(),
             TcpAction::SendRst
         );
     }

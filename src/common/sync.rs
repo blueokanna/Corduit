@@ -192,7 +192,10 @@ mod tests {
         n.notify_one();
         let (notified, latched) = waiter.join().unwrap();
         assert!(notified, "the notification was observed");
-        assert!(!latched, "the call parked, so it did not start from a latch");
+        assert!(
+            !latched,
+            "the call parked, so it did not start from a latch"
+        );
     }
 
     #[test]
