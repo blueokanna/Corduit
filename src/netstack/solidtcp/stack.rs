@@ -149,8 +149,7 @@ fn pump_udp_replies(
                 if n <= header_len {
                     continue;
                 }
-                let (IpAddr::V4(remote_ip), IpAddr::V4(client_ip)) =
-                    (remote.ip(), client.ip())
+                let (IpAddr::V4(remote_ip), IpAddr::V4(client_ip)) = (remote.ip(), client.ip())
                 else {
                     continue;
                 };
@@ -699,14 +698,14 @@ impl SolidStack {
             }
         }
 
-        let association =
-            Arc::new(self.clone_for_proxy().open_udp_association(src_addr, dst_addr)?);
+        let association = Arc::new(
+            self.clone_for_proxy()
+                .open_udp_association(src_addr, dst_addr)?,
+        );
 
         let mut table = self.udp_associations.lock();
         let replaced = table.insert(key, Arc::clone(&association));
-        let opened = self
-            .udp_associations_opened
-            .fetch_add(1, Ordering::Relaxed);
+        let opened = self.udp_associations_opened.fetch_add(1, Ordering::Relaxed);
         if opened % UDP_ASSOCIATION_SWEEP_EVERY == 0 {
             table.retain(|_, entry| entry.is_alive());
         }
@@ -1210,9 +1209,7 @@ impl StackProxy {
 
         debug!(
             "UDP association ready: {} -> {} via {}",
-            src_addr,
-            dst_addr,
-            relay_addr
+            src_addr, dst_addr, relay_addr
         );
 
         Ok(UdpAssociation {
