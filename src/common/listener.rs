@@ -233,9 +233,7 @@ impl ConnectionListener {
                                     io::ErrorKind::ConnectionAborted
                                         | io::ErrorKind::ConnectionReset
                                         | io::ErrorKind::Interrupted
-                                ) =>
-                            {
-                            }
+                                ) => {}
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(ACCEPT_ERROR_PAUSE);
                             }
@@ -362,7 +360,10 @@ mod tests {
         let peer = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the listener should hand the connection to a worker");
-        assert_eq!(peer.port(), client.local_addr().expect("client addr").port());
+        assert_eq!(
+            peer.port(),
+            client.local_addr().expect("client addr").port()
+        );
 
         listener.stop();
     }
@@ -404,9 +405,8 @@ mod tests {
 
         let waiter_cancel = cancel.clone();
         let waiter_slots = Arc::clone(&slots);
-        let waiter = std::thread::spawn(move || {
-            Slots::acquire(&waiter_slots, &waiter_cancel).is_none()
-        });
+        let waiter =
+            std::thread::spawn(move || Slots::acquire(&waiter_slots, &waiter_cancel).is_none());
 
         std::thread::sleep(Duration::from_millis(20));
         cancel.on_cancel({

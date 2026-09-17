@@ -233,9 +233,7 @@ impl SyncStream for TcpStream {
     /// the socket, not of the descriptor, so timeouts set through this handle
     /// or the original still agree.
     fn shared_handle(&self) -> Option<SharedStream> {
-        TcpStream::try_clone(self)
-            .ok()
-            .map(SharedStream::new)
+        TcpStream::try_clone(self).ok().map(SharedStream::new)
     }
 }
 
