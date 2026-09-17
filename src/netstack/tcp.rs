@@ -125,6 +125,76 @@ impl TcpConnection {
         self.inner.lock().download_bytes
     }
 
+    /// Read from the receive buffer, waiting for data or close.
+    ///
+    /// Takes `&self` on purpose. Everything this touches is already behind the
+    /// connection's own lock, so a reader and a writer can use the same
+    /// connection from two threads at once — which is what lets a relay read
+    /// and write the TUN side of a proxied connection without a lock of its
+    /// own, and therefore without a poll interval to hand that lock over.
+    /// See [`crate::common::stream::SharedStream`].
+    ///
+    /// The wait is bounded by [`READ_POLL_TIMEOUT`] rather than indefinite: a
+    /// notification can be missed between the condition check and the wait
+    /// (the condition lives under the connection lock, the notification under
+    /// the `Notify`), and this bound is what recovers from that.
+    pub fn read_blocking(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let notify = {
+                let mut inner = self.lock_inner();
+                if !inner.recv_buffer.is_empty() {
+                    let len = std::cmp::min(buf.len(), inner.recv_buffer.len());
+                    buf[..len].copy_from_slice(&inner.recv_buffer.split_to(len));
+                    return Ok(len);
+                }
+                if inner.closed {
+                    return Ok(0); // EOF
+                }
+                inner.notify.clone()
+            };
+            notify.wait(READ_POLL_TIMEOUT);
+            if self.lock_inner().closed {
+                return Ok(0);
+            }
+        }
+    }
+
+    /// Hand data to the stack for transmission.
+    ///
+    /// `&self`, for the same reason as [`read_blocking`](Self::read_blocking).
+    pub fn write_buffered(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut inner = self.lock_inner();
+
+        if inner.closed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Connection closed",
+            ));
+        }
+
+        inner.send_buffer.extend_from_slice(buf);
+        inner.upload_bytes += buf.len() as u64;
+
+        let _ = self.stack_tx.send(TcpStackEvent::DataReady(self.id));
+
+        Ok(buf.len())
+    }
+
+    /// Tear the connection down and tell the stack about it.
+    pub fn shutdown_both(&self) {
+        self.close();
+        let _ = self.stack_tx.send(TcpStackEvent::Close(self.id));
+    }
+
+    /// Lock the connection state, tolerating poisoning: a panic on one thread
+    /// must not make the connection unusable on the other.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, TcpConnectionInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Push data received from the network into the connection
     pub(crate) fn push_recv_data(&self, data: &[u8]) {
         const MAX_RECV_BUFFER: usize = 4 * 1024 * 1024;
@@ -150,52 +220,37 @@ impl TcpConnection {
 
 impl Read for TcpConnection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            let notify = {
-                let mut inner = self.inner.lock();
-                if !inner.recv_buffer.is_empty() {
-                    let len = std::cmp::min(buf.len(), inner.recv_buffer.len());
-                    buf[..len].copy_from_slice(&inner.recv_buffer.split_to(len));
-                    return Ok(len);
-                }
-                if inner.closed {
-                    return Ok(0); // EOF
-                }
-                inner.notify.clone()
-            };
-            // Block until data arrives or the connection is closed.
-            notify.wait(READ_POLL_TIMEOUT);
-            if self.inner.lock().closed {
-                return Ok(0);
-            }
-        }
+        self.read_blocking(buf)
     }
 }
 
 impl Write for TcpConnection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut inner = self.inner.lock();
-
-        if inner.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Connection closed",
-            ));
-        }
-
-        inner.send_buffer.extend_from_slice(buf);
-        inner.upload_bytes += buf.len() as u64;
-
-        // Notify the stack that there's data to send
-        let _ = self.stack_tx.send(TcpStackEvent::DataReady(self.id));
-
-        Ok(buf.len())
+        self.write_buffered(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The TUN side of a proxied connection is an ordinary duplex socket as far as
+/// the relay is concerned: its reads and writes are independent of each other
+/// and both already take the connection's own lock.
+impl crate::common::stream::StreamHandle for std::sync::Arc<TcpConnection> {
+    fn read_shared(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_blocking(buf)
+    }
+
+    fn write_shared(&self, buf: &[u8]) -> io::Result<usize> {
+        self.write_buffered(buf)
+    }
+
+    fn shutdown_shared(&self, how: std::net::Shutdown) -> io::Result<()> {
+        match how {
+            std::net::Shutdown::Write | std::net::Shutdown::Both => self.shutdown_both(),
+            std::net::Shutdown::Read => {}
+        }
         Ok(())
     }
 }
@@ -451,5 +506,15 @@ impl SyncStream for TcpStream {
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         Some(self.conn.src_addr())
+    }
+
+    /// The connection behind this stream is already internally locked and its
+    /// reads and writes are independent of each other, so a relay can use it
+    /// from both directions at once — no lock of its own, and therefore no
+    /// poll interval to hand that lock over.
+    fn shared_handle(&self) -> Option<crate::common::stream::SharedStream> {
+        Some(crate::common::stream::SharedStream::new(Arc::clone(
+            &self.conn,
+        )))
     }
 }

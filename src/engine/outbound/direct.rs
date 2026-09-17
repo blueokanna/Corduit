@@ -1,31 +1,18 @@
 //! DIRECT outbound: connect straight to the target.
 //!
-//! No upstream proxy — this is the baseline every other outbound is compared
+//! No upstream proxy 鈥?this is the baseline every other outbound is compared
 //! against. TCP relays run two dedicated copy threads (see
 //! [`relay_bidirectional_with_connection`]); UDP is a one-shot request/reply
 //! on a fresh socket (immune to Windows ICMP poisoning).
 
 use crate::common::cancel::CancellationToken;
-use crate::common::stream::SyncStream;
 use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::ConnectionTracker;
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Copy buffer size for the relay threads.
-const RELAY_CHUNK: usize = 32 * 1024;
-
-/// Lock-fairness yield after an idle relay poll.
-///
-/// The two relay threads share each stream behind a `std::sync::Mutex` whose
-/// handoff is not fair: after a read times out (idle), a thread re-locks its
-/// source stream almost instantly, which can starve the opposite direction's
-/// writes for seconds on Linux. Sleeping for this window with the lock
-/// released lets the other direction write through within a bounded time.
-const RELAY_POLL_YIELD: Duration = Duration::from_millis(15);
 
 pub struct DirectOutbound {
     config: OutboundConfig,
@@ -216,159 +203,45 @@ pub fn relay_bidirectional_with_connection(
     connection: Option<Arc<crate::engine::connection_tracker::TrackedConnection>>,
     token: CancellationToken,
 ) -> Result<()> {
-    // Bound every blocking read so no thread holds a stream's lock across
-    // an unbounded block (see `crate::common::stream::RELAY_READ_POLL`), and
-    // give writes a generous ceiling.
-    let _ = a.set_read_timeout(Some(crate::common::stream::RELAY_READ_POLL));
-    let _ = b.set_read_timeout(Some(crate::common::stream::RELAY_READ_POLL));
-    let _ = a.set_write_timeout(Some(Duration::from_secs(60)));
-    let _ = b.set_write_timeout(Some(Duration::from_secs(60)));
+    let upload_tracker = Arc::clone(&tracker);
+    let upload_connection = connection.clone();
+    let download_tracker = Arc::clone(&tracker);
+    let download_connection = connection;
 
-    let a = Arc::new(std::sync::Mutex::new(a));
-    let b = Arc::new(std::sync::Mutex::new(b));
-    let t1 = {
-        let a1 = a.clone();
-        let b1 = b.clone();
-        let tracker1 = tracker.clone();
-        let connection1 = connection.clone();
-        let token1 = token.clone();
-        std::thread::Builder::new()
-            .name("corduit-relay-up".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; RELAY_CHUNK];
-                loop {
-                    if token1.is_cancelled() {
-                        let _ = a1.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                        let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                        return Err(Error::network("relay cancelled"));
-                    }
-                    let n = {
-                        let mut guard = a1.lock().unwrap();
-                        match guard.read(&mut buf) {
-                            Ok(0) => {
-                                drop(guard);
-                                let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Write);
-                                return Ok(());
-                            }
-                            Ok(n) => n,
-                            Err(e)
-                                if matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                                ) =>
-                            {
-                                // Release the source stream's lock BEFORE
-                                // yielding so the opposite direction can write
-                                // through (the std mutex handoff is not fair
-                                // and otherwise starves it for seconds).
-                                drop(guard);
-                                std::thread::sleep(RELAY_POLL_YIELD);
-                                continue;
-                            }
-                            Err(e) => {
-                                drop(guard);
-                                let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                                let _ = a1.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                                return Err(Error::network(format!("relay read failed: {e}")));
-                            }
-                        }
-                    };
-                    if let Err(e) = b1.lock().unwrap().write_all(&buf[..n]) {
-                        let _ = a1.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                        let _ = b1.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                        return Err(Error::network(format!("relay write failed: {e}")));
-                    }
-                    tracker1.add_global_upload(n as u64);
-                    if let Some(ref c) = connection1 {
-                        c.add_upload(n as u64);
-                    }
-                }
-            })
-            .map_err(|e| Error::network(format!("spawn relay thread: {e}")))?
+    let accounting = crate::common::stream::RelayAccounting {
+        upstream: Some(Arc::new(move |bytes| {
+            upload_tracker.add_global_upload(bytes);
+            if let Some(ref tracked) = upload_connection {
+                tracked.add_upload(bytes);
+            }
+        })),
+        downstream: Some(Arc::new(move |bytes| {
+            download_tracker.add_global_download(bytes);
+            if let Some(ref tracked) = download_connection {
+                tracked.add_download(bytes);
+            }
+        })),
     };
-
-    let t2 = {
-        let a2 = a.clone();
-        let b2 = b.clone();
-        let tracker2 = tracker.clone();
-        let connection2 = connection.clone();
-        let token2 = token.clone();
-        std::thread::Builder::new()
-            .name("corduit-relay-down".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; RELAY_CHUNK];
-                loop {
-                    if token2.is_cancelled() {
-                        let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                        let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                        return Err(Error::network("relay cancelled"));
-                    }
-                    let n = {
-                        let mut guard = b2.lock().unwrap();
-                        match guard.read(&mut buf) {
-                            Ok(0) => {
-                                drop(guard);
-                                let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Write);
-                                return Ok(());
-                            }
-                            Ok(n) => n,
-                            Err(e)
-                                if matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                                ) =>
-                            {
-                                drop(guard);
-                                std::thread::sleep(RELAY_POLL_YIELD);
-                                continue;
-                            }
-                            Err(e) => {
-                                drop(guard);
-                                let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                                let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                                return Err(Error::network(format!("relay read failed: {e}")));
-                            }
-                        }
-                    };
-                    if let Err(e) = a2.lock().unwrap().write_all(&buf[..n]) {
-                        let _ = a2.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                        let _ = b2.lock().unwrap().shutdown(std::net::Shutdown::Both);
-                        return Err(Error::network(format!("relay write failed: {e}")));
-                    }
-                    tracker2.add_global_download(n as u64);
-                    if let Some(ref c) = connection2 {
-                        c.add_download(n as u64);
-                    }
-                }
-            })
-            .map_err(|e| Error::network(format!("spawn relay thread: {e}")))?
-    };
-
-    let r1 = t1
-        .join()
-        .map_err(|_| Error::network("relay thread panicked"))?;
-    let r2 = t2
-        .join()
-        .map_err(|_| Error::network("relay thread panicked"))?;
 
     if token.is_cancelled() {
         return Err(Error::network("relay cancelled"));
     }
 
-    // One clean direction (EOF) is success; both failing with connection
-    // teardown errors is also a normal close.
-    match (r1, r2) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(_)) | (Err(_), Ok(())) => Ok(()),
-        (Err(e1), Err(e2)) => {
-            let normal = |e: &Error| {
-                let msg = e.to_string().to_lowercase();
-                msg.contains("reset") || msg.contains("broken pipe") || msg.contains("connection")
-            };
-            if normal(&e1) && normal(&e2) {
+    match crate::common::stream::relay_with(a, b, token.clone(), accounting) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if token.is_cancelled() {
+                return Err(Error::network("relay cancelled"));
+            }
+            let message = error.to_string().to_lowercase();
+            let teardown = message.contains("reset")
+                || message.contains("broken pipe")
+                || message.contains("connection")
+                || message.contains("not connected");
+            if teardown {
                 Ok(())
             } else {
-                Err(Error::network(format!("Relay error: {} / {}", e1, e2)))
+                Err(Error::network(format!("Relay error: {error}")))
             }
         }
     }
