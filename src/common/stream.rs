@@ -317,6 +317,7 @@ fn copy_one_way(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
+                std::thread::sleep(RELAY_POLL_YIELD);
                 continue;
             }
             Err(e) => return Err(e),
@@ -515,7 +516,17 @@ fn copy_direction(
                 return Ok(());
             }
             Ok(Some(n)) => n,
-            Ok(None) => continue,
+            // Nothing to move yet. `Side::read` has already handed back any
+            // serialized lock it took, and this sleep is the loop's own
+            // guarantee that it never re-enters a read without having yielded
+            // the CPU first — even for a transport that reports "no progress"
+            // without ever having blocked. Without it, a handle that returns
+            // `WouldBlock` immediately turns this into a userspace spin: no
+            // syscalls, no I/O, one saturated core per relay direction.
+            Ok(None) => {
+                std::thread::sleep(RELAY_POLL_YIELD);
+                continue;
+            }
             Err(e) => {
                 src.release();
                 dst.release();
@@ -620,7 +631,23 @@ pub fn relay_with(
         let accounting = accounting.clone();
         std::thread::Builder::new()
             .name("corduit-relay-up".into())
-            .spawn(move || copy_direction(src, dst, token, stats, accounting, true))?
+            .spawn(move || copy_direction(src, dst, token, stats, accounting, true))
+    };
+
+    // Both spawns and both joins have to complete on every path out of this
+    // function. A `?` between the two spawns used to return while the first
+    // thread was already running: nothing owned it any more, so it kept its
+    // two streams, its buffers and its spot in the thread table for the life
+    // of the process. On a device that opens a connection per app flow the
+    // strays accumulate until thread creation itself starts failing, which is
+    // what turned a leak into a storm.
+    let upstream = match upstream {
+        Ok(handle) => handle,
+        Err(error) => {
+            a.release();
+            b.release();
+            return Err(error);
+        }
     };
 
     let downstream = {
@@ -631,15 +658,38 @@ pub fn relay_with(
         let accounting = accounting.clone();
         std::thread::Builder::new()
             .name("corduit-relay-down".into())
-            .spawn(move || copy_direction(src, dst, token, stats, accounting, false))?
+            .spawn(move || copy_direction(src, dst, token, stats, accounting, false))
     };
 
-    let up = upstream
-        .join()
-        .map_err(|_| io::Error::other("relay thread panicked"))?;
-    let down = downstream
-        .join()
-        .map_err(|_| io::Error::other("relay thread panicked"))?;
+    let downstream = match downstream {
+        Ok(handle) => handle,
+        Err(error) => {
+            // The upstream thread is already running and holds both sides.
+            // Releasing them is what wakes it, and joining it is what keeps
+            // this function the sole owner of every thread it started.
+            a.release();
+            b.release();
+            let _ = upstream.join();
+            return Err(error);
+        }
+    };
+
+    // Both joins run before any `?`, so a panic in one direction can never
+    // return early and strand the other thread.
+    let up = upstream.join();
+
+    // A panicking direction unwinds without releasing anything, so the other
+    // one can still be parked in a read that will never see data again.
+    // Release both sides before waiting for it, or this join never returns.
+    if up.is_err() {
+        a.release();
+        b.release();
+    }
+
+    let down = downstream.join();
+
+    let up = up.map_err(|_| io::Error::other("relay thread panicked"))?;
+    let down = down.map_err(|_| io::Error::other("relay thread panicked"))?;
 
     if token.is_cancelled() {
         return Err(io::Error::new(
@@ -830,5 +880,156 @@ mod tests {
 
         let outcome = relayed.join().expect("relay thread");
         assert!(outcome.is_err(), "a cancelled relay reports interruption");
+    }
+
+    /// A transport that has nothing to hand over until it is released, and that
+    /// reports when it is finally dropped.
+    ///
+    /// `WouldBlock` rather than a parked syscall keeps the copy thread inside
+    /// the relay's own loop, so the thread is alive for exactly as long as the
+    /// relay owns it — which is the property under test. The drop flag is the
+    /// only cross-platform way to tell a joined thread from a stray one: a
+    /// thread that outlives `relay` still holds its `Arc<Side>`, and therefore
+    /// still holds the transport.
+    struct Parking {
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        panic_on_read: bool,
+    }
+
+    impl Read for Parking {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            assert!(
+                !self.panic_on_read,
+                "the upstream direction was told to panic"
+            );
+            if self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(0);
+            }
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "nothing yet"))
+        }
+    }
+
+    impl Write for Parking {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SyncStream for Parking {
+        fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Drop for Parking {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A direction that unwinds must not leave its partner parked.
+    ///
+    /// This is the leak that turned into a storm on device: `relay_with`
+    /// returned on the panicking join without joining the other thread, so that
+    /// thread kept both transports (and their sockets) for the life of the
+    /// process, and a failing spawn did the same to a thread that had not even
+    /// started working yet. Both transports being dropped is the proof that no
+    /// thread is still holding them.
+    #[test]
+    fn a_panicking_direction_does_not_strand_its_partner() {
+        let up_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let down_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let down_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let upstream: BoxStream = Box::new(Parking {
+            released: std::sync::Arc::clone(&up_released),
+            dropped: std::sync::Arc::clone(&up_dropped),
+            panic_on_read: true,
+        });
+        let downstream: BoxStream = Box::new(Parking {
+            released: std::sync::Arc::clone(&down_released),
+            dropped: std::sync::Arc::clone(&down_dropped),
+            panic_on_read: false,
+        });
+
+        let outcome = relay(upstream, downstream, CancellationToken::new());
+
+        assert!(
+            outcome.is_err(),
+            "a panicking direction has to fail the relay"
+        );
+        assert!(
+            down_released.load(std::sync::atomic::Ordering::SeqCst),
+            "the surviving direction was left parked instead of released"
+        );
+        assert!(
+            up_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the upstream transport is still owned by a live thread"
+        );
+        assert!(
+            down_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the downstream transport is still owned by a live thread"
+        );
+    }
+
+    /// A relay that never sees data must poll, not spin: the no-progress path
+    /// has to sleep, so a silent connection costs a wake-up per poll interval
+    /// rather than a saturated core.
+    #[test]
+    fn a_silent_relay_parks_between_polls() {
+        let upstream: BoxStream = Box::new(Parking {
+            released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            panic_on_read: false,
+        });
+        let downstream: BoxStream = Box::new(Parking {
+            released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            panic_on_read: false,
+        });
+
+        let token = CancellationToken::new();
+        let relay_token = token.clone();
+        let relayed = std::thread::spawn(move || relay(upstream, downstream, relay_token));
+        let start = std::time::Instant::now();
+        let before = cpu_time();
+        std::thread::sleep(Duration::from_millis(300));
+        let burned = cpu_time().saturating_sub(before);
+        let elapsed = start.elapsed();
+
+        token.cancel();
+        let _ = relayed.join().expect("relay thread");
+
+        assert!(
+            burned < 150_000,
+            "a silent relay burned {burned:?} of CPU in {elapsed:?}"
+        );
+    }
+
+    /// This process's own CPU time, in microseconds.
+    #[cfg(target_os = "linux")]
+    fn cpu_time() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("own stat");
+        let rest = stat.split_once(") ").expect("comm").1;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let utime: u64 = fields[11].parse().expect("utime");
+        let stime: u64 = fields[12].parse().expect("stime");
+        // 100 ticks per second on every Linux kernel this runs on.
+        (utime + stime) * 10_000
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn cpu_time() -> u64 {
+        std::thread::sleep(Duration::from_millis(1));
+        0
     }
 }

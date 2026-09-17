@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "corduit"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",

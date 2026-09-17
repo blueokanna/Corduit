@@ -234,8 +234,6 @@ fn build_client(timeout: Duration) -> Client {
         now: unix_now(),
         min_version: TlsVersion::Tls12,
         max_version: TlsVersion::Tls13,
-        // No client certificate: the proxy's HTTP client authenticates the
-        // server, never itself.
         identity: None,
     };
     Client::with_config(ClientConfig {
@@ -345,8 +343,6 @@ fn proxy_get_once(
             .map_err(|e| HttpError::Tls(e.to_string()))?;
         h1_get_once(&mut tls, parsed, timeout)
     } else {
-        // `&TcpStream` (not the owned stream) implements courierust's
-        // transport traits, so hand a reborrow to the codec.
         h1_get_once(&mut &tcp, parsed, timeout)
     }
 }
@@ -433,9 +429,6 @@ fn h1_get_once<S: CRead + CWrite>(
             .map_err(|e| HttpError::InvalidResponse(format!("read chunked body: {e}")))?
             .to_vec(),
         h1::BodyLen::None => {
-            // No Content-Length / Transfer-Encoding. For a status that
-            // cannot carry a body this is the end; otherwise the body is
-            // close-delimited (we asked for Connection: close).
             if status.is_informational()
                 || status == StatusCode::NO_CONTENT
                 || status == StatusCode::NOT_MODIFIED
@@ -471,12 +464,12 @@ fn read_to_eof_capped<R: CRead>(
                 out.extend_from_slice(&chunk[..n]);
             }
             Err(e) if matches!(e.kind, CourierErrorKind::Timeout) => {
-                // For a `Connection: close` exchange the server closes right
-                // after the body, so a quiet connection after data is the
-                // normal completion path.
                 return Ok(out);
             }
-            Err(e) if matches!(e.kind, CourierErrorKind::WouldBlock) => continue,
+            Err(e) if matches!(e.kind, CourierErrorKind::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
             Err(e) if matches!(e.kind, CourierErrorKind::UnexpectedEof) => return Ok(out),
             Err(e) => return Err(HttpError::InvalidResponse(format!("read body: {e}"))),
         }
@@ -493,7 +486,7 @@ fn write_all_bytes<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<(), Cou
             }
             Ok(n) => data = &data[n..],
             Err(e) if matches!(e.kind, CourierErrorKind::WouldBlock) => {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(e) => return Err(e),
         }
@@ -522,8 +515,6 @@ fn establish_connect_tunnel(
         .write_all(request.as_bytes())
         .map_err(|e| HttpError::Proxy(format!("send CONNECT: {e}")))?;
 
-    // Read the response head (up to the blank line), capped to avoid
-    // unbounded buffering from a misbehaving proxy.
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
     loop {
@@ -568,8 +559,6 @@ mod tests {
 
     #[test]
     fn recognizes_redirect_codes() {
-        // Redirect following is owned by courierust's client; this test pins
-        // the HTTP status predicates the H/1 path relies on.
         assert!(StatusCode::MOVED_PERMANENTLY.is_redirection());
         assert!(StatusCode::FOUND.is_redirection());
         assert!(StatusCode::TEMPORARY_REDIRECT.is_redirection());
@@ -613,8 +602,6 @@ mod tests {
 
     #[test]
     fn courier_url_is_used_for_parsing() {
-        // The client parses URLs with courierust's own strict Url type; pin
-        // the behaviors the client depends on (default ports, IPv6, path).
         let u = Url::parse("https://example.com/a/b?q=1").unwrap();
         assert_eq!(u.host, "example.com");
         assert_eq!(u.port, 443);
@@ -646,7 +633,6 @@ mod tests {
 
     #[test]
     fn redirect_statuses_are_in_range() {
-        // The proxy path decides on the numeric status alone.
         for status in [301u16, 302, 303, 307, 308] {
             assert!((300..400).contains(&status) && status != 304);
         }

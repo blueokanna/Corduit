@@ -379,7 +379,7 @@ fn write_all<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<()> {
             Ok(0) => return Err(DnsError::Protocol("write returned 0 bytes".into())),
             Ok(n) => data = &data[n..],
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(e) => return Err(DnsError::Tls(e.to_string())),
         }
@@ -395,7 +395,7 @@ fn read_exact<R: CRead>(reader: &mut R, out: &mut [u8]) -> Result<()> {
             Ok(0) => return Err(DnsError::Protocol("connection closed mid-response".into())),
             Ok(n) => filled += n,
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::Timeout) => {
                 return Err(DnsError::Timeout);

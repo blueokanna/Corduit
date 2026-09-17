@@ -34,8 +34,7 @@ pub struct DotClientConfig {
     pub tls_name: Option<String>,
     /// Connection timeout.
     pub timeout: Duration,
-    /// Enable session resumption (courierust keeps a per-connector ticket
-    /// store, so a `TlsConnector` shared across queries resumes 1-RTT).
+    /// Enable session resumption (default: true).
     pub session_resumption: bool,
 }
 
@@ -158,7 +157,6 @@ impl DotClient {
 
     /// Send a DNS query over TLS via courierust (blocking exchange).
     fn send_query(&self, query: &[u8]) -> Result<Vec<u8>> {
-        // Resolve the host (courierust's transport is synchronous).
         let addrs: Vec<SocketAddr> = (self.server.as_str(), self.port)
             .to_socket_addrs()
             .map_err(DnsError::Io)?
@@ -170,21 +168,17 @@ impl DotClient {
         let tcp = TcpStream::connect_timeout(&addr, self.timeout).map_err(DnsError::Io)?;
         let _ = tcp.set_read_timeout(Some(self.timeout));
         let _ = tcp.set_write_timeout(Some(self.timeout));
-
-        // TLS handshake over the socket.
         let mut tls = self
             .tls_connector
             .connect(&self.tls_name, &tcp, &tcp)
             .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {e}")))?;
 
-        // Write the 2-byte length prefix + query.
         let mut request = Vec::with_capacity(LEN_PREFIX + query.len());
         request.extend_from_slice(&(query.len() as u16).to_be_bytes());
         request.extend_from_slice(query);
         write_all(&mut tls, &request)
             .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
 
-        // Read the response length prefix.
         let mut len_buf = [0u8; 2];
         read_exact(&mut tls, &mut len_buf)
             .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
@@ -193,7 +187,6 @@ impl DotClient {
             return Err(DnsError::Protocol("Response too large".to_string()));
         }
 
-        // Read the response body.
         let mut response = vec![0u8; response_len];
         read_exact(&mut tls, &mut response)
             .map_err(|e| DnsError::Io(std::io::Error::other(e.to_string())))?;
@@ -238,7 +231,7 @@ fn write_all<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<()> {
             Ok(0) => return Err(DnsError::Protocol("write returned 0 bytes".into())),
             Ok(n) => data = &data[n..],
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(e) => return Err(DnsError::Tls(e.to_string())),
         }
@@ -254,7 +247,7 @@ fn read_exact<R: CRead>(reader: &mut R, out: &mut [u8]) -> Result<()> {
             Ok(0) => return Err(DnsError::Protocol("connection closed mid-response".into())),
             Ok(n) => filled += n,
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::Timeout) => {
                 return Err(DnsError::Timeout);

@@ -69,9 +69,6 @@ impl DotServer {
             ));
         }
 
-        // `Identity::from_pem_file` proves that the key matches the leaf
-        // certificate, so a misconfigured pair fails here instead of failing
-        // every handshake later.
         let identity = Identity::from_pem_file(&config.cert_path, &config.key_path)
             .map_err(|e| DnsError::Config(format!("Failed to load DoT TLS identity: {e}")))?;
         let acceptor = Arc::new(TlsAcceptor::new(ServerConfig {
@@ -108,9 +105,6 @@ impl DotServer {
             })
             .map_err(DnsError::Io)?;
         info!("DoT server listening on {}", self.config.listen);
-
-        // Serve until `stop` is called, then tear the listener down; the
-        // token is the only cross-thread signal this server needs.
         self.shutdown.wait(Duration::from_secs(u64::MAX));
         server.stop();
         info!("DoT server stopped");
@@ -147,7 +141,6 @@ fn handle_connection(
         .map_err(|e| DnsError::Tls(format!("TLS handshake failed: {e}")))?;
 
     loop {
-        // Read the 2-byte big-endian length prefix.
         let mut len_buf = [0u8; 2];
         match read_exact(&mut tls, &mut len_buf) {
             Ok(()) => {}
@@ -200,7 +193,7 @@ fn read_exact<R: CRead>(reader: &mut R, out: &mut [u8]) -> Result<()> {
             Ok(0) => return Err(DnsError::Protocol("connection closed".into())),
             Ok(n) => filled += n,
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::Timeout) => {
                 return Err(DnsError::Timeout);
@@ -218,7 +211,7 @@ fn write_all<W: CWrite>(writer: &mut W, mut data: &[u8]) -> Result<()> {
             Ok(0) => return Err(DnsError::Protocol("write returned 0 bytes".into())),
             Ok(n) => data = &data[n..],
             Err(e) if matches!(e.kind, courierust::courierust_error::ErrorKind::WouldBlock) => {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(e) => return Err(DnsError::Tls(e.to_string())),
         }

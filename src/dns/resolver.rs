@@ -80,13 +80,11 @@ impl DnsResolver {
         let name = name.trim_end_matches('.');
         trace!("Resolving {} {:?}", name, record_type);
 
-        // 1. Check hosts file
         if let Some(ips) = self.hosts.read().lookup(name) {
             debug!("Hosts hit: {} -> {:?}", name, ips);
             return Ok(ips.to_vec());
         }
 
-        // 2. Check Fake-IP (for A records only)
         if record_type == RecordType::A {
             if let Some(ref fake_ip) = self.fake_ip {
                 if !fake_ip.should_filter(name) {
@@ -96,8 +94,6 @@ impl DnsResolver {
                 }
             }
         }
-
-        // 3. Check cache
         if let Some(entry) = self.cache.get(name, record_type) {
             debug!(
                 "Cache hit: {} {:?} -> {:?}",
@@ -106,10 +102,7 @@ impl DnsResolver {
             return Ok(entry.addresses);
         }
 
-        // 4. Query upstream DNS
         let result = self.query_upstream(name, record_type)?;
-
-        // 5. Cache the result
         if !result.is_empty() {
             self.cache.insert(name, record_type, result.clone(), 300); // Default 5 min TTL
         }
@@ -120,17 +113,14 @@ impl DnsResolver {
     /// Query upstream DNS servers
     fn query_upstream(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let wire_type = crate::dns::wire::RecordType::from(record_type);
-
-        // Try primary servers first
         for client in &self.primary_clients {
             match client.query(name, wire_type) {
                 Ok(response) => {
                     let ips = self.extract_ips(&response, record_type);
 
-                    // Check if we need fallback (anti-spoofing)
                     if self.should_use_fallback(name, &ips) {
                         debug!("Using fallback DNS for {} (anti-spoofing)", name);
-                        break; // Fall through to fallback
+                        break;
                     }
 
                     if !ips.is_empty() {
@@ -143,7 +133,6 @@ impl DnsResolver {
             }
         }
 
-        // Try fallback servers
         for client in &self.fallback_clients {
             match client.query(name, wire_type) {
                 Ok(response) => {
@@ -170,10 +159,8 @@ impl DnsResolver {
 
         for answer in &response.answers {
             match &answer.data {
-                RData::A(a) => {
-                    if record_type == RecordType::A {
-                        ips.push(IpAddr::V4(a.0));
-                    }
+                RData::A(a) if record_type == RecordType::A => {
+                    ips.push(IpAddr::V4(a.0));
                 }
                 RData::AAAA(aaaa) if record_type == RecordType::AAAA => {
                     ips.push(IpAddr::V6(aaaa.0));
@@ -182,7 +169,6 @@ impl DnsResolver {
             }
         }
 
-        // Sort: prefer IPv4 if configured
         if self.config.prefer_ipv4 {
             ips.sort_by_key(|ip| match ip {
                 IpAddr::V4(_) => 0,
@@ -196,8 +182,6 @@ impl DnsResolver {
     /// Check if fallback DNS should be used (anti-spoofing)
     fn should_use_fallback(&self, name: &str, ips: &[IpAddr]) -> bool {
         let filter = &self.config.fallback_filter;
-
-        // Check domain filter
         for pattern in &filter.domain {
             if let Some(suffix) = pattern.strip_prefix('+') {
                 if name.ends_with(suffix) || name == &suffix[1..] {
@@ -207,14 +191,10 @@ impl DnsResolver {
                 return true;
             }
         }
-
-        // Check for bogon IPs using the bogon detection module
         if contains_bogon(ips) {
             debug!("Bogon IP detected in response for {}: {:?}", name, ips);
             return true;
         }
-
-        // Check IP CIDR filter (additional custom ranges)
         for ip in ips {
             for cidr in &filter.ipcidr {
                 if let Ok(network) = cidr.parse::<ipnet::IpNet>() {
@@ -271,7 +251,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore] // Requires network
+    #[ignore]
     fn test_resolver_basic() {
         let config = DnsConfig {
             nameservers: vec!["8.8.8.8".to_string()],
