@@ -39,8 +39,6 @@ struct Inner {
     cancelled: AtomicBool,
     wake: Mutex<()>,
     cond: Condvar,
-    /// Released-in-cancel-order handlers. Taken wholesale by [`cancel`], so a
-    /// hook runs exactly once no matter how the race with `cancel()` falls.
     hooks: Mutex<Vec<Hook>>,
 }
 
