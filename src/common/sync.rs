@@ -80,11 +80,19 @@ impl Notify {
     /// call had to block at all.
     ///
     /// Returns `(notified, latched)`. `latched == true` means the flag was
-    /// already set when the call started, so *this returned without ever
+    /// already set when this call started, so *it returned without ever
     /// blocking*. That distinction is the whole difference between a poll and a
     /// busy loop for a condition-variable style caller: a latched wake that
     /// carries no data has to be bounded by the caller, while a real wait that
     /// observed the latch may loop again for free.
+    ///
+    /// The second element is exactly "did this call start from a latch", not
+    /// "was a notification observed". Every path that reaches `wait_for`
+    /// reports `false`, because `wait_for` parks before it can observe the
+    /// flag: a notification that arrives 1 ms into a 50 ms window is observed
+    /// *after* blocking, which is the case the caller has to bound. Deriving
+    /// it from `!timed_out()` labels exactly that case `latched`, i.e. reports
+    /// the one wake-up that needs a backoff as the one that does not.
     ///
     /// [`wait`](Self::wait) cannot express this because it answers "was a
     /// notification observed", which is true for both cases.
@@ -94,12 +102,12 @@ impl Notify {
             self.inner.flag.store(false, Ordering::Release);
             return (true, true);
         }
-        let outcome = self.inner.cond.wait_for(&mut guard, timeout);
+        let _ = self.inner.cond.wait_for(&mut guard, timeout);
         let notified = self.inner.flag.load(Ordering::Acquire);
         if notified {
             self.inner.flag.store(false, Ordering::Release);
         }
-        (notified, !outcome.timed_out() && notified)
+        (notified, false)
     }
 
     /// Block until the latch is set or `timeout` elapses.
@@ -170,6 +178,21 @@ mod tests {
         let (notified, latched) = n.wait_latched(Duration::from_millis(20));
         assert!(!notified);
         assert!(!latched);
+    }
+
+    #[test]
+    fn a_wait_woken_by_a_notification_is_not_latched() {
+        // The distinction that matters: this call *did* park, so the caller
+        // must bound the next iteration. Reporting it as latched would tell a
+        // poll loop to skip its backoff on the one path that needs it.
+        let n = Arc::new(Notify::new());
+        let n2 = Arc::clone(&n);
+        let waiter = std::thread::spawn(move || n2.wait_latched(Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(50));
+        n.notify_one();
+        let (notified, latched) = waiter.join().unwrap();
+        assert!(notified, "the notification was observed");
+        assert!(!latched, "the call parked, so it did not start from a latch");
     }
 
     #[test]

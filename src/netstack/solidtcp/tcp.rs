@@ -7,9 +7,78 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
+
+/// The largest receive window a TCP header can carry.
+///
+/// No window scaling is negotiated, so a value above this would be silently
+/// truncated on the wire: the window we compute and the window the peer acts
+/// on would disagree, and nothing would report the difference.
+pub const MAX_RECV_WINDOW: u16 = 65535;
+
+/// What the proxy writer owns on a connection's behalf.
+///
+/// Two things have to travel with the writer thread, and both are about the
+/// same hazard: this stack acknowledges a segment when it arrives, not when the
+/// proxy has taken it.
+///
+/// * the in-flight counter, released as the writer drains it, so the receive
+///   window reflects what is still queued rather than what is acknowledged;
+/// * the liveness flag, cleared on the way out of every path — including an
+///   early `break` — because "the channel is closed" is only discoverable by
+///   trying to send, and by then the bytes are already acknowledged.
+///
+/// The release is in `Drop` for that reason: a writer that stops early has to
+/// hand its bytes back to the window, or the connection would sit at a window
+/// of zero for the rest of its life.
+pub struct ProxyWriter {
+    inflight: Arc<AtomicUsize>,
+    alive: Arc<AtomicBool>,
+    held: usize,
+}
+
+impl ProxyWriter {
+    fn new(inflight: Arc<AtomicUsize>, alive: Arc<AtomicBool>) -> Self {
+        Self {
+            inflight,
+            alive,
+            held: 0,
+        }
+    }
+
+    /// Record bytes taken off the channel that are not on the wire yet.
+    pub fn take(&mut self, bytes: usize) {
+        self.held += bytes;
+    }
+
+    /// The bytes taken so far have been written; they no longer occupy the
+    /// window.
+    pub fn written(&mut self) {
+        self.release_held();
+    }
+
+    /// Bytes currently taken but not written.
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
+    fn release_held(&mut self) {
+        if self.held > 0 {
+            self.inflight.fetch_sub(self.held, Ordering::Relaxed);
+            self.held = 0;
+        }
+    }
+}
+
+impl Drop for ProxyWriter {
+    fn drop(&mut self) {
+        self.release_held();
+        self.alive.store(false, Ordering::Release);
+    }
+}
 
 /// TCP state (RFC 793)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +166,32 @@ pub struct TcpConnection {
     ooo_size: usize,
     is_websocket: bool,
     recv_window: u32,
-    last_window_update: u32,
+    /// The window value last put on the wire.
+    ///
+    /// Kept only to detect the one transition a peer cannot discover by
+    /// itself: a window that was advertised as zero and has since opened. A
+    /// peer that stopped for a closed window sends nothing but probes, so
+    /// without this the flow would resume only when its retransmission timer
+    /// expired.
+    last_advertised: u32,
+    /// Bytes handed to the proxy writer but not yet written to the proxy.
+    ///
+    /// The relay between this stack and the proxy socket is a queue, and a
+    /// queue nobody counts is not flow control. `recv_buf` is drained into the
+    /// channel inside the same call that fills it, so it is empty whenever the
+    /// window is recomputed — meaning the three buffers above could all read
+    /// zero while the proxy was megabytes behind. Shared with the writer
+    /// thread, which releases each chunk once it is on the wire.
+    proxy_inflight: Arc<AtomicUsize>,
+    /// Cleared by the proxy writer as it exits. A connection that is up but
+    /// whose writer is gone can neither deliver nor keep what the peer sends,
+    /// so it has to stop accepting rather than acknowledge and discard.
+    proxy_alive: Arc<AtomicBool>,
+    /// Set when a send to the writer's channel fails. Redundant with
+    /// `proxy_alive` except for the instant between the channel being dropped
+    /// and the writer's guard running, which is exactly the window in which a
+    /// segment would otherwise be accepted and thrown away.
+    proxy_dead: bool,
     dup_ack_count: u32,
 }
 
@@ -136,8 +230,11 @@ impl TcpConnection {
             max_ooo_size: 512 * 1024,
             ooo_size: 0,
             is_websocket,
-            recv_window: 65535 * 4,
-            last_window_update: 65535 * 4,
+            recv_window: MAX_RECV_WINDOW as u32,
+            last_advertised: MAX_RECV_WINDOW as u32,
+            proxy_inflight: Arc::new(AtomicUsize::new(0)),
+            proxy_alive: Arc::new(AtomicBool::new(false)),
+            proxy_dead: false,
             dup_ack_count: 0,
         }
     }
@@ -157,17 +254,65 @@ impl TcpConnection {
         self.recv_window
     }
 
+    /// Everything accepted from the peer that the proxy has not written yet.
+    ///
+    /// This is the queue the receive window exists to bound: bytes that have
+    /// been acknowledged but not consumed. The reassembly buffers count, and
+    /// so does what the proxy writer has taken but not written — leaving that
+    /// out is what let a slow proxy grow the queue without limit.
+    pub fn queued_bytes(&self) -> usize {
+        self.recv_buf
+            .len()
+            .saturating_add(self.pending_data.len())
+            .saturating_add(self.ooo_size)
+            .saturating_add(self.proxy_inflight.load(Ordering::Relaxed))
+    }
+
+    /// Whether the flow can still carry anything.
+    ///
+    /// A connection with no proxy yet is *not* gone: its bytes are buffered
+    /// until the SOCKS5 handshake finishes. A connection whose writer has
+    /// exited is, and so is one whose channel rejected a send.
+    fn proxy_is_gone(&self) -> bool {
+        self.proxy_dead
+            || (self.proxy_tx.is_some() && !self.proxy_alive.load(Ordering::Acquire))
+    }
+
+    /// Whether one more segment of `len` bytes fits in the queued-data budget.
+    fn has_room_for(&self, len: usize) -> bool {
+        !self.proxy_is_gone()
+            && self.queued_bytes().saturating_add(len) <= self.config.max_recv_buffer
+    }
+
+    /// The segment size to round windows to, never zero.
+    fn segment_size(&self) -> usize {
+        (self.mss as usize).max(1)
+    }
+
     fn update_recv_window(&mut self) {
-        let buffer_used = self.recv_buf.len() + self.pending_data.len() + self.ooo_size;
-        let max_buffer = self.config.max_recv_buffer;
-        let available = max_buffer.saturating_sub(buffer_used);
-        self.recv_window = (available as u32).min(65535 * 4);
+        let available = self
+            .config
+            .max_recv_buffer
+            .saturating_sub(self.queued_bytes());
+        // Whole segments only, and no artificial floor. A window that never
+        // closes cannot bound anything, and a floor would keep the peer
+        // refilling a queue we are refusing on every segment — one
+        // retransmission per segment, for as long as the proxy stays behind.
+        let segment = self.segment_size();
+        let window = (available / segment * segment).min(MAX_RECV_WINDOW as usize);
+        self.recv_window = window as u32;
+        self.last_advertised = self.recv_window;
+    }
 
-        let window_diff = self.recv_window.abs_diff(self.last_window_update);
-
-        if window_diff > 16384 {
-            self.last_window_update = self.recv_window;
-        }
+    /// Recompute the window and report whether the peer has to be told.
+    ///
+    /// True only for the transition from "closed" to "open": a peer that ran
+    /// out of window has no other way to learn that it may resume, since the
+    /// segment that would carry our ACK is the one it is waiting to send.
+    fn window_update_due(&mut self) -> bool {
+        let was_closed = self.last_advertised == 0;
+        self.update_recv_window();
+        was_closed && self.recv_window >= self.segment_size() as u32
     }
 
     pub fn state(&self) -> TcpState {
@@ -180,14 +325,27 @@ impl TcpConnection {
         matches!(self.state, TcpState::Closed | TcpState::TimeWait)
     }
 
-    pub fn set_proxy_tx(&mut self, tx: mpsc::Sender<Vec<u8>>) {
+    /// Attach the proxy writer's channel, flushing anything buffered while it
+    /// was being set up.
+    ///
+    /// Returns the handle the writer owns: it releases the in-flight counter as
+    /// it drains, and clears the liveness flag when it exits, so the receive
+    /// window reflects what is still queued rather than what is acknowledged.
+    pub fn set_proxy_tx(&mut self, tx: mpsc::Sender<Vec<u8>>) -> ProxyWriter {
         self.proxy_tx = Some(tx.clone());
         if !self.pending_data.is_empty() {
             let data: Vec<u8> = self.pending_data.drain(..).collect();
-            info!("Flushing {} bytes of pending data to proxy", data.len());
-            // Unbounded std channel: send never blocks, only fails on disconnect.
-            let _ = tx.send(data);
+            let len = data.len();
+            info!("Flushing {} bytes of pending data to proxy", len);
+            self.proxy_inflight.fetch_add(len, Ordering::Relaxed);
+            if tx.send(data).is_err() {
+                self.proxy_inflight.fetch_sub(len, Ordering::Relaxed);
+                self.proxy_dead = true;
+                warn!("Proxy channel closed while flushing {} bytes", len);
+            }
         }
+        self.proxy_alive.store(true, Ordering::Release);
+        ProxyWriter::new(Arc::clone(&self.proxy_inflight), Arc::clone(&self.proxy_alive))
     }
 
     pub fn snd_nxt(&self) -> u32 {
@@ -249,6 +407,9 @@ impl TcpConnection {
             self.state = TcpState::CloseWait;
             debug!("TCP FIN recv -> CLOSE_WAIT: {:?}", self.key);
             return Ok(TcpAction::SendFinAck);
+        }
+        if action == TcpAction::None && self.window_update_due() {
+            action = TcpAction::SendAck;
         }
         Ok(action)
     }
@@ -328,6 +489,10 @@ impl TcpConnection {
         if data.is_empty() {
             return Ok(TcpAction::None);
         }
+        if self.proxy_is_gone() {
+            self.state = TcpState::Closed;
+            return Ok(TcpAction::SendRst);
+        }
 
         self.update_recv_window();
         let seq_end = seq.wrapping_add(data.len() as u32);
@@ -343,6 +508,15 @@ impl TcpConnection {
         }
 
         if seq == self.rcv_nxt {
+            if !self.has_room_for(data.len()) {
+                trace!(
+                    "Refusing {} bytes: queued {} of {} (backpressure)",
+                    data.len(),
+                    self.queued_bytes(),
+                    self.config.max_recv_buffer
+                );
+                return Ok(TcpAction::SendAck);
+            }
             self.dup_ack_count = 0;
             self.recv_buf.extend(data);
             self.rcv_nxt = self.rcv_nxt.wrapping_add(data.len() as u32);
@@ -366,6 +540,9 @@ impl TcpConnection {
                     skip,
                     new_data.len()
                 );
+                if !self.has_room_for(new_data.len()) {
+                    return Ok(TcpAction::SendAck);
+                }
                 self.recv_buf.extend(new_data);
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(new_data.len() as u32);
                 self.bytes_rx += new_data.len() as u64;
@@ -374,6 +551,7 @@ impl TcpConnection {
                 if !d.is_empty() {
                     self.deliver_to_proxy(d);
                 }
+                self.update_recv_window();
             }
             return Ok(TcpAction::SendAck);
         }
@@ -456,36 +634,33 @@ impl TcpConnection {
         }
     }
 
+    /// Hand data to the proxy writer.
+    ///
+    /// Infallible by construction: [`has_room_for`](Self::has_room_for) gates
+    /// admission, so there is always room, and the bytes stay on the books as
+    /// in-flight until the writer reports them written.
     fn deliver_to_proxy(&mut self, data: Vec<u8>) {
         if data.is_empty() {
             return;
         }
 
-        if let Some(ref tx) = self.proxy_tx {
-            let data_len = data.len();
-            let tx = tx.clone();
-            trace!("Sending {} bytes to proxy", data_len);
-
-            // Unbounded std channel: send never blocks. The only failure mode
-            // is the receiver having been dropped (connection torn down).
-            match tx.send(data) {
-                Ok(()) => {
-                    trace!("Data sent to proxy");
-                }
-                Err(_) => {
-                    warn!("Proxy channel closed, cannot send {} bytes", data_len);
-                }
-            }
-        } else {
+        let Some(tx) = self.proxy_tx.clone() else {
             debug!("Buffering {} bytes (proxy not ready)", data.len());
-            let current_pending = self.pending_data.len();
-            if current_pending + data.len() <= self.config.max_recv_buffer {
-                self.pending_data.extend(data);
-            } else {
+            self.pending_data.extend(data);
+            return;
+        };
+
+        let data_len = data.len();
+        self.proxy_inflight.fetch_add(data_len, Ordering::Relaxed);
+        match tx.send(data) {
+            Ok(()) => trace!("Sending {} bytes to proxy", data_len),
+            Err(_) => {
+                self.proxy_inflight.fetch_sub(data_len, Ordering::Relaxed);
+                self.proxy_dead = true;
                 warn!(
-                    "Pending data buffer full ({} bytes), dropping {} bytes",
-                    current_pending,
-                    data.len()
+                    "Proxy channel closed, {} bytes cannot be delivered; \
+                     resetting {:?}",
+                    data_len, self.key
                 );
             }
         }
@@ -642,5 +817,177 @@ impl TcpManager {
 impl Default for TcpManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const SEGMENT: usize = 1024;
+    const BUDGET: usize = 4096;
+    const THEIR_ISN: u32 = 1000;
+
+    fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), port)
+    }
+
+    fn key() -> NatKey {
+        NatKey::new(addr([10, 0, 0, 2], 40100), addr([1, 1, 1, 1], 443))
+    }
+
+    fn config(budget: usize) -> TcpConfig {
+        TcpConfig {
+            max_recv_buffer: budget,
+            ..TcpConfig::default()
+        }
+    }
+
+    /// A connection whose proxy writer never runs: the channel exists but
+    /// nothing drains it, so every accepted byte stays queued.
+    fn stalled_proxy(budget: usize) -> (TcpConnection, mpsc::Receiver<Vec<u8>>, ProxyWriter) {
+        let mut conn =
+            TcpConnection::new_passive(key(), THEIR_ISN, Some(SEGMENT as u16), None, config(budget));
+        let (tx, rx) = mpsc::channel();
+        let writer = conn.set_proxy_tx(tx);
+        (conn, rx, writer)
+    }
+
+    /// Stand in for the writer thread draining the channel and writing it out.
+    fn drain_to_proxy(
+        rx: &mpsc::Receiver<Vec<u8>>,
+        writer: &mut ProxyWriter,
+    ) -> usize {
+        let mut drained = 0;
+        while let Ok(chunk) = rx.try_recv() {
+            writer.take(chunk.len());
+            drained += chunk.len();
+        }
+        writer.written();
+        drained
+    }
+
+    /// Feed segments until the connection refuses one, returning how many it
+    /// accepted. `process_data` is driven directly: the window and the queue
+    /// live there, and the state machine above it only decides when to call it.
+    fn fill_until_refused(conn: &mut TcpConnection) -> usize {
+        let mut seq = conn.rcv_nxt();
+        let mut accepted = 0;
+        for _ in 0..64 {
+            conn.process_data(seq, &vec![0u8; SEGMENT]).unwrap();
+            let now = conn.rcv_nxt();
+            if now == seq {
+                break;
+            }
+            accepted += 1;
+            seq = now;
+        }
+        accepted
+    }
+
+    #[test]
+    fn the_window_shrinks_by_what_the_proxy_has_not_written() {
+        let (mut conn, _rx, mut writer) = stalled_proxy(BUDGET);
+        conn.update_recv_window();
+        assert_eq!(conn.recv_window() as usize, BUDGET, "empty queue: budget is free");
+
+        let mut seq = conn.rcv_nxt();
+        for _ in 0..2 {
+            assert_eq!(
+                conn.process_data(seq, &vec![0u8; SEGMENT]).unwrap(),
+                TcpAction::SendAck
+            );
+            seq = conn.rcv_nxt();
+        }
+
+        assert!(conn.recv_buf.is_empty());
+        assert_eq!(conn.queued_bytes(), 2 * SEGMENT);
+        assert_eq!(conn.recv_window() as usize, BUDGET - 2 * SEGMENT);
+
+        writer.take(2 * SEGMENT);
+        writer.written();
+        conn.update_recv_window();
+        assert_eq!(conn.recv_window() as usize, BUDGET);
+    }
+
+    #[test]
+    fn a_full_queue_is_refused_rather_than_dropped() {
+        let (mut conn, _rx, _counter) = stalled_proxy(BUDGET);
+
+        let accepted = fill_until_refused(&mut conn);
+        assert_eq!(accepted, BUDGET / SEGMENT);
+        assert_eq!(conn.queued_bytes(), BUDGET);
+        assert_eq!(conn.rcv_nxt().wrapping_sub(THEIR_ISN + 1) as usize, BUDGET);
+        assert_eq!(conn.recv_window(), 0, "a full queue must close the window");
+    }
+
+    #[test]
+    fn draining_the_proxy_reopens_the_window_and_asks_for_an_update() {
+        let (mut conn, rx, mut writer) = stalled_proxy(BUDGET);
+        fill_until_refused(&mut conn);
+        assert_eq!(conn.recv_window(), 0);
+        assert_eq!(conn.last_advertised, 0);
+
+        assert_eq!(drain_to_proxy(&rx, &mut writer), BUDGET);
+        assert!(conn.window_update_due());
+        assert_eq!(conn.recv_window() as usize, BUDGET);
+        // ...and once only: the value is on the record now.
+        assert!(!conn.window_update_due());
+    }
+
+    #[test]
+    fn data_buffered_before_the_proxy_is_kept_up_to_the_budget() {
+        let mut conn =
+            TcpConnection::new_passive(key(), THEIR_ISN, Some(SEGMENT as u16), None, config(BUDGET));
+
+        let accepted = fill_until_refused(&mut conn);
+        assert_eq!(accepted, BUDGET / SEGMENT);
+        assert_eq!(conn.pending_data.len(), BUDGET);
+        assert_eq!(conn.queued_bytes(), BUDGET);
+
+        let (tx, rx) = mpsc::channel();
+        let mut writer = conn.set_proxy_tx(tx);
+        assert!(conn.pending_data.is_empty());
+        assert_eq!(conn.queued_bytes(), BUDGET);
+        assert_eq!(writer.held(), 0, "nothing taken yet: the window still holds it");
+        assert_eq!(rx.try_recv().unwrap().len(), BUDGET);
+        conn.update_recv_window();
+        assert_eq!(conn.recv_window(), 0);
+
+        writer.take(BUDGET);
+        writer.written();
+        conn.update_recv_window();
+        assert_eq!(conn.recv_window() as usize, BUDGET);
+    }
+
+    #[test]
+    fn a_stopped_writer_resets_the_flow_instead_of_acknowledging_into_a_hole() {
+        let (mut conn, _rx, writer) = stalled_proxy(BUDGET);
+        drop(writer);
+
+        let before = conn.rcv_nxt();
+        assert_eq!(
+            conn.process_data(before, &vec![0u8; SEGMENT]).unwrap(),
+            TcpAction::SendRst
+        );
+        assert_eq!(conn.rcv_nxt(), before, "nothing was acknowledged");
+        assert!(!conn.has_room_for(1));
+    }
+
+    #[test]
+    fn a_channel_that_rejects_a_send_resets_the_next_segment() {
+        let (mut conn, rx, _writer) = stalled_proxy(BUDGET);
+        drop(rx);
+
+        assert_eq!(
+            conn.process_data(conn.rcv_nxt(), &vec![0u8; SEGMENT]).unwrap(),
+            TcpAction::SendAck
+        );
+        assert!(conn.proxy_dead);
+        assert_eq!(
+            conn.process_data(conn.rcv_nxt(), &vec![0u8; SEGMENT]).unwrap(),
+            TcpAction::SendRst
+        );
     }
 }

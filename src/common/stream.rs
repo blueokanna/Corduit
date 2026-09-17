@@ -13,6 +13,7 @@
 use crate::common::cancel::CancellationToken;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -379,19 +380,44 @@ impl Side {
     }
 
     /// Release anything parked on this side, in both directions.
+    ///
+    /// Never blocks. A serialized side's lock is taken only if it is free
+    /// right now: waiting for it would mean waiting for the write that holds
+    /// it, which is bounded by [`RELAY_WRITE_TIMEOUT`] — sixty seconds — while
+    /// this is the path `cancel()` takes, on whichever thread called it, and
+    /// the cancellation contract is that a hook releases a blocked worker
+    /// rather than waiting for one.
+    ///
+    /// Skipping is safe because nothing depends on this for liveness. A
+    /// serialized read is bounded by [`RELAY_READ_POLL`], and both directions
+    /// watch the token and the finished flag, so a partner that is not shut
+    /// down still leaves on its own within one poll interval. What the
+    /// shutdown buys is promptness, and it is given up only in the one case
+    /// where it cannot be had without waiting for a write to finish anyway.
     fn release(&self) {
         self.shutdown(Shutdown::Both);
     }
 
     fn shutdown(&self, how: Shutdown) {
         match self {
+            // A socket shutdown is a non-blocking syscall, so it is always
+            // attempted: a read parked with no timeout of its own has nothing
+            // else that would ever wake it.
             Side::Shared(shared) => {
                 let _ = shared.shutdown(how);
             }
-            Side::Serialized(stream) => {
-                let guard = lock_stream(stream);
-                let _ = shutdown_lenient(&**guard, how);
-            }
+            Side::Serialized(stream) => match stream.try_lock() {
+                Ok(guard) => {
+                    let _ = shutdown_lenient(&**guard, how);
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    let _ = shutdown_lenient(&**error.into_inner(), how);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // The other direction is inside a write. It will return,
+                    // see the finished flag, and leave.
+                }
+            },
         }
     }
 
@@ -490,10 +516,19 @@ impl RelayAccounting {
 
 /// Copy `src` to `dst` until a side finishes, the relay is cancelled, or a
 /// transport fails.
+/// Copy `src` to `dst` until a side finishes, the relay is cancelled, or a
+/// transport fails.
+///
+/// `finished` is the partner's guarantee that it will stop. It is set on every
+/// ending except a clean half-close, and it exists because releasing the other
+/// side is best effort: [`Side::shutdown`] cannot take a lock that a write is
+/// holding, so "shut the partner down" is not something this function may
+/// depend on for its own termination.
 fn copy_direction(
     src: Arc<Side>,
     dst: Arc<Side>,
     token: CancellationToken,
+    finished: Arc<AtomicBool>,
     stats: Arc<Mutex<RelayStats>>,
     accounting: RelayAccounting,
     upstream: bool,
@@ -501,17 +536,28 @@ fn copy_direction(
     let mut buf = vec![0u8; RELAY_BUF_SIZE];
     loop {
         if token.is_cancelled() {
+            finished.store(true, Ordering::Release);
             src.release();
             dst.release();
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
 
+        // The other direction has ended and will not resume, so there is
+        // nothing left that could arrive to copy.
+        if finished.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         let n = match src.read(&mut buf) {
             Ok(Some(0)) => {
                 if token.is_cancelled() {
+                    finished.store(true, Ordering::Release);
                     dst.release();
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
                 }
+                // A clean half-close, not an ending: the other direction may
+                // still have everything left to carry, so `finished` stays
+                // clear and only this half is closed.
                 dst.shutdown(Shutdown::Write);
                 return Ok(());
             }
@@ -528,6 +574,7 @@ fn copy_direction(
                 continue;
             }
             Err(e) => {
+                finished.store(true, Ordering::Release);
                 src.release();
                 dst.release();
                 return Err(e);
@@ -535,6 +582,7 @@ fn copy_direction(
         };
 
         if let Err(e) = dst.write_all(&buf[..n]) {
+            finished.store(true, Ordering::Release);
             src.release();
             dst.release();
             return Err(e);
@@ -623,15 +671,22 @@ pub fn relay_with(
 
     let stats = Arc::new(Mutex::new(RelayStats::default()));
 
+    // Set by a direction that ends for any reason other than a half-close, and
+    // read by the other one at the top of every iteration. It is what makes the
+    // relay terminate without depending on a shutdown that a write may be
+    // holding the lock against.
+    let finished = Arc::new(AtomicBool::new(false));
+
     let upstream = {
         let src = Arc::clone(&a);
         let dst = Arc::clone(&b);
         let token = token.clone();
         let stats = Arc::clone(&stats);
+        let finished = Arc::clone(&finished);
         let accounting = accounting.clone();
         std::thread::Builder::new()
             .name("corduit-relay-up".into())
-            .spawn(move || copy_direction(src, dst, token, stats, accounting, true))
+            .spawn(move || copy_direction(src, dst, token, finished, stats, accounting, true))
     };
 
     // Both spawns and both joins have to complete on every path out of this
@@ -644,6 +699,7 @@ pub fn relay_with(
     let upstream = match upstream {
         Ok(handle) => handle,
         Err(error) => {
+            finished.store(true, Ordering::Release);
             a.release();
             b.release();
             return Err(error);
@@ -655,18 +711,20 @@ pub fn relay_with(
         let dst = Arc::clone(&a);
         let token = token.clone();
         let stats = Arc::clone(&stats);
+        let finished = Arc::clone(&finished);
         let accounting = accounting.clone();
         std::thread::Builder::new()
             .name("corduit-relay-down".into())
-            .spawn(move || copy_direction(src, dst, token, stats, accounting, false))
+            .spawn(move || copy_direction(src, dst, token, finished, stats, accounting, false))
     };
 
     let downstream = match downstream {
         Ok(handle) => handle,
         Err(error) => {
             // The upstream thread is already running and holds both sides.
-            // Releasing them is what wakes it, and joining it is what keeps
-            // this function the sole owner of every thread it started.
+            // The flag is what tells it to stop; releasing the sides is what
+            // makes it stop promptly when their locks happen to be free.
+            finished.store(true, Ordering::Release);
             a.release();
             b.release();
             let _ = upstream.join();
@@ -678,10 +736,11 @@ pub fn relay_with(
     // return early and strand the other thread.
     let up = upstream.join();
 
-    // A panicking direction unwinds without releasing anything, so the other
-    // one can still be parked in a read that will never see data again.
-    // Release both sides before waiting for it, or this join never returns.
+    // A panicking direction unwinds without setting anything, so the other one
+    // can still be parked in a read that will never see data again. Tell it to
+    // stop before waiting for it, or this join never returns.
     if up.is_err() {
+        finished.store(true, Ordering::Release);
         a.release();
         b.release();
     }
@@ -933,6 +992,180 @@ mod tests {
             self.dropped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// A transport whose `write` parks until it is opened, and whose `read`
+    /// never produces anything. It stands in for a transport whose write is
+    /// blocked on a peer that has stopped reading — the case that holds a
+    /// serialized side's lock for up to `RELAY_WRITE_TIMEOUT`.
+    struct Gate {
+        state: std::sync::Mutex<GateState>,
+        cv: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        entered: bool,
+        opened: bool,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            Self {
+                state: std::sync::Mutex::new(GateState::default()),
+                cv: std::sync::Condvar::new(),
+            }
+        }
+
+        fn wait_until_entered(&self, timeout: Duration) -> bool {
+            let deadline = std::time::Instant::now() + timeout;
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            while !state.entered {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                let (guard, _) = self
+                    .cv
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = guard;
+            }
+            true
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).opened = true;
+            self.cv.notify_all();
+        }
+
+        fn enter_and_wait(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entered = true;
+            self.cv.notify_all();
+            while !state.opened {
+                state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+
+    struct GateTransport(Arc<Gate>);
+
+    impl Read for GateTransport {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "nothing yet"))
+        }
+    }
+
+    impl Write for GateTransport {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.enter_and_wait();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SyncStream for GateTransport {
+        fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A transport with a fixed number of bytes to give, then nothing.
+    struct Slab {
+        left: usize,
+    }
+
+    impl Slab {
+        fn new(left: usize) -> Self {
+            Self { left }
+        }
+    }
+
+    impl Read for Slab {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.left.min(buf.len());
+            self.left -= n;
+            if n == 0 {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "drained"))
+            } else {
+                Ok(n)
+            }
+        }
+    }
+
+    impl Write for Slab {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SyncStream for Slab {
+        fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Cancelling must not wait for a write to finish.
+    ///
+    /// The cancellation contract is that a hook *releases* a blocked worker
+    /// rather than waiting for one, and `cancel()` runs its hooks on the thread
+    /// that called it — which for a teardown is the thread every other
+    /// connection is waiting on. A serialized side holds its lock across a
+    /// write bounded by `RELAY_WRITE_TIMEOUT`, so a release that took that lock
+    /// would park the canceller for up to a minute.
+    ///
+    /// Nothing depends on that release for liveness: a serialized read is
+    /// bounded by `RELAY_READ_POLL`, and both directions watch the finished
+    /// flag, so the partner still leaves on its own.
+    #[test]
+    fn cancel_does_not_wait_for_a_write_holding_the_relay_lock() {
+        let gate = Arc::new(Gate::new());
+
+        let token = CancellationToken::new();
+        let cancel_from = token.clone();
+        let relay_gate = Arc::clone(&gate);
+        let relay_thread = std::thread::spawn(move || {
+            let source: BoxStream = Box::new(Slab::new(8));
+            let sink: BoxStream = Box::new(GateTransport(relay_gate));
+            relay(source, sink, cancel_from)
+        });
+
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(5)),
+            "the relay never reached the write"
+        );
+
+        // Opened well after the assertion window, so a passing measurement
+        // cannot be explained by having waited for the write — and so the test
+        // reports a failure instead of hanging when cancellation does block.
+        let opener = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                gate.open();
+            })
+        };
+
+        let started = std::time::Instant::now();
+        token.cancel();
+        let elapsed = started.elapsed();
+
+        opener.join().expect("opener thread");
+        let outcome = relay_thread.join().expect("relay thread");
+
+        assert!(outcome.is_err(), "cancellation is reported as an error");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancel() waited {elapsed:?}: it took a lock a write was holding"
+        );
     }
 
     /// A direction that unwinds must not leave its partner parked.

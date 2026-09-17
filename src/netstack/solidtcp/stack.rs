@@ -9,7 +9,9 @@ use crate::netstack::solidtcp::packet::{
     build_ipv4_tcp, build_ipv4_udp, parse_packet, ParsedPacket, TcpFlags, TcpInfo, TransportInfo,
 };
 use crate::netstack::solidtcp::stats::StackStats;
-use crate::netstack::solidtcp::tcp::{TcpAction, TcpConfig, TcpConnection, TcpManager};
+use crate::netstack::solidtcp::tcp::{
+    TcpAction, TcpConfig, TcpConnection, TcpManager, MAX_RECV_WINDOW,
+};
 use crate::netstack::solidtcp::udp::{UdpConfig, UdpManager};
 use bytes::BytesMut;
 use parking_lot::{Mutex, RwLock};
@@ -569,6 +571,7 @@ impl SolidStack {
                 tcp_info.ack,
                 tcp_info.seq.wrapping_add(1),
                 TcpFlags::rst_ack(),
+                MAX_RECV_WINDOW,
                 &[],
                 None,
             )?;
@@ -613,6 +616,7 @@ impl SolidStack {
                 0,
                 tcp_info.seq.wrapping_add(1),
                 TcpFlags::rst_ack(),
+                MAX_RECV_WINDOW,
                 &[],
                 None,
             )?;
@@ -624,9 +628,14 @@ impl SolidStack {
             .handle_syn(src_addr, dst_addr, tcp_info, domain.clone())?;
         self.stats.record_tcp_connection();
 
-        let (our_seq, their_seq, mss) = {
+        let (our_seq, their_seq, mss, window) = {
             let conn = conn.read();
-            (conn.snd_nxt().wrapping_sub(1), conn.rcv_nxt(), conn.mss())
+            (
+                conn.snd_nxt().wrapping_sub(1),
+                conn.rcv_nxt(),
+                conn.mss(),
+                conn.recv_window() as u16,
+            )
         };
 
         info!(
@@ -641,6 +650,7 @@ impl SolidStack {
             our_seq,
             their_seq,
             TcpFlags::syn_ack(),
+            window,
             &[],
             Some(mss),
         )?;
@@ -724,11 +734,14 @@ impl SolidStack {
         conn: &Arc<RwLock<TcpConnection>>,
         action: TcpAction,
     ) -> Result<()> {
+        // Every segment sent to the client carries the connection's current
+        // receive window, so a sender that is being throttled finds out as
+        // soon as it hears from us.
         match action {
             TcpAction::SendAck => {
-                let (seq, ack) = {
+                let (seq, ack, window) = {
                     let conn = conn.read();
-                    (conn.snd_nxt(), conn.rcv_nxt())
+                    (conn.snd_nxt(), conn.rcv_nxt(), conn.recv_window() as u16)
                 };
                 self.send_tcp_packet(
                     dst_addr,
@@ -736,29 +749,57 @@ impl SolidStack {
                     seq,
                     ack,
                     TcpFlags::ack_only(),
+                    window,
                     &[],
                     None,
                 )?;
             }
             TcpAction::SendFinAck => {
-                let (seq, ack) = {
+                let (seq, ack, window) = {
                     let conn = conn.read();
-                    (conn.snd_nxt(), conn.rcv_nxt())
+                    (conn.snd_nxt(), conn.rcv_nxt(), conn.recv_window() as u16)
                 };
-                self.send_tcp_packet(dst_addr, src_addr, seq, ack, TcpFlags::fin_ack(), &[], None)?;
+                self.send_tcp_packet(
+                    dst_addr,
+                    src_addr,
+                    seq,
+                    ack,
+                    TcpFlags::fin_ack(),
+                    window,
+                    &[],
+                    None,
+                )?;
                 let close_action = conn.write().close();
                 if close_action == TcpAction::SendFin {}
             }
             TcpAction::SendFin => {
-                let (seq, ack) = {
+                let (seq, ack, window) = {
                     let conn = conn.read();
-                    (conn.snd_nxt(), conn.rcv_nxt())
+                    (conn.snd_nxt(), conn.rcv_nxt(), conn.recv_window() as u16)
                 };
-                self.send_tcp_packet(dst_addr, src_addr, seq, ack, TcpFlags::fin_ack(), &[], None)?;
+                self.send_tcp_packet(
+                    dst_addr,
+                    src_addr,
+                    seq,
+                    ack,
+                    TcpFlags::fin_ack(),
+                    window,
+                    &[],
+                    None,
+                )?;
             }
             TcpAction::SendRst => {
                 let seq = conn.read().snd_nxt();
-                self.send_tcp_packet(dst_addr, src_addr, seq, 0, TcpFlags::rst_only(), &[], None)?;
+                self.send_tcp_packet(
+                    dst_addr,
+                    src_addr,
+                    seq,
+                    0,
+                    TcpFlags::rst_only(),
+                    MAX_RECV_WINDOW,
+                    &[],
+                    None,
+                )?;
             }
             TcpAction::Established => {
                 debug!("TCP connection established: {} -> {}", src_addr, dst_addr);
@@ -769,12 +810,13 @@ impl SolidStack {
                 debug!("TCP connection closed: {} -> {}", src_addr, dst_addr);
             }
             TcpAction::SendData(data) => {
-                let (seq, ack) = {
+                let (seq, ack, window) = {
                     let mut conn = conn.write();
                     let seq = conn.snd_nxt();
                     let ack = conn.rcv_nxt();
+                    let window = conn.recv_window() as u16;
                     conn.advance_snd_nxt(data.len() as u32);
-                    (seq, ack)
+                    (seq, ack, window)
                 };
                 self.send_tcp_packet(
                     dst_addr,
@@ -782,6 +824,7 @@ impl SolidStack {
                     seq,
                     ack,
                     TcpFlags::psh_ack(),
+                    window,
                     &data,
                     None,
                 )?;
@@ -944,6 +987,7 @@ impl SolidStack {
         seq: u32,
         ack: u32,
         flags: TcpFlags,
+        window: u16,
         payload: &[u8],
         mss: Option<u16>,
     ) -> Result<()> {
@@ -962,7 +1006,7 @@ impl SolidStack {
             seq,
             ack,
             flags,
-            65535,
+            window,
             payload,
             mss,
         );
@@ -1252,7 +1296,10 @@ impl StackProxy {
         info!("SOCKS5 handshake complete: {} -> {}", src_addr, dst_addr);
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        conn.write().set_proxy_tx(tx);
+        // The writer owns this handle: it releases each chunk back to the
+        // connection's receive window as it drains, and clears the liveness
+        // flag when it leaves — see `ProxyWriter`.
+        let proxy_writer = conn.write().set_proxy_tx(tx);
 
         let stream = Arc::new(stream);
 
@@ -1275,6 +1322,10 @@ impl StackProxy {
             .spawn(move || {
                 let mut first_data = true;
                 let mut write_buffer = Vec::with_capacity(65536);
+                // Releases bytes back to the receive window as they reach the
+                // proxy, and gives back anything still held if this thread
+                // leaves early.
+                let mut flow = proxy_writer;
 
                 loop {
                     if !running.load(Ordering::Relaxed) {
@@ -1304,10 +1355,12 @@ impl StackProxy {
                                 }
                             }
 
+                            flow.take(data.len());
                             write_buffer.extend_from_slice(&data);
 
                             let mut has_pending = false;
                             while let Ok(more) = rx.try_recv() {
+                                flow.take(more.len());
                                 write_buffer.extend_from_slice(&more);
                                 has_pending = true;
                             }
@@ -1326,6 +1379,9 @@ impl StackProxy {
                                     }
                                     break;
                                 }
+                                // On the wire now, so no longer occupying the
+                                // receive window.
+                                flow.written();
                                 write_buffer.clear();
                             }
                         }
@@ -1345,6 +1401,7 @@ impl StackProxy {
                                     }
                                     break;
                                 }
+                                flow.written();
                                 write_buffer.clear();
                             }
                         }
@@ -1394,14 +1451,18 @@ impl StackProxy {
 
                                 if let Some((src_ip, dst_ip)) = ips {
                                     conn_guard.advance_snd_nxt(n as u32);
-                                    Some((base_seq, ack, mss, src_ip, dst_ip))
+                                    // The window rides on every segment we emit,
+                                    // so a sender that is being throttled on the
+                                    // uplink learns about it here too.
+                                    let window = conn_guard.recv_window() as u16;
+                                    Some((base_seq, ack, mss, window, src_ip, dst_ip))
                                 } else {
                                     warn!("IPv6 not supported");
                                     None
                                 }
                             };
 
-                            let (base_seq, ack, mss, src_ip, dst_ip) = match send_info {
+                            let (base_seq, ack, mss, window, src_ip, dst_ip) = match send_info {
                                 Some(info) => info,
                                 None => break,
                             };
@@ -1431,7 +1492,7 @@ impl StackProxy {
                                     seq,
                                     ack,
                                     flags,
-                                    65535,
+                                    window,
                                     chunk,
                                     None,
                                 );
@@ -1476,11 +1537,17 @@ impl StackProxy {
                         _ => None,
                     };
                     ips.map(|(src_ip, dst_ip)| {
-                        (conn_guard.snd_nxt(), conn_guard.rcv_nxt(), src_ip, dst_ip)
+                        (
+                            conn_guard.snd_nxt(),
+                            conn_guard.rcv_nxt(),
+                            conn_guard.recv_window() as u16,
+                            src_ip,
+                            dst_ip,
+                        )
                     })
                 };
 
-                if let Some((seq, ack, src_ip, dst_ip)) = fin_info {
+                if let Some((seq, ack, window, src_ip, dst_ip)) = fin_info {
                     if let Some(ref tx) = tun_tx {
                         let packet = build_ipv4_tcp(
                             src_ip,
@@ -1490,7 +1557,7 @@ impl StackProxy {
                             seq,
                             ack,
                             TcpFlags::fin_ack(),
-                            65535,
+                            window,
                             &[],
                             None,
                         );
