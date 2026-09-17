@@ -44,6 +44,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Upper bound on concurrently served SOCKS5 connections.
 const MAX_CONNECTIONS: usize = 2048;
+/// Pause after a receive that failed instead of returning a datagram.
+const UDP_RELAY_ERROR_PAUSE: Duration = Duration::from_millis(20);
+/// Consecutive receive errors after which the relay gives up.
+const UDP_RELAY_MAX_ERRORS: u32 = 50;
 
 /// SOCKS5 protocol version byte.
 const SOCKS5_VERSION: u8 = 0x05;
@@ -171,7 +175,6 @@ fn read_request(stream: &mut TcpStream) -> Result<(Socks5Addr, u16, u8)> {
         return Err(Error::protocol("Non-zero reserved byte in SOCKS5 request"));
     }
     let command = head[1];
-
     let (addr, port) = match head[3] {
         0x01 => {
             let mut addr = [0u8; 4];
@@ -345,8 +348,8 @@ fn handle_udp_associate(
     let mut byte = [0u8; 1];
     loop {
         match stream.read(&mut byte) {
-            Ok(0) => break,    // client closed
-            Ok(_) => continue, // nothing defined on this half
+            Ok(0) => break,
+            Ok(_) => continue,
             Err(e)
                 if matches!(
                     e.kind(),
@@ -368,6 +371,16 @@ fn handle_udp_associate(
     Ok(())
 }
 
+/// Wait out a failed receive before trying again.
+///
+/// The pause is what keeps the receive loop from becoming a spin; the token
+/// check keeps shutdown prompt when the association is being torn down.
+fn pause_before_retry(cancel: &crate::common::cancel::CancellationToken) {
+    if !cancel.is_cancelled() {
+        std::thread::sleep(UDP_RELAY_ERROR_PAUSE);
+    }
+}
+
 /// Forward datagrams between the client and the matched outbound.
 ///
 /// Only datagrams whose source IP matches the association's client are
@@ -381,10 +394,14 @@ fn run_udp_relay(
     cancel: crate::common::cancel::CancellationToken,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
+    let mut consecutive_errors = 0u32;
 
     while !cancel.is_cancelled() {
         let (len, src_addr) = match udp_socket.recv_from(&mut buf) {
-            Ok(result) => result,
+            Ok(result) => {
+                consecutive_errors = 0;
+                result
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -393,10 +410,22 @@ fn run_udp_relay(
                         | std::io::ErrorKind::ConnectionReset
                 ) =>
             {
+                if e.kind() != std::io::ErrorKind::TimedOut {
+                    pause_before_retry(&cancel);
+                }
                 continue;
             }
             Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= UDP_RELAY_MAX_ERRORS {
+                    tracing::debug!(
+                        "UDP relay for {client_addr} giving up after \
+                         {consecutive_errors} consecutive receive errors: {e}"
+                    );
+                    break;
+                }
                 tracing::debug!("UDP relay receive error: {e}");
+                pause_before_retry(&cancel);
                 continue;
             }
         };

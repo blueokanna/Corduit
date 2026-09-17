@@ -214,12 +214,7 @@ where
 
     /// Remove every entry, keeping the capacity.
     pub fn clear(&mut self) {
-        // Drop canonical keys first. `HashMap::clear` removes an entry before
-        // its key's `Drop` runs, so a panicking key `Drop` can never leave a
-        // map entry pointing at a recycled slot.
         self.map.clear();
-        // Drop the auxiliary key clones and values. `take` first so a
-        // panicking `Drop` leaves the slot inert rather than half-dropped.
         for slot in &mut self.slots {
             slot.key.take();
             slot.value.take();

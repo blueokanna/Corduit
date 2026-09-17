@@ -12,17 +12,190 @@ use crate::netstack::solidtcp::stats::StackStats;
 use crate::netstack::solidtcp::tcp::{TcpAction, TcpConfig, TcpConnection, TcpManager};
 use crate::netstack::solidtcp::udp::{UdpConfig, UdpManager};
 use bytes::BytesMut;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use smoltcp::wire::IpProtocol;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket as StdUdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, UdpSocket as StdUdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How long a UDP association may sit idle before it closes.
+///
+/// A flow that resumes after this pays one local handshake; leaving the
+/// association open forever would hold a server-side socket and thread for a
+/// flow that is already gone.
+const UDP_ASSOCIATION_IDLE: Duration = Duration::from_secs(120);
+
+/// Bound on a single datagram hand-off to the relay socket.
+const UDP_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Associations opened between sweeps of the table.
+const UDP_ASSOCIATION_SWEEP_EVERY: u64 = 256;
+
+/// A live SOCKS5 UDP association.
+///
+/// A `UDP ASSOCIATE` relays to any destination — every datagram carries its
+/// own target — so one association can serve a whole flow. That is the point
+/// of holding one: the path this replaced opened a TCP connection, ran the
+/// handshake and spawned three threads for *each datagram*, which made QUIC
+/// traffic create and destroy threads faster than anything else in the stack.
+struct UdpAssociation {
+    relay_addr: SocketAddr,
+    socket: StdUdpSocket,
+    /// Held only so the server keeps the relay in place; dropped when the
+    /// association is replaced or swept away.
+    _control: TcpStream,
+    /// Cleared by the reply pump when the association ends, so the packet path
+    /// builds a new one instead of writing into a socket nobody is reading.
+    alive: Arc<AtomicBool>,
+}
+
+impl UdpAssociation {
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// Frame one datagram for the relay and hand it to the socket.
+    fn send(
+        &self,
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
+        domain: Option<&str>,
+        payload: &[u8],
+    ) -> Result<()> {
+        let mut framed = Vec::with_capacity(payload.len() + 262);
+        framed.extend_from_slice(&[0x00, 0x00, 0x00]);
+
+        // A domain that cannot be expressed in the wire form is not worth
+        // dropping the datagram over: fall back to the address the flow
+        // resolved to.
+        match domain.filter(|domain| domain.len() <= u8::MAX as usize) {
+            Some(domain) => {
+                framed.push(0x03);
+                framed.push(domain.len() as u8);
+                framed.extend_from_slice(domain.as_bytes());
+            }
+            None => match dst_addr.ip() {
+                IpAddr::V4(ip) => {
+                    framed.push(0x01);
+                    framed.extend_from_slice(&ip.octets());
+                }
+                IpAddr::V6(ip) => {
+                    framed.push(0x04);
+                    framed.extend_from_slice(&ip.octets());
+                }
+            },
+        }
+        framed.extend_from_slice(&dst_addr.port().to_be_bytes());
+        framed.extend_from_slice(payload);
+
+        self.socket
+            .send_to(&framed, self.relay_addr)
+            .map_err(|e| SolidTcpError::ProxyError(format!("UDP send failed: {}", e)))?;
+
+        debug!(
+            "UDP forwarded: {} -> {} ({} bytes)",
+            src_addr,
+            dst_addr,
+            payload.len()
+        );
+        Ok(())
+    }
+}
+
+/// Length of the SOCKS5 UDP request header at the front of `datagram`.
+///
+/// `None` when the datagram is too short or carries an address type the relay
+/// cannot have produced.
+fn socks5_udp_header_len(datagram: &[u8]) -> Option<usize> {
+    match *datagram.get(3)? {
+        0x01 => Some(10),
+        0x03 => Some(7 + *datagram.get(4)? as usize),
+        0x04 => Some(22),
+        _ => None,
+    }
+}
+
+/// Read replies from an association's relay socket and hand them to the TUN.
+///
+/// One thread per flow rather than one per datagram. It ends when the flow has
+/// been quiet for [`UDP_ASSOCIATION_IDLE`] or the relay fails, and it closes
+/// the control connection on the way out so the server drops its half of the
+/// association immediately.
+fn pump_udp_replies(
+    socket: StdUdpSocket,
+    control: TcpStream,
+    client: SocketAddr,
+    remote: SocketAddr,
+    tun_tx: Option<mpsc::Sender<BytesMut>>,
+    stats: Arc<StackStats>,
+    alive: Arc<AtomicBool>,
+) {
+    let mut buf = vec![0u8; 65535];
+
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                let Some(header_len) = socks5_udp_header_len(&buf[..n]) else {
+                    debug!("UDP reply with an unusable header ({} bytes)", n);
+                    continue;
+                };
+                if n <= header_len {
+                    continue;
+                }
+                let (IpAddr::V4(remote_ip), IpAddr::V4(client_ip)) =
+                    (remote.ip(), client.ip())
+                else {
+                    continue;
+                };
+                let Some(ref tx) = tun_tx else {
+                    continue;
+                };
+
+                let packet = build_ipv4_udp(
+                    remote_ip,
+                    client_ip,
+                    remote.port(),
+                    client.port(),
+                    &buf[header_len..n],
+                );
+                stats.record_sent(packet.len());
+                if tx.send(BytesMut::from(&packet[..])).is_err() {
+                    break;
+                }
+            }
+            // Nothing arrived within the idle budget: the flow is done with
+            // this association. The packet path builds another one if it
+            // comes back.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                debug!("UDP association {client} -> {remote} went idle");
+                break;
+            }
+            Err(e) if is_transient(&e) => continue,
+            Err(e) => {
+                debug!("UDP relay recv error {client} -> {remote}: {e}");
+                break;
+            }
+        }
+    }
+
+    alive.store(false, Ordering::Release);
+    // Closing the control connection is what makes the server drop its half of
+    // the association — including the thread serving it — instead of holding it
+    // until the listener stops.
+    let _ = control.shutdown(Shutdown::Both);
+}
 const PROXY_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const FAKE_IP_MISS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -200,6 +373,14 @@ pub struct SolidStack {
     running: Arc<AtomicBool>,
     tun_tx: Option<mpsc::Sender<BytesMut>>,
     fake_ip_miss_log: Arc<LogThrottle>,
+    /// One reusable SOCKS5 UDP association per flow, keyed by the client and
+    /// destination addresses.
+    udp_associations: Mutex<HashMap<(SocketAddr, SocketAddr), Arc<UdpAssociation>>>,
+    /// Associations opened, used only to pace sweeping the tombstones of dead
+    /// ones out of the table. The server side of a dead association is already
+    /// gone — the reply pump closes its control connection as it ends — so a
+    /// tombstone costs nothing but its table entry.
+    udp_associations_opened: AtomicU64,
 }
 
 impl SolidStack {
@@ -217,6 +398,8 @@ impl SolidStack {
             running: Arc::new(AtomicBool::new(false)),
             tun_tx: None,
             fake_ip_miss_log: Arc::new(LogThrottle::new(FAKE_IP_MISS_LOG_INTERVAL)),
+            udp_associations: Mutex::new(HashMap::new()),
+            udp_associations_opened: AtomicU64::new(0),
             config,
         }
     }
@@ -495,6 +678,46 @@ impl SolidStack {
         }
     }
 
+    /// The association serving `src_addr -> dst_addr`, created on first use.
+    ///
+    /// A datagram for a flow that already has a live association costs one map
+    /// lookup and a `send_to`; everything else — a new flow, or one whose
+    /// association has since gone idle — builds a fresh one.
+    fn udp_association(
+        &self,
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
+    ) -> Result<Arc<UdpAssociation>> {
+        let key = (src_addr, dst_addr);
+
+        {
+            let table = self.udp_associations.lock();
+            if let Some(existing) = table.get(&key) {
+                if existing.is_alive() {
+                    return Ok(Arc::clone(existing));
+                }
+            }
+        }
+
+        let association =
+            Arc::new(self.clone_for_proxy().open_udp_association(src_addr, dst_addr)?);
+
+        let mut table = self.udp_associations.lock();
+        let replaced = table.insert(key, Arc::clone(&association));
+        let opened = self
+            .udp_associations_opened
+            .fetch_add(1, Ordering::Relaxed);
+        if opened % UDP_ASSOCIATION_SWEEP_EVERY == 0 {
+            table.retain(|_, entry| entry.is_alive());
+        }
+        drop(table);
+        // Dropping the association the sweep just replaced closes its control
+        // connection, which is what tells the server to release the relay.
+        drop(replaced);
+
+        Ok(association)
+    }
+
     fn execute_tcp_action(
         &self,
         src_addr: SocketAddr,
@@ -696,17 +919,19 @@ impl SolidStack {
         self.udp_manager
             .record_sent(src_addr, dst_addr, payload.len());
 
-        let stack = self.clone_for_proxy();
-        let payload_vec = payload.to_vec();
-        if let Err(e) = std::thread::Builder::new()
-            .name("tun-proxy-udp".into())
-            .spawn(move || {
-                if let Err(e) = stack.forward_udp(src_addr, dst_addr, domain, &payload_vec) {
-                    debug!("UDP forward error: {} -> {}: {}", src_addr, dst_addr, e);
+        // Straight into the flow's association: no thread, no TCP connect and
+        // no handshake per packet. Only a missing or dead association pays for
+        // the setup below, and that runs on the packet thread because a
+        // handshake against the engine's own local listener takes microseconds.
+        match self.udp_association(src_addr, dst_addr) {
+            Ok(association) => {
+                if let Err(e) = association.send(src_addr, dst_addr, domain.as_deref(), payload) {
+                    debug!("UDP send error: {} -> {}: {}", src_addr, dst_addr, e);
                 }
-            })
-        {
-            warn!("Failed to spawn UDP forward thread: {}", e);
+            }
+            Err(e) => {
+                debug!("UDP association error: {} -> {}: {}", src_addr, dst_addr, e);
+            }
         }
 
         Ok(())
@@ -852,13 +1077,15 @@ impl StackProxy {
         Ok(())
     }
 
-    fn forward_udp(
+    /// Open a fresh `UDP ASSOCIATE` and start the reply pump for it.
+    ///
+    /// Callers go through `SolidStack::udp_association`, which is what keeps
+    /// one association per flow instead of one per datagram.
+    fn open_udp_association(
         &self,
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
-        domain: Option<String>,
-        payload: &[u8],
-    ) -> Result<()> {
+    ) -> Result<UdpAssociation> {
         // Connect to the proxy and perform the SOCKS5 UDP ASSOCIATE handshake.
         let tcp_stream = crate::common::socket::connect(&self.proxy_addr, PROXY_HANDSHAKE_TIMEOUT)
             .map_err(|e| {
@@ -947,85 +1174,53 @@ impl StackProxy {
             }
         }
 
-        // 30s window for the single UDP response.
-        let _ = udp_socket.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = udp_socket.set_write_timeout(Some(Duration::from_secs(30)));
+        // The association outlives this call: the control connection is held
+        // open (and dropped with the association) so the server keeps the
+        // relay in place, and the pump is the only reader of the socket.
+        let _ = udp_socket.set_read_timeout(Some(UDP_ASSOCIATION_IDLE));
+        let _ = udp_socket.set_write_timeout(Some(UDP_SEND_TIMEOUT));
 
-        let mut udp_request = Vec::with_capacity(payload.len() + 262);
-        udp_request.extend_from_slice(&[0x00, 0x00, 0x00]);
+        let alive = Arc::new(AtomicBool::new(true));
+        let pump_socket = udp_socket
+            .try_clone()
+            .map_err(|e| SolidTcpError::ProxyError(format!("UDP socket clone failed: {}", e)))?;
+        let pump_control = tcp_stream
+            .try_clone()
+            .map_err(|e| SolidTcpError::ProxyError(format!("UDP control clone failed: {}", e)))?;
+        let pump_alive = Arc::clone(&alive);
+        let pump_tun_tx = self.tun_tx.clone();
+        let pump_stats = self.stats.clone();
 
-        if let Some(ref domain) = domain {
-            udp_request.push(0x03);
-            udp_request.push(domain.len() as u8);
-            udp_request.extend_from_slice(domain.as_bytes());
-        } else {
-            match dst_addr.ip() {
-                IpAddr::V4(ip) => {
-                    udp_request.push(0x01);
-                    udp_request.extend_from_slice(&ip.octets());
-                }
-                IpAddr::V6(ip) => {
-                    udp_request.push(0x04);
-                    udp_request.extend_from_slice(&ip.octets());
-                }
-            }
-        }
-        udp_request.extend_from_slice(&dst_addr.port().to_be_bytes());
-        udp_request.extend_from_slice(payload);
-
-        udp_socket
-            .send_to(&udp_request, relay_addr)
-            .map_err(|e| SolidTcpError::ProxyError(format!("UDP send failed: {}", e)))?;
+        std::thread::Builder::new()
+            .name("tun-udp-relay".into())
+            .spawn(move || {
+                pump_udp_replies(
+                    pump_socket,
+                    pump_control,
+                    src_addr,
+                    dst_addr,
+                    pump_tun_tx,
+                    pump_stats,
+                    pump_alive,
+                );
+            })
+            .map_err(|e| {
+                SolidTcpError::ProxyError(format!("Failed to spawn UDP reply pump: {}", e))
+            })?;
 
         debug!(
-            "UDP forwarded: {} -> {} ({} bytes)",
+            "UDP association ready: {} -> {} via {}",
             src_addr,
             dst_addr,
-            payload.len()
+            relay_addr
         );
 
-        let mut buf = vec![0u8; 65535];
-        match udp_socket.recv_from(&mut buf) {
-            Ok((n, _)) => {
-                if n > 10 {
-                    let atyp = buf[3];
-                    let header_len = match atyp {
-                        0x01 => 10,
-                        0x03 => 7 + buf[4] as usize,
-                        0x04 => 22,
-                        _ => return Ok(()),
-                    };
-
-                    if n > header_len {
-                        let response_payload = &buf[header_len..n];
-
-                        if let Some(ref tx) = self.tun_tx {
-                            let (src_ip, dst_ip) = match (dst_addr.ip(), src_addr.ip()) {
-                                (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
-                                _ => return Ok(()),
-                            };
-
-                            let packet = build_ipv4_udp(
-                                src_ip,
-                                dst_ip,
-                                dst_addr.port(),
-                                src_addr.port(),
-                                response_payload,
-                            );
-
-                            self.stats.record_sent(packet.len());
-                            let _ = tx.send(BytesMut::from(&packet[..]));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("UDP recv error: {}", e);
-            }
-        }
-
-        drop(tcp_stream);
-        Ok(())
+        Ok(UdpAssociation {
+            relay_addr,
+            socket: udp_socket,
+            _control: tcp_stream,
+            alive,
+        })
     }
 
     fn establish_proxy_connection(
@@ -1068,7 +1263,14 @@ impl StackProxy {
         let running = self.running.clone();
         let src_clone = src_addr;
         let dst_clone = dst_addr;
-        let conn_for_ws = conn.clone();
+        // Weak, not a clone. The connection owns the channel's sender, so a
+        // strong reference here would keep that sender alive for as long as
+        // this thread runs — and this thread only ends when the sender is
+        // dropped. Teardown (the reader removing the connection from the
+        // manager) is what has to end it, so the writer must not be part of
+        // what keeps it alive: with a clone here every finished flow left a
+        // writer parked in `recv_timeout` for the life of the engine.
+        let conn_for_ws = Arc::downgrade(&conn);
         let write_stream = stream.clone();
         let rx = rx;
         std::thread::Builder::new()
@@ -1096,7 +1298,11 @@ impl StackProxy {
                                             "WebSocket upgrade detected for {} -> {}",
                                             src_clone, dst_clone
                                         );
-                                        conn_for_ws.write().set_websocket(true);
+                                        // The flow may already be gone; the
+                                        // flag matters only while it is not.
+                                        if let Some(conn) = conn_for_ws.upgrade() {
+                                            conn.write().set_websocket(true);
+                                        }
                                     }
                                 }
                             }

@@ -134,8 +134,6 @@ fn peek_connect_head(stream: &TcpStream) -> std::result::Result<Option<usize>, S
                 return Ok(Some(end + 4));
             }
         } else if available >= CONNECT_PREFIX.len() {
-            // Any other method differs within the prefix, so the decision is
-            // final even if the rest of the head has not arrived yet.
             return Ok(None);
         }
         if Instant::now() > deadline {
@@ -289,9 +287,6 @@ fn write_text(
         &[
             ("content-type", "text/plain; charset=utf-8"),
             ("content-length", &length),
-            // Every failure answers on a short-lived connection: the client
-            // may have a request in flight behind this one, and a reused
-            // connection would leave it unanswered.
             ("connection", "close"),
         ],
     )?;
@@ -313,9 +308,6 @@ struct ConnectRelay {
 
 impl ConnectRelay {
     fn relay(&self, client: BoxStream) {
-        // Resolve the destination for the traffic dashboard. Informational
-        // only (the relay itself is routed by name) and bounded, so a slow
-        // resolver cannot delay the tunnel indefinitely.
         let destination_ip =
             crate::common::socket::resolve_host(&self.host, self.port, Duration::from_secs(3))
                 .ok()
@@ -401,17 +393,10 @@ impl HttpProxyHandler {
 
         let target = TargetAddr::new_domain(host.clone(), port);
         let (mut client_side, server_side) = forward::mem_duplex(64 * 1024);
-
-        // Relay the server end to the origin on a dedicated thread; the
-        // client end carries the request and the response below.
         let relay_handle = std::thread::Builder::new()
             .name("corduit-http-relay".into())
             .spawn(move || outbound.relay_tcp(Box::new(server_side) as BoxStream, target))
             .map_err(|e| Error::network(format!("Failed to spawn relay thread: {e}")))?;
-
-        // The request body is materialized (bounded); re-serialize it with
-        // the hop-by-hop headers stripped and an explicit Content-Length
-        // (CWE-444).
         let body = req.body.as_bytes().map(|b| b.to_vec()).unwrap_or_default();
 
         forward::send_request(
@@ -503,11 +488,7 @@ impl HttpInbound {
             return Ok(());
         }
 
-        // Bind here rather than inside courierust: the listener needs
-        // SO_REUSEADDR and, for a wildcard IPv6 address, the dual-stack
-        // option, so IPv4 loopback clients of a TUN / system proxy reach it.
         let (listener, addr) = bind_tcp_listener(&self.config.listen, self.config.port, "HTTP")?;
-
         let handler = Arc::new(HttpProxyHandler::new(
             "http",
             Arc::clone(&self.router),
@@ -537,8 +518,6 @@ impl HttpInbound {
             self.config.listen,
             self.config.port
         );
-        // Take the listener out first so the lock is released before the
-        // (blocking) join of the accept loop.
         let mut server = self.server.lock().take();
         if let Some(server) = server.as_mut() {
             server.stop();

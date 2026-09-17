@@ -114,8 +114,6 @@ impl Timer {
         loop {
             let mut guard = core.inner.lock();
             while !guard.shutdown {
-                // Copy the next deadline out so no borrow of `guard` is held
-                // across the condvar wait (which needs `&mut guard`).
                 let next = guard.heap.peek().map(|&Reverse((d, _))| d);
                 match next {
                     None => core.wake.wait(&mut guard),
@@ -132,32 +130,22 @@ impl Timer {
                 return;
             }
 
-            // Pop the due entry (there must be one at the heap top).
             let Some(Reverse((_deadline, id))) = guard.heap.pop() else {
                 continue;
             };
             let Some(mut entry) = guard.entries.remove(&id) else {
-                continue; // cancelled
+                continue;
             };
             if entry.cancelled.load(Ordering::Acquire) {
                 continue;
             }
             drop(guard);
 
-            // Run the job on the timer thread. Callbacks must be short —
-            // long-running work should be delegated to the work-stealing
-            // pool *by the callback itself* (`crate::common::exec::spawn`).
-            // Running here (instead of moving the job to the pool) is what
-            // lets repeating timers keep their job across re-arms.
             (entry.job)();
             entry.fires += 1;
 
-            // Re-arm repeating timers with a drift-free deadline anchored on
-            // the original schedule.
             if let Some(period) = entry.period {
                 let mut deadline = entry.anchor + period;
-                // Skip missed ticks so a slow callback doesn't cause a burst
-                // of back-to-back firings.
                 while deadline <= Instant::now() {
                     deadline += period;
                 }
@@ -279,7 +267,6 @@ mod tests {
         let t = Timer::new();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        // Keep the handle alive: dropping a TimerHandle cancels the timer.
         let _handle = t.after(Duration::from_millis(30), move || {
             h.fetch_add(1, Ordering::SeqCst);
         });
@@ -310,27 +297,19 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let (h, a, m) = (hits.clone(), active.clone(), max_active.clone());
-        // Keep the handle alive so the repeating timer is not cancelled.
         let _handle = t.every(Duration::from_millis(10), move || {
             let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
             m.fetch_max(cur, Ordering::SeqCst);
             h.fetch_add(1, Ordering::SeqCst);
             a.fetch_sub(1, Ordering::SeqCst);
         });
-        // Observe for a generous window. macOS CI VMs coalesce condvar
-        // timeouts (parking_lot waits with CLOCK_REALTIME
-        // `pthread_cond_timedwait` there), so a 10ms timer can fire as
-        // rarely as every ~100ms under load. Assert a conservative lower
-        // bound: even a ~10x slowdown still clears it, while a timer that
-        // fails to repeat (or fires only once) is still caught.
+
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         let n = hits.load(Ordering::SeqCst);
         assert!(n >= 3, "expected at least 3 firings, got {n}");
-        // The wheel runs callbacks on a single thread and re-arms only after
-        // the previous callback returns, so executions never overlap.
         assert_eq!(
             max_active.load(Ordering::SeqCst),
             1,

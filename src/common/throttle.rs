@@ -80,7 +80,6 @@ mod tests {
         assert_eq!(throttle.admit_at(start), Some(0), "first event is logged");
         assert_eq!(throttle.admit_at(start + Duration::from_millis(10)), None);
         assert_eq!(throttle.admit_at(start + Duration::from_millis(20)), None);
-        // The next admitted message reports everything it stood in for.
         assert_eq!(
             throttle.admit_at(start + Duration::from_secs(6)),
             Some(2),

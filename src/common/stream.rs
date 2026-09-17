@@ -601,9 +601,6 @@ pub fn relay_with(
         ));
     }
 
-    // Cancellation is what releases a shared side, which has no timeout of its
-    // own to bring it back. Registered before the threads start so a cancel
-    // that lands while they are spawning still reaches the transports.
     {
         let a = Arc::clone(&a);
         let b = Arc::clone(&b);
@@ -828,7 +825,6 @@ mod tests {
             )
         });
 
-        // Both directions are parked in reads with no timeout by now.
         std::thread::sleep(Duration::from_millis(50));
         token.cancel();
 

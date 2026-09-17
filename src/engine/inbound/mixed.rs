@@ -87,9 +87,6 @@ impl MixedInbound {
         }
 
         let (listener, addr) = bind_tcp_listener(&self.config.listen, self.config.port, "Mixed")?;
-
-        // The HTTP half is the shared proxy engine; build its handler and
-        // server configuration once, per listener.
         let handler = Arc::new(HttpProxyHandler::new(
             "mixed",
             Arc::clone(&self.router),
@@ -130,8 +127,7 @@ impl MixedInbound {
             self.config.listen,
             self.config.port
         );
-        // Take the listener out first so the lock is released before the
-        // (blocking) join of the accept loop.
+
         let mut server = self.server.lock().take();
         if let Some(server) = server.as_mut() {
             server.stop();
@@ -153,8 +149,6 @@ fn dispatch(
     handler: &Arc<HttpProxyHandler>,
     server_config: &Arc<ServerConfig>,
 ) -> Result<()> {
-    // `peek` leaves the byte in place, and the server engines below expect a
-    // blocking socket.
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(SNIFF_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SNIFF_TIMEOUT));

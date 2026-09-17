@@ -79,7 +79,6 @@ mod tests {
             let mut buf = [0u8; 4];
             peer.read_exact(&mut buf).expect("peer read");
             peer.write_all(b"pong").expect("peer write");
-            // After the local half-close, the peer's read returns 0.
             let mut tail = [0u8; 1];
             let n = peer.read(&mut tail).expect("peer read after shutdown");
             (buf, n)
