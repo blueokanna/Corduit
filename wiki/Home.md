@@ -67,5 +67,6 @@ curl -X POST http://127.0.0.1:8765/rpc \
 | [FFI-API](FFI-API) | C ABI：C / Dart 绑定示例 |
 | [RPC-API](RPC-API) | HTTP / WebSocket JSON-RPC 用法 |
 | [Methods-Reference](Methods-Reference) | 全部方法清单：参数、返回、示例 |
+| [Performance](Performance) | 空闲开销约束、空转的可观测特征与实测方法 |
 | [Security](Security) | 安全模型与边界 |
 | [Troubleshooting](Troubleshooting) | 常见问题排查 |

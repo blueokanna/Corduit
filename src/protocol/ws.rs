@@ -255,8 +255,6 @@ impl<S: SyncStream> WebSocket<S> {
                     .map_err(|_| io::Error::other("websocket: session lock poisoned"))?;
                 match session.poll_message() {
                     Ok(Some(event)) => {
-                        // A Ping was answered and a Close echoed by the
-                        // session; make sure those control frames left.
                         if !matches!(event, Event::Text(_) | Event::Binary(_)) {
                             let _ = session.flush();
                         }
@@ -348,9 +346,6 @@ impl<S: SyncStream> Read for WebSocket<S> {
                     self.pending = text.into_bytes();
                 }
                 Ok(Message::Close) => return Ok(0),
-                // A peer that vanished without a closing handshake is
-                // end-of-stream, not a transport failure: the relay
-                // finishes this direction and half-closes the other side.
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
                 Err(e) => return Err(e),
             }
@@ -419,15 +414,108 @@ fn session_error(e: courierust::Error) -> io::Error {
     let kind = match e.kind {
         CourierKind::WouldBlock => io::ErrorKind::WouldBlock,
         CourierKind::Timeout => io::ErrorKind::TimedOut,
-        CourierKind::UnexpectedEof => return io::Error::new(io::ErrorKind::UnexpectedEof, ""),
+        CourierKind::UnexpectedEof => io::ErrorKind::UnexpectedEof,
         CourierKind::Protocol | CourierKind::InvalidHeader | CourierKind::Overflow => {
             io::ErrorKind::InvalidData
         }
-        CourierKind::Canceled => io::ErrorKind::Interrupted,
+        CourierKind::Canceled => cancelled_kind(),
         CourierKind::Io | CourierKind::Other => io::ErrorKind::Other,
         _ => io::ErrorKind::Other,
     };
-    io::Error::new(kind, e.to_string())
+
+    io::Error::new(kind, Deferred(e))
+}
+
+/// An `io::Error` payload that renders the underlying error on demand.
+///
+/// `io::Error::new` wants an owned payload, and `e.to_string()` is the obvious
+/// way to supply one — but that allocates a `String` (and grows a `Vec`, and
+/// reallocs) on a path that runs once per failed frame write. Borrowing the
+/// error instead makes producing it free, and moves the formatting to the
+/// single place that can legitimately afford it: whoever prints the error.
+///
+/// This is the part that makes the trade-off disappear. Reporting a static
+/// message per kind is cheaper but loses the cause; formatting eagerly keeps the
+/// cause but pays for it on every failure. Deferring keeps both.
+struct Deferred(courierust::Error);
+
+impl std::fmt::Display for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Debug for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Deferred {}
+
+/// The `io` kind a cancelled session maps to.
+///
+/// It must not be [`io::ErrorKind::Interrupted`]. `std::io::Write::write_all`
+/// retries `Interrupted` **without a bound**, so a cancellation reported that
+/// way is not an error a relay can act on: every frame write re-enters
+/// `WebSocket::write`, fails, maps, allocates and retries, with no syscall to
+/// block in. That is a userspace spin at roughly one core per direction, and on
+/// a phone it is measurable as heat and as every other application stalling.
+fn cancelled_kind() -> io::ErrorKind {
+    io::ErrorKind::ConnectionAborted
+}
+
+#[cfg(test)]
+mod cancellation_kind_tests {
+    use super::*;
+
+    /// Counts the attempts `write_all` makes before it gives up.
+    struct Counting {
+        kind: io::ErrorKind,
+        attempts: usize,
+    }
+
+    impl io::Write for Counting {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            self.attempts += 1;
+            Err(io::Error::new(self.kind, "session canceled"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The mapping and the retry behaviour are one invariant, so both are
+    /// asserted here: a kind is only safe for cancellation if `write_all`
+    /// returns instead of retrying it.
+    #[test]
+    fn a_cancelled_session_is_not_retried_by_write_all() {
+        let mut writer = Counting {
+            kind: cancelled_kind(),
+            attempts: 0,
+        };
+        assert!(writer.write_all(b"frame").is_err());
+        assert_eq!(
+            writer.attempts, 1,
+            "the error has to reach the caller on the first attempt"
+        );
+
+        let mut interrupt = Counting {
+            kind: io::ErrorKind::Interrupted,
+            attempts: 0,
+        };
+        let mut bounded = 0usize;
+        while bounded < 64 && interrupt.attempts < 64 {
+            if interrupt.write(b"frame").is_err() {
+                bounded += 1;
+            }
+        }
+        assert_eq!(
+            interrupt.attempts, 64,
+            "Interrupted is retried without a bound — that is why cancellation must not map to it"
+        );
+    }
 }
 
 /// Validate the `Host` header value.

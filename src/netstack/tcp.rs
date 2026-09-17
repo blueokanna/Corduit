@@ -18,6 +18,13 @@ use tracing::debug;
 
 /// How long a blocking read waits for data before re-checking connection state.
 const READ_POLL_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// How long a reader parks after a latched wake-up that carried no data.
+///
+/// A latched wake means the wait did not block at all, so retrying it
+/// immediately is a userspace loop with no syscall in it to yield. One
+/// millisecond bounds the retry without being visible as latency.
+const NOTIFY_NO_PROGRESS_BACKOFF: Duration = Duration::from_millis(1);
 /// How long `accept()` waits between polls of the new-connection queue.
 const ACCEPT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -155,9 +162,16 @@ impl TcpConnection {
                 }
                 inner.notify.clone()
             };
-            notify.wait(READ_POLL_TIMEOUT);
-            if self.lock_inner().closed {
+            let (_, latched) = notify.wait_latched(READ_POLL_TIMEOUT);
+            let (closed, empty) = {
+                let inner = self.lock_inner();
+                (inner.closed, inner.recv_buffer.is_empty())
+            };
+            if closed {
                 return Ok(0);
+            }
+            if latched && empty {
+                std::thread::sleep(NOTIFY_NO_PROGRESS_BACKOFF);
             }
         }
     }
@@ -202,6 +216,9 @@ impl TcpConnection {
         if inner.recv_buffer.len() + data.len() > MAX_RECV_BUFFER {
             return;
         }
+        if data.is_empty() {
+            return;
+        }
         inner.recv_buffer.extend_from_slice(data);
         inner.download_bytes += data.len() as u64;
         drop(inner);
@@ -211,10 +228,13 @@ impl TcpConnection {
     /// Close the connection
     pub fn close(&self) {
         let mut inner = self.inner.lock();
+        let was_open = !inner.closed;
         inner.closed = true;
         inner.state = TcpState::Closed;
         drop(inner);
-        self.inner.lock().notify.notify_waiters();
+        if was_open {
+            self.inner.lock().notify.notify_waiters();
+        }
     }
 }
 

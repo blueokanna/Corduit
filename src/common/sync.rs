@@ -76,6 +76,32 @@ impl Notify {
         f
     }
 
+    /// Block until the latch is set or `timeout` elapses, reporting whether the
+    /// call had to block at all.
+    ///
+    /// Returns `(notified, latched)`. `latched == true` means the flag was
+    /// already set when the call started, so *this returned without ever
+    /// blocking*. That distinction is the whole difference between a poll and a
+    /// busy loop for a condition-variable style caller: a latched wake that
+    /// carries no data has to be bounded by the caller, while a real wait that
+    /// observed the latch may loop again for free.
+    ///
+    /// [`wait`](Self::wait) cannot express this because it answers "was a
+    /// notification observed", which is true for both cases.
+    pub fn wait_latched(&self, timeout: Duration) -> (bool, bool) {
+        let mut guard = self.inner.lock.lock();
+        if self.inner.flag.load(Ordering::Acquire) {
+            self.inner.flag.store(false, Ordering::Release);
+            return (true, true);
+        }
+        let outcome = self.inner.cond.wait_for(&mut guard, timeout);
+        let notified = self.inner.flag.load(Ordering::Acquire);
+        if notified {
+            self.inner.flag.store(false, Ordering::Release);
+        }
+        (notified, !outcome.timed_out() && notified)
+    }
+
     /// Block until the latch is set or `timeout` elapses.
     ///
     /// Returns `true` if a notification was observed within the window (the
@@ -123,6 +149,27 @@ mod tests {
         n.notify_one();
         assert!(n.wait(Duration::from_millis(10)));
         assert!(!n.wait(Duration::from_millis(10)), "latch consumed");
+    }
+
+    #[test]
+    fn a_latched_wait_never_blocks() {
+        let n = Notify::new();
+        n.notify_one();
+        // Latched: the caller is told it did not have to block, which is what
+        // lets a data path bound itself instead of spinning on the latch.
+        assert_eq!(n.wait_latched(Duration::from_millis(50)), (true, true));
+        // Consumed, so the next call really waits and reports the timeout.
+        let (notified, latched) = n.wait_latched(Duration::from_millis(20));
+        assert!(!notified, "the first call consumed the latch");
+        assert!(!latched, "a timed-out wait is not a latched wake");
+    }
+
+    #[test]
+    fn a_timeout_is_reported_as_not_latched() {
+        let n = Notify::new();
+        let (notified, latched) = n.wait_latched(Duration::from_millis(20));
+        assert!(!notified);
+        assert!(!latched);
     }
 
     #[test]
