@@ -184,6 +184,103 @@ pub fn shutdown_lenient(stream: &dyn SyncStream, how: Shutdown) -> io::Result<()
     }
 }
 
+/// A stream with bytes that are already off the wire.
+///
+/// Any protocol that reads a preamble and then hands the socket over — an
+/// HTTP `CONNECT` response, a `Banner`-first service behind a proxy — faces
+/// the same hazard: the read that finds the end of the preamble can only be
+/// satisfied by a buffer, and a buffer that is dropped takes whatever it read
+/// past the delimiter with it. That data is gone: the peer already sent it and
+/// will not send it again, so a MySQL handshake or an SMTP banner disappears
+/// and the connection stalls until it times out.
+///
+/// `PrefixedStream` is the fix. The over-read bytes are kept and served
+/// before the inner stream is touched again, so the caller can hand out a
+/// stream that starts exactly where the preamble ended.
+pub struct PrefixedStream {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: BoxStream,
+}
+
+impl PrefixedStream {
+    /// Wrap `inner`, serving `prefix` first.
+    pub fn new(prefix: Vec<u8>, inner: BoxStream) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+
+    /// Bytes still waiting to be delivered.
+    pub fn remaining(&self) -> usize {
+        self.prefix.len() - self.offset
+    }
+
+    /// The wrapped transport, with the prefix still undelivered if there is
+    /// any. Callers that need the raw transport must have drained the prefix
+    /// first, or use [`PrefixedStream::remaining`] to check.
+    pub fn into_inner(self) -> (Vec<u8>, BoxStream) {
+        (self.prefix[self.offset..].to_vec(), self.inner)
+    }
+}
+
+impl Read for PrefixedStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.offset < self.prefix.len() {
+            let n = (self.prefix.len() - self.offset).min(buf.len());
+            buf[..n].copy_from_slice(&self.prefix[self.offset..self.offset + n]);
+            self.offset += n;
+            // The prefix is bounded by the preamble cap and is drained in at
+            // most one read, so nothing accumulates here.
+            if self.offset == self.prefix.len() {
+                self.prefix = Vec::new();
+                self.offset = 0;
+            }
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl Write for PrefixedStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl SyncStream for PrefixedStream {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.inner.shutdown(how)
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr()
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(timeout)
+    }
+
+    /// Deliberately `None`: the whole point of this wrapper is that `read`
+    /// must run before the inner stream does. Handing out the inner transport's
+    /// handle would let a relay read around the prefix, and the prefix is
+    /// exactly the bytes the peer is waiting on. The serialized relay path
+    /// calls `Read` here, which is correct.
+    fn shared_handle(&self) -> Option<SharedStream> {
+        None
+    }
+}
+
 impl StreamHandle for TcpStream {
     /// `Read` is implemented for `&TcpStream` precisely so a socket can be read
     /// from one thread and written from another without a lock: the two
@@ -1264,5 +1361,105 @@ mod tests {
     fn cpu_time() -> u64 {
         std::thread::sleep(Duration::from_millis(1));
         0
+    }
+
+    /// A stream that hands out fixed bytes and then EOFs, refusing to be read
+    /// again once drained.
+    struct Chunk {
+        data: std::collections::VecDeque<u8>,
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Chunk {
+        fn new(data: &[u8]) -> (Self, Arc<Mutex<Vec<u8>>>) {
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    data: data.iter().copied().collect(),
+                    writes: writes.clone(),
+                },
+                writes,
+            )
+        }
+    }
+
+    impl Read for Chunk {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.data.len().min(buf.len());
+            for slot in buf.iter_mut().take(n) {
+                *slot = self.data.pop_front().expect("len checked");
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for Chunk {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes
+                .lock()
+                .expect("test lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SyncStream for Chunk {
+        fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_prefixed_stream_serves_the_prefix_before_the_transport() {
+        let (inner, _) = Chunk::new(b"world");
+        let mut stream = PrefixedStream::new(b"hello ".to_vec(), Box::new(inner));
+        assert_eq!(stream.remaining(), 6);
+
+        let mut all = Vec::new();
+        stream.read_to_end(&mut all).unwrap();
+        assert_eq!(all, b"hello world");
+        assert_eq!(stream.remaining(), 0);
+    }
+
+    #[test]
+    fn a_prefix_is_delivered_across_short_reads_without_loss() {
+        let (inner, _) = Chunk::new(b"abcdef");
+        let mut stream = PrefixedStream::new(b"0123".to_vec(), Box::new(inner));
+
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            let mut one = [0u8; 1];
+            if stream.read(&mut one).unwrap() == 0 {
+                break;
+            }
+            got.push(one[0]);
+        }
+        assert_eq!(got, b"0123ab");
+    }
+
+    #[test]
+    fn writes_bypass_the_prefix_and_reach_the_transport() {
+        let (inner, writes) = Chunk::new(b"");
+        let mut stream = PrefixedStream::new(b"held".to_vec(), Box::new(inner));
+        stream.write_all(b"outgoing").unwrap();
+        assert_eq!(&writes.lock().expect("test lock")[..], b"outgoing");
+        assert_eq!(stream.remaining(), 4, "writing must not consume the prefix");
+    }
+
+    /// The relay prefers a transport's own concurrency over a lock, so a
+    /// wrapper that skipped this would let a shared-handle relay read *around*
+    /// the prefix — and the prefix is data the peer is already waiting for.
+    #[test]
+    fn a_prefixed_stream_refuses_to_offer_a_shared_handle() {
+        let (left, _right) = socket_pair();
+        let mut stream = PrefixedStream::new(b"x".to_vec(), Box::new(left));
+        assert!(stream.shared_handle().is_none());
+        let mut one = [0u8; 1];
+        assert_eq!(stream.read(&mut one).unwrap(), 1);
+        assert_eq!(one[0], b'x');
     }
 }

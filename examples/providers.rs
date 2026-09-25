@@ -3,7 +3,7 @@
 //! End-to-end provider wiring without any network: writes a small rule file
 //! and a proxy subscription into the system temp directory, then starts an
 //! engine whose selector group pulls its members from the provider via
-//! `use:` (Clash semantics) and whose `rule-set` rule resolves against the
+//! `use:` and whose `rule-set` rule resolves against the
 //! rule provider.
 //!
 //! ```bash

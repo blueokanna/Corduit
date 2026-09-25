@@ -141,3 +141,61 @@ impl io::Read for QuicRecvStream {
         }
     }
 }
+
+/// A QUIC bidirectional stream as one duplex [`SyncStream`](crate::common::stream::SyncStream).
+///
+/// A QUIC stream is handed out as two independent objects, but every engine
+/// relay speaks one duplex stream. Pairing them is not a formality: the two
+/// halves are separate handles to the same stream, so the relay can drive them
+/// from two threads without a lock held across a blocking read. Each half keeps
+/// its own `Mutex` purely because `std::io::Read`/`Write` take `&mut self` —
+/// the shared state underneath is the connection's, and it is already
+/// internally synchronized.
+///
+/// `shutdown(Write)` is a QUIC FIN, queued behind whatever the send buffer
+/// still holds; the read half keeps working, which is what makes TCP half-close
+/// semantics survive the round trip.
+pub struct QuicStreamPair {
+    send: parking_lot::Mutex<QuicSendStream>,
+    recv: parking_lot::Mutex<QuicRecvStream>,
+}
+
+impl QuicStreamPair {
+    /// Pair the two halves of one bidirectional stream.
+    pub fn new(send: QuicSendStream, recv: QuicRecvStream) -> Self {
+        Self {
+            send: parking_lot::Mutex::new(send),
+            recv: parking_lot::Mutex::new(recv),
+        }
+    }
+
+    /// The peer's stream id, useful for logging a relay.
+    pub fn id(&self) -> u64 {
+        self.send.lock().id()
+    }
+}
+
+impl io::Read for QuicStreamPair {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut *self.recv.lock(), buf)
+    }
+}
+
+impl io::Write for QuicStreamPair {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut *self.send.lock(), buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::Write::flush(&mut *self.send.lock())
+    }
+}
+
+impl crate::common::stream::SyncStream for QuicStreamPair {
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        if matches!(how, std::net::Shutdown::Write | std::net::Shutdown::Both) {
+            self.send.lock().finish()?;
+        }
+        Ok(())
+    }
+}

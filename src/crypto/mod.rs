@@ -26,9 +26,10 @@
 //! |---------------|----------|
 //! | [`hash`]      | MD5, SHA-1, SHA-2, SHA-3, BLAKE2, BLAKE3 |
 //! | [`mac`]       | HMAC, keyed BLAKE2s |
-//! | [`stream`]    | ChaCha20, AES block cipher, CTR mode |
+//! | [`stream`]    | ChaCha20 (RFC 8439 and the original 64-bit-nonce shape), Salsa20, RC4, AES, and the CFB128 / CTR / CBC modes |
 //! | [`aead`]      | ChaCha20-Poly1305, AES-GCM |
-//! | [`kdf`]       | HKDF |
+//! | [`kdf`]       | HKDF, Argon2id |
+//! | [`checksum`]  | CRC-32 and Adler-32 (integrity shaping only — never a MAC) |
 //! | [`dh`]        | X25519 |
 //! | [`codec`]     | hex, and the base64 entry points over courierust's codec |
 //! | [`rng`]       | ChaCha-based deterministic CSPRNG |
@@ -51,6 +52,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod aead;
+pub mod checksum;
 pub mod codec;
 pub mod dh;
 pub mod digest;

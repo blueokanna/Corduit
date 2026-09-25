@@ -14,9 +14,9 @@
 | `init_app` | — | `null` | 初始化日志/TLS（幂等） |
 | `start_proxy_from_yaml` | `yaml_config: string` | `null` | 从 JSON 字符串启动代理 |
 | `start_proxy_from_file` | `config_path: string` | `null` | 从文件启动 |
-| `stop_proxy` | — | `null` | 停止代理 |
+| `stop_proxy` | — | `null` | 停止代理（含引擎按 profile 起的那份外部控制器；未运行时静默返回成功） |
 | `is_proxy_running` | — | `bool` | 是否运行中 |
-| `reload_config_from_yaml` | `yaml_config: string` | `null` | 热重载 |
+| `reload_config_from_yaml` | `yaml_config: string` | `null` | 热重载（接受引擎核心配置写法） |
 | `reload_config_from_file` | `config_path: string` | `null` | 热重载（文件） |
 
 ```bash
@@ -85,12 +85,12 @@ curl -s -X POST http://127.0.0.1:8765/rpc -H "Authorization: Bearer $T" -H "Cont
 
 | method | params | 返回 data | 说明 |
 |---|---|---|---|
-| `get_rules` | — | `[RuleDto]` | `{rule_type,payload,outbound,matched_count}` |
+| `get_rules` | — | `[RuleDto]` | `{rule_type,payload,outbound,matched_count}`，`rule_type` 用 profile 的写法（`domain-suffix` / `ip-cidr` / `rule-set`） |
 | `get_dns_config` | — | `DnsConfigDto` | `{enable,listen,enhanced_mode,nameservers,fallback}` |
 | `set_proxy_mode` | `mode: i32` | `null` | `1=global 2=direct 3=rule` |
 | `get_proxy_mode` | — | `i32` | 当前模式 |
 | `get_logs` | `lines?: u32` | `[string]` | 最近日志 |
-| `set_log_level` | `level: string` | `null` | `silent/error/warning/info/debug` |
+| `set_log_level` | `level: string` | `null` | `silent/error/warning/info/debug`；**运行时真正切换**控制台过滤器（日志缓冲区不受影响）。日志系统未安装时（启动时配了 `silent`，或宿主已自行装好订阅器）返回错误，不假装成功 |
 
 ## TUN / Windows
 

@@ -44,8 +44,8 @@ mod transport;
 pub use client::{ClientConnection, QuicClient};
 pub use config::{ClientConfig, CongestionControl};
 pub use error::{QuicError, Result};
-pub use obfs::Salamander;
-pub use stream::{QuicRecvStream, QuicSendStream};
+pub use obfs::{PacketObfs, Salamander, XPlus};
+pub use stream::{QuicRecvStream, QuicSendStream, QuicStreamPair};
 
 /// QUIC version 1 (RFC 9000).
 pub(crate) const QUIC_VERSION: u32 = 0x0000_0001;

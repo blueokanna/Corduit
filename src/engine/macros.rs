@@ -30,6 +30,20 @@ macro_rules! impl_config_enum {
                     $($ty::$variant => $canonical,)+
                 }
             }
+
+            /// The variant a configuration string names, `None` for anything
+            /// else.
+            ///
+            /// The table is the same one the deserializer reads, on purpose: a
+            /// second hand-written match here would be a second definition of
+            /// the same vocabulary, and the two would drift the first time a
+            /// spelling was added to one of them.
+            pub fn parse(value: &str) -> ::core::option::Option<Self> {
+                match value {
+                    $($canonical $(| $alias)* => Some($ty::$variant),)+
+                    _ => None,
+                }
+            }
         }
         impl<'de> ::nextjson::NsonDeserialize<'de> for $ty {
             fn nextdecode_into<D: ::nextjson::FormatDecoder<'de>>(

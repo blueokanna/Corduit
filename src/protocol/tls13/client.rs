@@ -537,6 +537,16 @@ impl<R: Read, W: Write> Tls13Stream<R, W> {
         self.peer_certificate.as_deref()
     }
 
+    /// Give the transport back and drop the TLS session.
+    ///
+    /// A wrapper protocol that runs a real handshake for camouflage and then
+    /// frames the same socket itself (ShadowTLS) needs the transport, not a way
+    /// to talk over it — and the session's keys are worthless once the peer has
+    /// switched to its own framing.
+    pub fn into_parts(self) -> (R, W) {
+        (self.reader, self.writer)
+    }
+
     /// Send `close_notify` and close the write side (RFC 8446 §6.1).
     pub fn close_notify(&mut self) -> std::io::Result<()> {
         if self.closed {

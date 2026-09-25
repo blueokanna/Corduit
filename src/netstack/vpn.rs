@@ -1,7 +1,7 @@
 //! Platform-neutral TUN packet processing runtime.
 
 use crate::netstack::error::{NetStackError, Result};
-use crate::netstack::solidtcp::{SolidStack, StackBuilder, StackStats};
+use crate::netstack::solidtcp::{ClientDnsSettings, SolidStack, StackBuilder, StackStats};
 use bytes::BytesMut;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -42,10 +42,26 @@ impl TunPacketProcessor {
         mtu: u16,
         tun_tx: mpsc::Sender<BytesMut>,
     ) -> Self {
+        Self::new_with_dns(proxy_addr, mtu, tun_tx, ClientDnsSettings::default())
+    }
+
+    /// Build a processor whose intercepted DNS follows the profile.
+    ///
+    /// The settings decide whether a query gets a fake address, a real answer,
+    /// or is forwarded. Without them the responder applies its own default,
+    /// which is how every `A` query ended up faked no matter what the profile
+    /// asked for.
+    pub fn new_with_dns(
+        proxy_addr: SocketAddr,
+        mtu: u16,
+        tun_tx: mpsc::Sender<BytesMut>,
+        dns: ClientDnsSettings,
+    ) -> Self {
         let mut stack = StackBuilder::new()
             .proxy_addr(proxy_addr)
             .mtu(usize::from(mtu))
             .dns_intercept(true)
+            .client_dns(dns)
             .build();
         stack.set_tun_tx(tun_tx);
         stack.start();

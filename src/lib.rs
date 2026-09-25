@@ -87,6 +87,7 @@ use std::sync::Arc;
 // --- no_std protocol core ---------------------------------------------------
 pub mod common;
 pub mod crypto;
+pub mod nat;
 pub mod protocol;
 
 // --- threaded networking layer (std) ----------------------------------------
@@ -552,6 +553,7 @@ mod tests {
                     nameservers,
                     fallback,
                     nameserver_policy: std::collections::HashMap::new(),
+                    ..DnsConfigDto::default()
                 }
             })
     }

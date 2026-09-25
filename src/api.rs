@@ -85,38 +85,142 @@ fn init_tracing_safe() -> std::result::Result<(), ()> {
     }
 }
 
-// ============== Proxy Control API (Design Document Compliant) ==============
-pub fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
-    tracing::info!("Starting proxy from config JSON...");
+// ---------------------------------------------------------------------------
+// Engine instance access
+// ---------------------------------------------------------------------------
 
-    // This public entry point must honor `rule_providers` / `proxy_providers`
-    // just like initialize/reload/test-config do.
-    configure_rule_providers(&yaml_config).map_err(|e| e.to_string())?;
-    configure_proxy_providers(&yaml_config).map_err(|e| e.to_string())?;
+/// Run `f` with a read-locked engine instance.
+///
+/// Every entry point here needs the same three things: reach the process-wide
+/// instance, take the read lock, and decide what "no engine is running" means.
+/// Only the last differs between callers, so it is the parameter — which also
+/// stops the answer a caller sees from depending on which function happened to
+/// be written first.
+fn with_instance<T>(f: impl FnOnce(&crate::engine::Corduit) -> Result<T>) -> Result<T> {
+    let instance = get_corduit_instance()
+        .map_err(|e| CorduitError::Internal(format!("Failed to get instance: {e}")))?;
+    let guard = instance.read();
+    let corduit = guard
+        .as_ref()
+        .ok_or_else(|| CorduitError::Internal("Corduit not initialized".to_string()))?;
+    f(corduit)
+}
 
-    let config: Config =
-        nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {}", e))?;
+/// Run `f` with a read-locked engine instance, or answer `absent` when none is
+/// running.
+///
+/// A read-only call can have a legitimate answer for "nothing is running" —
+/// `false`, `None`, `0` — and inventing a failure for it would make a polled
+/// question look like an error. Only the absence is answered with `absent`; a
+/// failure inside `f` still fails.
+fn with_instance_or<T>(
+    absent: T,
+    f: impl FnOnce(&crate::engine::Corduit) -> Result<T>,
+) -> Result<T> {
+    let instance = get_corduit_instance()
+        .map_err(|e| CorduitError::Internal(format!("Failed to get instance: {e}")))?;
+    let guard = instance.read();
+    match guard.as_ref() {
+        Some(corduit) => f(corduit),
+        None => Ok(absent),
+    }
+}
+
+/// Run `f` with a write-locked engine instance, for the calls that reconfigure
+/// or restart it.
+fn with_instance_mut<T>(f: impl FnOnce(&mut crate::engine::Corduit) -> Result<T>) -> Result<T> {
+    let instance = get_corduit_instance()
+        .map_err(|e| CorduitError::Internal(format!("Failed to get instance: {e}")))?;
+    let mut guard = instance.write();
+    let corduit = guard
+        .as_mut()
+        .ok_or_else(|| CorduitError::Internal("Corduit not initialized".to_string()))?;
+    f(corduit)
+}
+
+/// The same lock, in the string-error vocabulary the C ABI and the JSON-RPC
+/// table use.
+///
+/// Two error types exist for two consumers, and each gets one acquisition path
+/// rather than one per function.
+fn with_instance_legacy<T>(
+    f: impl FnOnce(&crate::engine::Corduit) -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {e}"))?;
+    let guard = instance.read();
+    match guard.as_ref() {
+        Some(corduit) => f(corduit),
+        None => Err("Proxy not initialized".to_string()),
+    }
+}
+
+/// Install `core_config` as the live engine, replacing whatever was running.
+///
+/// `initialize_corduit` and `start_proxy_from_yaml` do exactly this; they differ
+/// only in the shape of the JSON they were handed, so the replacement itself
+/// lives here. The previous instance must stop before the new one binds the
+/// same ports, hence the pause.
+fn install_instance(core_config: crate::engine::Config) -> Result<()> {
     {
         let mut instance = CORDUIT_INSTANCE.write();
-        if let Some(ref corduit) = *instance {
-            tracing::info!("Stopping existing Corduit instance before re-initialization");
-            if let Err(e) = corduit.stop() {
-                tracing::warn!("Error stopping existing instance: {}", e);
+        if let Some(running) = instance.as_ref() {
+            tracing::info!("Stopping the running engine before re-initialization");
+            if let Err(error) = running.stop() {
+                tracing::warn!("error while stopping the previous instance: {error}");
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         *instance = None;
     }
 
-    let corduit = crate::engine::Corduit::new(config)
-        .map_err(|e| format!("Failed to create Corduit: {}", e))?;
+    let corduit = crate::engine::Corduit::new(core_config).map_err(CorduitError::from)?;
+    *CORDUIT_INSTANCE.write() = Some(corduit);
+    Ok(())
+}
 
-    corduit
-        .start()
-        .map_err(|e| format!("Failed to start proxy: {}", e))?;
+/// Replace the running engine's configuration.
+///
+/// The two reload entry points differ only in how they obtain a core config,
+/// so the reload itself is here.
+fn reload_with(core_config: crate::engine::Config) -> Result<()> {
+    with_instance_mut(|corduit| corduit.reload(core_config).map_err(CorduitError::from))
+}
 
-    let mut instance = CORDUIT_INSTANCE.write();
-    *instance = Some(corduit);
+/// Select a proxy inside a group.
+///
+/// Both spellings — the string-error one and the `bool` one — land here, so
+/// "that group does not exist" cannot mean an error in one and `false` in the
+/// other.
+fn set_selector(group_tag: &str, proxy_tag: &str) -> Result<bool> {
+    with_instance(|corduit| {
+        let proxy_manager = corduit.proxy_manager();
+        let outbound_manager = proxy_manager.outbound_manager();
+        if outbound_manager.get_proxy(group_tag).is_none() {
+            return Ok(false);
+        }
+        outbound_manager
+            .set_selector_proxy(group_tag, proxy_tag)
+            .map_err(CorduitError::from)?;
+        tracing::info!("Proxy selection updated: {group_tag} -> {proxy_tag}");
+        Ok(true)
+    })
+}
+
+// ============== Proxy Control API (Design Document Compliant) ==============
+pub fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
+    tracing::info!("Starting proxy from config JSON...");
+
+    configure_rule_providers(&yaml_config).map_err(|e| e.to_string())?;
+    configure_proxy_providers(&yaml_config).map_err(|e| e.to_string())?;
+
+    let config: Config =
+        nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {e}"))?;
+
+    install_instance(config).map_err(|e| e.to_string())?;
+
+    // Bringing up the listeners — and the dashboard the profile asked for — is
+    // the same operation as `start_corduit`, so it is the same code.
+    start_corduit().map_err(|e| e.to_string())?;
 
     tracing::info!("Proxy started successfully from config JSON");
     Ok(())
@@ -131,65 +235,28 @@ pub fn start_proxy_from_file(config_path: String) -> std::result::Result<(), Str
 }
 
 pub fn stop_proxy() -> std::result::Result<(), String> {
-    tracing::info!("Stopping proxy...");
+    // `stop_corduit` is the whole operation: the dashboard the engine started
+    // goes down with it, the tracker is reset and the instance is dropped.
+    stop_corduit().map_err(|e| e.to_string())
+}
 
-    let tracker = crate::engine::connection_tracker::global_tracker();
-    tracker.reset();
-    {
-        let instance =
-            get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-        let corduit_guard = instance.read();
-
-        if let Some(corduit) = corduit_guard.as_ref() {
-            corduit
-                .stop()
-                .map_err(|e| format!("Failed to stop proxy: {}", e))?;
-        } else {
-            tracing::warn!("Proxy was not running");
-            return Ok(());
-        }
-    }
-
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    {
-        let mut instance = CORDUIT_INSTANCE.write();
-        *instance = None;
-    }
-
-    tracing::info!("Proxy stopped successfully");
-    Ok(())
+/// Whether a running engine instance is serving.
+pub fn is_running() -> Result<bool> {
+    with_instance_or(false, |corduit| {
+        corduit.is_running().map_err(CorduitError::from)
+    })
 }
 
 pub fn is_proxy_running() -> std::result::Result<bool, String> {
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let corduit_guard = instance.read();
-
-    if let Some(corduit) = corduit_guard.as_ref() {
-        corduit
-            .is_running()
-            .map_err(|e| format!("Failed to check running status: {}", e))
-    } else {
-        Ok(false)
-    }
+    is_running().map_err(|e| e.to_string())
 }
 
 pub fn reload_config_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
     tracing::info!("Reloading config from JSON...");
     let config: Config =
-        nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {}", e))?;
+        nextjson::from_str(&yaml_config).map_err(|e| format!("Invalid config JSON: {e}"))?;
 
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let mut corduit_guard = instance.write();
-
-    if let Some(corduit) = corduit_guard.as_mut() {
-        corduit
-            .reload(config)
-            .map_err(|e| format!("Failed to reload config: {}", e))?;
-        tracing::info!("Config reloaded successfully");
-        Ok(())
-    } else {
-        Err("Proxy not initialized".to_string())
-    }
+    reload_with(config).map_err(|e| e.to_string())
 }
 
 pub fn reload_config_from_file(config_path: String) -> std::result::Result<(), String> {
@@ -219,12 +286,10 @@ pub fn get_traffic_stats_dto() -> std::result::Result<TrafficStatsDto, String> {
             });
         }
     }
-    let uptime_secs = {
-        let instance =
-            get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-        let guard = instance.read();
-        guard.as_ref().map(|v| v.uptime_secs()).unwrap_or(0)
-    };
+    // An engine that was never installed has no uptime to report, and that is a
+    // zero rather than a failure.
+    let uptime_secs =
+        with_instance_or(0, |corduit| Ok(corduit.uptime_secs())).map_err(|e| e.to_string())?;
 
     Ok(TrafficStatsDto {
         upload: tracker.total_upload(),
@@ -278,10 +343,7 @@ pub fn close_all_connections_dto() -> std::result::Result<(), String> {
 
 // ============== Proxy Management API (Design Document Compliant) ==============
 pub fn get_proxies() -> std::result::Result<Vec<ProxyInfoDto>, String> {
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read();
-
-    if let Some(corduit) = guard.as_ref() {
+    with_instance_legacy(|corduit| {
         let config = corduit.config();
         let proxy_manager = corduit.proxy_manager();
         let outbound_manager = proxy_manager.outbound_manager();
@@ -289,7 +351,7 @@ pub fn get_proxies() -> std::result::Result<Vec<ProxyInfoDto>, String> {
         let mut result = Vec::new();
         for outbound_config in &config.outbounds {
             let tag = &outbound_config.tag;
-            let protocol_type = format!("{:?}", outbound_config.outbound_type).to_lowercase();
+            let protocol_type = outbound_config.outbound_type.as_str().to_string();
             let (server, port) = if let Some(proxy) = outbound_manager.get_proxy(tag) {
                 proxy
                     .server_addr()
@@ -310,30 +372,21 @@ pub fn get_proxies() -> std::result::Result<Vec<ProxyInfoDto>, String> {
         }
 
         Ok(result)
-    } else {
-        Err("Proxy not initialized".to_string())
-    }
+    })
 }
 
 pub fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, String> {
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read();
-
-    if let Some(corduit) = guard.as_ref() {
+    with_instance_legacy(|corduit| {
         let config = corduit.config();
         let proxy_manager = corduit.proxy_manager();
         let outbound_manager = proxy_manager.outbound_manager();
         let mut groups = Vec::new();
 
         for outbound in &config.outbounds {
-            let group_type = match outbound.outbound_type {
-                crate::engine::OutboundType::Selector => "selector",
-                crate::engine::OutboundType::Urltest => "url-test",
-                crate::engine::OutboundType::Fallback => "fallback",
-                crate::engine::OutboundType::Loadbalance => "load-balance",
-                crate::engine::OutboundType::Relay => "relay",
-                _ => continue,
-            };
+            if !outbound.outbound_type.is_group() {
+                continue;
+            }
+            let group_type = outbound.outbound_type.as_str();
 
             let mut proxies: Vec<String> = outbound
                 .options
@@ -383,36 +436,16 @@ pub fn get_proxy_groups() -> std::result::Result<Vec<ProxyGroupDto>, String> {
         }
 
         Ok(groups)
-    } else {
-        Err("Proxy not initialized".to_string())
-    }
+    })
 }
 
 pub fn select_proxy(group_tag: String, proxy_tag: String) -> std::result::Result<(), String> {
-    tracing::info!(
-        "Selecting proxy: group='{}', proxy='{}'",
-        group_tag,
-        proxy_tag
-    );
+    tracing::info!("Selecting proxy: group='{group_tag}', proxy='{proxy_tag}'");
 
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read();
-
-    if let Some(corduit) = guard.as_ref() {
-        let proxy_manager = corduit.proxy_manager();
-        let outbound_manager = proxy_manager.outbound_manager();
-        if outbound_manager.get_proxy(&group_tag).is_none() {
-            return Err(format!("Proxy group '{}' not found", group_tag));
-        }
-
-        outbound_manager
-            .set_selector_proxy(&group_tag, &proxy_tag)
-            .map_err(|e| format!("Failed to set proxy selection: {}", e))?;
-
-        tracing::info!("Proxy selection updated: {} -> {}", group_tag, proxy_tag);
-        Ok(())
-    } else {
-        Err("Proxy not initialized".to_string())
+    match set_selector(&group_tag, &proxy_tag) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("Proxy group '{group_tag}' not found")),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -423,9 +456,7 @@ pub fn test_proxy_latency_dto(
 ) -> std::result::Result<u64, String> {
     use std::time::Duration;
 
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read();
-    if let Some(corduit) = guard.as_ref() {
+    with_instance_legacy(|corduit| {
         let proxy_manager = corduit.proxy_manager();
 
         if let Some(proxy) = proxy_manager.outbound_manager().get_proxy(&tag) {
@@ -437,9 +468,7 @@ pub fn test_proxy_latency_dto(
         } else {
             Err(format!("Proxy '{}' not found", tag))
         }
-    } else {
-        Err("Proxy not initialized".to_string())
-    }
+    })
 }
 
 pub fn test_all_proxies_latency(
@@ -448,10 +477,7 @@ pub fn test_all_proxies_latency(
 ) -> std::result::Result<Vec<ProxyLatencyDto>, String> {
     use std::time::Duration;
 
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read();
-
-    if let Some(corduit) = guard.as_ref() {
+    with_instance_legacy(|corduit| {
         let proxy_manager = corduit.proxy_manager();
         let outbound_manager = proxy_manager.outbound_manager();
         let tags = outbound_manager.get_all_tags();
@@ -476,24 +502,19 @@ pub fn test_all_proxies_latency(
         }
 
         Ok(results)
-    } else {
-        Err("Proxy not initialized".to_string())
-    }
+    })
 }
 
 // ============== Configuration Query API (Design Document Compliant) ==============
 pub fn get_rules() -> std::result::Result<Vec<RuleDto>, String> {
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read();
-
-    if let Some(corduit) = guard.as_ref() {
+    with_instance_legacy(|corduit| {
         let config = corduit.config();
 
         let rules: Vec<RuleDto> = config
             .rules
             .iter()
             .map(|rule| RuleDto {
-                rule_type: format!("{:?}", rule.rule_type).to_lowercase(),
+                rule_type: rule.rule_type.as_str().to_string(),
                 payload: rule.payload.clone(),
                 outbound: rule.outbound.clone(),
                 matched_count: 0,
@@ -501,27 +522,87 @@ pub fn get_rules() -> std::result::Result<Vec<RuleDto>, String> {
             .collect();
 
         Ok(rules)
-    } else {
-        Err("Proxy not initialized".to_string())
-    }
+    })
 }
 
 pub fn get_dns_config() -> std::result::Result<DnsConfigDto, String> {
-    let instance = get_corduit_instance().map_err(|e| format!("Failed to get instance: {}", e))?;
-    let guard = instance.read();
-
-    if let Some(corduit) = guard.as_ref() {
+    with_instance_legacy(|corduit| {
         let config = corduit.config();
         Ok(DnsConfigDto {
             enable: config.dns.enable,
             listen: config.dns.listen.clone(),
-            enhanced_mode: format!("{:?}", config.dns.enhanced_mode).to_lowercase(),
+            enhanced_mode: config.dns.enhanced_mode.as_str().to_string(),
             nameservers: config.dns.nameservers.clone(),
             fallback: config.dns.fallback.clone(),
             nameserver_policy: config.dns.nameserver_policy.clone(),
+            default_nameserver: config.dns.default_nameserver.clone(),
+            fallback_filter: DnsFallbackFilterDto {
+                geoip: Some(config.dns.fallback_filter.geoip),
+                geoip_code: Some(config.dns.fallback_filter.geoip_code.clone()),
+                ipcidr: config.dns.fallback_filter.ipcidr.clone(),
+                domain: config.dns.fallback_filter.domain.clone(),
+            },
+            fake_ip_range: config.dns.fake_ip_range.clone(),
+            fake_ip_filter: config.dns.fake_ip_filter.clone(),
+            fake_ip_ttl: config.dns.fake_ip_ttl,
+            host_count: config.dns.hosts.len(),
+            use_hosts: config.dns.use_hosts,
+            cache_size: config.dns.cache_size,
         })
-    } else {
-        Err("Proxy not initialized".to_string())
+    })
+}
+
+/// The client-facing DNS settings in effect.
+///
+/// Read from the live configuration so the intercepted DNS follows the profile.
+/// Falls back to the responder's default when the engine is not running yet,
+/// which is the behaviour the stack had before these settings existed.
+fn client_dns_settings() -> crate::netstack::solidtcp::ClientDnsSettings {
+    use crate::engine::config::DnsMode;
+    use crate::netstack::solidtcp::{ClientDnsMode, ClientDnsSettings};
+    use std::net::IpAddr;
+
+    let default = ClientDnsSettings::default();
+
+    let Ok(instance) = get_corduit_instance() else {
+        return default;
+    };
+    let guard = instance.read();
+    let Some(corduit) = guard.as_ref() else {
+        return default;
+    };
+    let config = corduit.config();
+    let dns = &config.dns;
+
+    // Exhaustive on purpose: a new mode must force a decision here rather than
+    // fall through to whatever a string comparison happens to do.
+    let mode = match &dns.enhanced_mode {
+        DnsMode::FakeIp => ClientDnsMode::FakeIp,
+        DnsMode::Normal => ClientDnsMode::Normal,
+    };
+
+    let mut hosts: Vec<(String, Vec<IpAddr>)> = Vec::new();
+    for (name, address) in &dns.hosts {
+        match address.trim().parse::<IpAddr>() {
+            Ok(ip) => hosts.push((name.clone(), vec![ip])),
+            Err(_) => tracing::warn!(
+                "dns.hosts['{name}'] is '{address}', which is not an IP address; the \
+                 entry is ignored (aliasing one name to another is not supported)"
+            ),
+        }
+    }
+
+    match ClientDnsSettings::from_parts(mode, &dns.fake_ip_range, &dns.fake_ip_filter, &hosts) {
+        Ok(settings) => settings
+            .with_ipv6(config.general.ipv6)
+            .with_fake_ip_ttl(dns.fake_ip_ttl),
+        Err(error) => {
+            // Validation should have rejected this long before now. Falling back
+            // keeps the tunnel usable instead of refusing to start over a pool
+            // range, and the warning says exactly which value was wrong.
+            tracing::warn!("invalid client DNS settings ({error}); using the default pool");
+            ClientDnsSettings::default()
+        }
     }
 }
 
@@ -695,22 +776,7 @@ pub fn initialize_corduit(config_json: String) -> Result<()> {
         .map_err(|e| CorduitError::Parse(format!("Invalid config JSON: {}", e)))?;
     let core_config = convert_ffi_config_to_core(config)?;
 
-    {
-        let mut instance = CORDUIT_INSTANCE.write();
-        if let Some(ref corduit) = *instance {
-            tracing::info!("Stopping existing Corduit instance before re-initialization");
-            if let Err(e) = corduit.stop() {
-                tracing::warn!("Error stopping existing instance: {}", e);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        *instance = None;
-    }
-
-    let corduit = crate::engine::Corduit::new(core_config).map_err(CorduitError::from)?;
-
-    let mut instance = CORDUIT_INSTANCE.write();
-    *instance = Some(corduit);
+    install_instance(core_config)?;
 
     tracing::info!("Corduit initialized successfully");
     Ok(())
@@ -719,17 +785,13 @@ pub fn initialize_corduit(config_json: String) -> Result<()> {
 pub fn start_corduit() -> Result<()> {
     tracing::info!("Starting Corduit proxy server...");
 
-    let instance = get_corduit_instance()?;
-    let corduit_guard = instance.read();
+    with_instance(|corduit| corduit.start().map_err(CorduitError::from))?;
+    tracing::info!("Corduit proxy server started successfully");
 
-    if let Some(corduit) = corduit_guard.as_ref() {
-        corduit.start().map_err(CorduitError::from)?;
-        tracing::info!("Corduit proxy server started successfully");
-    } else {
-        return Err(CorduitError::Internal(
-            "Corduit not initialized".to_string(),
-        ));
-    }
+    // The dashboard API starts after the engine and outside the read guard: it
+    // reads the loaded configuration itself, and taking a second read lock
+    // while holding one can deadlock against a queued writer.
+    start_external_controller_from_config().map_err(CorduitError::Internal)?;
 
     Ok(())
 }
@@ -737,26 +799,25 @@ pub fn start_corduit() -> Result<()> {
 pub fn stop_corduit() -> Result<()> {
     tracing::info!("Stopping Corduit proxy server...");
 
+    // The dashboard API goes first: an in-flight request should fail against a
+    // closed listener rather than hang on an engine that is going away.
+    let _ = stop_external_controller();
+
     let tracker = crate::engine::connection_tracker::global_tracker();
     tracker.reset();
     tracing::info!("Connection tracker reset");
-    {
-        let instance = get_corduit_instance()?;
-        let corduit_guard = instance.read();
 
-        if let Some(corduit) = corduit_guard.as_ref() {
-            corduit.stop().map_err(CorduitError::from)?;
-        } else {
-            tracing::warn!("Corduit was not initialized, nothing to stop");
-            return Ok(());
-        }
+    let was_running = with_instance_or(false, |corduit| {
+        corduit.stop().map_err(CorduitError::from)?;
+        Ok(true)
+    })?;
+    if !was_running {
+        tracing::warn!("Corduit was not initialized, nothing to stop");
+        return Ok(());
     }
 
     std::thread::sleep(std::time::Duration::from_millis(500));
-    {
-        let mut instance = CORDUIT_INSTANCE.write();
-        *instance = None;
-    }
+    *CORDUIT_INSTANCE.write() = None;
 
     tracing::info!("Corduit proxy server stopped successfully");
     Ok(())
@@ -766,81 +827,72 @@ pub fn reload_corduit(config_json: String) -> Result<()> {
     configure_rule_providers(&config_json)?;
     configure_proxy_providers(&config_json)?;
     let config: CorduitConfig = nextjson::from_str(&config_json)
-        .map_err(|e| CorduitError::Parse(format!("Invalid config JSON: {}", e)))?;
+        .map_err(|e| CorduitError::Parse(format!("Invalid config JSON: {e}")))?;
 
-    let core_config = convert_ffi_config_to_core(config)?;
-
-    let instance = get_corduit_instance()?;
-    let mut corduit_guard = instance.write();
-
-    if let Some(corduit) = corduit_guard.as_mut() {
-        corduit.reload(core_config).map_err(CorduitError::from)?;
-    } else {
-        return Err(CorduitError::Internal(
-            "Corduit not initialized".to_string(),
-        ));
-    }
-
-    Ok(())
+    reload_with(convert_ffi_config_to_core(config)?)
 }
 
 pub fn get_corduit_status() -> Result<ProxyStatus> {
+    with_instance_or(stopped_status(), running_status_of)
+}
+
+/// The status of an engine that is not running.
+///
+/// "Is it up?" is polled, so absence is an answer rather than a failure.
+fn stopped_status() -> ProxyStatus {
+    ProxyStatus {
+        running: false,
+        inbound_count: 0,
+        outbound_count: 0,
+        connection_count: 0,
+        memory_usage: 0,
+        uptime: 0,
+    }
+}
+
+/// The status of a running engine.
+fn running_status_of(corduit: &crate::engine::Corduit) -> Result<ProxyStatus> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
-    let instance = get_corduit_instance()?;
-    let corduit_guard = instance.read();
+    let tracker = crate::engine::connection_tracker::global_tracker();
+    let config = corduit.config();
 
-    if let Some(corduit) = corduit_guard.as_ref() {
-        let tracker = crate::engine::connection_tracker::global_tracker();
-        let config = corduit.config();
+    let memory_usage = {
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+        );
+        let pid = Pid::from_u32(std::process::id());
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        sys.process(pid).map(|p| p.memory()).unwrap_or(0)
+    };
 
-        let memory_usage = {
-            let mut sys = System::new_with_specifics(
-                RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-            );
-            let pid = Pid::from_u32(std::process::id());
-            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-            sys.process(pid).map(|p| p.memory()).unwrap_or(0)
-        };
-
-        let uptime = corduit.uptime_secs();
-        let connection_count = {
-            let base_count = tracker.active_count() as u32;
-            #[cfg(target_os = "android")]
-            {
-                if let Some(processor) = crate::get_android_vpn_processor() {
-                    let vpn_stats = processor.get_traffic_stats();
-                    let vpn_connections =
-                        (vpn_stats.tcp_connections + vpn_stats.udp_sessions) as u32;
-                    base_count.max(vpn_connections)
-                } else {
-                    base_count
-                }
-            }
-            #[cfg(not(target_os = "android"))]
-            {
+    let uptime = corduit.uptime_secs();
+    let connection_count = {
+        let base_count = tracker.active_count() as u32;
+        #[cfg(target_os = "android")]
+        {
+            if let Some(processor) = crate::get_android_vpn_processor() {
+                let vpn_stats = processor.get_traffic_stats();
+                let vpn_connections = (vpn_stats.tcp_connections + vpn_stats.udp_sessions) as u32;
+                base_count.max(vpn_connections)
+            } else {
                 base_count
             }
-        };
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            base_count
+        }
+    };
 
-        Ok(ProxyStatus {
-            running: corduit.is_running().unwrap_or(false),
-            inbound_count: config.inbounds.len() as u32,
-            outbound_count: config.outbounds.len() as u32,
-            connection_count,
-            memory_usage,
-            uptime,
-        })
-    } else {
-        Ok(ProxyStatus {
-            running: false,
-            inbound_count: 0,
-            outbound_count: 0,
-            connection_count: 0,
-            memory_usage: 0,
-            uptime: 0,
-        })
-    }
+    Ok(ProxyStatus {
+        running: corduit.is_running().unwrap_or(false),
+        inbound_count: config.inbounds.len() as u32,
+        outbound_count: config.outbounds.len() as u32,
+        connection_count,
+        memory_usage,
+        uptime,
+    })
 }
 
 pub fn get_traffic_stats() -> Result<TrafficStats> {
@@ -881,18 +933,40 @@ pub fn test_config(config_json: String) -> Result<bool> {
 }
 
 pub fn get_connections() -> Result<Vec<ConnectionInfo>> {
-    let instance = get_corduit_instance()?;
-    let corduit_guard = instance.read();
+    let tracker = crate::engine::connection_tracker::global_tracker();
 
-    if let Some(corduit) = corduit_guard.as_ref() {
-        corduit.traffic_stats().active_connections();
-        Ok(vec![])
-    } else {
-        Ok(vec![])
-    }
+    Ok(tracker
+        .get_all()
+        .iter()
+        .map(|conn| ConnectionInfo {
+            id: conn.id.clone(),
+            host: conn.host.clone(),
+            destination: match conn.destination_ip.as_deref() {
+                Some(ip) => format!("{ip}:{}", conn.destination_port),
+                None => format!("{}:{}", conn.host, conn.destination_port),
+            },
+            upload: conn.get_upload(),
+            download: conn.get_download(),
+            start_time: conn.start_timestamp,
+            rule: conn.rule.clone(),
+            // The engine records the outbound a connection left through, not
+            // the selection chain that chose it, so this is what is reported.
+            chains: vec![conn.outbound_tag.clone()],
+        })
+        .collect())
 }
 
-pub fn close_connection(_connection_id: String) -> Result<()> {
+/// Close one connection by id.
+///
+/// Idempotent: an id that is already gone is not a failure, because a UI that
+/// clicks close twice should not see an error. [`close_active_connection`]
+/// returns the boolean for callers that need to know whether anything was
+/// closed.
+pub fn close_connection(connection_id: String) -> Result<()> {
+    let tracker = crate::engine::connection_tracker::global_tracker();
+    if !tracker.close_connection(&connection_id) {
+        tracing::debug!("connection '{connection_id}' was already gone");
+    }
     Ok(())
 }
 
@@ -908,17 +982,20 @@ pub fn get_logs(lines: Option<u32>) -> Result<Vec<String>> {
     }
 }
 
+/// Change the console log level of the running engine.
+///
+/// The string is parsed with the same vocabulary the configuration uses, and
+/// the filter is then actually swapped. A level that cannot be applied —
+/// logging installed by someone else, or `silent` at startup, where no
+/// subscriber exists to retarget — is an error rather than a silent success: a
+/// caller who believed the level had changed would be debugging a level that
+/// was never in effect.
 pub fn set_log_level(level: String) -> Result<()> {
-    match level.to_lowercase().as_str() {
-        "error" => tracing::Level::ERROR,
-        "warn" | "warning" => tracing::Level::WARN,
-        "info" => tracing::Level::INFO,
-        "debug" => tracing::Level::DEBUG,
-        "trace" => tracing::Level::TRACE,
-        _ => return Err(CorduitError::Parse(format!("Invalid log level: {}", level))),
-    };
+    let parsed = crate::engine::config::LogLevel::parse(level.trim().to_ascii_lowercase().as_str())
+        .ok_or_else(|| CorduitError::Parse(format!("Invalid log level: {level}")))?;
 
-    tracing::info!("Log level change requested: {}", level);
+    crate::engine::logging::set_log_level(parsed)?;
+    tracing::info!("Console log level changed to {}", parsed.as_str());
     Ok(())
 }
 
@@ -1117,6 +1194,168 @@ pub fn get_rpc_server_status() -> std::result::Result<RpcServerStatus, String> {
     }
 }
 
+// ==================== External controller (REST API) ====================
+
+/// Handle of the running external controller, if any.
+static EXTERNAL_CONTROLLER: once_cell::sync::Lazy<
+    parking_lot::Mutex<Option<crate::rpc::controller::ExternalControllerHandle>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+/// Start the external controller.
+///
+/// `external_controller` is a `host:port` address (see
+/// [`crate::rpc::controller::ExternalControllerConfig::parse`]). A non-loopback
+/// address requires a non-empty `secret`: the controller can select outbounds,
+/// switch the proxy mode and drop connections, so an unauthenticated public
+/// listener is refused rather than warned about.
+pub fn start_external_controller(
+    external_controller: &str,
+    secret: Option<String>,
+) -> std::result::Result<(), String> {
+    let mut guard = EXTERNAL_CONTROLLER.lock();
+    if let Some(handle) = guard.as_ref() {
+        if handle.is_running() {
+            return Err("external controller is already running".to_string());
+        }
+    }
+
+    let config = crate::rpc::controller::ExternalControllerConfig::parse(
+        external_controller,
+        secret.as_deref(),
+    )?;
+    let controller = crate::rpc::controller::ExternalController::bind(config).map_err(|e| {
+        format!(
+            "Failed to bind the external controller on {}: {e}",
+            external_controller.trim()
+        )
+    })?;
+
+    let bound = controller.addr();
+    let handle = controller.spawn();
+    if handle.secret_required() {
+        tracing::info!("external controller listening on {bound} (secret required)");
+    } else {
+        tracing::info!("external controller listening on {bound} (loopback, no secret)");
+    }
+    *guard = Some(handle);
+    Ok(())
+}
+
+/// Start the external controller if, and only if, the running configuration
+/// asks for one.
+///
+/// This is the automatic path: `external-controller` in the config is a
+/// request to serve the dashboard API, so the engine honours it when it starts
+/// and says so when it cannot.
+pub fn start_external_controller_from_config() -> std::result::Result<(), String> {
+    let (requested, secret) = with_instance_legacy(|corduit| {
+        let config = corduit.config();
+        let general = &config.general;
+        Ok((general.external_controller.clone(), general.secret.clone()))
+    })?;
+
+    let Some(requested) = requested.filter(|value| !value.trim().is_empty()) else {
+        tracing::debug!("external-controller is not configured; the controller stays off");
+        return Ok(());
+    };
+
+    match start_external_controller(&requested, secret) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Starting the proxy must not fail because a dashboard could not be
+            // served; the operator gets the reason instead.
+            tracing::warn!("external controller not started: {error}");
+            Ok(())
+        }
+    }
+}
+
+/// Stop the external controller if it is running. Idempotent.
+pub fn stop_external_controller() -> std::result::Result<(), String> {
+    let mut guard = EXTERNAL_CONTROLLER.lock();
+    if let Some(handle) = guard.take() {
+        handle.stop();
+        tracing::info!("external controller stopped");
+    } else {
+        tracing::debug!("external controller was not running");
+    }
+    Ok(())
+}
+
+/// Report whether the external controller is running and where.
+pub fn get_external_controller_status(
+) -> std::result::Result<crate::types::ExternalControllerStatus, String> {
+    let guard = EXTERNAL_CONTROLLER.lock();
+    Ok(match guard.as_ref() {
+        Some(handle) if handle.is_running() => crate::types::ExternalControllerStatus {
+            running: true,
+            addr: Some(handle.addr().to_string()),
+            secret_required: handle.secret_required(),
+        },
+        _ => crate::types::ExternalControllerStatus {
+            running: false,
+            addr: None,
+            secret_required: false,
+        },
+    })
+}
+
+/// The general settings the controller's `/configs` route reports.
+///
+/// A plain struct rather than a DTO: it is read inside the process by the
+/// controller, which reshapes it into the payload that route serves.
+#[derive(Debug, Clone)]
+pub struct GeneralSnapshot {
+    /// The configured mode, spelled `rule` / `global` / `direct`.
+    pub mode: String,
+    /// The runtime override: `1` global, `2` direct, `3` rule, `0` none.
+    pub runtime_mode: i32,
+    /// The configured log level.
+    pub log_level: String,
+    /// Whether the inbound listeners accept remote clients.
+    pub allow_lan: bool,
+    /// The address the inbounds bind to.
+    pub bind_address: String,
+    /// Whether IPv6 is enabled for outbound dialling.
+    pub ipv6: bool,
+    /// Whether host-name resolution races its candidate addresses.
+    pub tcp_concurrent: bool,
+    /// The SOCKS inbound port, when one is configured.
+    pub socks_port: Option<u16>,
+    /// The mixed inbound port, when one is configured.
+    pub mixed_port: Option<u16>,
+}
+
+/// Read the live general settings, straight from the running engine so that a
+/// reload is visible immediately.
+pub fn get_general_snapshot() -> std::result::Result<GeneralSnapshot, String> {
+    with_instance_legacy(general_snapshot_of)
+}
+
+/// The general settings of one engine instance.
+///
+/// Split out so the public function above does nothing but acquire the engine.
+fn general_snapshot_of(
+    corduit: &crate::engine::Corduit,
+) -> std::result::Result<GeneralSnapshot, String> {
+    let config = corduit.config();
+    let general = &config.general;
+
+    Ok(GeneralSnapshot {
+        mode: general.mode.as_str().to_string(),
+        // The runtime mode is process-global rather than part of the loaded
+        // configuration, so it is read from the engine.
+        runtime_mode: crate::engine::get_runtime_proxy_mode(),
+        log_level: general.log_level.as_str().to_string(),
+        allow_lan: general.allow_lan,
+        bind_address: general.bind_address.clone(),
+        ipv6: general.ipv6,
+        tcp_concurrent: general.tcp_concurrent,
+        socks_port: general.socks_port,
+        mixed_port: general.mixed_port,
+    })
+}
+
 /// Get build information
 pub fn get_build_info() -> String {
     let target = if cfg!(target_os = "windows") {
@@ -1256,10 +1495,7 @@ fn configure_proxy_providers(config_json: &str) -> Result<()> {
 fn convert_ffi_config_to_core(ffi_config: CorduitConfig) -> Result<Config> {
     use crate::engine::config::*;
     let general = GeneralConfig {
-        port: ffi_config.general.port,
         socks_port: ffi_config.general.socks_port,
-        redir_port: ffi_config.general.redir_port,
-        tproxy_port: ffi_config.general.tproxy_port,
         mixed_port: ffi_config.general.mixed_port,
         authentication: ffi_config.general.authentication.map(|auths| {
             auths
@@ -1291,17 +1527,46 @@ fn convert_ffi_config_to_core(ffi_config: CorduitConfig) -> Result<Config> {
         secret: ffi_config.general.secret,
     };
 
-    let dns = DnsConfig {
-        enable: ffi_config.dns.enable,
-        listen: ffi_config.dns.listen,
-        nameservers: ffi_config.dns.nameservers,
-        fallback: ffi_config.dns.fallback,
-        enhanced_mode: match ffi_config.dns.enhanced_mode.as_str() {
-            "fake-ip" => DnsMode::FakeIp,
-            _ => DnsMode::Normal,
-        },
-        nameserver_policy: ffi_config.dns.nameserver_policy,
+    // Start from the engine defaults and override only what the caller sent, so
+    // a field the caller does not know about keeps its default instead of being
+    // flattened to the zero value.
+    let mut dns = DnsConfig::default();
+    dns.enable = ffi_config.dns.enable;
+    dns.listen = ffi_config.dns.listen;
+    dns.nameservers = ffi_config.dns.nameservers;
+    dns.fallback = ffi_config.dns.fallback;
+    dns.enhanced_mode = match ffi_config.dns.enhanced_mode.as_str() {
+        "fake-ip" | "fakeip" | "fake_ip" => DnsMode::FakeIp,
+        // Includes `redir-host`: this engine answers with the real address and
+        // routes on the resolved IP, which is what the client gets either way.
+        _ => DnsMode::Normal,
     };
+    dns.nameserver_policy = ffi_config.dns.nameserver_policy;
+    dns.default_nameserver = ffi_config.dns.default_nameserver;
+    dns.fake_ip_filter = ffi_config.dns.fake_ip_filter;
+    dns.hosts = ffi_config.dns.hosts;
+    if let Some(filter) = ffi_config.dns.fallback_filter {
+        if let Some(geoip) = filter.geoip {
+            dns.fallback_filter.geoip = geoip;
+        }
+        if let Some(code) = filter.geoip_code {
+            dns.fallback_filter.geoip_code = code;
+        }
+        dns.fallback_filter.ipcidr = filter.ipcidr;
+        dns.fallback_filter.domain = filter.domain;
+    }
+    if let Some(range) = ffi_config.dns.fake_ip_range {
+        dns.fake_ip_range = range;
+    }
+    if let Some(use_hosts) = ffi_config.dns.use_hosts {
+        dns.use_hosts = use_hosts;
+    }
+    if let Some(cache_size) = ffi_config.dns.cache_size {
+        dns.cache_size = cache_size;
+    }
+    if let Some(fake_ip_ttl) = ffi_config.dns.fake_ip_ttl {
+        dns.fake_ip_ttl = fake_ip_ttl;
+    }
 
     let inbounds = ffi_config
         .inbounds
@@ -1348,6 +1613,8 @@ fn convert_ffi_config_to_core(ffi_config: CorduitConfig) -> Result<Config> {
                 payload: rule.payload,
                 outbound: rule.outbound,
                 process_name: rule.process_name,
+                no_resolve: rule.no_resolve,
+                rules: rule.rules,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1449,12 +1716,18 @@ fn parse_rule_type(value: &str) -> Result<crate::engine::RuleType> {
         "domain-keyword" => Ok(RuleType::DomainKeyword),
         "domain-regex" => Ok(RuleType::DomainRegex),
         "geoip" => Ok(RuleType::Geoip),
-        "ip-cidr" => Ok(RuleType::IpCidr),
+        "ip-cidr" | "ip-cidr6" => Ok(RuleType::IpCidr),
         "src-ip-cidr" => Ok(RuleType::SrcIpCidr),
         "src-port" => Ok(RuleType::SrcPort),
         "dst-port" => Ok(RuleType::DstPort),
         "process-name" => Ok(RuleType::ProcessName),
+        "process-path" => Ok(RuleType::ProcessPath),
+        "network" => Ok(RuleType::Network),
         "rule-set" => Ok(RuleType::RuleSet),
+        "geosite" => Ok(RuleType::Geosite),
+        "and" => Ok(RuleType::And),
+        "or" => Ok(RuleType::Or),
+        "not" => Ok(RuleType::Not),
         "match" => Ok(RuleType::Match),
         unsupported => Err(CorduitError::Config(format!(
             "Unsupported routing rule type '{unsupported}'"
@@ -1479,31 +1752,23 @@ pub fn test_proxy_latency(server: String, port: u16, timeout_ms: u32) -> Result<
     let proxy_name = format!("{}:{}", server, port);
     let timeout_duration = Duration::from_millis(timeout_ms as u64);
 
-    let proxy_addr = {
-        let instance = get_corduit_instance();
-        match instance {
-            Ok(inst) => {
-                let guard = inst.read();
-                if let Some(corduit) = guard.as_ref() {
-                    let config = corduit.config();
-                    let mut port = 7890u16;
-                    for inbound in &config.inbounds {
-                        if matches!(
-                            inbound.inbound_type,
-                            crate::engine::InboundType::Mixed | crate::engine::InboundType::Http
-                        ) {
-                            port = inbound.port;
-                            break;
-                        }
-                    }
-                    local_proxy_addr(config, port)?
-                } else {
-                    std::net::SocketAddr::from(([127, 0, 0, 1], 7890))
+    let proxy_addr = with_instance_or(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 7890)),
+        |corduit| {
+            let config = corduit.config();
+            let mut port = 7890u16;
+            for inbound in &config.inbounds {
+                if matches!(
+                    inbound.inbound_type,
+                    crate::engine::InboundType::Mixed | crate::engine::InboundType::Http
+                ) {
+                    port = inbound.port;
+                    break;
                 }
             }
-            Err(_) => std::net::SocketAddr::from(([127, 0, 0, 1], 7890)),
-        }
-    };
+            local_proxy_addr(config, port)
+        },
+    )?;
 
     let test_url = "http://www.gstatic.com/generate_204";
     let start = Instant::now();
@@ -1534,17 +1799,10 @@ pub fn test_outbound_latency(outbound_name: String, timeout_ms: u32) -> Result<L
     let timeout_duration = Duration::from_millis(timeout_ms as u64);
     let test_url = "http://www.gstatic.com/generate_204";
 
-    let proxy = {
-        let instance = get_corduit_instance()?;
-        let guard = instance.read();
-
-        if let Some(corduit) = guard.as_ref() {
-            let proxy_manager = corduit.proxy_manager();
-            proxy_manager.outbound_manager().get_proxy(&outbound_name)
-        } else {
-            None
-        }
-    };
+    let proxy = with_instance_or(None, |corduit| {
+        let proxy_manager = corduit.proxy_manager();
+        Ok(proxy_manager.outbound_manager().get_proxy(&outbound_name))
+    })?;
 
     let proxy = match proxy {
         Some(p) => p,
@@ -2052,49 +2310,17 @@ pub fn test_proxies_latency(
 
 // ============== Proxy Group Selection ==============
 pub fn select_proxy_in_group(group_name: String, proxy_name: String) -> Result<bool> {
-    tracing::info!(
-        "Selecting proxy in group: group='{}', proxy='{}'",
-        group_name,
-        proxy_name
-    );
-
-    let instance = get_corduit_instance()?;
-    let corduit_guard = instance.read();
-
-    if let Some(corduit) = corduit_guard.as_ref() {
-        let proxy_manager = corduit.proxy_manager();
-        let outbound_manager = proxy_manager.outbound_manager();
-
-        if outbound_manager.get_proxy(&group_name).is_some() {
-            outbound_manager
-                .set_selector_proxy(&group_name, &proxy_name)
-                .map_err(CorduitError::from)?;
-
-            tracing::info!("Proxy selection updated: {} -> {}", group_name, proxy_name);
-            Ok(true)
-        } else {
-            tracing::warn!("Proxy group '{}' not found", group_name);
-            Ok(false)
-        }
-    } else {
-        Err(CorduitError::Internal(
-            "Corduit not initialized".to_string(),
-        ))
-    }
+    tracing::info!("Selecting proxy in group: group='{group_name}', proxy='{proxy_name}'");
+    set_selector(&group_name, &proxy_name)
 }
 
 pub fn get_selected_proxy_in_group(group_name: String) -> Result<Option<String>> {
-    let instance = get_corduit_instance()?;
-    let corduit_guard = instance.read();
-
-    if let Some(corduit) = corduit_guard.as_ref() {
+    with_instance_or(None, |corduit| {
         let proxy_manager = corduit.proxy_manager();
-        let outbound_manager = proxy_manager.outbound_manager();
-
-        Ok(outbound_manager.get_selector_proxy(&group_name))
-    } else {
-        Ok(None)
-    }
+        Ok(proxy_manager
+            .outbound_manager()
+            .get_selector_proxy(&group_name))
+    })
 }
 
 // ============== Connection Tracking ==============
@@ -2482,10 +2708,11 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             }
         };
 
-        let processor = std::sync::Arc::new(WindowsVpnProcessor::new_with_proxy_addr(
+        let processor = std::sync::Arc::new(WindowsVpnProcessor::new_with_dns(
             proxy_addr,
             config.mtu,
             tun_tx.clone(),
+            client_dns_settings(),
         ));
 
         let processor_clone = processor.clone();
@@ -2691,8 +2918,11 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             });
         };
 
-        let processor = std::sync::Arc::new(TunPacketProcessor::new_with_proxy_addr(
-            proxy_addr, config.mtu, tun_tx,
+        let processor = std::sync::Arc::new(TunPacketProcessor::new_with_dns(
+            proxy_addr,
+            config.mtu,
+            tun_tx,
+            client_dns_settings(),
         ));
         let packet_processor = std::sync::Arc::clone(&processor);
         let packet_task = std::thread::Builder::new()
@@ -3246,10 +3476,12 @@ fn start_android_vpn_inner() -> Result<bool> {
             return Ok(false);
         };
 
-        let processor =
-            std::sync::Arc::new(crate::netstack::AndroidVpnProcessor::new_with_proxy_addr(
-                proxy_addr, config.mtu, tun_tx,
-            ));
+        let processor = std::sync::Arc::new(crate::netstack::AndroidVpnProcessor::new_with_dns(
+            proxy_addr,
+            config.mtu,
+            tun_tx,
+            client_dns_settings(),
+        ));
         let packet_processor = std::sync::Arc::clone(&processor);
         let packet_task = std::thread::Builder::new()
             .name("corduit-tun-packet".to_string())
@@ -3361,7 +3593,7 @@ mod config_conversion_tests {
                 "name": "proxy",
                 "type": "http",
                 "behavior": "domain",
-                "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt",
+                "url": "https://cdn.jsdelivr.net/gh/example/rulesets@release/proxy.txt",
                 "interval": 86400
             }]
         }"#;

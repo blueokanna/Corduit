@@ -1,8 +1,7 @@
 use crate::engine::config::LogLevel;
 use crate::engine::error::{Error, Result};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Once};
-use tracing::Level;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 /// Format the current UTC time as `YYYY-MM-DD HH:MM:SS`.
@@ -11,6 +10,44 @@ fn now_timestamp() -> String {
 }
 
 static INIT: Once = Once::new();
+
+/// The live console filter.
+///
+/// `init_logging` installs at most one subscriber per process, so without a
+/// handle onto its filter the level chosen at startup would be the only level
+/// there could ever be — and a later request to change it would be accepted and
+/// then dropped. The handle swaps the filter in place: the formatter stays, the
+/// UI buffer layer stays, and because the buffer is not filtered at all,
+/// nothing already captured disappears when the level narrows.
+type FilterHandle = tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
+static CONSOLE_FILTER: OnceLock<FilterHandle> = OnceLock::new();
+
+/// The console filter for `level`.
+///
+/// `RUST_LOG` is read first, so an operator can widen the filter from the
+/// environment; the configured level is applied on top of it.
+fn console_filter(level: LogLevel) -> Result<EnvFilter> {
+    let directives = [
+        match level {
+            LogLevel::Silent => "corduit=off",
+            LogLevel::Error => "corduit=error",
+            LogLevel::Warning => "corduit=warn",
+            LogLevel::Info => "corduit=info",
+            LogLevel::Debug => "corduit=debug",
+        },
+        "tokio=warn",
+    ];
+
+    let mut filter = EnvFilter::from_default_env();
+    for raw in directives {
+        let directive = raw
+            .parse()
+            .map_err(|e| Error::config(format!("Invalid log directive '{raw}': {e}")))?;
+        filter = filter.add_directive(directive);
+    }
+    Ok(filter)
+}
 
 /// Global log buffer for storing recent logs
 /// Increased buffer size to 5000 to store more logs
@@ -87,27 +124,14 @@ pub fn init_logging(level: LogLevel) -> Result<()> {
 }
 
 fn init_logging_inner(level: LogLevel) -> Result<()> {
-    // Convert LogLevel to tracing::Level
-    let tracing_level = match level {
-        LogLevel::Silent => return Ok(()), // Don't initialize logging
-        LogLevel::Error => Level::ERROR,
-        LogLevel::Warning => Level::WARN,
-        LogLevel::Info => Level::INFO,
-        LogLevel::Debug => Level::DEBUG,
-    };
+    if matches!(level, LogLevel::Silent) {
+        return Ok(()); // Silent means no subscriber at all, not a muted one.
+    }
 
-    // Create filter for console output
-    let filter = EnvFilter::from_default_env()
-        .add_directive(
-            format!("corduit={}", tracing_level)
-                .parse()
-                .map_err(|e| Error::config(format!("Invalid log directive: {}", e)))?,
-        )
-        .add_directive(
-            "tokio=warn"
-                .parse()
-                .map_err(|e| Error::config(format!("Invalid log directive: {}", e)))?,
-        );
+    // The filter lives behind a reload layer, which is what lets
+    // `set_log_level` retarget it later without rebuilding the subscriber.
+    let (filter_layer, filter_handle) =
+        tracing_subscriber::reload::Layer::new(console_filter(level)?);
 
     // Create formatter for console
     let fmt_layer = fmt::layer()
@@ -115,27 +139,77 @@ fn init_logging_inner(level: LogLevel) -> Result<()> {
         .with_thread_ids(false)
         .with_thread_names(false)
         .compact()
-        .with_filter(filter);
+        .with_filter(filter_layer);
 
     // Create buffer layer for capturing logs
     let buffer_layer = BufferLayer;
 
     // Initialize subscriber with both layers
     // Use try_init to avoid panic if tracing is already initialized
-    let result = tracing_subscriber::registry()
+    let installed = tracing_subscriber::registry()
         .with(fmt_layer)
         .with(buffer_layer)
         .try_init();
 
-    // If tracing was already initialized, that's fine - just log to buffer
-    if result.is_err() {
+    if installed.is_err() {
+        // Someone else owns the subscriber, so there is no filter of ours to
+        // swap later either; saying so here beats failing at the first attempt
+        // to change the level.
         add_log("[INFO] Tracing already initialized, using existing subscriber".to_string());
-    } else {
-        // Add initial log entry
-        add_log(format!("[INFO] Logging initialized at level: {:?}", level));
-        tracing::info!("Logging initialized at level: {:?}", level);
+        return Ok(());
     }
+
+    let _ = CONSOLE_FILTER.set(filter_handle);
+    add_log(format!("[INFO] Logging initialized at level: {level:?}"));
+    tracing::info!("Logging initialized at level: {level:?}");
     Ok(())
+}
+
+/// Retarget the console filter of a running engine.
+///
+/// Fails rather than pretending when logging was never installed (a `silent`
+/// configuration, or a host application that owns the subscriber): there is no
+/// filter to change, and a caller who believed otherwise would be debugging a
+/// level that was never in effect.
+pub fn set_log_level(level: LogLevel) -> Result<()> {
+    let filter = console_filter(level)?;
+    let Some(handle) = CONSOLE_FILTER.get() else {
+        return Err(Error::Internal {
+            message: "logging is not installed, so there is no console filter to change"
+                .to_string(),
+            source: None,
+        });
+    };
+    handle.reload(filter).map_err(|error| Error::Internal {
+        message: format!("Failed to change the console log level: {error}"),
+        source: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The directive each level maps to.
+    ///
+    /// `silent` is the one worth reading twice: it has to silence *our*
+    /// targets, not the whole process, so that a host application that shares
+    /// the subscriber keeps its own logging. `corduit=off` does that; a global
+    /// `off` would not.
+    #[test]
+    fn every_level_maps_to_a_directive_for_our_targets_only() {
+        for (level, expected) in [
+            (LogLevel::Silent, "corduit=off"),
+            (LogLevel::Error, "corduit=error"),
+            (LogLevel::Warning, "corduit=warn"),
+            (LogLevel::Info, "corduit=info"),
+            (LogLevel::Debug, "corduit=debug"),
+        ] {
+            let filter = console_filter(level).expect("the directive table is valid");
+            let rendered = filter.to_string();
+            assert!(rendered.contains(expected), "{level:?}: {rendered}");
+        }
+    }
 }
 
 /// Custom layer that captures logs to the buffer

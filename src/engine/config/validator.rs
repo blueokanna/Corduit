@@ -18,46 +18,55 @@ impl ConfigValidator {
 
     /// Validate general configuration
     fn validate_general(general: &GeneralConfig) -> Result<()> {
-        // Validate port ranges
-        if general.port == 0 {
-            return Err(Error::config("Invalid port: must be between 1 and 65535"));
-        }
-
-        if let Some(socks_port) = general.socks_port {
-            if socks_port == 0 {
-                return Err(Error::config(
-                    "Invalid socks_port: must be between 1 and 65535",
-                ));
-            }
-        }
-
-        if let Some(redir_port) = general.redir_port {
-            if redir_port == 0 {
-                return Err(Error::config(
-                    "Invalid redir_port: must be between 1 and 65535",
-                ));
-            }
-        }
-
-        if let Some(tproxy_port) = general.tproxy_port {
-            if tproxy_port == 0 {
-                return Err(Error::config(
-                    "Invalid tproxy_port: must be between 1 and 65535",
-                ));
-            }
-        }
-
-        if let Some(mixed_port) = general.mixed_port {
-            if mixed_port == 0 {
-                return Err(Error::config(
-                    "Invalid mixed_port: must be between 1 and 65535",
-                ));
+        // Only the port fields something actually reads are validated here.
+        // `mixed_port` and `socks_port` select the local inbound that captured
+        // TUN traffic is handed to, and `bind_address` is the listen address an
+        // inbound falls back to; `port`, `redir_port` and `tproxy_port` were
+        // accepted and never read, so they are gone from the schema instead of
+        // being validated for an effect they never had.
+        for (label, port) in [
+            ("socks_port", general.socks_port),
+            ("mixed_port", general.mixed_port),
+        ] {
+            if port == Some(0) {
+                return Err(Error::config(format!(
+                    "Invalid {label}: must be between 1 and 65535"
+                )));
             }
         }
 
         // Validate bind address
         if general.bind_address.is_empty() {
             return Err(Error::config("bind_address cannot be empty"));
+        }
+
+        // The external controller is served by `rpc::controller`. Its address is
+        // parsed here so that a typo is a load error instead of a dashboard
+        // that quietly never appears. Whether the address may be *served* is a
+        // separate question, answered at bind time by
+        // `ExternalControllerConfig::guard`, which refuses a non-loopback bind
+        // without a secret.
+        if let Some(external_controller) = general
+            .external_controller
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            crate::rpc::controller::ExternalControllerConfig::parse(
+                external_controller,
+                general.secret.as_deref(),
+            )
+            .map_err(Error::config)?;
+        }
+
+        // `external-ui` serves a dashboard's static files, which this build
+        // does not do. Saying so is the difference between a setting that does
+        // nothing and a setting that silently does nothing.
+        if general.external_ui.is_some() {
+            tracing::warn!(
+                "external-ui is configured but this build serves no static dashboard \
+                 files, so the setting has no effect"
+            );
         }
 
         // Validate IPv6 setting doesn't conflict with bind address
@@ -74,25 +83,104 @@ impl ConfigValidator {
     }
 
     /// Validate DNS configuration
+    /// Validate the DNS section.
+    ///
+    /// Checked whether or not the section is enabled, because a syntax error is
+    /// a syntax error: a profile that carries a mistyped `fake-ip-range` has a
+    /// bug its author cannot see while the setting is inert, and it becomes a
+    /// mystery the day the feature is switched on.
     fn validate_dns(dns: &DnsConfig) -> Result<()> {
+        if dns.enable && dns.listen.trim().is_empty() {
+            return Err(Error::config("DNS listen address cannot be empty"));
+        }
+        // A listener is started from this string, so an address it cannot parse
+        // is a configuration error — not something to discover as a warning at
+        // startup, when the operator has already stopped reading.
         if dns.enable {
-            // Validate listen address format
-            if dns.listen.is_empty() {
-                return Err(Error::config("DNS listen address cannot be empty"));
-            }
+            dns.listen
+                .trim()
+                .parse::<std::net::SocketAddr>()
+                .map_err(|error| {
+                    Error::config(format!(
+                        "dns.listen '{}' is not an address: {error}",
+                        dns.listen
+                    ))
+                })?;
+        }
 
-            for nameserver in &dns.nameservers {
-                if nameserver.is_empty() {
-                    return Err(Error::config("Nameserver cannot be empty"));
+        for (label, servers) in [
+            ("nameservers", &dns.nameservers),
+            ("fallback", &dns.fallback),
+            ("default-nameserver", &dns.default_nameserver),
+        ] {
+            for server in servers.iter() {
+                if server.trim().is_empty() {
+                    return Err(Error::config(format!(
+                        "dns.{label} contains an empty entry"
+                    )));
                 }
             }
+        }
 
-            // Validate fallback nameservers
-            for nameserver in &dns.fallback {
-                if nameserver.is_empty() {
-                    return Err(Error::config("Fallback nameserver cannot be empty"));
-                }
+        for (suffix, servers) in &dns.nameserver_policy {
+            if suffix.trim().is_empty() {
+                return Err(Error::config(
+                    "dns.nameserver-policy contains an empty key".to_string(),
+                ));
             }
+            if servers.is_empty() {
+                return Err(Error::config(format!(
+                    "dns.nameserver-policy['{suffix}'] has no servers"
+                )));
+            }
+        }
+
+        // The fake-IP pool is an IPv4 pool: the stack hands out an `Ipv4Addr`,
+        // so an IPv6 range here is not a preference, it is unusable.
+        let pool = dns.fake_ip_network().map_err(Error::config)?;
+        if !matches!(pool, ipnet::IpNet::V4(_)) {
+            return Err(Error::config(format!(
+                "dns.fake-ip-range '{}' must be IPv4; the fake-IP pool hands out IPv4 addresses",
+                dns.fake_ip_range
+            )));
+        }
+
+        for entry in &dns.fake_ip_filter {
+            if entry.trim().is_empty() {
+                return Err(Error::config(
+                    "dns.fake-ip-filter contains an empty suffix".to_string(),
+                ));
+            }
+        }
+
+        for network in &dns.fallback_filter.ipcidr {
+            if network.trim().parse::<ipnet::IpNet>().is_err() {
+                return Err(Error::config(format!(
+                    "dns.fallback-filter.ipcidr '{network}' is not a CIDR"
+                )));
+            }
+        }
+
+        for (host, address) in &dns.hosts {
+            if host.trim().is_empty() {
+                return Err(Error::config(
+                    "dns.hosts contains an empty host name".to_string(),
+                ));
+            }
+            // A value that is not an IP literal is deliberately accepted rather
+            // than rejected: this dialect allows aliasing one name to another
+            // here, and refusing to load a whole profile over an entry
+            // this build cannot use would be a worse outcome than ignoring it.
+            // The consumer warns about the entries it skips.
+            if address.trim().is_empty() {
+                return Err(Error::config(format!("dns.hosts['{host}'] has no value")));
+            }
+        }
+
+        if dns.cache_size == 0 {
+            return Err(Error::config(
+                "dns.cache-size must be at least 1".to_string(),
+            ));
         }
 
         Ok(())
@@ -198,14 +286,20 @@ impl ConfigValidator {
                     // Direct and Reject don't need server/port
                 }
                 OutboundType::Socks5
+                | OutboundType::Socks4
                 | OutboundType::Http
                 | OutboundType::Shadowsocks
+                | OutboundType::ShadowsocksR
+                | OutboundType::Snell
                 | OutboundType::Vmess
                 | OutboundType::Vless
                 | OutboundType::Trojan
                 | OutboundType::Wireguard
                 | OutboundType::Tuic
-                | OutboundType::Hysteria2 => {
+                | OutboundType::Hysteria
+                | OutboundType::Hysteria2
+                | OutboundType::ShadowTls
+                | OutboundType::Naive => {
                     Self::require_outbound_endpoint(outbound)?;
                 }
                 // Proxy group types don't need server/port
@@ -261,53 +355,39 @@ impl ConfigValidator {
     }
 
     /// Validate routing rules
+    ///
+    /// Payload syntax — CIDR, regex, port ranges, transports — is checked by
+    /// the router while it compiles. This pass only rejects rules that are
+    /// missing the one thing their type cannot work without, so a caller gets
+    /// the diagnostic at config load instead of on the first connection.
     fn validate_rules(rules: &[RuleConfig]) -> Result<()> {
         for rule in rules {
-            // Validate rule type
-            match rule.rule_type {
-                RuleType::Domain
-                | RuleType::DomainSuffix
-                | RuleType::DomainKeyword
-                | RuleType::DomainRegex => {
-                    if rule.payload.is_empty() {
-                        return Err(Error::config("Domain rule payload cannot be empty"));
-                    }
-                }
-                RuleType::IpCidr | RuleType::SrcIpCidr => {
-                    if rule.payload.is_empty() {
-                        return Err(Error::config("IP CIDR rule payload cannot be empty"));
-                    }
-                }
-                RuleType::Geoip => {
-                    if rule.payload.is_empty() {
-                        return Err(Error::config("GeoIP rule payload cannot be empty"));
-                    }
-                }
-                RuleType::SrcPort | RuleType::DstPort => {
-                    if rule.payload.is_empty() {
-                        return Err(Error::config("Port rule payload cannot be empty"));
-                    }
-                }
-                RuleType::ProcessName => {
-                    if rule.payload.is_empty() {
-                        return Err(Error::config("Process name rule payload cannot be empty"));
-                    }
-                    // Process name rules should have process_name set
-                    if rule.process_name.is_none() {
-                        return Err(Error::config(
-                            "Process name rule requires process_name field",
-                        ));
-                    }
-                }
-                RuleType::RuleSet => {
-                    // Rule-set rules reference external rule files
-                    if rule.payload.is_empty() {
-                        return Err(Error::config("Rule-set rule payload cannot be empty"));
-                    }
-                }
-                RuleType::Match => {
-                    // Match rule doesn't need payload
-                }
+            // `match` is the catch-all and a combinator carries its condition
+            // in its children, so nothing else may have an empty payload.
+            let needs_payload = !matches!(
+                rule.rule_type,
+                RuleType::And | RuleType::Or | RuleType::Not | RuleType::Match
+            );
+            if needs_payload && rule.payload.trim().is_empty() {
+                return Err(Error::config(format!(
+                    "{:?} rule payload cannot be empty",
+                    rule.rule_type
+                )));
+            }
+
+            if matches!(rule.rule_type, RuleType::And | RuleType::Or | RuleType::Not)
+                && rule.rules.is_empty()
+            {
+                return Err(Error::config(format!(
+                    "{:?} rule needs at least one child rule",
+                    rule.rule_type
+                )));
+            }
+
+            if rule.rule_type == RuleType::Not && rule.rules.len() != 1 {
+                return Err(Error::config(
+                    "not rule takes exactly one child rule".to_string(),
+                ));
             }
 
             // Validate outbound tag
@@ -469,6 +549,7 @@ mod tests {
                 payload: "".to_string(),
                 outbound: "direct".to_string(),
                 process_name: None,
+                ..RuleConfig::default()
             }],
         };
 

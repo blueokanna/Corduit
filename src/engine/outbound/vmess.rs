@@ -212,8 +212,8 @@ pub struct VmessOutbound {
     cipher: VmessCipher,
     udp_enabled: bool,
     cmd_key: [u8; 16],
-    /// `alterId > 0` asks for the pre-AEAD handshake (what Clash-family
-    /// clients send and what legacy-configured servers accept).
+    /// `alterId > 0` asks for the pre-AEAD handshake — what a legacy-configured
+    /// server accepts, and therefore what has to be sent to it.
     legacy: bool,
     /// The alter-ID chain a legacy server accepts, primary UUID last. One
     /// entry is picked per connection, exactly like the reference client.
@@ -522,13 +522,13 @@ impl VmessOutbound {
         header_buf
     }
 
-    /// The pre-AEAD request header, wire-compatible with Clash-family
-    /// clients (`transport/vmess` of mihomo / Clash.Meta:
-    /// `HMAC-MD5(alterUUID, timestamp)` followed by the whole header
-    /// encrypted with AES-128-CFB keyed by `MD5(uuid ‖ salt)` and the
-    /// timestamp-derived IV). Legacy servers reject the AEAD handshake and
-    /// close the connection before any error can surface, which is exactly
-    /// the "silent quarter-second disconnect" this path removes.
+    /// The pre-AEAD request header: `HMAC-MD5(alterUUID, timestamp)` followed
+    /// by the whole header encrypted with AES-128-CFB keyed by
+    /// `MD5(uuid ‖ salt)` and the timestamp-derived IV. A legacy server rejects
+    /// the AEAD handshake and closes the connection before any error can
+    /// surface, which is exactly the "silent quarter-second disconnect" this
+    /// path removes — so there is no error to catch and retry on, and the only
+    /// fix is to send the handshake the server actually understands.
     fn seal_header_legacy(&self, header: &VmessHeader, timestamp: i64) -> Result<Vec<u8>> {
         if self.alter_uuids.is_empty() {
             return Err(Error::config(
@@ -1703,8 +1703,9 @@ fn next_alter_uuid(uuid_bytes: &[u8; 16]) -> [u8; 16] {
     }
 }
 
-/// The list a legacy server accepts: every chained alter ID, the primary
-/// UUID last (mihomo `newAlterIDs`). The client picks one per connection.
+/// The list a legacy server accepts: every chained alter ID, and the primary
+/// UUID last, because a server that never forgot the original still accepts it.
+/// The client picks one entry per connection.
 fn build_alter_list(primary: [u8; 16], count: u16) -> Vec<[u8; 16]> {
     let mut list = Vec::with_capacity(count as usize + 1);
     let mut prev = primary;

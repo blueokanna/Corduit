@@ -2,7 +2,7 @@
 
 use crate::common::LogThrottle;
 use crate::netstack::solidtcp::device::DeviceConfig;
-use crate::netstack::solidtcp::dns::{DnsHandler, FakeIpConfig, FakeIpPool};
+use crate::netstack::solidtcp::dns::{ClientDnsSettings, DnsHandler, DnsVerdict, FakeIpPool};
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use crate::netstack::solidtcp::nat::{NatConfig, NatTable};
 use crate::netstack::solidtcp::packet::{
@@ -283,7 +283,7 @@ pub struct StackConfig {
     pub tcp: TcpConfig,
     pub udp: UdpConfig,
     pub nat: NatConfig,
-    pub fake_ip: FakeIpConfig,
+    pub dns: ClientDnsSettings,
     pub proxy_addr: SocketAddr,
     pub dns_intercept: bool,
     pub cleanup_interval: Duration,
@@ -296,7 +296,7 @@ impl Default for StackConfig {
             tcp: TcpConfig::default(),
             udp: UdpConfig::default(),
             nat: NatConfig::default(),
-            fake_ip: FakeIpConfig::default(),
+            dns: ClientDnsSettings::default(),
             proxy_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7890),
             dns_intercept: true,
             cleanup_interval: Duration::from_secs(30),
@@ -335,9 +335,13 @@ impl StackBuilder {
         self
     }
 
-    pub fn fake_ip_range(mut self, start: Ipv4Addr, size: u32) -> Self {
-        self.config.fake_ip.range_start = start;
-        self.config.fake_ip.pool_size = size;
+    /// How the intercepted DNS is answered.
+    ///
+    /// Replaces the old `fake_ip_range(start, size)` setter: the range, the mode
+    /// and the filter are one decision, and splitting them across two setters is
+    /// how a stack ends up in `normal` mode while still holding a fake pool.
+    pub fn client_dns(mut self, settings: ClientDnsSettings) -> Self {
+        self.config.dns = settings;
         self
     }
 
@@ -386,8 +390,8 @@ pub struct SolidStack {
 
 impl SolidStack {
     pub fn new(config: StackConfig) -> Self {
-        let fake_ip_pool = Arc::new(FakeIpPool::with_config(config.fake_ip.clone()));
-        let dns_handler = Arc::new(DnsHandler::new(fake_ip_pool.clone()));
+        let fake_ip_pool = Arc::new(FakeIpPool::with_config(config.dns.fake_ip.clone()));
+        let dns_handler = Arc::new(DnsHandler::new(fake_ip_pool.clone(), &config.dns));
 
         Self {
             tcp_manager: Arc::new(TcpManager::with_config(config.tcp.clone())),
@@ -889,20 +893,23 @@ impl SolidStack {
         );
 
         match self.dns_handler.handle_query(payload) {
-            Ok((response, domain)) => {
-                if let Some(ref d) = domain {
-                    info!("DNS query for domain: {} - Fake-IP allocated", d);
+            Ok(DnsVerdict::Answer {
+                bytes,
+                faked_domain,
+            }) => {
+                if let Some(domain) = faked_domain {
+                    info!("DNS query for domain: {domain} - Fake-IP allocated");
                     self.stats.record_fake_ip();
                 }
                 self.stats.record_dns_response();
                 info!(
                     "DNS response ready: {} bytes, sending back to {} from {}",
-                    response.len(),
+                    bytes.len(),
                     src_addr,
                     dst_addr
                 );
 
-                match self.send_udp_packet(dst_addr, src_addr, &response) {
+                match self.send_udp_packet(dst_addr, src_addr, &bytes) {
                     Ok(()) => {
                         info!("=== DNS response sent successfully to {} ===", src_addr);
                     }
@@ -911,6 +918,16 @@ impl SolidStack {
                         return Err(e);
                     }
                 }
+            }
+            // Not a record the pool can stand in for. Letting it travel as
+            // ordinary UDP reaches a real resolver and supports every record
+            // type, which beats inventing an answer the client would act on.
+            Ok(DnsVerdict::Forward) => {
+                debug!(
+                    "DNS query {} -> {} is not pool-answerable; forwarding as UDP",
+                    src_addr, dst_addr
+                );
+                return self.handle_udp_data(src_addr, dst_addr, payload);
             }
             Err(e) => {
                 warn!("DNS query handling failed: {}", e);

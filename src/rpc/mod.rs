@@ -23,6 +23,7 @@ use nextjson::NsonSerialize;
 
 use crate::api;
 
+pub mod controller;
 pub mod server;
 
 // ---------------------------------------------------------------------------
@@ -401,6 +402,15 @@ pub fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
         "stop_rpc_server" => call(api::stop_rpc_server()),
         "get_rpc_server_status" => call(api::get_rpc_server_status()),
 
+        // ---- External controller ----
+        "start_external_controller" => {
+            let addr = args.string("external_controller")?;
+            let secret = args.opt_string("secret")?;
+            call(api::start_external_controller(&addr, secret))
+        }
+        "stop_external_controller" => call(api::stop_external_controller()),
+        "get_external_controller_status" => call(api::get_external_controller_status()),
+
         _ => Err(format!("unknown method '{method}'")),
     }
 }
@@ -503,6 +513,9 @@ pub const CORDUIT_METHODS: &[&str] = &[
     "start_rpc_server",
     "stop_rpc_server",
     "get_rpc_server_status",
+    "start_external_controller",
+    "stop_external_controller",
+    "get_external_controller_status",
 ];
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
-//! Replays VeloGuard's converted engine config on the host.
+//! Replays an ArcadiaPlus-exported engine config on the host.
 //!
 //! ```text
-//! cargo run --example veloguard_repro -- <config.json> [node-fragment]
+//! cargo run --example engine_config_repro -- <config.json> [node-fragment]
 //! ```
 //!
 //! Initializes and starts the engine with the exported app config, selects
@@ -16,7 +16,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let config_path = args
         .next()
-        .expect("usage: veloguard_repro <config.json> [node-fragment]");
+        .expect("usage: engine_config_repro <config.json> [node-fragment]");
     let node_fragment = args.next();
 
     let json = std::fs::read_to_string(&config_path).expect("read config");

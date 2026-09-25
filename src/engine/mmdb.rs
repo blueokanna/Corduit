@@ -511,7 +511,7 @@ mod tests {
             ("binary_format_major_version", field(5, &2u16.to_be_bytes())),
             ("binary_format_minor_version", field(5, &0u16.to_be_bytes())),
             ("build_epoch", field(9, &0u64.to_be_bytes())),
-            ("database_type", field(2, b"VeloGuard-Fixture")),
+            ("database_type", field(2, b"corduit-test-fixture")),
             ("ip_version", field(5, &ip_version.to_be_bytes())),
             ("node_count", field(6, &node_count.to_be_bytes())),
             ("record_size", field(5, &record_size.to_be_bytes())),

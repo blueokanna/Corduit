@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "corduit"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",
@@ -207,6 +207,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "proptest",
+ "recurse-x",
  "regex",
  "rustbinary",
  "smoltcp",
@@ -935,6 +936,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "recurse-x"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd6bca0db31610771304be8cfd92f2daf94b77157c3e2d86cfe64b2b3390be9e"
+dependencies = [
+ "courierust",
+ "nextjson",
+ "rustbinary",
+ "tzcraft",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1336,6 +1349,12 @@ dependencies = [
  "windows-sys 0.60.2",
  "winreg",
 ]
+
+[[package]]
+name = "tzcraft"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cec9458ae44ab93f5dfbbea23325c6dfef65cf1723358894785721e363e41635"
 
 [[package]]
 name = "unarray"

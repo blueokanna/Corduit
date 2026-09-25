@@ -21,10 +21,7 @@ pub struct CorduitConfig {
 /// General configuration for FFI
 #[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct GeneralConfig {
-    pub port: u16,
     pub socks_port: Option<u16>,
-    pub redir_port: Option<u16>,
-    pub tproxy_port: Option<u16>,
     pub mixed_port: Option<u16>,
     pub authentication: Option<Vec<AuthenticationConfig>>,
     pub allow_lan: bool,
@@ -46,10 +43,47 @@ pub struct DnsConfig {
     pub nameservers: Vec<String>,
     pub fallback: Vec<String>,
     pub enhanced_mode: String,
-    /// Per-suffix resolver overrides (`nameserver-policy`): keys like
-    /// `+.example.com`, values are upstream server strings (`tcp://host:port`).
     #[serde(default)]
     pub nameserver_policy: std::collections::HashMap<String, Vec<String>>,
+    /// Resolvers used only to resolve a resolver's own hostname.
+    #[serde(default)]
+    pub default_nameserver: Vec<String>,
+    /// When an answer is suspect enough to re-resolve through `fallback`.
+    #[serde(default)]
+    pub fallback_filter: Option<DnsFallbackFilterDto>,
+    /// Fake-IP pool in CIDR form. `None` keeps the engine default rather than
+    /// replacing it with an empty string.
+    #[serde(default)]
+    pub fake_ip_range: Option<String>,
+    /// Suffixes that must never receive a fake address.
+    #[serde(default)]
+    pub fake_ip_filter: Vec<String>,
+    /// TTL handed to the client for a fake address. `None` keeps the engine
+    /// default rather than replacing it with zero.
+    #[serde(default)]
+    pub fake_ip_ttl: Option<u32>,
+    /// Static host entries.
+    #[serde(default)]
+    pub hosts: std::collections::HashMap<String, String>,
+    /// Whether `hosts` is consulted. `None` keeps the engine default.
+    #[serde(default)]
+    pub use_hosts: Option<bool>,
+    /// Forward-cache capacity. `None` keeps the engine default.
+    #[serde(default)]
+    pub cache_size: Option<usize>,
+}
+
+/// `fallback-filter` for FFI.
+#[derive(Debug, Clone, Default, NsonSerialize, NsonDeserialize)]
+pub struct DnsFallbackFilterDto {
+    #[serde(default)]
+    pub geoip: Option<bool>,
+    #[serde(default)]
+    pub geoip_code: Option<String>,
+    #[serde(default)]
+    pub ipcidr: Vec<String>,
+    #[serde(default)]
+    pub domain: Vec<String>,
 }
 
 /// Inbound configuration for FFI
@@ -76,9 +110,19 @@ pub struct OutboundConfig {
 #[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
 pub struct RuleConfig {
     pub rule_type: String,
+    /// Match pattern. Empty for the logical combinators.
+    #[serde(default)]
     pub payload: String,
     pub outbound: String,
+    #[serde(default)]
     pub process_name: Option<String>,
+    /// `no-resolve` modifier, carried through to the engine unchanged.
+    #[serde(default)]
+    pub no_resolve: bool,
+    /// Child rules for `and` / `or` / `not`, carried through as untyped values
+    /// so nesting depth is not fixed by this DTO.
+    #[serde(default)]
+    pub rules: Vec<nextjson::Value>,
 }
 
 /// Authentication configuration for FFI
@@ -152,6 +196,17 @@ pub struct RpcServerStatus {
     pub addr: Option<String>,
     /// Whether a bearer token is required (always `true` while running).
     pub token_set: bool,
+}
+
+/// External controller status (never exposes the secret).
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
+pub struct ExternalControllerStatus {
+    /// Whether the controller's accept loop is running.
+    pub running: bool,
+    /// The bound address, e.g. `"127.0.0.1:9090"` (`None` when stopped).
+    pub addr: Option<String>,
+    /// Whether requests must present `general.secret`.
+    pub secret_required: bool,
 }
 
 /// Active connection for tracking
@@ -297,6 +352,24 @@ pub struct DnsConfigDto {
     pub fallback: Vec<String>,
     #[serde(default)]
     pub nameserver_policy: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub default_nameserver: Vec<String>,
+    #[serde(default)]
+    pub fallback_filter: DnsFallbackFilterDto,
+    #[serde(default)]
+    pub fake_ip_range: String,
+    #[serde(default)]
+    pub fake_ip_filter: Vec<String>,
+    #[serde(default)]
+    pub fake_ip_ttl: u32,
+    /// Number of static host entries in effect. The entries themselves are not
+    /// exported: a UI only needs the count, and a hosts file can be large.
+    #[serde(default)]
+    pub host_count: usize,
+    #[serde(default)]
+    pub use_hosts: bool,
+    #[serde(default)]
+    pub cache_size: usize,
 }
 
 // ============== From Trait Implementations for DTO Types ==============
@@ -465,6 +538,14 @@ impl DnsConfigDto {
             nameservers,
             fallback,
             nameserver_policy: std::collections::HashMap::new(),
+            default_nameserver: Vec::new(),
+            fallback_filter: DnsFallbackFilterDto::default(),
+            fake_ip_range: "198.18.0.1/16".to_string(),
+            fake_ip_filter: Vec::new(),
+            fake_ip_ttl: 10,
+            host_count: 0,
+            use_hosts: true,
+            cache_size: 4096,
         }
     }
 }
@@ -474,10 +555,18 @@ impl Default for DnsConfigDto {
         Self {
             enable: false,
             listen: "127.0.0.1:53".to_string(),
-            enhanced_mode: "normal".to_string(),
+            enhanced_mode: "redir-host".to_string(),
             nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
-            fallback: vec!["8.8.4.4".to_string(), "1.0.0.1".to_string()],
+            fallback: Vec::new(),
             nameserver_policy: std::collections::HashMap::new(),
+            default_nameserver: Vec::new(),
+            fallback_filter: DnsFallbackFilterDto::default(),
+            fake_ip_range: "198.18.0.1/16".to_string(),
+            fake_ip_filter: Vec::new(),
+            fake_ip_ttl: 10,
+            host_count: 0,
+            use_hosts: true,
+            cache_size: 4096,
         }
     }
 }
@@ -511,7 +600,10 @@ impl ProxyInfoDto {
     pub fn from_outbound_config(config: &crate::engine::OutboundConfig) -> Self {
         Self {
             tag: config.tag.clone(),
-            protocol_type: format!("{:?}", config.outbound_type).to_lowercase(),
+            // `as_str()`, not `format!("{:?}")`: the debug form spells
+            // `Urltest` as `urltest`, which is not the spelling the rest of the
+            // system prints for the same group.
+            protocol_type: config.outbound_type.as_str().to_string(),
             server: config.server.clone(),
             port: config.port,
             latency_ms: None,
@@ -524,14 +616,11 @@ impl ProxyInfoDto {
 impl ProxyGroupDto {
     /// Create from an OutboundConfig reference (for group types only)
     pub fn from_outbound_config(config: &crate::engine::OutboundConfig) -> Option<Self> {
-        let group_type = match config.outbound_type {
-            crate::engine::OutboundType::Selector => "selector",
-            crate::engine::OutboundType::Urltest => "url-test",
-            crate::engine::OutboundType::Fallback => "fallback",
-            crate::engine::OutboundType::Loadbalance => "load-balance",
-            crate::engine::OutboundType::Relay => "relay",
-            _ => return None, // Not a group type
-        };
+        // A group is the one case where the same configuration type means a
+        // policy rather than a proxy, so the check has to come first.
+        if !config.outbound_type.is_group() {
+            return None;
+        }
 
         // Get proxies list from options
         let proxies: Vec<String> = config
@@ -550,7 +639,7 @@ impl ProxyGroupDto {
 
         Some(Self {
             tag: config.tag.clone(),
-            group_type: group_type.to_string(),
+            group_type: config.outbound_type.as_str().to_string(),
             proxies,
             selected,
         })
@@ -562,7 +651,7 @@ impl RuleDto {
     /// Create from a RuleConfig reference
     pub fn from_rule_config(config: &crate::engine::RuleConfig) -> Self {
         Self {
-            rule_type: format!("{:?}", config.rule_type).to_lowercase(),
+            rule_type: config.rule_type.as_str().to_string(),
             payload: config.payload.clone(),
             outbound: config.outbound.clone(),
             matched_count: 0, // Matched count is tracked separately
@@ -577,10 +666,25 @@ impl DnsConfigDto {
         Self {
             enable: config.enable,
             listen: config.listen.clone(),
-            enhanced_mode: format!("{:?}", config.enhanced_mode).to_lowercase(),
+            // `as_str()`, not `format!("{:?}")`: the debug form spells the mode
+            // `fakeip`, which is not the spelling any profile or caller uses.
+            enhanced_mode: config.enhanced_mode.as_str().to_string(),
             nameservers: config.nameservers.clone(),
             fallback: config.fallback.clone(),
             nameserver_policy: config.nameserver_policy.clone(),
+            default_nameserver: config.default_nameserver.clone(),
+            fallback_filter: DnsFallbackFilterDto {
+                geoip: Some(config.fallback_filter.geoip),
+                geoip_code: Some(config.fallback_filter.geoip_code.clone()),
+                ipcidr: config.fallback_filter.ipcidr.clone(),
+                domain: config.fallback_filter.domain.clone(),
+            },
+            fake_ip_range: config.fake_ip_range.clone(),
+            fake_ip_filter: config.fake_ip_filter.clone(),
+            fake_ip_ttl: config.fake_ip_ttl,
+            host_count: config.hosts.len(),
+            use_hosts: config.use_hosts,
+            cache_size: config.cache_size,
         }
     }
 }

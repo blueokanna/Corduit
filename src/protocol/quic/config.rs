@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::obfs::Salamander;
+use super::obfs::PacketObfs;
 
 /// Congestion-control algorithm selection.
 ///
@@ -74,10 +74,11 @@ pub struct ClientConfig {
     pub max_udp_payload_size: u64,
     /// Congestion-control selection.
     pub congestion_control: CongestionControl,
-    /// Optional "Salamander" packet obfuscation (Hysteria 2). When set,
-    /// every datagram is wrapped as `[8-byte salt][XOR(keystream)]` before
-    /// hitting the wire and unwrapped on receive.
-    pub obfs: Option<Arc<Salamander>>,
+    /// Optional per-packet obfuscation. Hysteria 2 uses
+    /// [`PacketObfs::Salamander`], Hysteria 1 its own `XPlus`. When set,
+    /// every datagram is wrapped with a fresh salt before hitting the wire
+    /// and unwrapped on receive.
+    pub obfs: Option<Arc<PacketObfs>>,
 }
 
 impl ClientConfig {

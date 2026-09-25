@@ -26,9 +26,9 @@ and a userspace TCP/IP stack. It is published for **lawful use only**.
   included — providing or using a proxy, VPN or tunnel service to bypass state
   network controls is illegal. Corduit grants no right to do that; the
   maintainers neither authorize nor support it.
-- **TUIC and Hysteria2 are opt-in.** Both are disabled Cargo features
-  (`tuic`, `hysteria2`) and are absent from a default build. Enabling them is
-  an explicit, deliberate decision of yours.
+- **TUIC, Hysteria and Hysteria2 are opt-in.** They are disabled Cargo features
+  (`tuic`, `hysteria`, `hysteria2`) and are absent from a default build. Enabling
+  them is an explicit, deliberate decision of yours.
 - **Unlawful use gets no support.** Issues, pull requests and discussions that
   would enable unlawful use will be closed.
 - **No warranty, no liability.** The software is provided as is. See
@@ -54,16 +54,26 @@ Capability inventory:
   TUN mode over the in-tree userspace stack. `redir` / `tproxy` are recognized
   by the config model but not implemented — a build logs a warning and skips
   them instead of pretending.
-- **Outbounds**: `direct`, `reject`, `socks5`, `http`, `shadowsocks`,
-  `vmess`, `vless`, `trojan`, `wireguard`, and the opt-in `tuic` /
+- **Outbounds**: `direct`, `reject`, `socks5`, `socks4` / `socks4a`, `http`
+  (plain or TLS-wrapped), `shadowsocks`, `snell` (v4 / v5), `vmess`, `vless`,
+  `trojan`, `wireguard`, and the opt-in `tuic` (v5), `hysteria` (v1) and
   `hysteria2`; plus the group selectors `selector`, `url-test`, `fallback`,
   `load-balance` and `relay`.
 - **Routing**: `domain`, `domain-suffix`, `domain-keyword`, `domain-regex`,
   `geoip`, `ip-cidr`, `src-ip-cidr`, `src-port`, `dst-port`, `process-name`,
   `rule-set` and `match`, over the three modes `rule` / `global` / `direct`;
   rule providers and proxy providers with periodic refresh.
-- **DNS**: UDP / TCP / DoH / DoT, both directions (client and server), a
-  TTL-aware cache, fake-IP, hosts, bogon filtering and split resolution.
+- **DNS**: [RecurseX](https://crates.io/crates/recurse-x) *is* the resolver —
+  upstream UDP / TCP / DoT / DoH / DoH3 / DoQ, a stability-measured multi-tier
+  cache, request coalescing, and server selection priced by expected cost. It is
+  the same author's resolver, consumed as a library. Corduit contributes what a
+  profile needs and RecurseX cannot know: the profile dialect shapes
+  (`nameserver-policy`, `default-nameserver`, `hosts`, `cache-size`), the
+  hostname-to-literal bootstrap for encrypted upstreams, and the bogon / GeoIP
+  answer filter — RecurseX ships no country database, so the country signal is
+  kept on this side rather than configured into silence. `dns.enable` starts a
+  real listener on `dns.listen`, over UDP **and** TCP, answering from the same
+  profile.
 - **Synchronous by construction**: no tokio, no reactor, no `async` / `await`
   in the engine. Concurrency comes from a work-stealing pool for short tasks
   and dedicated threads for long-lived relays.
@@ -85,7 +95,7 @@ flowchart LR
     end
 
     MIX & HTTP & S5 & TUN --> RT["Router<br/>rules · rule providers · geoip"]
-    DNS["DNS stack<br/>cache · fake-IP · DoH/DoT · hosts"] -.-> RT
+    DNS["DNS — RecurseX<br/>resolver · cache · transports"] -.-> RT
     RT --> OM["OutboundManager<br/>groups · health check · tracker"]
     OM --> DIAL["dial outbound<br/>handshake + optional chain"]
     DIAL --> RELAY["relay<br/>two threads, half-close, accounting"]
@@ -140,19 +150,20 @@ connections — that is the correct trade.
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `std` | on | Threaded engine layer: engine, DNS servers, netstack, RPC, FFI. Implies `tls`. |
+| `std` | on | Threaded engine layer: engine, netstack, RPC, FFI. Implies `tls`. |
 | `tls` | on | `protocol::tls` client/server layers and the TLS-based outbounds (HTTPS, Trojan, VMess/VLESS TLS, TLS inbounds). |
 | `wireguard` | on | `protocol::wireguard` plus the WireGuard outbound. |
 | `quic` | off | `protocol::quic` — the in-tree QUIC v1 client transport (RFC 9000/9001/9002). |
 | `tuic` | off | TUIC v5 outbound. Implies `quic`. |
+| `hysteria` | off | Hysteria v1 outbound (control-stream auth, XPlus obfuscation, struct-encoded UDP datagrams). Implies `quic`. |
 | `hysteria2` | off | Hysteria2 outbound (HTTP/3 `POST /auth`, Salamander obfuscation). Implies `quic`. |
 | `tls13` | off | The in-tree TLS 1.3 client and the browser-shaped `ClientHello` fingerprints it can present (`chrome`, `randomized`, `off`). |
 | `reality` | off | REALITY client authentication for VLESS/Trojan/VMess (`security: reality`). Implies `tls13`. |
 
-A build without `tuic` / `hysteria2` **rejects** such an outbound with an
-explicit config error naming the missing feature; it never degrades to a direct
-connection. The same fail-closed rule applies to `security: reality` and to
-`fingerprint` without their features.
+A build without `tuic` / `hysteria` / `hysteria2` **rejects** such an outbound
+with an explicit config error naming the missing feature; it never degrades to a
+direct connection. The same fail-closed rule applies to `security: reality` and
+to `fingerprint` without their features.
 
 ## Division of labour: courierust vs. in-tree
 
@@ -173,13 +184,14 @@ only the layers courierust deliberately does not expose:
 | QUIC v1 **connection runtime** (handshake driver, ACK/loss recovery, congestion control, flow control, datagrams) | `protocol::quic` (in-tree) |
 | TLS 1.3 client with data-driven `ClientHello` fingerprints | `protocol::tls13` (in-tree) |
 | REALITY client (`security: reality`) | `protocol::reality` (in-tree) |
-| Shadowsocks / VMess / VLESS / Trojan / TUIC / Hysteria2 / WireGuard | `engine::outbound` (in-tree) |
-| DNS wire codec, resolver, cache, fake-IP | `dns` (in-tree) |
+| Shadowsocks / Snell / VMess / VLESS / Trojan / TUIC / Hysteria / Hysteria2 / WireGuard / SOCKS4 | `engine::outbound` (in-tree) |
+| DNS resolver, semantic cache, UDP/TCP/DoT/DoH/DoH3/DoQ transports, wire codec | [RecurseX](https://crates.io/crates/recurse-x) — the same author's resolver, consumed as a library |
+| Profile → resolver adaptation, upstream bootstrap, bogon/GeoIP answer filter | `dns` (in-tree) |
 | Userspace TCP/IP stack (SolidTCP) + NAT + TUN | `netstack` (in-tree) |
 
 The rule applied throughout the workspace is one implementation per
-responsibility: a second RFC 6455 state machine, a second QPACK codec or a
-second base64 would be a defect, not a feature.
+responsibility: a second RFC 6455 state machine, a second QPACK codec, a second
+base64 — or a second DNS wire codec — would be a defect, not a feature.
 
 ## REALITY and TLS fingerprints
 
@@ -235,12 +247,18 @@ sequenceDiagram
     S->>C: 1-RTT - STREAM or DATAGRAM
 ```
 
-On top of that transport sit TUIC v5 (`tuic`) and Hysteria2 (`hysteria2`).
-Hysteria2 is implemented against the official specification — HTTP/3
-`POST /auth` on a client-initiated bidirectional stream (QPACK field section,
-`:status 233` expected), `0x401` TCP request frames, its own UDP session /
-fragment framing, and Salamander packet obfuscation (BLAKE2b-256 keyed by an
-8-byte per-packet salt, applied at the socket layer).
+On top of that transport sit TUIC v5 (`tuic`), Hysteria v1 (`hysteria`) and
+Hysteria2 (`hysteria2`) — three protocols with nothing in common above QUIC.
+Hysteria2 is implemented against the official specification: HTTP/3 `POST /auth`
+on a client-initiated bidirectional stream (QPACK field section, `:status 233`
+expected), `0x401` TCP request frames, its own UDP session / fragment framing,
+and Salamander packet obfuscation (BLAKE2b-256 keyed by an 8-byte per-packet
+salt, applied at the socket layer). Hysteria v1 is the older design: a struct
+(no alignment padding, big-endian) `client hello` on a control stream, one
+bi-stream per TCP connection, struct-encoded UDP datagrams, and its own XPlus
+obfuscation (SHA-256 keyed by a 16-byte salt) — close enough to Salamander to
+look alike and different enough not to interoperate, which is why the two live
+behind separate types.
 
 Deliberately not offered, each called out with an explicit warning when a
 config asks for it rather than silently faked: 0-RTT (early data), BBR /
@@ -363,13 +381,13 @@ src/
 ├── engine/         # config, routing, inbounds, outbounds, providers, stats
 ├── crypto/         # crypto primitives + text codecs (no_std)
 ├── protocol/       # wire protocols: QUIC v1, TLS 1.3, REALITY, WebSocket, WireGuard
-├── dns/            # DNS wire codec, resolver, cache, fake-IP, DoH/DoT
+├── dns/            # profile → RecurseX adaptation: upstreams, bogon, patterns
 └── netstack/       # userspace TCP/IP (SolidTCP), TUN, NAT, VPN drivers
 ```
 
 The `no_std` core is `crypto/`, `common/url`, `protocol/address` and
 `protocol/error` — pure logic, no OS. The threaded networking layer (engine,
-DNS servers, netstack, RPC, transports) is gated behind the `std` feature.
+netstack, RPC, transports) is gated behind the `std` feature.
 
 ## Building and testing
 
@@ -404,8 +422,11 @@ This is a local tool that controls network traffic, so the boundary is explicit:
 - **Outbound handshakes**: a WebSocket upgrade whose `Sec-WebSocket-Accept`
   does not match is a hard failure — never a warning; config-supplied handshake
   headers are validated (token name, no CR/LF) before a byte reaches the wire.
-- **Data paths**: DNS compression pointers capped, MMDB reads bounds-checked,
-  HTTP response bodies capped, `skip-cert-verify` off by default.
+- **Data paths**: DNS wire parsing is RecurseX's, which caps section counts
+  before any loop, bounds every length field against the message, and follows
+  compression pointers only forwards with a hop budget derived from the 255-byte
+  name limit; MMDB reads bounds-checked, HTTP response bodies capped,
+  `skip-cert-verify` off by default.
 
 More: [Security](https://github.com/blueokanna/Corduit/wiki/Security).
 

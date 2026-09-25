@@ -85,7 +85,7 @@ fn outbounds() -> Vec<OutboundConfig> {
     ]
 }
 
-/// Rule table (first match wins, like Clash): proxy Google, direct .cn via
+/// Rule table (first match wins, top to bottom): proxy Google, direct .cn via
 /// GeoIP, everything else through the selector group.
 fn rules() -> Vec<RuleConfig> {
     vec![
@@ -94,18 +94,21 @@ fn rules() -> Vec<RuleConfig> {
             payload: "google.com".to_string(),
             outbound: "ss-node".to_string(),
             process_name: None,
+            ..RuleConfig::default()
         },
         RuleConfig {
             rule_type: RuleType::Geoip,
             payload: "cn".to_string(),
             outbound: "DIRECT".to_string(),
             process_name: None,
+            ..RuleConfig::default()
         },
         RuleConfig {
             rule_type: RuleType::Match,
             payload: String::new(),
             outbound: "PROXY".to_string(),
             process_name: None,
+            ..RuleConfig::default()
         },
     ]
 }
@@ -141,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             payload: "youtube.com".to_string(),
             outbound: "ss-node".to_string(),
             process_name: None,
+            ..RuleConfig::default()
         },
     );
 

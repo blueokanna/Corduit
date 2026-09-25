@@ -83,7 +83,7 @@ pub use http::{HttpClient, HttpError, HttpResponse};
 #[cfg(feature = "std")]
 pub use socket::{connect, connect_host, udp_exchange};
 #[cfg(feature = "std")]
-pub use stream::{relay, BoxStream, RelayStats, SyncStream};
+pub use stream::{relay, BoxStream, PrefixedStream, RelayStats, SyncStream};
 #[cfg(feature = "std")]
 pub use throttle::LogThrottle;
 pub use url::{Url, UrlError};

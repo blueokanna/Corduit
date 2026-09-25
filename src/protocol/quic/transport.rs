@@ -34,7 +34,7 @@ use courierust::courierust_tls::crypto::rng::{self, ChaChaRng};
 
 use super::config::ClientConfig;
 use super::error::{QuicError, Result};
-use super::obfs::Salamander;
+use super::obfs::PacketObfs;
 use super::tls13::{Tls13Client, TransportParameters};
 use crate::common::sync::Notify;
 use crate::protocol::quic::{INITIAL_CWND, MAX_PACKET, MAX_UDP_PAYLOAD, MIN_CWND};
@@ -278,7 +278,7 @@ pub(crate) struct QuicConn {
     pub(crate) state: Mutex<ConnState>,
     pub(crate) writer: Notify,
     /// Optional packet obfuscation wrapping every datagram on the wire.
-    pub(crate) obfs: Option<Arc<Salamander>>,
+    pub(crate) obfs: Option<Arc<PacketObfs>>,
     /// Woken whenever the handshake completes or the connection closes (so
     /// waiters wake and re-check the connection state under the lock).
     pub(crate) handshake: Notify,

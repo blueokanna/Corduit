@@ -4,7 +4,7 @@
 //! without binding any sockets, to show how the three modes decide the
 //! outbound for a connection:
 //!
-//! * **rule** (mode `3`): first matching rule wins (Clash semantics);
+//! * **rule** (mode `3`): the first matching rule wins, in table order;
 //! * **direct** (mode `2`): everything goes to the direct outbound;
 //! * **global** (mode `1`): everything goes to the proxy group (or the first
 //!   non-direct outbound when no group exists);
@@ -60,12 +60,14 @@ fn router() -> Router {
                 payload: "google.com".to_string(),
                 outbound: "socks-node".to_string(),
                 process_name: None,
+                ..RuleConfig::default()
             },
             RuleConfig {
                 rule_type: RuleType::Match,
                 payload: String::new(),
                 outbound: "DIRECT".to_string(),
                 process_name: None,
+                ..RuleConfig::default()
             },
         ],
         ..Config::default()

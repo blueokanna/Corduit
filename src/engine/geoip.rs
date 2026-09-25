@@ -127,7 +127,7 @@ impl GeoIpDatabase {
     pub fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
         if country_code.eq_ignore_ascii_case("LAN") || country_code.eq_ignore_ascii_case("PRIVATE")
         {
-            return is_private_ip(ip);
+            return is_non_routable(ip);
         }
         let Some(code) = CountryCode::parse(country_code) else {
             return false;
@@ -275,33 +275,22 @@ impl Clone for GeoIpManager {
     }
 }
 
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ipv4) => {
-            ipv4.is_private()
-                || ipv4.is_loopback()
-                || ipv4.is_link_local()
-                || ipv4.is_broadcast()
-                || ipv4.is_documentation()
-                || ipv4.is_unspecified()
-                || is_cgnat(ipv4)
-        }
-        IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified() || is_ipv6_private(&ipv6),
-    }
-}
-
-pub(crate) fn is_local_or_private_ip(ip: IpAddr) -> bool {
-    is_private_ip(ip)
-}
-
-fn is_cgnat(ip: std::net::Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    octets[0] == 100 && (octets[1] >= 64 && octets[1] <= 127)
-}
-
-fn is_ipv6_private(ip: &std::net::Ipv6Addr) -> bool {
-    let segments = ip.segments();
-    (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80 || ip.is_multicast()
+/// Whether an address can be reached from the public internet.
+///
+/// Delegated to [`crate::dns::bogon`] rather than re-derived. There used to be
+/// a second, hand-written range check here, and it had already drifted: it knew
+/// about RFC 1918, loopback, link-local, CGNAT and the documentation nets, but
+/// not multicast, not `0.0.0.0/8` beyond the single unspecified address, not
+/// `240.0.0.0/4`, not the benchmarking range, and nothing about
+/// `::ffff:0:0/96` or the v6 translation prefixes. Two tables of "addresses that
+/// are not routable" is one table too many, and the failure mode is silent:
+/// a rule that reads as if it protects simply stops recognising a range.
+///
+/// The one table lives with the answer-quality gate that reads it, because that
+/// gate is where an unroutable address in an answer means "an upstream is
+/// lying" rather than "do not dial this".
+pub(crate) fn is_non_routable(ip: IpAddr) -> bool {
+    crate::dns::bogon::is_bogon(ip)
 }
 
 #[cfg(test)]
@@ -311,18 +300,28 @@ mod tests {
 
     #[test]
     fn test_private_ipv4() {
-        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
-        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
-        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        // The ranges the old hand-written check knew about...
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(!is_non_routable(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+
+        // ...and the ones it did not, which is why there is one table now.
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3))));
+        assert!(is_non_routable(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
     }
 
     #[test]
     fn test_private_ipv6() {
-        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(!is_private_ip(IpAddr::V6(Ipv6Addr::new(
+        assert!(is_non_routable(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_non_routable("fe80::1".parse().expect("ipv6")));
+        assert!(is_non_routable("fd00::1".parse().expect("ipv6")));
+        assert!(is_non_routable("::ffff:10.0.0.1".parse().expect("mapped")));
+        assert!(!is_non_routable(IpAddr::V6(Ipv6Addr::new(
             0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888
         ))));
     }

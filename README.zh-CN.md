@@ -17,7 +17,7 @@ Corduit 是网络工程工具：代理协议、规则路由、DNS 与用户态 T
 
 - **以你所在司法辖区的法律为准。** 本仓库、其许可证与文档不授予你任何当地法律未曾给予的许可；使用后果由你自行承担。
 - **不得用于违法用途。** 在某些司法辖区——包括中国大陆——提供或使用代理、VPN、隧道类服务规避国家网络管控属于违法。Corduit 不授予此类权利，维护者既不授权也不支持。
-- **TUIC 与 Hysteria2 默认关闭。** 二者均为可选 Cargo feature（`tuic`、`hysteria2`），默认构建不包含；开启它们是你显式且经过考虑的决定。
+- **TUIC、Hysteria v1 与 Hysteria2 默认关闭。** 三者均为可选 Cargo feature（`tuic`、`hysteria`、`hysteria2`），默认构建不包含；开启它们是你显式且经过考虑的决定。
 - **违法用途不提供支持。** 涉及违法用途的 issue、PR、讨论一律关闭。
 - **无担保、无责任。** 软件按“现状”提供，见 [LICENSE](LICENSE)——其中的附加许可人条款把合法使用作为所有许可的前提条件。
 - **本声明不是法律意见。** 若不确定用途是否合法，请先咨询你所在辖区的执业律师，再构建或运行。
@@ -31,9 +31,9 @@ Corduit 是网络工程工具：代理协议、规则路由、DNS 与用户态 T
 能力清单：
 
 - **入站**：`http`、`socks5`、`mixed`（HTTP + SOCKS5 自动识别），以及基于仓库内用户态协议栈的 TUN 模式。`redir` / `tproxy` 在配置模型中被识别但未实现——构建时打印警告并跳过，不做任何伪装。
-- **出站**：`direct`、`reject`、`socks5`、`http`、`shadowsocks`、`vmess`、`vless`、`trojan`、`wireguard`，以及可选启用的 `tuic` / `hysteria2`；代理组 `selector`、`url-test`、`fallback`、`load-balance`、`relay`。
+- **出站**：`direct`、`reject`、`socks5`、`socks4` / `socks4a`、`http`（明文或 TLS 包裹）、`shadowsocks`、`snell`（v4 / v5）、`vmess`、`vless`、`trojan`、`wireguard`，以及可选启用的 `tuic`（v5）、`hysteria`（v1）与 `hysteria2`；代理组 `selector`、`url-test`、`fallback`、`load-balance`、`relay`。
 - **路由**：`domain`、`domain-suffix`、`domain-keyword`、`domain-regex`、`geoip`、`ip-cidr`、`src-ip-cidr`、`src-port`、`dst-port`、`process-name`、`rule-set`、`match`，配合 `rule` / `global` / `direct` 三种模式；规则集与代理集支持周期刷新。
-- **DNS**：UDP / TCP / DoH / DoT 双向（客户端与服务端）、TTL 感知缓存、fake-IP、hosts、bogon 过滤、内外分流。
+- **DNS**：[RecurseX](https://crates.io/crates/recurse-x) **就是**解析器本身——上游 UDP / TCP / DoT / DoH / DoH3 / DoQ、按稳定性度量的分层缓存、请求合并、按期望成本排序的服务器选择，同作者的库，以依赖形式引入。Corduit 只补上 profile 需要而 RecurseX 无从知道的那部分：profile 方言写法（`nameserver-policy`、`default-nameserver`、`hosts`、`cache-size`）、加密上游的主机名→IP bootstrap，以及 bogon / GeoIP 应答过滤——RecurseX 不带国家库，所以这条信号留在本侧，而不是被配成一个不会生效的开关。`dns.enable` 会真的在 `dns.listen` 上起一个监听器（UDP **与** TCP），用同一份 profile 回答客户端。
 - **同步执行**：没有 tokio、没有 reactor、引擎内没有 `async` / `await`。并发来自短任务的 work-stealing 池与长连接中继的专用线程。
 - **`no_std` 核心**：`default-features = false` 时以 `no_std + alloc` 编译——加密原语、URL 解析器与纯线缆编解码（`protocol::address`、`protocol::error`）零 OS 依赖。
 - **热重载**（`Corduit::reload`）与**流量统计**（逐连接上下行、速率、活跃列表）。
@@ -50,7 +50,7 @@ flowchart LR
     end
 
     MIX & HTTP & S5 & TUN --> RT["Router<br/>规则 · 规则集 · geoip"]
-    DNS["DNS 栈<br/>缓存 · fake-IP · DoH/DoT · hosts"] -.-> RT
+    DNS["DNS — RecurseX<br/>解析器 · 缓存 · 传输"] -.-> RT
     RT --> OM["OutboundManager<br/>代理组 · 健康检查 · 连接追踪"]
     OM --> DIAL["拨号出站<br/>握手 + 可选链式代理"]
     DIAL --> RELAY["中继<br/>两线程、半关闭、计量"]
@@ -85,16 +85,17 @@ flowchart TB
 
 | Feature | 默认 | 作用 |
 |---|---|---|
-| `std` | 开 | 线程化引擎层：engine、DNS 服务端、netstack、RPC、FFI。隐含 `tls`。 |
+| `std` | 开 | 线程化引擎层：engine、netstack、RPC、FFI。隐含 `tls`。 |
 | `tls` | 开 | `protocol::tls` 客户端 / 服务端层，以及依赖它的出站（HTTPS、Trojan、VMess/VLESS TLS、TLS 入站）。 |
 | `wireguard` | 开 | `protocol::wireguard` 与 WireGuard 出站。 |
 | `quic` | 关 | `protocol::quic`——仓库内 QUIC v1 客户端传输（RFC 9000/9001/9002）。 |
 | `tuic` | 关 | TUIC v5 出站。隐含 `quic`。 |
+| `hysteria` | 关 | Hysteria v1 出站（控制流认证、XPlus 混淆、struct 编码的 UDP 数据报）。隐含 `quic`。 |
 | `hysteria2` | 关 | Hysteria2 出站（HTTP/3 `POST /auth`、Salamander 混淆）。隐含 `quic`。 |
 | `tls13` | 关 | 仓库内 TLS 1.3 客户端，及其可呈现的浏览器形态 `ClientHello` 指纹（`chrome`、`randomized`、`off`）。 |
 | `reality` | 关 | VLESS/Trojan/VMess 的 REALITY 客户端认证（`security: reality`）。隐含 `tls13`。 |
 
-未开启 `tuic` / `hysteria2` 的构建会**直接拒绝**对应出站配置，并报出指明缺失 feature 的错误——绝不静默退化为直连。`security: reality` 与 `fingerprint` 在缺少对应 feature 时遵循同一 fail-closed 规则。
+未开启 `tuic` / `hysteria` / `hysteria2` 的构建会**直接拒绝**对应出站配置，并报出指明缺失 feature 的错误——绝不静默退化为直连。`security: reality` 与 `fingerprint` 在缺少对应 feature 时遵循同一 fail-closed 规则。
 
 ## 职责划分：courierust 与仓库内实现
 
@@ -113,11 +114,12 @@ flowchart TB
 | QUIC v1 **连接运行时**（握手驱动、ACK/丢包恢复、拥塞控制、流控、datagram） | `protocol::quic`（仓库内） |
 | 数据驱动的 TLS 1.3 客户端指纹 | `protocol::tls13`（仓库内） |
 | REALITY 客户端（`security: reality`） | `protocol::reality`（仓库内） |
-| Shadowsocks / VMess / VLESS / Trojan / TUIC / Hysteria2 / WireGuard | `engine::outbound`（仓库内） |
-| DNS wire 编解码、解析器、缓存、fake-IP | `dns`（仓库内） |
+| Shadowsocks / Snell / VMess / VLESS / Trojan / TUIC / Hysteria / Hysteria2 / WireGuard / SOCKS4 | `engine::outbound`（仓库内） |
+| DNS 解析器、语义缓存、UDP/TCP/DoT/DoH/DoH3/DoQ 传输、线格式编解码 | [RecurseX](https://crates.io/crates/recurse-x)（同作者的解析器，以依赖引入） |
+| profile → 解析器 适配、上游 bootstrap、bogon/GeoIP 应答过滤 | `dns`（仓库内） |
 | 用户态 TCP/IP 协议栈（SolidTCP）+ NAT + TUN | `netstack`（仓库内） |
 
-全仓库遵循同一条准则：一个职责只保留一份实现。第二套 RFC 6455 状态机、第二份 QPACK 编解码或第二份 base64 都是缺陷而非功能。
+全仓库遵循同一条准则：一个职责只保留一份实现。第二套 RFC 6455 状态机、第二份 QPACK 编解码、第二份 base64——或者第二份 DNS 线格式编解码——都是缺陷而非功能。
 
 ## REALITY 与 TLS 指纹
 
@@ -153,7 +155,7 @@ sequenceDiagram
     S->>C: 1-RTT - STREAM / DATAGRAM
 ```
 
-该传输之上承载 TUIC v5（`tuic`）与 Hysteria2（`hysteria2`）。Hysteria2 按官方规范实现：客户端初始化的双向流上的 HTTP/3 `POST /auth`（QPACK 字段段，期望 `:status 233`）、`0x401` TCP 请求帧、自有的 UDP 会话 / 分片组帧，以及 Salamander 包混淆（以每包 8 字节盐为密钥的 BLAKE2b-256，作用于 socket 层）。
+该传输之上承载 TUIC v5（`tuic`）、Hysteria v1（`hysteria`）与 Hysteria2（`hysteria2`）——三者在 QUIC 之上没有任何共同点。Hysteria2 按官方规范实现：客户端初始化的双向流上的 HTTP/3 `POST /auth`（QPACK 字段段，期望 `:status 233`）、`0x401` TCP 请求帧、自有的 UDP 会话 / 分片组帧，以及 Salamander 包混淆（以每包 8 字节盐为密钥的 BLAKE2b-256，作用于 socket 层）。Hysteria v1 是更早的设计：控制流上的 struct（无对齐填充、大端）`client hello`、每连接一条双向流、struct 编码的 UDP 数据报，以及它自己的 XPlus 混淆（以 16 字节盐为密钥的 SHA-256）——它看起来很像 Salamander，却互不兼容，所以两者是各自独立的类型，而不是一个类型加参数。
 
 以下能力**有意不提供**，且当配置请求它们时逐一给出显式警告而非静默伪装：0-RTT（early data）、BBR / TCP-Brutal 拥塞控制（仅 NewReno）、源端口跳动，以及 courierust 连接器上的 TLS 指纹模拟。
 
@@ -267,7 +269,7 @@ src/
 ├── engine/         # 配置、路由、入站、出站、代理集、统计
 ├── crypto/         # 加密原语 + 文本编解码（no_std）
 ├── protocol/       # 线缆协议：QUIC v1、TLS 1.3、REALITY、WebSocket、WireGuard
-├── dns/            # DNS wire 编解码、解析器、缓存、fake-IP、DoH/DoT
+├── dns/            # profile → RecurseX 适配：上游、bogon、域名模式
 └── netstack/       # 用户态 TCP/IP（SolidTCP）、TUN、NAT、VPN 驱动
 ```
 

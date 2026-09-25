@@ -290,7 +290,8 @@ impl ShadowsocksOutbound {
             .map(yaml_value_to_string)
             .unwrap_or_default();
 
-        // Get cipher/method from options - Clash configs use both "cipher" and "method"
+        // Accept both spellings: profiles in the wild use `cipher` and `method`
+        // interchangeably, so either may be the one that is present.
         let cipher = config
             .options
             .get("cipher")

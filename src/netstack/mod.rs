@@ -68,39 +68,12 @@ pub use route::RouteManager;
 pub use tun::{TunConfig, TunDevice};
 pub use vpn::{TunPacketProcessor, TunTrafficStats};
 
-// Re-export DNS types from corduit-dns crate
+// Re-export the DNS surface a netstack caller may need. RecurseX is the DNS
+// engine itself, so its vocabulary is re-exported rather than mirrored; the
+// `dns` modules below it are the adapter from a profile to a resolver.
 pub use crate::dns::{
-    CacheStatistics,
-    DnsCache,
-    // Client
-    DnsClient,
-    DnsConfig,
-    DnsError,
-    // Core types
-    DnsManager,
-    DnsManagerState,
-    DnsProtocol,
-    DnsResolver,
-    DnsServer,
-    // DoH/DoT
-    DohClient,
-    DohClientConfig,
-    DohMethod,
-    DohResolver,
-    DotClient,
-    DotClientConfig,
-    DotResolver,
-    FakeIpEntry,
-    // Fake-IP
-    FakeIpPool,
-    FallbackFilter,
-    // Other
-    HostsFile,
-    RecordType,
-    Result as DnsResult,
-    // Config
-    UpstreamConfig,
-    UpstreamProtocol,
+    bogon, engine_resolver, upstream, HeaderFlags, Message, Name, Question, RData, Rcode, Record,
+    RrClass, RrType, Upstream, UpstreamProtocol,
 };
 
 // Android-specific exports

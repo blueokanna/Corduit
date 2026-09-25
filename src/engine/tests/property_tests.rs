@@ -10,10 +10,27 @@ use crate::engine::proxy_provider::{
     HealthCheckConfig, ProxyProvider, ProxyProviderConfig, ProxyProviderType,
 };
 use crate::engine::rule_provider::{
-    CompiledRuleEntry, RuleProvider, RuleProviderBehavior, RuleProviderConfig, RuleProviderType,
+    CompiledRuleEntry, RuleMatchInput, RuleProvider, RuleProviderBehavior, RuleProviderConfig,
+    RuleProviderType,
 };
 use proptest::prelude::*;
 use std::net::IpAddr;
+
+/// A match input carrying only a domain.
+fn by_domain(domain: &str) -> RuleMatchInput<'_> {
+    RuleMatchInput {
+        domain: Some(domain),
+        ..RuleMatchInput::default()
+    }
+}
+
+/// A match input carrying only a destination address.
+fn by_dst(address: &str) -> RuleMatchInput<'static> {
+    RuleMatchInput {
+        dst_ip: Some(address.parse::<IpAddr>().expect("valid address")),
+        ..RuleMatchInput::default()
+    }
+}
 
 fn domain_strategy() -> impl Strategy<Value = String> {
     (
@@ -214,14 +231,14 @@ proptest! {
 
         let subdomain = format!("{}.{}", subdomain_prefix, base_domain);
         prop_assert!(
-            provider.matches_entry(&entry, Some(&subdomain), None),
+            provider.matches_entry(&entry, &by_domain(&subdomain)),
             "Subdomain {} should match suffix {}",
             subdomain,
             base_domain
         );
 
         prop_assert!(
-            provider.matches_entry(&entry, Some(&base_domain), None),
+            provider.matches_entry(&entry, &by_domain(&base_domain)),
             "Exact domain {} should match suffix {}",
             base_domain,
             base_domain
@@ -229,7 +246,7 @@ proptest! {
 
         let unrelated = format!("unrelated{}.xyz", crate::engine::random::u32());
         prop_assert!(
-            !provider.matches_entry(&entry, Some(&unrelated), None),
+            !provider.matches_entry(&entry, &by_domain(&unrelated)),
             "Unrelated domain {} should not match suffix {}",
             unrelated,
             base_domain
@@ -377,11 +394,11 @@ mod unit_tests {
         let provider = RuleProvider::new(config);
         let entry = CompiledRuleEntry::DomainSuffix("google.com".to_string());
 
-        assert!(provider.matches_entry(&entry, Some("www.google.com"), None));
-        assert!(provider.matches_entry(&entry, Some("mail.google.com"), None));
-        assert!(provider.matches_entry(&entry, Some("google.com"), None));
-        assert!(!provider.matches_entry(&entry, Some("notgoogle.com"), None));
-        assert!(!provider.matches_entry(&entry, Some("google.org"), None));
+        assert!(provider.matches_entry(&entry, &by_domain("www.google.com")));
+        assert!(provider.matches_entry(&entry, &by_domain("mail.google.com")));
+        assert!(provider.matches_entry(&entry, &by_domain("google.com")));
+        assert!(!provider.matches_entry(&entry, &by_domain("notgoogle.com")));
+        assert!(!provider.matches_entry(&entry, &by_domain("google.org")));
     }
 
     #[test]
@@ -398,10 +415,10 @@ mod unit_tests {
         let provider = RuleProvider::new(config);
         let entry = CompiledRuleEntry::DomainKeyword("google".to_string());
 
-        assert!(provider.matches_entry(&entry, Some("www.google.com"), None));
-        assert!(provider.matches_entry(&entry, Some("google.org"), None));
-        assert!(provider.matches_entry(&entry, Some("mygoogle.net"), None));
-        assert!(!provider.matches_entry(&entry, Some("example.com"), None));
+        assert!(provider.matches_entry(&entry, &by_domain("www.google.com")));
+        assert!(provider.matches_entry(&entry, &by_domain("google.org")));
+        assert!(provider.matches_entry(&entry, &by_domain("mygoogle.net")));
+        assert!(!provider.matches_entry(&entry, &by_domain("example.com")));
     }
 
     #[test]
@@ -419,10 +436,10 @@ mod unit_tests {
         let network: ipnet::IpNet = "192.168.0.0/16".parse().unwrap();
         let entry = CompiledRuleEntry::IpCidr(network);
 
-        assert!(provider.matches_entry(&entry, None, Some("192.168.1.1".parse().unwrap())));
-        assert!(provider.matches_entry(&entry, None, Some("192.168.255.255".parse().unwrap())));
-        assert!(!provider.matches_entry(&entry, None, Some("10.0.0.1".parse().unwrap())));
-        assert!(!provider.matches_entry(&entry, None, Some("8.8.8.8".parse().unwrap())));
+        assert!(provider.matches_entry(&entry, &by_dst("192.168.1.1")));
+        assert!(provider.matches_entry(&entry, &by_dst("192.168.255.255")));
+        assert!(!provider.matches_entry(&entry, &by_dst("10.0.0.1")));
+        assert!(!provider.matches_entry(&entry, &by_dst("8.8.8.8")));
     }
 
     #[test]

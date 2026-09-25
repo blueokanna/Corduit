@@ -24,13 +24,21 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 mod direct;
+mod group;
 mod http;
+#[cfg(feature = "hysteria")]
+mod hysteria;
 #[cfg(feature = "hysteria2")]
 mod hysteria2;
+mod naive;
 mod reject;
-mod selector;
 mod shadowsocks;
+#[cfg(feature = "shadowtls")]
+mod shadowtls;
+mod snell;
+mod socks4;
 mod socks5;
+mod ssr;
 mod trojan;
 #[cfg(feature = "tuic")]
 mod tuic;
@@ -41,13 +49,21 @@ mod wireguard;
 
 pub use direct::relay_bidirectional_with_connection;
 pub use direct::DirectOutbound;
+pub use group::{GroupOutbound, GroupStrategy};
 pub use http::HttpOutbound;
+#[cfg(feature = "hysteria")]
+pub use hysteria::HysteriaOutbound;
 #[cfg(feature = "hysteria2")]
 pub use hysteria2::Hysteria2Outbound;
+pub use naive::NaiveOutbound;
 pub use reject::RejectOutbound;
-pub use selector::SelectorOutbound;
 pub use shadowsocks::ShadowsocksOutbound;
+#[cfg(feature = "shadowtls")]
+pub use shadowtls::ShadowTlsOutbound;
+pub use snell::SnellOutbound;
+pub use socks4::Socks4Outbound;
 pub use socks5::Socks5Outbound;
+pub use ssr::SsrOutbound;
 pub use trojan::TrojanOutbound;
 #[cfg(feature = "tuic")]
 pub use tuic::TuicOutbound;
@@ -152,7 +168,7 @@ pub struct OutboundManager {
     /// Lifecycle list (start/stop/tags); replaced atomically on reload.
     proxy_list: parking_lot::RwLock<Vec<Arc<dyn OutboundProxy>>>,
     /// Loaded `proxy-providers`; their proxies are registered in `proxies`
-    /// and can be referenced by proxy groups (Clash `use:` / provider tags).
+    /// and can be referenced by proxy groups (`use:` / provider tags).
     proxy_providers: Arc<ProxyProviderManager>,
     /// Tags that came from proxy providers, so a background refresh can
     /// replace exactly those entries in the shared registry.
@@ -228,8 +244,11 @@ pub(crate) fn build_outbound_proxy(
         OutboundType::Direct => Some(Arc::new(DirectOutbound::new(config.clone()))),
         OutboundType::Reject => Some(Arc::new(RejectOutbound::new(config.clone()))),
         OutboundType::Socks5 => Some(Arc::new(Socks5Outbound::new(config.clone())?)),
+        OutboundType::Socks4 => Some(Arc::new(Socks4Outbound::new(config.clone())?)),
         OutboundType::Http => Some(Arc::new(HttpOutbound::new(config.clone())?)),
         OutboundType::Shadowsocks => Some(Arc::new(ShadowsocksOutbound::new(config.clone())?)),
+        OutboundType::ShadowsocksR => Some(Arc::new(SsrOutbound::new(config.clone())?)),
+        OutboundType::Snell => Some(Arc::new(SnellOutbound::new(config.clone())?)),
         OutboundType::Vmess => Some(Arc::new(VmessOutbound::new(config.clone())?)),
         OutboundType::Vless => Some(Arc::new(VlessOutbound::new(config.clone())?)),
         OutboundType::Trojan => Some(Arc::new(TrojanOutbound::new(config.clone())?)),
@@ -251,6 +270,15 @@ pub(crate) fn build_outbound_proxy(
                 "tuic",
             ))
         }
+        #[cfg(feature = "hysteria")]
+        OutboundType::Hysteria => Some(Arc::new(HysteriaOutbound::new(config.clone())?)),
+        #[cfg(not(feature = "hysteria"))]
+        OutboundType::Hysteria => {
+            return Err(crate::engine::config::disabled_protocol_error(
+                &config.tag,
+                "hysteria",
+            ))
+        }
         #[cfg(feature = "hysteria2")]
         OutboundType::Hysteria2 => Some(Arc::new(Hysteria2Outbound::new(config.clone())?)),
         #[cfg(not(feature = "hysteria2"))]
@@ -260,6 +288,16 @@ pub(crate) fn build_outbound_proxy(
                 "hysteria2",
             ))
         }
+        #[cfg(feature = "shadowtls")]
+        OutboundType::ShadowTls => Some(Arc::new(ShadowTlsOutbound::new(config.clone())?)),
+        #[cfg(not(feature = "shadowtls"))]
+        OutboundType::ShadowTls => {
+            return Err(crate::engine::config::disabled_protocol_error(
+                &config.tag,
+                "shadowtls",
+            ))
+        }
+        OutboundType::Naive => Some(Arc::new(NaiveOutbound::new(config.clone())?)),
         OutboundType::Selector
         | OutboundType::Urltest
         | OutboundType::Fallback
@@ -339,11 +377,15 @@ impl OutboundManager {
 
         // Pass 3: proxy groups with access to the registry. A group's
         // `use: [provider]` option is expanded into explicit member tags
-        // before construction (Clash semantics).
+        // before construction, so the group itself never has to know that
+        // providers exist: it resolves members by tag and nothing else.
         for mut group_config in proxy_group_configs {
             Self::expand_provider_use(&mut group_config, provider_manager)?;
-            let proxy: Arc<dyn OutboundProxy> =
-                Arc::new(SelectorOutbound::new(group_config, registry.clone())?);
+            let group = Arc::new(GroupOutbound::new(group_config, registry.clone())?);
+            // Start the probe loop for the strategies that need it, now that
+            // the group is about to become reachable.
+            group.ensure_prober();
+            let proxy: Arc<dyn OutboundProxy> = group;
             let tag = proxy.tag().to_string();
             proxy_list.push(proxy.clone());
             registry.write().insert(tag, proxy);
@@ -384,8 +426,8 @@ impl OutboundManager {
         Ok(())
     }
 
-    /// Expand a proxy group's `use: [provider, …]` option (Clash semantics)
-    /// into explicit `outbounds` members resolved from the loaded providers.
+    /// Expand a proxy group's `use: [provider, …]` option into explicit
+    /// `outbounds` members resolved from the loaded providers.
     /// Explicitly listed `outbounds` are kept and provider members appended.
     fn expand_provider_use(
         group_config: &mut OutboundConfig,

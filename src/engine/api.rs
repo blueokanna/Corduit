@@ -275,7 +275,7 @@ fn get_rules(state: &ApiState) -> Response<Body> {
         .into_iter()
         .map(|rule| {
             nextjson::json!({
-                "type": format!("{:?}", rule.rule_type),
+                "type": rule.rule_type.as_str(),
                 "payload": rule.payload,
                 "outbound": rule.outbound,
                 "process_name": rule.process_name,

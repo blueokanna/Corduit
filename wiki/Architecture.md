@@ -17,7 +17,7 @@ flowchart TB
     ROOT --> ENGINE["engine/<br/>代理引擎核心"]
     ROOT --> CRYPTO["crypto/<br/>加密原语 + 文本编解码"]
     ROOT --> PROTOCOL["protocol/<br/>线缆协议（QUIC v1 客户端、TLS 1.2/1.3、TLS 1.3+REALITY、WebSocket、WireGuard）"]
-    ROOT --> DNS["dns/<br/>DNS 解析与服务器"]
+    ROOT --> DNS["dns/<br/>profile → RecurseX 适配"]
     ROOT --> NETSTACK["netstack/<br/>用户态 TCP/IP + TUN"]
 
     ENGINE --> EC["config/<br/>校验过的配置模型"]
@@ -53,7 +53,7 @@ flowchart LR
         REAL["protocol::reality<br/>REALITY 认证"]
         WSM["protocol::ws<br/>WS 封装（唯一入口）"]
         OB["engine::outbound<br/>SS/VMess/VLESS/Trojan/TUIC/Hysteria2/WireGuard"]
-        DNS["dns/<br/>wire 编解码 + 解析器"]
+        DNS["dns/<br/>profile → RecurseX 适配<br/>上游 · bootstrap · bogon"]
         NS["netstack/<br/>用户态 TCP/IP"]
     end
 
@@ -189,7 +189,7 @@ flowchart LR
         V2["ct_eq 常数时间 token 比较"]
         V3["请求体/消息 16MiB 上限"]
         V4["rustbinary 64MiB + 集合上限"]
-        V5["DNS 压缩指针 ≤128 跳"]
+        V5["DNS 报文解析（RecurseX）<br/>段计数 · 长度字段 · 压缩指针全部设限"]
     end
     FFI --> V1
     RPC --> V2

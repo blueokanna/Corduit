@@ -1,16 +1,16 @@
 use crate::common::lru::LruCache;
 use crate::engine::config::{Config, Mode, RuleConfig, RuleType};
 use crate::engine::error::{Error, Result};
-use crate::engine::geoip::{is_local_or_private_ip, CountryMatcher, GeoIpManager};
+use crate::engine::geoip::{is_non_routable, CountryMatcher, GeoIpManager};
 use crate::engine::rule_provider::RuleProviderConfig;
 use crate::engine::rule_provider::RuleProviderManager;
 use ipnet::IpNet;
 use parking_lot::{Mutex, RwLock};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant};
@@ -110,10 +110,81 @@ struct DefaultOutbounds {
     default: String,
 }
 
+/// Nesting limit for `and` / `or` / `not` rules. A cycle is impossible in a
+/// tree, but a deeply nested config would otherwise recurse until the stack
+/// gives out during compilation.
+const MAX_RULE_DEPTH: usize = 8;
+
+/// Transport a connection uses.
+///
+/// Spelled `tcp` / `udp` in a `network` rule payload, matching the vocabulary
+/// the profiles this engine consumes are written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Network {
+    /// Stream transport.
+    #[default]
+    Tcp,
+    /// Datagram transport.
+    Udp,
+}
+
+impl Network {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            other => Err(Error::config(format!(
+                "Invalid network '{other}': expected 'tcp' or 'udp'"
+            ))),
+        }
+    }
+}
+
+/// Everything a rule may inspect about one connection attempt.
+///
+/// A struct rather than a parameter list on purpose. While the inputs were
+/// positional `Option`s a call site could not tell a source port from a
+/// destination port, and `src-port` and `dst-port` were both fed the
+/// destination port as a result.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RouteRequest<'a> {
+    /// Destination hostname, when the client supplied one.
+    pub domain: Option<&'a str>,
+    /// Destination address, when the client already knows it.
+    pub dst_ip: Option<IpAddr>,
+    /// Destination port.
+    pub dst_port: Option<u16>,
+    /// Address the connection originates from.
+    pub src_ip: Option<IpAddr>,
+    /// Port the connection originates from.
+    pub src_port: Option<u16>,
+    /// Transport in use.
+    pub network: Network,
+    /// Executable name owning the connection, when it is resolvable.
+    pub process_name: Option<&'a str>,
+    /// Full executable path, when it is resolvable.
+    pub process_path: Option<&'a str>,
+}
+
+/// What one routing decision decided, and how long it took.
 #[derive(Debug, Clone)]
+pub struct RouteDecision {
+    /// Outbound tag the request was routed to.
+    pub outbound: String,
+    /// Position in the configured rule list of the rule that decided it.
+    /// `None` when a routing mode short-circuited the list, or when no rule
+    /// matched and the default outbound was used.
+    pub rule_index: Option<usize>,
+    /// Type of the rule that decided it, when a rule did.
+    pub rule_type: Option<RuleType>,
+    /// Wall-clock time the decision took.
+    pub elapsed: Duration,
+}
+
+#[derive(Debug)]
 struct CompiledRule {
     rule_type: RuleType,
-    /// Canonical pattern. Domain/process patterns are lowercased once at
+    /// Canonical pattern. Domain and process patterns are lowercased once at
     /// compile time so matching never allocates or re-parses.
     pattern: String,
     outbound: String,
@@ -122,6 +193,103 @@ struct CompiledRule {
     ipnet: Option<IpNet>,
     /// Pre-parsed inclusive port ranges for `SrcPort` / `DstPort` rules.
     port_ranges: Vec<(u16, u16)>,
+    /// Required transport for a `Network` rule.
+    network: Option<Network>,
+    /// `no-resolve`: never compare against an address the router resolved.
+    no_resolve: bool,
+    /// Children of `and` / `or` / `not`.
+    children: Vec<CompiledRule>,
+    /// Connections this rule has decided since it was compiled.
+    hits: AtomicU64,
+}
+
+impl CompiledRule {
+    /// Whether this rule, or a nested one, can only be decided once the
+    /// destination address is known.
+    ///
+    /// The router resolves a domain at most once per request, and only when
+    /// this returns `true` somewhere in the rule list — a configuration whose
+    /// IP rules are all `no-resolve` never pays for a lookup.
+    fn wants_dst_ip(&self) -> bool {
+        if self.no_resolve {
+            return false;
+        }
+        match self.rule_type {
+            RuleType::IpCidr | RuleType::Geoip => true,
+            // A rule set may hold IP entries, but only the provider knows
+            // whether it does, and asking it means doing the lookup this
+            // predicate exists to avoid. Resolving on the chance that some set
+            // contains IP rules would put a system DNS query on every request
+            // of every domain-only config, so it stays off: rule-set entries are
+            // compared against an address the client actually supplied.
+            RuleType::RuleSet | RuleType::Geosite => false,
+            // `not` inverts its child, so the child still drives the need.
+            RuleType::And | RuleType::Or | RuleType::Not => {
+                self.children.iter().any(Self::wants_dst_ip)
+            }
+            _ => false,
+        }
+    }
+
+    fn matches_port(&self, port: u16) -> bool {
+        self.port_ranges
+            .iter()
+            .any(|(start, end)| port >= *start && port <= *end)
+    }
+
+    /// A rule with every optional field empty, for tests that only care about
+    /// the type and the pattern.
+    #[cfg(test)]
+    fn blank() -> Self {
+        Self {
+            rule_type: RuleType::Match,
+            pattern: String::new(),
+            outbound: String::new(),
+            regex: None,
+            ipnet: None,
+            port_ranges: Vec::new(),
+            network: None,
+            no_resolve: false,
+            children: Vec::new(),
+            hits: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The inputs a compiled rule is evaluated against.
+struct MatchContext<'a> {
+    domain: Option<&'a str>,
+    dst_ip: Option<IpAddr>,
+    /// Addresses the destination domain resolved to. Empty when the request
+    /// carried a literal address or when no rule needed a lookup.
+    resolved: &'a [IpAddr],
+    dst_port: Option<u16>,
+    src_ip: Option<IpAddr>,
+    src_port: Option<u16>,
+    network: Network,
+    process_name: Option<&'a str>,
+    process_path: Option<&'a str>,
+}
+
+impl MatchContext<'_> {
+    /// The subset of this context that a rule set matches against.
+    fn rule_input(&self) -> crate::engine::rule_provider::RuleMatchInput<'_> {
+        crate::engine::rule_provider::RuleMatchInput {
+            domain: self.domain,
+            dst_ip: self.dst_ip,
+            src_ip: self.src_ip,
+            process_name: self.process_name,
+        }
+    }
+
+    /// Addresses an `ip-cidr` / `geoip` rule may compare against.
+    ///
+    /// A literal destination address always counts; an address the router had
+    /// to resolve only counts when the rule did not ask for `no-resolve`.
+    fn dst_candidates(&self, no_resolve: bool) -> impl Iterator<Item = IpAddr> + '_ {
+        let resolved: &[IpAddr] = if no_resolve { &[] } else { self.resolved };
+        self.dst_ip.into_iter().chain(resolved.iter().copied())
+    }
 }
 
 impl Router {
@@ -137,7 +305,7 @@ impl Router {
             .collect();
         for provider_name in rules
             .iter()
-            .filter(|rule| rule.rule_type == RuleType::RuleSet)
+            .filter(|rule| matches!(rule.rule_type, RuleType::RuleSet | RuleType::Geosite))
             .map(|rule| rule.pattern.as_str())
         {
             if !configured_names.contains(provider_name) {
@@ -193,6 +361,23 @@ impl Router {
         Arc::clone(&self.rule_provider_manager)
     }
 
+    /// Decide which outbound serves one connection attempt.
+    pub fn route(&self, request: &RouteRequest<'_>) -> RouteDecision {
+        let started = Instant::now();
+        let (outbound, rule_index, rule_type) = self.decide(request);
+        RouteDecision {
+            outbound,
+            rule_index,
+            rule_type,
+            elapsed: started.elapsed(),
+        }
+    }
+
+    /// Decide the outbound tag for one connection attempt.
+    ///
+    /// Convenience wrapper over [`Router::route`] for callers that only know a
+    /// destination. It carries no source address, no transport and no process
+    /// information, so rules that need those cannot match.
     pub fn match_outbound(
         &self,
         domain: Option<&str>,
@@ -200,6 +385,29 @@ impl Router {
         port: Option<u16>,
         process_name: Option<&str>,
     ) -> String {
+        self.route(&RouteRequest {
+            domain,
+            dst_ip: ip,
+            dst_port: port,
+            process_name,
+            ..RouteRequest::default()
+        })
+        .outbound
+    }
+
+    /// Hit counts per configured rule, in configuration order.
+    ///
+    /// Read-only view for diagnostics: it answers "is this rule ever reached,
+    /// and which rules carry the traffic" without re-reading the config.
+    pub fn rule_hits(&self) -> Vec<u64> {
+        self.rules
+            .read()
+            .iter()
+            .map(|rule| rule.hits.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    fn decide(&self, request: &RouteRequest<'_>) -> (String, Option<usize>, Option<RuleType>) {
         let runtime_mode = get_runtime_proxy_mode();
         let effective_mode = {
             let config = self.config.read();
@@ -220,89 +428,96 @@ impl Router {
         };
 
         tracing::debug!(
-            "Routing request: domain={:?}, ip={:?}, port={:?}, mode={:?}",
-            domain,
-            ip,
-            port,
+            "Routing request: domain={:?}, dst={:?}:{:?}, src={:?}:{:?}, network={:?}, mode={:?}",
+            request.domain,
+            request.dst_ip,
+            request.dst_port,
+            request.src_ip,
+            request.src_port,
+            request.network,
             effective_mode
         );
 
         if matches!(effective_mode, Mode::Global) {
             if let Some(outbound) = global_outbound {
                 tracing::info!("Global mode: routing to proxy outbound '{}'", outbound);
-                return outbound;
+                return (outbound, None, None);
             }
-            return direct_outbound;
+            return (direct_outbound, None, None);
         }
 
         if matches!(effective_mode, Mode::Direct) {
             tracing::debug!("Direct mode: routing to '{}'", direct_outbound);
-            return direct_outbound;
+            return (direct_outbound, None, None);
         }
 
         let rules = self.rules.read();
 
-        // DNS is resolved lazily and cached for the duration of this request.
-        // Pure domain-rule configs (the common case, e.g. clash-rules sets)
-        // never touch the resolver; only the no-rule China shortcut and
-        // geoip/ip-cidr rules that need an IP trigger a lookup — at most once
-        // per request, reused across every IP-based rule.
-        let mut resolved_ips: Option<Vec<IpAddr>> = None;
+        // Resolve the destination domain at most once per request, and only
+        // when a rule that is allowed to see a resolved address could use one.
+        // A literal address needs no lookup, and a config whose IP rules are
+        // all `no-resolve` never triggers one.
+        let resolved: Vec<IpAddr> = match request.dst_ip {
+            Some(address) => vec![address],
+            None => {
+                let resolution_is_useful =
+                    rules.is_empty() || rules.iter().any(CompiledRule::wants_dst_ip);
+                if resolution_is_useful {
+                    Self::resolve_destination_ips(request.domain, None)
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+
+        let context = MatchContext {
+            domain: request.domain,
+            dst_ip: request.dst_ip,
+            resolved: &resolved,
+            dst_port: request.dst_port,
+            src_ip: request.src_ip,
+            src_port: request.src_port,
+            network: request.network,
+            process_name: request.process_name,
+            process_path: request.process_path,
+        };
 
         // The mainland-China auto-direct shortcut is a fallback for configs
-        // with no rules at all. Once rules are configured (e.g. the clash-rules
-        // sets), rules are evaluated strictly in order — Clash semantics — so
-        // an explicit rule always wins over the shortcut.
+        // with no rules at all. Once rules are configured they are evaluated
+        // strictly in order and the first match wins, so an explicit rule always
+        // wins over the shortcut.
         if rules.is_empty() {
-            if Self::is_mainland_china_domain(domain) {
+            if Self::is_mainland_china_domain(request.domain) {
                 tracing::info!(
                     "Mainland China domain identified: domain={:?} -> '{}'",
-                    domain,
+                    request.domain,
                     direct_outbound
                 );
-                return direct_outbound;
+                return (direct_outbound, None, None);
             }
 
-            if resolved_ips.is_none() {
-                resolved_ips = Some(Self::resolve_destination_ips(domain, ip));
-            }
-            if self.is_mainland_china_ip(resolved_ips.as_deref().unwrap_or(&[])) {
+            if self.is_mainland_china_ip(&resolved) {
                 tracing::info!(
                     "Mainland China destination identified: domain={:?}, ips={:?} -> '{}'",
-                    domain,
-                    resolved_ips,
+                    request.domain,
+                    resolved,
                     direct_outbound
                 );
-                return direct_outbound;
+                return (direct_outbound, None, None);
             }
         }
 
-        for rule in rules.iter() {
-            let mut matched = self.matches_rule(rule, domain, ip, port, process_name);
-            if !matched
-                && ip.is_none()
-                && matches!(rule.rule_type, RuleType::Geoip | RuleType::IpCidr)
-            {
-                if resolved_ips.is_none() {
-                    resolved_ips = Some(Self::resolve_destination_ips(domain, ip));
-                }
-                if let Some(resolved_ips) = resolved_ips.as_deref() {
-                    for resolved_ip in resolved_ips {
-                        if self.matches_rule(rule, domain, Some(*resolved_ip), port, process_name) {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if matched {
+        for (index, rule) in rules.iter().enumerate() {
+            if self.matches_rule_with(rule, &context) {
+                rule.hits.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(
-                    "Rule matched: {:?} '{}' -> '{}'",
+                    "Rule matched: #{} {:?} '{}' -> '{}'",
+                    index,
                     rule.rule_type,
                     rule.pattern,
                     rule.outbound
                 );
-                return rule.outbound.clone();
+                return (rule.outbound.clone(), Some(index), Some(rule.rule_type));
             }
         }
 
@@ -310,7 +525,7 @@ impl Router {
             "No rule matched, using default outbound: {}",
             default_outbound
         );
-        default_outbound
+        (default_outbound, None, None)
     }
 
     fn is_mainland_china_domain(domain: Option<&str>) -> bool {
@@ -326,9 +541,7 @@ impl Router {
 
     fn is_mainland_china_ip(&self, addresses: &[IpAddr]) -> bool {
         for address in addresses {
-            if is_local_or_private_ip(*address)
-                || self.geoip_manager.matches_country("CN", *address)
-            {
+            if is_non_routable(*address) || self.geoip_manager.matches_country("CN", *address) {
                 return true;
             }
         }
@@ -367,21 +580,13 @@ impl Router {
             cache.pop(&normalized);
         }
 
-        // `resolve_host` runs the system resolver on a dedicated thread so the
-        // caller is not stalled for the resolver's full hang time; resolution
-        // errors degrade to domain-rule-only matching.
+        // The engine's own DNS answers first, then the system resolver, with the
+        // lookup bounded by `DNS_LOOKUP_TIMEOUT` either way (see
+        // `socket::resolve_host_all`). Resolution errors degrade to
+        // domain-rule-only matching.
         let addresses =
-            match crate::common::socket::resolve_host(&normalized, 0, DNS_LOOKUP_TIMEOUT) {
-                Ok(resolved) => {
-                    let mut addresses = Vec::new();
-                    for socket_address in resolved {
-                        let address = socket_address.ip();
-                        if !addresses.contains(&address) {
-                            addresses.push(address);
-                        }
-                    }
-                    addresses
-                }
+            match crate::common::socket::resolve_host_all(&normalized, DNS_LOOKUP_TIMEOUT) {
+                Ok(resolved) => resolved,
                 Err(error) => {
                     tracing::debug!("Failed to resolve '{}' for routing: {}", normalized, error);
                     Vec::new()
@@ -508,56 +713,149 @@ impl Router {
         }
     }
 
+    /// Compile the configured rules into the form the hot path matches against.
+    ///
+    /// Everything decidable from the payload alone is decided here — regexes,
+    /// CIDRs, port ranges, transports — and every nesting level is walked, so an
+    /// unusable rule fails at load time instead of on the first connection that
+    /// happens to reach it.
     fn compile_rules(rules: &[RuleConfig]) -> Result<Vec<CompiledRule>> {
         let mut compiled = Vec::with_capacity(rules.len());
-
         for rule in rules {
-            let regex = if rule.rule_type == RuleType::DomainRegex {
-                Some(
-                    Regex::new(&rule.payload)
-                        .map_err(|e| Error::config(format!("Invalid regex pattern: {}", e)))?,
-                )
-            } else {
-                None
-            };
+            compiled.push(Self::compile_rule(rule, 0)?);
+        }
+        Ok(compiled)
+    }
 
-            // Pre-parse CIDRs and port ranges so hot-path matching never
-            // re-parses strings. Invalid payloads fail loudly at compile time.
-            let ipnet = if matches!(rule.rule_type, RuleType::IpCidr | RuleType::SrcIpCidr) {
-                Some(rule.payload.parse::<IpNet>().map_err(|e| {
+    /// Decode and compile one level of nested rules.
+    ///
+    /// Children arrive as untyped values because `RuleConfig` cannot hold a
+    /// `Vec<RuleConfig>` — see the field's own note. Decoding each level on the
+    /// way in keeps nesting depth unbounded.
+    fn compile_nested_rules(rules: &[nextjson::Value], depth: usize) -> Result<Vec<CompiledRule>> {
+        if depth > MAX_RULE_DEPTH {
+            return Err(Error::config(format!(
+                "Routing rules nest deeper than {MAX_RULE_DEPTH} levels"
+            )));
+        }
+
+        let mut compiled = Vec::with_capacity(rules.len());
+        for value in rules {
+            let rule: RuleConfig = nextjson::from_value(value.clone())
+                .map_err(|error| Error::config(format!("Invalid nested routing rule: {error}")))?;
+            compiled.push(Self::compile_rule(&rule, depth)?);
+        }
+        Ok(compiled)
+    }
+
+    fn compile_rule(rule: &RuleConfig, depth: usize) -> Result<CompiledRule> {
+        let rule_type = rule.rule_type;
+        let outbound = rule.outbound.as_str();
+
+        let children = if matches!(rule_type, RuleType::And | RuleType::Or | RuleType::Not) {
+            let children = Self::compile_nested_rules(&rule.rules, depth + 1)?;
+            match rule_type {
+                // A combinator with nothing to combine either always matches
+                // or never matches depending on the operator. Both are config
+                // mistakes, so refuse instead of guessing which one was meant.
+                RuleType::And | RuleType::Or if children.is_empty() => {
+                    return Err(Error::config(format!(
+                        "{rule_type:?} rule for '{outbound}' has no child rules"
+                    )));
+                }
+                RuleType::Not if children.len() != 1 => {
+                    return Err(Error::config(format!(
+                        "not rule for '{outbound}' takes exactly one child rule, got {}",
+                        children.len()
+                    )));
+                }
+                _ => {}
+            }
+            children
+        } else {
+            Vec::new()
+        };
+
+        // `match` is the catch-all and the combinators carry their condition in
+        // their children, so an empty payload is only wrong anywhere else.
+        if !matches!(
+            rule_type,
+            RuleType::And | RuleType::Or | RuleType::Not | RuleType::Match
+        ) && rule.payload.trim().is_empty()
+        {
+            return Err(Error::config(format!(
+                "{rule_type:?} rule for '{outbound}' has an empty payload"
+            )));
+        }
+
+        let regex = if rule_type == RuleType::DomainRegex {
+            // Case-insensitive, because a DNS name is (RFC 1035 §2.3.3) and
+            // every sibling rule type here already is: their patterns are
+            // lowercased at compile time and their comparisons ignore case. A
+            // case-sensitive regex was the one hole in that, and it is the kind
+            // that fails silently — `domain-regex:"^ad\."` would miss
+            // `Host: AD.example.com`, and the rule would look like it worked.
+            //
+            // A pattern that genuinely needs case sensitivity can still ask for
+            // it with an inline `(?-i)`.
+            Some(
+                RegexBuilder::new(&rule.payload)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|e| Error::config(format!("Invalid regex pattern: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
+        // Pre-parse CIDRs and port ranges so hot-path matching never re-parses
+        // strings, and so an unusable payload is reported at load time.
+        let ipnet =
+            if matches!(rule_type, RuleType::IpCidr | RuleType::SrcIpCidr) {
+                Some(rule.payload.trim().parse::<IpNet>().map_err(|e| {
                     Error::config(format!("Invalid CIDR '{}': {}", rule.payload, e))
                 })?)
             } else {
                 None
             };
-            let port_ranges = if matches!(rule.rule_type, RuleType::SrcPort | RuleType::DstPort) {
-                Self::compile_port_ranges(&rule.payload)?
-            } else {
-                Vec::new()
-            };
+        let port_ranges = if matches!(rule_type, RuleType::SrcPort | RuleType::DstPort) {
+            Self::compile_port_ranges(&rule.payload)?
+        } else {
+            Vec::new()
+        };
+        let network = if rule_type == RuleType::Network {
+            Some(Network::parse(&rule.payload)?)
+        } else {
+            None
+        };
 
-            // Lowercase domain/process patterns once; matching then uses
-            // case-insensitive comparisons with zero allocations.
-            let pattern = if matches!(
-                rule.rule_type,
-                RuleType::Domain | RuleType::DomainSuffix | RuleType::DomainKeyword
-            ) {
-                rule.payload.to_ascii_lowercase()
-            } else {
-                rule.payload.clone()
-            };
+        // Lowercase domain and process patterns once; matching then compares
+        // case-insensitively with zero allocations.
+        let pattern = if matches!(
+            rule_type,
+            RuleType::Domain
+                | RuleType::DomainSuffix
+                | RuleType::DomainKeyword
+                | RuleType::ProcessName
+                | RuleType::ProcessPath
+        ) {
+            rule.payload.trim().to_ascii_lowercase()
+        } else {
+            rule.payload.clone()
+        };
 
-            compiled.push(CompiledRule {
-                rule_type: rule.rule_type,
-                pattern,
-                outbound: rule.outbound.clone(),
-                regex,
-                ipnet,
-                port_ranges,
-            });
-        }
-
-        Ok(compiled)
+        Ok(CompiledRule {
+            rule_type,
+            pattern,
+            outbound: rule.outbound.clone(),
+            regex,
+            ipnet,
+            port_ranges,
+            network,
+            no_resolve: rule.no_resolve,
+            children,
+            hits: AtomicU64::new(0),
+        })
     }
 
     /// Parse a comma-separated port list / range list into inclusive ranges.
@@ -591,6 +889,76 @@ impl Router {
         Ok(ranges)
     }
 
+    fn matches_rule_with(&self, rule: &CompiledRule, context: &MatchContext<'_>) -> bool {
+        match rule.rule_type {
+            RuleType::Domain => context
+                .domain
+                .is_some_and(|d| d.trim_end_matches('.').eq_ignore_ascii_case(&rule.pattern)),
+            RuleType::DomainSuffix => context
+                .domain
+                .is_some_and(|d| Self::matches_domain_suffix(d, &rule.pattern)),
+            RuleType::DomainKeyword => context
+                .domain
+                .is_some_and(|d| contains_ignore_case(d, &rule.pattern)),
+            RuleType::DomainRegex => match (context.domain, rule.regex.as_ref()) {
+                (Some(domain), Some(regex)) => regex.is_match(domain),
+                _ => false,
+            },
+            RuleType::IpCidr => match rule.ipnet {
+                Some(network) => context
+                    .dst_candidates(rule.no_resolve)
+                    .any(|address| network.contains(&address)),
+                None => false,
+            },
+            RuleType::Geoip => context
+                .dst_candidates(rule.no_resolve)
+                .any(|address| self.geoip_manager.matches_country(&rule.pattern, address)),
+            // The source address is the peer address of the inbound
+            // connection; it is never something the router resolved.
+            RuleType::SrcIpCidr => match (rule.ipnet, context.src_ip) {
+                (Some(network), Some(address)) => network.contains(&address),
+                _ => false,
+            },
+            RuleType::DstPort => context.dst_port.is_some_and(|port| rule.matches_port(port)),
+            RuleType::SrcPort => context.src_port.is_some_and(|port| rule.matches_port(port)),
+            RuleType::ProcessName => context
+                .process_name
+                .is_some_and(|process| Self::matches_process_name(&rule.pattern, process)),
+            RuleType::ProcessPath => context
+                .process_path
+                .is_some_and(|path| Self::matches_process_path(&rule.pattern, path)),
+            RuleType::Network => rule.network == Some(context.network),
+            RuleType::RuleSet | RuleType::Geosite => {
+                // The provider sees the addresses the client actually supplied.
+                // Handing it a resolved one would make the outcome depend on
+                // whether some unrelated rule elsewhere in the list happened to
+                // request a lookup.
+                self.rule_provider_manager
+                    .matches(&rule.pattern, &context.rule_input())
+            }
+            RuleType::And => rule
+                .children
+                .iter()
+                .all(|child| self.matches_rule_with(child, context)),
+            RuleType::Or => rule
+                .children
+                .iter()
+                .any(|child| self.matches_rule_with(child, context)),
+            // `not` negates the match of its single child.
+            RuleType::Not => !rule
+                .children
+                .iter()
+                .any(|child| self.matches_rule_with(child, context)),
+            RuleType::Match => true,
+        }
+    }
+
+    /// Positional adapter for the table and property tests.
+    ///
+    /// Production callers go through [`Router::route`], which builds a full
+    /// [`MatchContext`]. This keeps those tests readable without giving the hot
+    /// path a second signature it does not need.
+    #[cfg(test)]
     fn matches_rule(
         &self,
         rule: &CompiledRule,
@@ -599,61 +967,20 @@ impl Router {
         port: Option<u16>,
         process_name: Option<&str>,
     ) -> bool {
-        match rule.rule_type {
-            RuleType::Domain => domain.is_some_and(|d| d.eq_ignore_ascii_case(&rule.pattern)),
-            RuleType::DomainSuffix => {
-                domain.is_some_and(|d| Self::matches_domain_suffix(d, &rule.pattern))
-            }
-            RuleType::DomainKeyword => {
-                domain.is_some_and(|d| contains_ignore_case(d, &rule.pattern))
-            }
-            RuleType::DomainRegex => {
-                if let Some(domain) = domain {
-                    if let Some(regex) = &rule.regex {
-                        regex.is_match(domain)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            RuleType::IpCidr | RuleType::SrcIpCidr => {
-                if let Some(ip) = ip {
-                    rule.ipnet.is_some_and(|network| network.contains(&ip))
-                } else {
-                    false
-                }
-            }
-            RuleType::Geoip => {
-                if let Some(ip) = ip {
-                    self.geoip_manager.matches_country(&rule.pattern, ip)
-                } else {
-                    false
-                }
-            }
-            RuleType::SrcPort | RuleType::DstPort => {
-                if let Some(port) = port {
-                    rule.port_ranges
-                        .iter()
-                        .any(|(start, end)| port >= *start && port <= *end)
-                } else {
-                    false
-                }
-            }
-            RuleType::ProcessName => {
-                if let Some(process) = process_name {
-                    Self::matches_process_name(&rule.pattern, process)
-                } else {
-                    false
-                }
-            }
-            RuleType::RuleSet => {
-                self.rule_provider_manager
-                    .matches(&rule.pattern, domain, ip, process_name)
-            }
-            RuleType::Match => true,
-        }
+        self.matches_rule_with(
+            rule,
+            &MatchContext {
+                domain,
+                dst_ip: ip,
+                resolved: &[],
+                dst_port: port,
+                src_ip: None,
+                src_port: None,
+                network: Network::Tcp,
+                process_name,
+                process_path: None,
+            },
+        )
     }
 
     /// Match a domain against a lowercased suffix pattern (`example.com`),
@@ -671,39 +998,50 @@ impl Router {
         domain.as_bytes()[start - 1] == b'.' && domain[start..].eq_ignore_ascii_case(pattern)
     }
 
-    /// Match a process name against a lowercased pattern, checking the full
-    /// path, the basename and the `.exe`-stripped variants.
+    /// Match a process name against a lowercased pattern.
+    ///
+    /// Nothing here allocates, and nothing lowercases the process name. The
+    /// pattern was lowercased when the rule was compiled, so every comparison is
+    /// an ASCII-case-insensitive one against it — the same answer
+    /// `process_name.to_ascii_lowercase() == pattern` gives, without building
+    /// that string once per process rule per request.
     fn matches_process_name(pattern: &str, process_name: &str) -> bool {
-        let process_lower = process_name.to_ascii_lowercase();
-
-        if process_lower == pattern {
+        if process_name.eq_ignore_ascii_case(pattern) {
             return true;
         }
 
-        if let Some(name) = process_name.rsplit(['/', '\\']).next() {
-            if name.eq_ignore_ascii_case(pattern) {
+        // A rule means the executable, not the path it was launched from.
+        let basename = basename_of(process_name);
+        if basename.eq_ignore_ascii_case(pattern) {
+            return true;
+        }
+
+        // A rule may name the Windows executable with or without its extension,
+        // and either side may carry it.
+        if let Some(without_ext) = strip_suffix_ignore_case(pattern, ".exe") {
+            if process_name.eq_ignore_ascii_case(without_ext)
+                || basename.eq_ignore_ascii_case(without_ext)
+            {
                 return true;
             }
         }
-
-        if let Some(name_without_ext) = pattern.strip_suffix(".exe") {
-            if process_lower == name_without_ext {
-                return true;
-            }
-            if let Some(proc_name) = process_name.rsplit(['/', '\\']).next() {
-                if proc_name.eq_ignore_ascii_case(name_without_ext) {
-                    return true;
-                }
-            }
-        }
-
-        if let Some(proc_without_ext) = process_lower.strip_suffix(".exe") {
-            if proc_without_ext == pattern {
+        if let Some(without_ext) = strip_suffix_ignore_case(process_name, ".exe") {
+            if without_ext.eq_ignore_ascii_case(pattern) {
                 return true;
             }
         }
 
         false
+    }
+
+    /// Match a process path against a lowercased pattern.
+    ///
+    /// A `process-path` rule pins the executable itself rather than its file
+    /// name, so the comparison is an exact, ASCII-case-insensitive match on the
+    /// whole path — the same meaning sing-box gives `process_path`.
+    fn matches_process_path(pattern: &str, process_path: &str) -> bool {
+        let path = process_path.trim();
+        !path.is_empty() && !pattern.is_empty() && path.eq_ignore_ascii_case(pattern)
     }
 
     #[cfg(test)]
@@ -750,6 +1088,28 @@ fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     }
     let limit = haystack.len() - needle.len();
     (0..=limit).any(|i| haystack[i..i + needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// The part of a path after its last separator.
+///
+/// A path with no separator is its own basename, which is what a bare process
+/// name is.
+fn basename_of(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// `text` without a trailing `suffix`, compared without case.
+///
+/// `None` when it does not end that way — and the byte check is also what keeps
+/// the slice on a character boundary, since a non-ASCII tail cannot compare
+/// equal to an ASCII suffix anyway.
+fn strip_suffix_ignore_case<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = text.len().checked_sub(suffix.len())?;
+    if text.is_char_boundary(cut) && text[cut..].eq_ignore_ascii_case(suffix) {
+        Some(&text[..cut])
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -809,6 +1169,7 @@ mod tests {
                 payload: String::new(),
                 outbound: "proxy".to_string(),
                 process_name: None,
+                ..RuleConfig::default()
             }],
             ..Config::default()
         };
@@ -838,7 +1199,7 @@ mod tests {
     #[test]
     fn mainland_cn_domain_follows_rule_when_configured() {
         // With rules configured, the explicit MATCH rule wins over the
-        // mainland-China auto-direct shortcut (Clash rule-order semantics).
+        // mainland-China auto-direct shortcut: first match in order.
         let _mode_guard = MODE_LOCK.lock();
         set_runtime_proxy_mode(proxy_mode::RULE);
         let router = mainland_routing_test_router();
@@ -961,6 +1322,7 @@ mod tests {
                 payload: String::new(),
                 outbound: "DIRECT".to_string(),
                 process_name: None,
+                ..RuleConfig::default()
             }],
             ..Config::default()
         };
@@ -1120,6 +1482,121 @@ mod tests {
         assert!(Router::matches_process_name("chrome.exe", "chrome"));
         assert!(Router::matches_process_name("chrome", "chrome.exe"));
     }
+
+    /// The allocation-free comparison must answer exactly what lowering the
+    /// process name answered.
+    ///
+    /// A differential test against the implementation it replaced, because "the
+    /// same answer without the allocation" is a claim about *all* inputs and
+    /// hand-picked examples only check the ones someone thought of. The pairs
+    /// below include the non-ASCII ones, where `to_ascii_lowercase` leaves the
+    /// bytes alone and a comparison that folds more than ASCII would quietly
+    /// diverge.
+    #[test]
+    fn process_name_matching_agrees_with_lowercasing() {
+        const NAMES: &[&str] = &[
+            "",
+            "chrome",
+            "Chrome",
+            "CHROME",
+            "chrome.exe",
+            "CHROME.EXE",
+            "Chrome.Exe",
+            "/usr/bin/chrome",
+            "/USR/BIN/Chrome",
+            "C:\\Program Files\\Chrome.EXE",
+            "C:\\Program Files\\chrome",
+            "chrome.pif",
+            "café",
+            "CAFÉ",
+            "CAFÉ.EXE",
+            "a/b/c",
+            "///",
+        ];
+
+        // The rule the old body implemented, written out verbatim.
+        fn by_lowercasing(pattern: &str, name: &str) -> bool {
+            let process_lower = name.to_ascii_lowercase();
+            if process_lower == pattern {
+                return true;
+            }
+            if let Some(base) = name.rsplit(['/', '\\']).next() {
+                if base.eq_ignore_ascii_case(pattern) {
+                    return true;
+                }
+            }
+            if let Some(without_ext) = pattern.strip_suffix(".exe") {
+                if process_lower == without_ext {
+                    return true;
+                }
+                if let Some(base) = name.rsplit(['/', '\\']).next() {
+                    if base.eq_ignore_ascii_case(without_ext) {
+                        return true;
+                    }
+                }
+            }
+            if let Some(without_ext) = process_lower.strip_suffix(".exe") {
+                if without_ext == pattern {
+                    return true;
+                }
+            }
+            false
+        }
+
+        for raw_pattern in NAMES {
+            // Rules are lowercased when they are compiled, so that is the
+            // pattern the matcher actually receives.
+            let pattern = raw_pattern.to_ascii_lowercase();
+            for name in NAMES {
+                assert_eq!(
+                    Router::matches_process_name(&pattern, name),
+                    by_lowercasing(&pattern, name),
+                    "pattern {raw_pattern:?} (as {pattern:?}) against {name:?}"
+                );
+            }
+        }
+    }
+
+    /// `domain-regex` is case-insensitive, like every other domain rule.
+    ///
+    /// A DNS name is case-insensitive (RFC 1035 §2.3.3), so a rule that matched
+    /// `ad.example.com` but not `AD.example.com` was the one kind of domain rule
+    /// that silently does nothing when the client spells the same name
+    /// differently.
+    #[test]
+    fn domain_regex_matches_regardless_of_case() {
+        fn compile(payload: &str) -> CompiledRule {
+            let config = Config {
+                rules: vec![RuleConfig {
+                    rule_type: RuleType::DomainRegex,
+                    payload: payload.to_string(),
+                    outbound: "proxy".to_string(),
+                    process_name: None,
+                    ..RuleConfig::default()
+                }],
+                ..Config::default()
+            };
+            Router::compile_rules(&config.rules)
+                .expect("a valid regex rule")
+                .into_iter()
+                .next()
+                .expect("one compiled rule")
+        }
+
+        let rule = compile(r"^ad\.");
+        let regex = rule.regex.as_ref().expect("a compiled regex");
+        assert!(regex.is_match("ad.example.com"));
+        assert!(regex.is_match("AD.example.com"));
+        assert!(regex.is_match("Ad.Example.COM"));
+        // The pattern still decides what matches; only its case is relaxed.
+        assert!(!regex.is_match("ads.example.com"));
+
+        // A pattern that genuinely needs case sensitivity can ask for it.
+        let strict = compile(r"(?-i)^AD\.");
+        let strict = strict.regex.as_ref().expect("a compiled regex");
+        assert!(strict.is_match("AD.example.com"));
+        assert!(!strict.is_match("ad.example.com"));
+    }
 }
 
 #[cfg(test)]
@@ -1173,6 +1650,7 @@ mod property_tests {
                 regex: None,
                 ipnet: None,
                 port_ranges: Vec::new(),
+                ..CompiledRule::blank()
             };
 
             let router = Router {
@@ -1220,6 +1698,7 @@ mod property_tests {
                 regex: None,
                 ipnet: None,
                 port_ranges: Vec::new(),
+                ..CompiledRule::blank()
             };
 
             let router = Router {
@@ -1260,6 +1739,7 @@ mod property_tests {
                 regex: None,
                 ipnet: None,
                 port_ranges: Vec::new(),
+                ..CompiledRule::blank()
             };
 
             let router = Router {
@@ -1361,6 +1841,7 @@ mod property_tests {
                 regex: None,
                 ipnet: None,
                 port_ranges: Vec::new(),
+                ..CompiledRule::blank()
             };
 
             let router = Router {
@@ -1404,18 +1885,21 @@ mod property_tests {
                     payload: domain.clone(),
                     outbound: "first".to_string(),
                     process_name: None,
+                    ..RuleConfig::default()
                 },
                 RuleConfig {
                     rule_type: RuleType::DomainSuffix,
                     payload: domain.split('.').next_back().unwrap_or("com").to_string(),
                     outbound: "second".to_string(),
                     process_name: None,
+                    ..RuleConfig::default()
                 },
                 RuleConfig {
                     rule_type: RuleType::Match,
                     payload: String::new(),
                     outbound: "fallback".to_string(),
                     process_name: None,
+                    ..RuleConfig::default()
                 },
             ];
 

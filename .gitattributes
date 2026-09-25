@@ -1,0 +1,7 @@
+# Test fixtures are byte-exact inputs. A checkout must never rewrite their line
+# endings: `core.autocrlf = true` turns an LF inside a `pss_msg.bin` into CRLF,
+# which silently invalidates the signature made over it, and the result looks
+# like broken cryptography rather than a git setting — the fixture was fine, its
+# working-tree copy was not.
+src/protocol/tls13/testdata/** -text
+*.der -text

@@ -550,6 +550,12 @@ mod tests {
     /// RSA-PSS signatures produced by OpenSSL over fixed messages must verify
     /// with the certificate's SPKI — an independent check of the SPKI parser
     /// and the PSS dispatch (no self-signed-by-our-own-code vector).
+    ///
+    /// The messages are byte-exact inputs, and `pss_msg.bin`/`pss_msg384.bin`
+    /// are pinned as binary in `.gitattributes` for a reason: with
+    /// `core.autocrlf = true` and no attribute, git rewrites the LF inside them
+    /// to CRLF on checkout, the signature no longer covers the bytes on disk,
+    /// and the failure reads like broken cryptography. It is the checkout.
     #[test]
     fn rsa_pss_vectors_from_openssl_verify() {
         let cert = courierust::courierust_tls::x509::parse_certificate(include_bytes!(

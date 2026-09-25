@@ -45,8 +45,8 @@ use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::engine::tls::yaml_value_to_string;
 use crate::protocol::quic::{
-    ClientConfig as QuicClientConfig, ClientConnection, QuicClient, QuicRecvStream, QuicSendStream,
-    Salamander,
+    ClientConfig as QuicClientConfig, ClientConnection, PacketObfs, QuicClient, QuicRecvStream,
+    QuicSendStream, QuicStreamPair, Salamander,
 };
 use bytes::Buf;
 use parking_lot::{Mutex, RwLock};
@@ -63,8 +63,7 @@ const HY2_TCP_REQUEST_ID: u64 = 0x401;
 const H3_FRAME_HEADERS: u64 = 0x01;
 const H3_CONTROL_STREAM: u64 = 0x00;
 const H3_SETTINGS_FRAME: u64 = 0x04;
-/// Max UDP relay payload per QUIC datagram (conservative; the transport caps
-/// a datagram at ~1200 bytes including headers).
+/// Max UDP relay payload per QUIC datagram
 const MAX_DATAGRAM_PAYLOAD: usize = 1100;
 /// Reassembly TTL for fragmented UDP packets.
 const FRAGMENT_TTL: Duration = Duration::from_secs(10);
@@ -853,7 +852,9 @@ impl Hysteria2Outbound {
         cfg.max_concurrent_bidi_streams = 100;
         cfg.max_concurrent_uni_streams = 100;
         if let ObfsType::Salamander(pwd) = &self.hy2_config.obfs {
-            cfg.obfs = Some(Arc::new(Salamander::new(pwd.as_bytes())));
+            cfg.obfs = Some(Arc::new(PacketObfs::Salamander(Salamander::new(
+                pwd.as_bytes(),
+            ))));
         }
         Ok(cfg)
     }
@@ -1043,49 +1044,6 @@ impl OutboundProxy for Hysteria2Outbound {
 
         let pair = QuicStreamPair::new(send, recv);
         relay_streams!(inbound, pair, connection)
-    }
-}
-
-/// Combines a QUIC stream's send/recv halves into one duplex `SyncStream` so
-/// the bidirectional relay can drive both directions concurrently (each half
-/// is an independent handle to the same QUIC stream).
-struct QuicStreamPair {
-    send: Mutex<QuicSendStream>,
-    recv: Mutex<QuicRecvStream>,
-}
-
-impl QuicStreamPair {
-    fn new(send: QuicSendStream, recv: QuicRecvStream) -> Self {
-        Self {
-            send: Mutex::new(send),
-            recv: Mutex::new(recv),
-        }
-    }
-}
-
-impl Read for QuicStreamPair {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.recv.lock().read(buf)
-    }
-}
-
-impl Write for QuicStreamPair {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.send.lock().write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.send.lock().flush()
-    }
-}
-
-impl crate::common::stream::SyncStream for QuicStreamPair {
-    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        if matches!(how, std::net::Shutdown::Write | std::net::Shutdown::Both) {
-            // Half-close: queue the QUIC stream FIN after buffered data.
-            self.send.lock().finish()?;
-        }
-        Ok(())
     }
 }
 

@@ -58,7 +58,10 @@ pub mod udp;
 
 // Re-exports for convenience
 pub use device::{DeviceConfig, DeviceStats, VirtualDevice};
-pub use dns::{DnsHandler, DnsQuery, FakeIpConfig, FakeIpPool};
+pub use dns::{
+    ClientDnsMode, ClientDnsSettings, DnsHandler, DnsQuery, DnsVerdict, FakeIpConfig, FakeIpPool,
+    HOSTS_TTL_SECS, REAL_ANSWER_TTL_SECS,
+};
 pub use error::{Result, SolidTcpError};
 pub use nat::{NatConfig, NatEntry, NatKey, NatState, NatTable};
 pub use packet::{

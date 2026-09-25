@@ -3,10 +3,10 @@
 规则引擎解决一个问题：**一条连接该走哪个出站**。它由三部分组成：
 
 1. **模式（mode）**：global / direct / rule，决定整体策略；
-2. **规则表（rules）**：从上到下第一条命中生效，和 Clash 的规则语义一致；
+2. **规则表（rules）**：从上到下第一条命中生效，先匹配先赢；
 3. **规则集与代理订阅（rule-provider / proxy-provider）**：把外部维护的规则和节点列表拉进来，不必全部手写。
 
-这篇文章按「先模式、再规则、再 provider、最后 clash-rules 对照」的顺序讲清楚，每个行为都对应真实代码，不含示例性虚构。
+这篇文章按「先模式、再规则、再 provider、最后第三方规则集对照」的顺序讲清楚，每个行为都对应真实代码，不含示例性虚构。
 
 ---
 
@@ -34,7 +34,7 @@
 - `direct`：第一个 `direct` 类型出站，否则字符串 `DIRECT`；
 - `global`：如上（代理组 → 非直连非拒绝出站）。
 
-> 一个容易踩的坑：`rule` 模式下，如果**规则表为空**，引擎会启用「大陆自动直连」兜底（见第 3 节）。一旦你配置了任何规则，就严格按顺序匹配，不再有内置捷径——这是刻意对齐 Clash 语义的行为。
+> 一个容易踩的坑：`rule` 模式下，如果**规则表为空**，引擎会启用「大陆自动直连」兜底（见第 3 节）。一旦你配置了任何规则，就严格按顺序匹配，不再有内置捷径——兜底只在「一条规则都没有」这一种情况下存在，这是刻意的设计。
 
 ---
 
@@ -49,7 +49,7 @@
 | `domain` | 完整域名 | 大小写不敏感**精确**相等 |
 | `domain-suffix` | 域名后缀 | 匹配**自身 + 所有子域**，且带点边界：`example.com` 命中 `example.com` 和 `a.example.com`，但**不**命中 `notexample.com` |
 | `domain-keyword` | 域名子串 | 域名包含该子串即命中（大小写不敏感） |
-| `domain-regex` | 正则 | 对整个域名跑正则；编译期校验，非法正则直接报配置错误 |
+| `domain-regex` | 正则 | 对整个域名跑正则；**大小写不敏感**（DNS 名字本就不区分大小写，RFC 1035 §2.3.3）——需要区分时用内联 `(?-i)`。编译期校验，非法正则直接报配置错误 |
 | `geoip` | 国家/地区码，或定制库里的提供商标签 | 目标 IP 属于该国家/地区即命中（GeoIP 库）；大小写不敏感，`A-Z{2,16}` |
 | `ip-cidr` | 目标 IP 段 | 目标 IP 在 CIDR 内（支持 IPv4/IPv6） |
 | `src-ip-cidr` | 源 IP 段 | 连接发起方 IP 在 CIDR 内 |
@@ -73,15 +73,16 @@
 - 解析超时 **3 秒**（超时按「未命中」处理，继续走域名规则）；
 - 结果缓存 **300 秒**、容量 4096 条；
 - 解析失败的负缓存 **30 秒**，避免把坏域名反复打爆上游。
+- 解析走的是**当前 profile 的引擎 DNS**（`nameservers` / `nameserver-policy` / `default-nameserver`），只有引擎没有可用解析器时才退回系统解析器。规则看到的地址必须就是连接将要使用的地址：否则 `geoip` / `ip-cidr` 可能按一个答案判定、而拨号用的是另一个，两者恰好会在「profile 特意配了 DNS」时不一致。IPv4 与 IPv6 **都会**被问到——一条 IP 规则可能匹配到任一族的地址。
 
 ### 2.3 大陆自动直连兜底
 
 `rule` 模式下规则表为空时，以下两种情况直接走 `direct`：
 
 - 域名以 `.cn` 结尾（含裸 `cn`，大小写不敏感，忽略末尾点）；
-- 解析出的目标 IP 是内网/保留地址，或 GeoIP 判定为 CN。
+- 解析出的目标 IP **不可全球路由**，或 GeoIP 判定为 CN。「不可全球路由」用的是 DNS 反污染闸门那张 [IANA 特殊用途表](Configuration)（含多播、保留段、benchmark、`::ffff:0:0/96`、Teredo/6to4/ORCHID 等）——与 GEOIP 的 `LAN`/`PRIVATE` 伪国家码共用同一份判定，全仓库只有一张表。
 
-**只要规则表非空，这段兜底就被跳过**，一切由你的规则说了算。想复刻 Clash「国内直连」的效果，直接参考第 5 节把 `cncidr.txt` 等规则集挂进来即可，不必依赖兜底。
+**只要规则表非空，这段兜底就被跳过**，一切由你的规则说了算。想要「国内直连、其余走代理」的效果，参考第 5 节把 `cncidr` 等规则集挂进来即可，不必依赖兜底。
 
 ---
 
@@ -104,7 +105,7 @@ RPC / FFI 提供 `set_proxy_mode(mode)`，参数是整数：`0`=CONFIG、`1`=GLO
       "name": "proxy",
       "type": "http",
       "behavior": "domain",
-      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt",
+      "url": "https://cdn.jsdelivr.net/gh/example/rulesets@release/proxy.txt",
       "interval": 86400
     }
   ]
@@ -125,7 +126,7 @@ RPC / FFI 提供 `set_proxy_mode(mode)`，参数是整数：`0`=CONFIG、`1`=GLO
 
 | behavior | 内容格式 | 典型文件 |
 |---|---|---|
-| `domain` | `payload:` 列表或逐行纯域名；支持 `keyword:` 前缀、`regexp:`/`regex:` 前缀、`full:` 精确前缀、`+`/`.` 前缀；默认按**后缀**处理 | clash-rules 的 `proxy.txt`、`direct.txt`、`apple.txt`、`google.txt` 等 |
+| `domain` | `payload:` 列表或逐行纯域名；支持 `keyword:` 前缀、`regexp:`/`regex:` 前缀、`full:` 精确前缀、`+`/`.` 前缀；默认按**后缀**处理 | 常见的 `proxy.txt`、`direct.txt`、`apple.txt`、`google.txt` 等域名列表 |
 | `ip-cidr` | `payload:` 列表或逐行 CIDR | `telegramcidr.txt`、`cncidr.txt`、`lancidr.txt` |
 | `classical` | 完整的规则行：`DOMAIN,xxx`、`DOMAIN-SUFFIX,xxx`、`DOMAIN-KEYWORD,xxx`、`DOMAIN-REGEX,xxx`、`IP-CIDR,xxx`、`IP-CIDR6,xxx`、`SRC-IP-CIDR,xxx`、`PROCESS-NAME,xxx` | 混合规则文件 |
 
@@ -172,7 +173,7 @@ RPC / FFI 提供 `set_proxy_mode(mode)`，参数是整数：`0`=CONFIG、`1`=GLO
 加载出的节点会注册进**共享出站注册表**（按 tag），所以：
 
 - 代理组可以直接在 `outbounds` 里引用订阅节点的 tag；
-- 也可以更省事，用 `use` 把整个 provider 的节点全部展开进组（Clash 语义）：
+- 也可以更省事，用 `use` 把整个 provider 的节点全部展开进组：
 
 ```json
 {
@@ -194,15 +195,15 @@ RPC / FFI 提供 `set_proxy_mode(mode)`，参数是整数：`0`=CONFIG、`1`=GLO
 
 ---
 
-## 5. 对照 Loyalsoldier/clash-rules
+## 5. 对照第三方规则集
 
-[Loyalsoldier/clash-rules](https://github.com/Loyalsoldier/clash-rules) 的 `release` 分支提供现成规则文件，它们大多是 YAML 的 `payload:` 列表。Corduit 的 rule-provider 三种 behavior 正好一一对应：
+公开的规则集大多以「一行一条（可带 `payload:` 前缀）」的形式分发。Corduit 的 rule-provider 三种 behavior 正好一一对应：
 
-| clash-rules 文件 | 内容 | Corduit `behavior` |
-|---|---|---|
-| `proxy.txt` `direct.txt` `apple.txt` `google.txt` `gfw.txt` `greatfire.txt` 等 | 域名后缀/关键词/正则 | `domain` |
-| `telegramcidr.txt` `cncidr.txt` `lancidr.txt` `private.txt` | CIDR | `ip-cidr` |
-| 需要逐条指定类型的混合文件 | `DOMAIN,...` 等完整行 | `classical` |
+| 文件内容 | Corduit `behavior` |
+|---|---|
+| 域名后缀 / 关键词 / 正则（`proxy.txt`、`direct.txt`、`apple.txt`、`google.txt`、`gfw.txt` 等） | `domain` |
+| CIDR 列表（`telegramcidr.txt`、`cncidr.txt`、`lancidr.txt`、`private.txt` 等） | `ip-cidr` |
+| 逐行写全类型的混合文件（`DOMAIN,...`） | `classical` |
 
 **典型配置**（rules 顺序即优先级：直连 → 广告/私网 → 需要代理的 → 兜底）：
 
@@ -210,13 +211,13 @@ RPC / FFI 提供 `set_proxy_mode(mode)`，参数是整数：`0`=CONFIG、`1`=GLO
 {
   "rule_providers": [
     { "name": "direct", "type": "http", "behavior": "domain",
-      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt", "interval": 86400 },
+      "url": "https://cdn.jsdelivr.net/gh/example/rulesets@release/direct.txt", "interval": 86400 },
     { "name": "private", "type": "http", "behavior": "ip-cidr",
-      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt", "interval": 86400 },
+      "url": "https://cdn.jsdelivr.net/gh/example/rulesets@release/private.txt", "interval": 86400 },
     { "name": "cncidr", "type": "http", "behavior": "ip-cidr",
-      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt", "interval": 86400 },
+      "url": "https://cdn.jsdelivr.net/gh/example/rulesets@release/cncidr.txt", "interval": 86400 },
     { "name": "proxy", "type": "http", "behavior": "domain",
-      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt", "interval": 86400 }
+      "url": "https://cdn.jsdelivr.net/gh/example/rulesets@release/proxy.txt", "interval": 86400 }
   ],
   "rules": [
     { "type": "rule-set", "payload": "direct", "outbound": "DIRECT" },
@@ -230,8 +231,10 @@ RPC / FFI 提供 `set_proxy_mode(mode)`，参数是整数：`0`=CONFIG、`1`=GLO
 
 两个注意点：
 
-- clash-rules 的 `direct.txt` 等是「域名后缀」语义（`example.com` 匹配自身与子域），正好是 Corduit `domain` behavior 的默认处理，**不需要改文件**；
-- 想在 `rule` 模式下彻底对齐 Clash 行为，就按上面这样把 `cncidr`/`private` 挂在最前面（直连）、`proxy` 挂在代理组前面（走代理）、最后 `MATCH` 兜底。规则表非空后，内置的「大陆直连」兜底自动让位。
+- 这类文件的域名条目是「后缀」语义（`example.com` 匹配自身与子域），正好是 Corduit `domain` behavior 的默认处理，**不需要改文件**；
+- 想彻底复刻「国内直连、其余走代理」的顺序，就按上面这样把 `cncidr`/`private` 挂在最前面（直连）、`proxy` 挂在代理组前面（走代理）、最后 `MATCH` 兜底。规则表非空后，内置的「大陆直连」兜底自动让位。
+
+> 上面的 URL 是占位地址。任何按这三种格式之一分发、且能通过 **HTTPS** 拉取的规则集都可以直接换进去（明文 http 会被拒绝加载）。
 
 ---
 

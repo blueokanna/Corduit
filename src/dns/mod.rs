@@ -1,195 +1,58 @@
-//! Corduit DNS - High-performance DNS resolver and server
+//! Corduit's DNS: a profile's DNS section, on top of RecurseX.
 //!
-//! A comprehensive DNS library for Corduit with support for:
-//! - Local DNS server (UDP/TCP/DoH/DoT)
-//! - Multiple upstream DNS protocols (UDP/TCP/DoH/DoT)
-//! - DNS caching with TTL awareness
-//! - Fake-IP mode for transparent proxying
-//! - Anti-spoofing protection
-//! - Domain-based routing (domestic/foreign DNS)
-//! - Hosts file support
-//!
-//! # Architecture
+//! There is exactly **one** DNS implementation in this crate, and it is not
+//! here. [RecurseX](https://github.com/blueokanna/RecurseX) owns the wire codec,
+//! the name and record types, the semantic cache, every transport (UDP, TCP,
+//! DoT, DoH, DoH3, DoQ), request coalescing, upstream selection and the server
+//! loop. This module is the adapter that turns a Corduit profile into a
+//! `ResolverConfig`, plus the one decision RecurseX cannot make for us.
 //!
 //! ```text
-//! +-------------------------------------------------------------+
-//! |                     DNS Manager                             |
-//! | +---------+ +---------+ +---------+ +---------+             |
-//! | |   DoH   | |   DoT   | |  Cache  | | Fake-IP |             |
-//! | +----+----+ +----+----+ +----+----+ +----+----+             |
-//! |      +----------+----------+----------+                     |
-//! |                        |                                    |
-//! |                   +----v----+                               |
-//! |                   |Resolver | (Domain-based routing)        |
-//! |                   +----+----+                               |
-//! |          +-------------+-------------+                      |
-//! |     +----v----+  +----v----+  +----v----+                   |
-//! |     | Hosts   |  | Primary |  |Fallback |                   |
-//! |     |  File   |  |   DNS   |  |   DNS   |                   |
-//! |     +---------+  +---------+  +---------+                   |
-//! +-------------------------------------------------------------+
-//!                        |
-//!                   +----v----+
-//!                   |  DNS    |
-//!                   | Server  |
-//!                   +---------+
+//!  profile DNS section             this module                    RecurseX
+//!  ┌───────────────────┐   ┌─────────────────────────┐   ┌──────────────────────┐
+//!  │ nameservers       │   │ upstream::Upstream      │   │ Forwarder            │
+//!  │ default-nameserver├──▶│  parse · bootstrap      ├──▶│ ForwarderSet         │
+//!  │ nameserver-policy │   │  render → IP literal    │   │ NameserverPolicy     │
+//!  │ hosts             │   │                         │   │ HostsTable           │
+//!  │ fallback(-filter) │   │ engine_resolver::Plan   │   │ Resolver             │
+//!  │ cache-size        │   │  + SuspectPolicy        │   │  cache · transports  │
+//!  └───────────────────┘   └─────────────────────────┘   └──────────────────────┘
 //! ```
 //!
-//! # Quick Start
+//! # The four modules
 //!
-//! ```rust,no_run
-//! use corduit::dns::{DnsManager, DnsConfig, RecordType};
+//! - [`upstream`] — the grammar of an upstream server string, and the two
+//!   rewrites a profile needs before RecurseX will accept one.
+//! - [`engine_resolver`] — the process-wide resolver the engine dials through,
+//!   its anti-poisoning gate, and the `configure` / `resolve` entry points.
+//! - [`bogon`] — which addresses a public name may answer with. Used by the
+//!   gate above, and useful on its own to any caller inspecting a response.
+//! - [`pattern`] — the domain-rule spellings on the string side, for the
+//!   paths that hold a name as text rather than as a parsed [`Name`].
+//! - [`server`] — the client-facing listener `dns.enable` and `dns.listen`
+//!   start, which is RecurseX's server bound to a resolver built from the same
+//!   profile.
 //!
-//! fn main() -> corduit::dns::Result<()> {
-//!     // Create DNS manager with default config
-//!     let manager = DnsManager::new()?;
+//! # What a profile cannot express
 //!
-//!     // Resolve a domain
-//!     let ips = manager.resolve("google.com")?;
-//!     println!("Resolved: {:?}", ips);
-//!
-//!     // Start DNS server
-//!     manager.start_server()?;
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! # Features
-//!
-//! - **Multi-protocol support**: UDP, TCP, DoH (DNS over HTTPS), DoT (DNS over TLS)
-//! - **Intelligent caching**: TTL-aware caching with stale-while-revalidate support
-//! - **Fake-IP mode**: Virtual IP allocation for transparent proxying
-//! - **Anti-spoofing**: Fallback DNS with bogon IP detection
-//! - **Load balancing**: Round-robin across multiple upstream servers
-//! - **Hot reload**: Configuration can be reloaded without restart
+//! Nothing here reads `/etc/resolv.conf` unless the profile asked for it: an
+//! upstream named by a hostname is resolved through `default-nameserver`, and
+//! the operating system's resolver is only the last resort when the profile
+//! names no bootstrap server. That is the same rule RecurseX applies, for the
+//! same reason — a resolver that depends on the resolution it is meant to
+//! replace is not a resolver — relaxed by exactly the amount a proxy engine
+//! needs, because the machine running the engine is already online.
 
 pub mod bogon;
-pub mod cache;
-pub mod client;
-pub mod config;
-pub mod doh;
-pub mod doh_server;
-pub mod dot;
-pub mod dot_server;
 pub mod engine_resolver;
-pub mod error;
-pub mod fake_ip;
-pub mod hosts;
-pub mod manager;
-pub mod resolver;
+pub mod pattern;
 pub mod server;
-pub mod util;
-pub mod wire;
+pub mod upstream;
 
-#[cfg(test)]
-mod tests;
-
-// Re-export main types
-pub use bogon::{
-    classify_bogon, contains_bogon, filter_bogons, is_bogon, is_bogon_ipv4, is_bogon_ipv6,
-    is_loopback, is_private, is_reserved, BogonType,
-};
-pub use cache::{CacheEntry, CacheStats, DnsCache};
-pub use client::{create_clients, DnsClient, DnsProtocol};
-pub use config::{DnsConfig, FallbackFilter, UpstreamConfig, UpstreamProtocol};
-pub use doh::{DohClient, DohClientConfig, DohMethod, DohResolver};
-pub use doh_server::{DohServer, DohServerConfig};
-pub use dot::{DotClient, DotClientConfig, DotResolver};
-pub use dot_server::{DotServer, DotServerConfig};
-pub use error::{DnsError, Result};
-pub use fake_ip::{FakeIpEntry, FakeIpPool};
-pub use hosts::HostsFile;
-pub use manager::{CacheStatistics, DnsManager, DnsManagerState};
-pub use resolver::DnsResolver;
+// RecurseX *is* the DNS engine, so its vocabulary is re-exported rather than
+// duplicated: a second `RecordType` enum next to `RrType` would be a second
+// implementation of "which record types exist", and the two would drift.
+pub use pattern::{normalize_suffix, suffix_matches};
+pub use recurse_x::{HeaderFlags, Message, Name, Question, RData, Rcode, Record, RrClass, RrType};
 pub use server::DnsServer;
-
-/// DNS record types supported by this library
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RecordType {
-    /// IPv4 address record
-    A,
-    /// IPv6 address record
-    AAAA,
-    /// Canonical name record
-    CNAME,
-    /// Text record
-    TXT,
-    /// Mail exchange record
-    MX,
-    /// Name server record
-    NS,
-    /// Start of authority record
-    SOA,
-    /// Pointer record (reverse DNS)
-    PTR,
-    /// Service record
-    SRV,
-    /// HTTPS service binding
-    HTTPS,
-    /// Service binding
-    SVCB,
-}
-
-impl std::fmt::Display for RecordType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecordType::A => write!(f, "A"),
-            RecordType::AAAA => write!(f, "AAAA"),
-            RecordType::CNAME => write!(f, "CNAME"),
-            RecordType::TXT => write!(f, "TXT"),
-            RecordType::MX => write!(f, "MX"),
-            RecordType::NS => write!(f, "NS"),
-            RecordType::SOA => write!(f, "SOA"),
-            RecordType::PTR => write!(f, "PTR"),
-            RecordType::SRV => write!(f, "SRV"),
-            RecordType::HTTPS => write!(f, "HTTPS"),
-            RecordType::SVCB => write!(f, "SVCB"),
-        }
-    }
-}
-
-impl From<crate::dns::wire::RecordType> for RecordType {
-    fn from(rt: crate::dns::wire::RecordType) -> Self {
-        match rt {
-            crate::dns::wire::RecordType::A => RecordType::A,
-            crate::dns::wire::RecordType::AAAA => RecordType::AAAA,
-            crate::dns::wire::RecordType::CNAME => RecordType::CNAME,
-            crate::dns::wire::RecordType::TXT => RecordType::TXT,
-            crate::dns::wire::RecordType::MX => RecordType::MX,
-            crate::dns::wire::RecordType::NS => RecordType::NS,
-            crate::dns::wire::RecordType::SOA => RecordType::SOA,
-            crate::dns::wire::RecordType::PTR => RecordType::PTR,
-            crate::dns::wire::RecordType::SRV => RecordType::SRV,
-            crate::dns::wire::RecordType::HTTPS => RecordType::HTTPS,
-            crate::dns::wire::RecordType::SVCB => RecordType::SVCB,
-            _ => RecordType::A, // Default fallback
-        }
-    }
-}
-
-impl From<RecordType> for crate::dns::wire::RecordType {
-    fn from(rt: RecordType) -> Self {
-        match rt {
-            RecordType::A => crate::dns::wire::RecordType::A,
-            RecordType::AAAA => crate::dns::wire::RecordType::AAAA,
-            RecordType::CNAME => crate::dns::wire::RecordType::CNAME,
-            RecordType::TXT => crate::dns::wire::RecordType::TXT,
-            RecordType::MX => crate::dns::wire::RecordType::MX,
-            RecordType::NS => crate::dns::wire::RecordType::NS,
-            RecordType::SOA => crate::dns::wire::RecordType::SOA,
-            RecordType::PTR => crate::dns::wire::RecordType::PTR,
-            RecordType::SRV => crate::dns::wire::RecordType::SRV,
-            RecordType::HTTPS => crate::dns::wire::RecordType::HTTPS,
-            RecordType::SVCB => crate::dns::wire::RecordType::SVCB,
-        }
-    }
-}
-
-/// Prelude module for convenient imports
-pub mod prelude {
-    pub use crate::dns::config::DnsConfig;
-    pub use crate::dns::error::{DnsError, Result};
-    pub use crate::dns::manager::DnsManager;
-    pub use crate::dns::RecordType;
-}
+pub use upstream::{Upstream, UpstreamProtocol};

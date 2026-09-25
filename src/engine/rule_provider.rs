@@ -3,7 +3,8 @@ use ipnet::IpNet;
 use nextjson::{NsonDeserialize, NsonSerialize};
 use parking_lot::RwLock;
 use regex::Regex;
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,9 +75,263 @@ pub enum ClassicalRuleType {
     ProcessName,
 }
 
+/// What a rule set is matched against.
+///
+/// A struct rather than a parameter list, for the same reason the router uses
+/// one: `IP-CIDR` and `SRC-IP-CIDR` are different inputs, and with two adjacent
+/// `Option<IpAddr>` parameters a call site cannot tell them apart. That is
+/// exactly how `SRC-IP-CIDR` entries came to be matched against the destination
+/// address here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuleMatchInput<'a> {
+    /// Destination hostname, when the client supplied one.
+    pub domain: Option<&'a str>,
+    /// Destination address.
+    pub dst_ip: Option<IpAddr>,
+    /// Address the connection came from.
+    pub src_ip: Option<IpAddr>,
+    /// Executable name owning the connection.
+    pub process_name: Option<&'a str>,
+}
+
+/// Fold ASCII uppercase to lowercase, borrowing when there is nothing to fold.
+///
+/// Well-formed clients send lowercase hostnames, so the common path allocates
+/// nothing; the fallback keeps matching correct for the ones that do not.
+/// Only ASCII is folded, which is what `eq_ignore_ascii_case` means and what DNS
+/// itself is case-insensitive about.
+fn fold_ascii_lower(value: &str) -> Cow<'_, str> {
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(value.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+fn folded_box(value: &str) -> Box<str> {
+    fold_ascii_lower(value).into_owned().into_boxed_str()
+}
+
+/// ASCII case-insensitive substring test, without allocating a lowercase copy of
+/// either side.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    (0..=haystack.len() - needle.len())
+        .any(|start| haystack[start..start + needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// Whether any configured suffix ends `domain` on a label boundary.
+///
+/// Walks the domain's own labels — at most one hash probe per label — instead of
+/// asking every suffix in the set whether it matches. On a rule set with tens of
+/// thousands of suffixes that is the difference between four lookups and fifty
+/// thousand comparisons, and it is why suffix-heavy sets are usable at all.
+fn suffix_matches(suffixes: &HashSet<Box<str>>, domain: &str) -> bool {
+    if suffixes.is_empty() {
+        return false;
+    }
+    let mut rest = domain;
+    loop {
+        if suffixes.contains(rest) {
+            return true;
+        }
+        match rest.split_once('.') {
+            Some((_, tail)) => rest = tail,
+            None => return false,
+        }
+    }
+}
+
+/// A rule set arranged for lookup rather than for storage.
+///
+/// [`CompiledRuleEntry`] stays as authored so a set can be inspected and
+/// reported; this is what matching runs against. Every pattern is folded to
+/// ASCII lowercase exactly once, here, so the hot path never lowercases,
+/// formats or parses anything — the three things the previous linear scan did
+/// per entry, per connection.
+#[derive(Debug, Default)]
+struct RuleIndex {
+    /// Fully-qualified domains: one hash probe.
+    exact: HashSet<Box<str>>,
+    /// Domain suffixes: one probe per label of the queried domain.
+    suffixes: HashSet<Box<str>>,
+    /// Substrings, which have no structure a set can exploit and stay a list.
+    keywords: Vec<Box<str>>,
+    regexes: Vec<Regex>,
+    /// Destination networks, pre-parsed.
+    dst_nets: Vec<IpNet>,
+    /// Source networks, pre-parsed. Kept separate from `dst_nets` because they
+    /// are compared against a different address.
+    src_nets: Vec<IpNet>,
+    /// Process names, folded.
+    process_names: Vec<Box<str>>,
+    /// Entries that parsed but could not be indexed, with the reason.
+    /// Kept so a bad rule set is a diagnostic rather than a silent no-match.
+    rejected: Vec<String>,
+}
+
+impl RuleIndex {
+    fn compile(entries: &[CompiledRuleEntry]) -> Self {
+        let mut index = Self::default();
+        for entry in entries {
+            index.add(entry);
+        }
+        index
+    }
+
+    fn add(&mut self, entry: &CompiledRuleEntry) {
+        match entry {
+            CompiledRuleEntry::Domain(pattern) => {
+                if !pattern.is_empty() {
+                    self.exact.insert(folded_box(pattern));
+                }
+            }
+            CompiledRuleEntry::DomainSuffix(pattern) => {
+                if !pattern.is_empty() {
+                    self.suffixes.insert(folded_box(pattern));
+                }
+            }
+            CompiledRuleEntry::DomainKeyword(pattern) => {
+                if !pattern.is_empty() {
+                    self.keywords.push(folded_box(pattern));
+                }
+            }
+            CompiledRuleEntry::DomainRegex(regex) => self.regexes.push(regex.clone()),
+            CompiledRuleEntry::IpCidr(network) => self.dst_nets.push(*network),
+            CompiledRuleEntry::Classical {
+                rule_type,
+                pattern,
+                regex,
+            } => match rule_type {
+                ClassicalRuleType::Domain => {
+                    if !pattern.is_empty() {
+                        self.exact.insert(folded_box(pattern));
+                    }
+                }
+                ClassicalRuleType::DomainSuffix => {
+                    if !pattern.is_empty() {
+                        self.suffixes.insert(folded_box(pattern));
+                    }
+                }
+                ClassicalRuleType::DomainKeyword => {
+                    if !pattern.is_empty() {
+                        self.keywords.push(folded_box(pattern));
+                    }
+                }
+                ClassicalRuleType::DomainRegex => match regex {
+                    Some(regex) => self.regexes.push(regex.clone()),
+                    None => self
+                        .rejected
+                        .push(format!("DOMAIN-REGEX '{pattern}' is not a valid regex")),
+                },
+                ClassicalRuleType::IpCidr => match pattern.trim().parse::<IpNet>() {
+                    Ok(network) => self.dst_nets.push(network),
+                    Err(error) => self.rejected.push(format!("IP-CIDR '{pattern}': {error}")),
+                },
+                ClassicalRuleType::SrcIpCidr => match pattern.trim().parse::<IpNet>() {
+                    Ok(network) => self.src_nets.push(network),
+                    Err(error) => self
+                        .rejected
+                        .push(format!("SRC-IP-CIDR '{pattern}': {error}")),
+                },
+                ClassicalRuleType::ProcessName => {
+                    if !pattern.is_empty() {
+                        self.process_names.push(folded_box(pattern));
+                    }
+                }
+            },
+        }
+    }
+
+    /// Entries that can actually decide a match.
+    fn matchable_count(&self) -> usize {
+        self.exact.len()
+            + self.suffixes.len()
+            + self.keywords.len()
+            + self.regexes.len()
+            + self.dst_nets.len()
+            + self.src_nets.len()
+            + self.process_names.len()
+    }
+
+    /// A bounded description of what could not be indexed.
+    fn rejected_summary(&self) -> String {
+        const SHOWN: usize = 3;
+        let mut summary = self
+            .rejected
+            .iter()
+            .take(SHOWN)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        if self.rejected.len() > SHOWN {
+            summary.push_str(&format!(" (+{} more)", self.rejected.len() - SHOWN));
+        }
+        summary
+    }
+
+    fn matches(&self, input: &RuleMatchInput<'_>) -> bool {
+        if let Some(domain) = input.domain {
+            let domain = fold_ascii_lower(domain.trim_end_matches('.'));
+            let domain = domain.as_ref();
+            if self.exact.contains(domain)
+                || suffix_matches(&self.suffixes, domain)
+                || self
+                    .keywords
+                    .iter()
+                    .any(|keyword| domain.contains(keyword.as_ref()))
+                || self.regexes.iter().any(|regex| regex.is_match(domain))
+            {
+                return true;
+            }
+        }
+
+        if let Some(address) = input.dst_ip {
+            if self
+                .dst_nets
+                .iter()
+                .any(|network| network.contains(&address))
+            {
+                return true;
+            }
+        }
+
+        if let Some(address) = input.src_ip {
+            if self
+                .src_nets
+                .iter()
+                .any(|network| network.contains(&address))
+            {
+                return true;
+            }
+        }
+
+        if let Some(process) = input.process_name {
+            let basename = process.rsplit(['/', '\\']).next().unwrap_or(process);
+            let basename = fold_ascii_lower(basename);
+            let stem = basename.strip_suffix(".exe").unwrap_or(basename.as_ref());
+            if self.process_names.iter().any(|pattern| {
+                let pattern_stem = pattern.strip_suffix(".exe").unwrap_or(pattern);
+                pattern.as_ref() == basename.as_ref() || pattern_stem == stem
+            }) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
 pub struct RuleProvider {
     config: RuleProviderConfig,
-    rules: RwLock<Vec<CompiledRuleEntry>>,
+    index: RwLock<RuleIndex>,
     last_update: RwLock<Option<Instant>>,
 }
 
@@ -84,7 +339,7 @@ impl RuleProvider {
     pub fn new(config: RuleProviderConfig) -> Self {
         Self {
             config,
-            rules: RwLock::new(Vec::new()),
+            index: RwLock::new(RuleIndex::default()),
             last_update: RwLock::new(None),
         }
     }
@@ -102,30 +357,56 @@ impl RuleProvider {
         self.config.behavior
     }
 
+    /// Fetch, parse and index the rule set.
+    ///
+    /// Two failures are told apart because they need different fixes: a source
+    /// that parsed into no entries at all (wrong file), and a source whose
+    /// entries were all unusable (wrong format). Entries that parse but cannot
+    /// be indexed are reported instead of dropped — a rule that silently never
+    /// matches is the hardest kind of routing bug to find.
     pub fn load(&self) -> Result<()> {
         let content = match self.config.provider_type {
             RuleProviderType::File => self.load_from_file()?,
             RuleProviderType::Http => self.load_from_http()?,
         };
 
-        let rules = self.parse_rules(&content)?;
-        if rules.is_empty() {
+        let entries = self.parse_rules(&content)?;
+        if entries.is_empty() {
             return Err(Error::config(format!(
                 "Rule provider '{}' did not contain any supported rules",
                 self.config.name
             )));
         }
 
-        let mut rules_guard = self.rules.write();
-        *rules_guard = rules;
+        let index = RuleIndex::compile(&entries);
+        let indexed = index.matchable_count();
+        if indexed == 0 {
+            return Err(Error::config(format!(
+                "Rule provider '{}' has {} entries but none are usable: {}",
+                self.config.name,
+                entries.len(),
+                index.rejected_summary()
+            )));
+        }
+        if !index.rejected.is_empty() {
+            tracing::warn!(
+                "Rule provider '{}' indexed {} of {} entries; {} unusable: {}",
+                self.config.name,
+                indexed,
+                entries.len(),
+                index.rejected.len(),
+                index.rejected_summary()
+            );
+        }
 
-        let mut last_update = self.last_update.write();
-        *last_update = Some(Instant::now());
+        *self.index.write() = index;
+
+        *self.last_update.write() = Some(Instant::now());
 
         tracing::info!(
             "Rule provider '{}' loaded {} rules",
             self.config.name,
-            rules_guard.len()
+            indexed
         );
 
         Ok(())
@@ -390,99 +671,80 @@ impl RuleProvider {
         }
     }
 
-    pub fn matches(
-        &self,
-        domain: Option<&str>,
-        ip: Option<IpAddr>,
-        process_name: Option<&str>,
-    ) -> bool {
-        let rules = self.rules.read();
-
-        for rule in rules.iter() {
-            if self.matches_entry_with_process(rule, domain, ip, process_name) {
-                return true;
-            }
-        }
-
-        false
+    /// Whether any entry in this set matches.
+    ///
+    /// Runs against the compiled index: no allocation for a lowercase hostname,
+    /// no per-entry lowercasing or `format!`, and no re-parsing of CIDRs.
+    pub fn matches(&self, input: &RuleMatchInput<'_>) -> bool {
+        self.index.read().matches(input)
     }
 
-    pub fn matches_entry(
-        &self,
-        entry: &CompiledRuleEntry,
-        domain: Option<&str>,
-        ip: Option<IpAddr>,
-    ) -> bool {
-        self.matches_entry_with_process(entry, domain, ip, None)
-    }
-
-    fn matches_entry_with_process(
-        &self,
-        entry: &CompiledRuleEntry,
-        domain: Option<&str>,
-        ip: Option<IpAddr>,
-        process_name: Option<&str>,
-    ) -> bool {
+    /// Whether one specific entry matches, without going through the index.
+    ///
+    /// For diagnostics, and for tests that assert what a parsed entry *means*.
+    /// The hot path is [`RuleProvider::matches`]; this exists so the meaning of
+    /// a single entry can be checked directly instead of inferred from a set.
+    pub fn matches_entry(&self, entry: &CompiledRuleEntry, input: &RuleMatchInput<'_>) -> bool {
         match entry {
-            CompiledRuleEntry::Domain(pattern) => {
-                domain.is_some_and(|d| d.eq_ignore_ascii_case(pattern))
-            }
-            CompiledRuleEntry::DomainSuffix(pattern) => domain.is_some_and(|d| {
-                let d_lower = d.to_lowercase();
-                let p_lower = pattern.to_lowercase();
-                d_lower == p_lower || d_lower.ends_with(&format!(".{}", p_lower))
+            CompiledRuleEntry::Domain(pattern) => input
+                .domain
+                .is_some_and(|domain| domain.trim_end_matches('.').eq_ignore_ascii_case(pattern)),
+            CompiledRuleEntry::DomainSuffix(pattern) => input.domain.is_some_and(|domain| {
+                let domain = domain.trim_end_matches('.');
+                domain.eq_ignore_ascii_case(pattern)
+                    || (domain.len() > pattern.len()
+                        && domain.as_bytes()[domain.len() - pattern.len() - 1] == b'.'
+                        && domain[domain.len() - pattern.len()..].eq_ignore_ascii_case(pattern))
             }),
-            CompiledRuleEntry::DomainKeyword(pattern) => {
-                domain.is_some_and(|d| d.to_lowercase().contains(&pattern.to_lowercase()))
+            CompiledRuleEntry::DomainKeyword(pattern) => input
+                .domain
+                .is_some_and(|domain| contains_ignore_ascii_case(domain, pattern)),
+            CompiledRuleEntry::DomainRegex(regex) => {
+                input.domain.is_some_and(|domain| regex.is_match(domain))
             }
-            CompiledRuleEntry::DomainRegex(regex) => domain.is_some_and(|d| regex.is_match(d)),
-            CompiledRuleEntry::IpCidr(network) => ip.is_some_and(|addr| network.contains(&addr)),
+            CompiledRuleEntry::IpCidr(network) => input
+                .dst_ip
+                .is_some_and(|address| network.contains(&address)),
             CompiledRuleEntry::Classical {
                 rule_type,
                 pattern,
                 regex,
-            } => {
-                self.matches_classical(rule_type, pattern, regex.as_ref(), domain, ip, process_name)
-            }
-        }
-    }
-
-    fn matches_classical(
-        &self,
-        rule_type: &ClassicalRuleType,
-        pattern: &str,
-        regex: Option<&Regex>,
-        domain: Option<&str>,
-        ip: Option<IpAddr>,
-        process_name: Option<&str>,
-    ) -> bool {
-        match rule_type {
-            ClassicalRuleType::Domain => domain.is_some_and(|d| d.eq_ignore_ascii_case(pattern)),
-            ClassicalRuleType::DomainSuffix => domain.is_some_and(|d| {
-                let d_lower = d.to_lowercase();
-                let p_lower = pattern.to_lowercase();
-                d_lower == p_lower || d_lower.ends_with(&format!(".{}", p_lower))
-            }),
-            ClassicalRuleType::DomainKeyword => {
-                domain.is_some_and(|d| d.to_lowercase().contains(&pattern.to_lowercase()))
-            }
-            ClassicalRuleType::DomainRegex => {
-                if let Some(regex) = regex {
-                    domain.is_some_and(|d| regex.is_match(d))
-                } else {
-                    false
+            } => match rule_type {
+                ClassicalRuleType::Domain => input.domain.is_some_and(|domain| {
+                    domain.trim_end_matches('.').eq_ignore_ascii_case(pattern)
+                }),
+                ClassicalRuleType::DomainSuffix => input.domain.is_some_and(|domain| {
+                    let domain = domain.trim_end_matches('.');
+                    domain.eq_ignore_ascii_case(pattern)
+                        || (domain.len() > pattern.len()
+                            && domain.as_bytes()[domain.len() - pattern.len() - 1] == b'.'
+                            && domain[domain.len() - pattern.len()..].eq_ignore_ascii_case(pattern))
+                }),
+                ClassicalRuleType::DomainKeyword => input
+                    .domain
+                    .is_some_and(|domain| contains_ignore_ascii_case(domain, pattern)),
+                ClassicalRuleType::DomainRegex => match regex {
+                    Some(regex) => input.domain.is_some_and(|domain| regex.is_match(domain)),
+                    None => false,
+                },
+                ClassicalRuleType::IpCidr => {
+                    pattern.trim().parse::<IpNet>().ok().is_some_and(|network| {
+                        input
+                            .dst_ip
+                            .is_some_and(|address| network.contains(&address))
+                    })
                 }
-            }
-            ClassicalRuleType::IpCidr | ClassicalRuleType::SrcIpCidr => {
-                if let Ok(network) = pattern.parse::<IpNet>() {
-                    ip.is_some_and(|addr| network.contains(&addr))
-                } else {
-                    false
+                ClassicalRuleType::SrcIpCidr => {
+                    pattern.trim().parse::<IpNet>().ok().is_some_and(|network| {
+                        input
+                            .src_ip
+                            .is_some_and(|address| network.contains(&address))
+                    })
                 }
-            }
-            ClassicalRuleType::ProcessName => {
-                process_name.is_some_and(|process| Self::matches_process_name(pattern, process))
-            }
+                ClassicalRuleType::ProcessName => input
+                    .process_name
+                    .is_some_and(|process| Self::matches_process_name(pattern, process)),
+            },
         }
     }
 
@@ -532,7 +794,7 @@ impl RuleProvider {
     }
 
     pub fn rule_count(&self) -> usize {
-        self.rules.read().len()
+        self.index.read().matchable_count()
     }
 
     pub fn last_update_time(&self) -> Option<Instant> {
@@ -572,16 +834,10 @@ impl RuleProviderManager {
         providers.get(name).cloned()
     }
 
-    pub fn matches(
-        &self,
-        provider_name: &str,
-        domain: Option<&str>,
-        ip: Option<IpAddr>,
-        process_name: Option<&str>,
-    ) -> bool {
+    pub fn matches(&self, provider_name: &str, input: &RuleMatchInput<'_>) -> bool {
         let providers = self.providers.read();
         if let Some(provider) = providers.get(provider_name) {
-            provider.matches(domain, ip, process_name)
+            provider.matches(input)
         } else {
             false
         }
@@ -640,6 +896,56 @@ impl Clone for RuleProviderManager {
 mod tests {
     use super::*;
 
+    fn test_provider(behavior: RuleProviderBehavior) -> RuleProvider {
+        RuleProvider::new(RuleProviderConfig {
+            name: "test".to_string(),
+            provider_type: RuleProviderType::File,
+            behavior,
+            url: None,
+            path: Some("test.txt".to_string()),
+            interval: 86400,
+        })
+    }
+
+    /// A provider whose index was built from `entries`.
+    fn provider_with_entries(entries: Vec<CompiledRuleEntry>) -> RuleProvider {
+        let provider = test_provider(RuleProviderBehavior::Classical);
+        *provider.index.write() = RuleIndex::compile(&entries);
+        provider
+    }
+
+    /// A match input carrying only a domain.
+    fn domain_input(domain: &str) -> RuleMatchInput<'_> {
+        RuleMatchInput {
+            domain: Some(domain),
+            ..RuleMatchInput::default()
+        }
+    }
+
+    /// A match input carrying only a destination address.
+    fn dst_input(address: &str) -> RuleMatchInput<'static> {
+        RuleMatchInput {
+            dst_ip: Some(address.parse::<IpAddr>().expect("valid address")),
+            ..RuleMatchInput::default()
+        }
+    }
+
+    /// A match input carrying only a source address.
+    fn src_input(address: &str) -> RuleMatchInput<'static> {
+        RuleMatchInput {
+            src_ip: Some(address.parse::<IpAddr>().expect("valid address")),
+            ..RuleMatchInput::default()
+        }
+    }
+
+    /// A match input carrying only a process name.
+    fn process_input(process: &str) -> RuleMatchInput<'_> {
+        RuleMatchInput {
+            process_name: Some(process),
+            ..RuleMatchInput::default()
+        }
+    }
+
     #[test]
     fn test_parse_domain_entry_suffix() {
         let provider = RuleProvider::new(RuleProviderConfig {
@@ -697,9 +1003,9 @@ mod tests {
         });
 
         let entry = CompiledRuleEntry::DomainSuffix("google.com".to_string());
-        assert!(provider.matches_entry(&entry, Some("www.google.com"), None));
-        assert!(provider.matches_entry(&entry, Some("google.com"), None));
-        assert!(!provider.matches_entry(&entry, Some("notgoogle.com"), None));
+        assert!(provider.matches_entry(&entry, &domain_input("www.google.com")));
+        assert!(provider.matches_entry(&entry, &domain_input("google.com")));
+        assert!(!provider.matches_entry(&entry, &domain_input("notgoogle.com")));
     }
 
     #[test]
@@ -716,8 +1022,8 @@ mod tests {
         let network: IpNet = "192.168.0.0/16".parse().unwrap();
         let entry = CompiledRuleEntry::IpCidr(network);
 
-        assert!(provider.matches_entry(&entry, None, Some("192.168.1.1".parse().unwrap())));
-        assert!(!provider.matches_entry(&entry, None, Some("10.0.0.1".parse().unwrap())));
+        assert!(provider.matches_entry(&entry, &dst_input("192.168.1.1")));
+        assert!(!provider.matches_entry(&entry, &dst_input("10.0.0.1")));
     }
 
     #[test]
@@ -735,13 +1041,11 @@ mod tests {
             .parse_classical_entry("PROCESS-NAME,qBittorrent.exe")
             .expect("PROCESS-NAME should be supported");
 
-        assert!(provider.matches_entry_with_process(
+        assert!(provider.matches_entry(
             &entry,
-            None,
-            None,
-            Some(r"C:\Program Files\qBittorrent\qbittorrent.exe"),
+            &process_input(r"C:\Program Files\qBittorrent\qbittorrent.exe")
         ));
-        assert!(!provider.matches_entry_with_process(&entry, None, None, Some("firefox.exe"),));
+        assert!(!provider.matches_entry(&entry, &process_input("firefox.exe")));
     }
 
     #[test]
@@ -759,6 +1063,134 @@ mod tests {
             .parse_classical_entry("IP-CIDR,10.0.0.0/8,no-resolve")
             .expect("IP-CIDR should be supported");
 
-        assert!(provider.matches_entry(&entry, None, Some("10.20.30.40".parse().unwrap()),));
+        assert!(provider.matches_entry(&entry, &dst_input("10.20.30.40")));
+    }
+
+    /// The index and the single-entry path must agree on every input. They use
+    /// different mechanisms — hash sets and label walking against a direct scan
+    /// — so this is what keeps the two from drifting apart.
+    #[test]
+    fn the_index_agrees_with_the_single_entry_path() {
+        let entries = vec![
+            CompiledRuleEntry::Domain("exact.example.com".to_string()),
+            CompiledRuleEntry::DomainSuffix("suffix.example.com".to_string()),
+            CompiledRuleEntry::DomainKeyword("keyword".to_string()),
+            CompiledRuleEntry::DomainRegex(Regex::new(r"^re\..*\.net$").expect("valid regex")),
+            CompiledRuleEntry::IpCidr("10.0.0.0/8".parse().expect("valid cidr")),
+            CompiledRuleEntry::Classical {
+                rule_type: ClassicalRuleType::SrcIpCidr,
+                pattern: "192.168.0.0/16".to_string(),
+                regex: None,
+            },
+            CompiledRuleEntry::Classical {
+                rule_type: ClassicalRuleType::ProcessName,
+                pattern: "qbittorrent.exe".to_string(),
+                regex: None,
+            },
+        ];
+        let provider = provider_with_entries(entries.clone());
+        let index = RuleIndex::compile(&entries);
+
+        let cases = [
+            domain_input("exact.example.com"),
+            domain_input("EXACT.EXAMPLE.COM"),
+            domain_input("a.suffix.example.com"),
+            domain_input("suffix.example.com"),
+            domain_input("notsuffix.example.com"),
+            domain_input("www.keyword.net"),
+            domain_input("re.foo.net"),
+            domain_input("re.foo.org"),
+            dst_input("10.1.2.3"),
+            dst_input("11.1.2.3"),
+            src_input("192.168.5.5"),
+            src_input("10.1.2.3"),
+            process_input(r"C:\Program Files\qBittorrent\qbittorrent.exe"),
+            process_input("firefox.exe"),
+            RuleMatchInput {
+                domain: Some("www.google.com"),
+                dst_ip: Some("10.0.0.1".parse().expect("valid")),
+                src_ip: Some("192.168.1.1".parse().expect("valid")),
+                process_name: Some("chrome"),
+            },
+        ];
+
+        for case in cases {
+            let expected = entries
+                .iter()
+                .any(|entry| provider.matches_entry(entry, &case));
+            assert_eq!(
+                index.matches(&case),
+                expected,
+                "index and direct path disagree on {case:?}"
+            );
+        }
+    }
+
+    /// `SRC-IP-CIDR` compares the source address and `IP-CIDR` the destination.
+    /// They used to share one branch that read the destination for both, so a
+    /// source rule could never fire.
+    #[test]
+    fn source_and_destination_cidrs_use_different_addresses() {
+        let index = RuleIndex::compile(&[
+            CompiledRuleEntry::Classical {
+                rule_type: ClassicalRuleType::SrcIpCidr,
+                pattern: "192.168.0.0/16".to_string(),
+                regex: None,
+            },
+            CompiledRuleEntry::Classical {
+                rule_type: ClassicalRuleType::IpCidr,
+                pattern: "10.0.0.0/8".to_string(),
+                regex: None,
+            },
+        ]);
+
+        let case = |src: &str, dst: &str| RuleMatchInput {
+            src_ip: Some(src.parse().expect("valid")),
+            dst_ip: Some(dst.parse().expect("valid")),
+            ..RuleMatchInput::default()
+        };
+
+        assert!(index.matches(&case("192.168.1.1", "203.0.113.1")));
+        assert!(index.matches(&case("203.0.113.1", "10.1.1.1")));
+        assert!(!index.matches(&case("203.0.113.1", "203.0.113.2")));
+        // A source address must not satisfy a destination rule.
+        assert!(!index.matches(&src_input("10.1.1.1")));
+    }
+
+    /// A suffix is a label boundary, not a string tail.
+    #[test]
+    fn suffix_matching_respects_the_label_boundary() {
+        let index =
+            RuleIndex::compile(&[CompiledRuleEntry::DomainSuffix("example.com".to_string())]);
+        assert!(index.matches(&domain_input("example.com")));
+        assert!(index.matches(&domain_input("a.example.com")));
+        assert!(index.matches(&domain_input("EXAMPLE.COM")));
+        assert!(!index.matches(&domain_input("notexample.com")));
+        assert!(!index.matches(&domain_input("example.com.evil.net")));
+    }
+
+    /// Unusable entries are reported rather than dropped: a rule that never
+    /// matches is invisible otherwise.
+    #[test]
+    fn unusable_entries_are_reported() {
+        let index = RuleIndex::compile(&[
+            CompiledRuleEntry::IpCidr("10.0.0.0/8".parse().expect("valid")),
+            CompiledRuleEntry::Classical {
+                rule_type: ClassicalRuleType::IpCidr,
+                pattern: "not-a-cidr".to_string(),
+                regex: None,
+            },
+        ]);
+        assert_eq!(index.matchable_count(), 1);
+        assert_eq!(index.rejected.len(), 1);
+        assert!(index.rejected[0].contains("not-a-cidr"));
+    }
+
+    /// Folding must borrow when the hostname is already lowercase, which is what
+    /// every well-formed client sends.
+    #[test]
+    fn folding_borrows_when_there_is_nothing_to_fold() {
+        assert!(matches!(fold_ascii_lower("example.com"), Cow::Borrowed(_)));
+        assert!(matches!(fold_ascii_lower("Example.com"), Cow::Owned(_)));
     }
 }

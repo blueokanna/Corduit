@@ -111,16 +111,21 @@ pub struct Corduit {
     traffic_stats: std::sync::Arc<TrafficStatsManager>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     start_time: std::sync::Arc<std::sync::RwLock<Option<Instant>>>,
+    /// The client-facing DNS listener, when `dns.enable` is set.
+    ///
+    /// Owned by the engine rather than kept in a process-wide static because a
+    /// listener's lifetime *is* the engine's: bound on start, unbound on stop,
+    /// rebound on reload. A static would have to be told which engine it
+    /// belongs to, and there is only ever one.
+    dns_listener: parking_lot::Mutex<Option<crate::dns::DnsServer>>,
 }
 
 impl Corduit {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
         logging::init_logging(config.general.log_level)?;
-        crate::dns::engine_resolver::configure(
-            &config.dns.nameservers,
-            &config.dns.nameserver_policy,
-        );
+        crate::dns::engine_resolver::configure(config.dns.resolver_settings());
+        crate::common::socket::set_tcp_concurrent(config.general.tcp_concurrent);
 
         let proxy_manager = ProxyManager::new(config.clone())?;
         let traffic_stats = TrafficStatsManager::new();
@@ -133,7 +138,56 @@ impl Corduit {
             traffic_stats: std::sync::Arc::new(traffic_stats),
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             start_time: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            dns_listener: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Bind the client-facing DNS listener, if the profile asked for one.
+    ///
+    /// Not fatal. A listener that cannot bind its port is a real problem, but it
+    /// is not a reason to refuse to run a proxy: the operator asked for two
+    /// things and losing one must not take the other with it. The warning names
+    /// the address, so the reason is one line away.
+    fn start_dns_listener(&self) {
+        let dns = &self.config.dns;
+        if !dns.enable {
+            return;
+        }
+
+        let listen = match dns.listen.trim().parse::<std::net::SocketAddr>() {
+            Ok(address) => address,
+            Err(error) => {
+                tracing::warn!(
+                    "dns.listen '{}' is not an address ({error}); no DNS listener started",
+                    dns.listen
+                );
+                return;
+            }
+        };
+
+        if dns.enhanced_mode == DnsMode::FakeIp {
+            tracing::info!(
+                "dns.enhanced-mode is fake-ip, but the DNS listener answers with real addresses: \
+                 a synthesized address is only useful to something that can map it back, and only \
+                 the netstack's responder owns that pool"
+            );
+        }
+
+        let started = crate::dns::engine_resolver::client_resolver(dns.resolver_settings())
+            .and_then(|resolver| {
+                crate::dns::DnsServer::start(resolver, listen).map_err(|error| error.to_string())
+            });
+        match started {
+            Ok(server) => *self.dns_listener.lock() = Some(server),
+            Err(error) => tracing::warn!("DNS listener could not start on {listen}: {error}"),
+        }
+    }
+
+    /// Stop the listener, if one is running.
+    fn stop_dns_listener(&self) {
+        if let Some(server) = self.dns_listener.lock().take() {
+            server.stop();
+        }
     }
 
     /// Start the proxy server
@@ -149,6 +203,9 @@ impl Corduit {
         // Start background provider refreshes (proxy/rule providers, health checks)
         self.proxy_manager.start_providers()?;
 
+        // Start the client-facing DNS listener, if `dns.enable` asked for one
+        self.start_dns_listener();
+
         // Mark as running and record start time
         self.running
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -163,6 +220,11 @@ impl Corduit {
     /// Stop the proxy server
     pub fn stop(&self) -> Result<()> {
         let _perf = logging::time_operation("Corduit shutdown");
+
+        // The listener goes first: it is answering clients that are about to be
+        // told the engine is gone, and leaving it up while the proxy tears down
+        // would hand out answers the engine can no longer honour.
+        self.stop_dns_listener();
 
         match self.proxy_manager.stop() {
             Ok(()) => {
@@ -204,12 +266,19 @@ impl Corduit {
     /// Reload configuration
     pub fn reload(&mut self, config: Config) -> Result<()> {
         tracing::info!("Reloading Corduit configuration");
-        crate::dns::engine_resolver::configure(
-            &config.dns.nameservers,
-            &config.dns.nameserver_policy,
-        );
+        crate::dns::engine_resolver::configure(config.dns.resolver_settings());
+        crate::common::socket::set_tcp_concurrent(config.general.tcp_concurrent);
         self.proxy_manager.reload(config.clone())?;
         self.config = config;
+
+        // Rebinding is the only way a changed `dns.listen`, `dns.enable` or
+        // upstream set takes effect: a listener holds its resolver for its whole
+        // life, and the resolver holds the forwarders it was built with.
+        self.stop_dns_listener();
+        if self.running.load(std::sync::atomic::Ordering::Relaxed) {
+            self.start_dns_listener();
+        }
+
         tracing::info!("Corduit configuration reloaded");
         Ok(())
     }
