@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
 
 jobs:
   # ---- Native matrix: build + full test on the three desktop OSes ----------
@@ -33,6 +34,14 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+      - name: Examples (offline smoke tests)
+        run: |
+          cargo run --example minimal
+          cargo run --example typed_config
+          cargo run --example routing_modes
+          cargo run --example json_api
+          cargo run --example rpc_server
+          cargo run --example providers
 
       - name: Docs
         run: cargo doc --workspace --no-deps --all-features
@@ -145,18 +154,11 @@ jobs:
 
       - name: Check (std, no optional protocols)
         run: cargo check --no-default-features --features std
+      - name: Test (std, no optional protocols)
+        run: cargo test --workspace --no-default-features --features std
 
       - name: Check (no_std core)
         run: cargo check --no-default-features
-
-  # ---- Wiki: publish docs after CI succeeds on main ------------------------
-  # The `wiki/` directory in the repository is the source of truth. After every
-  # green push to `main` it is pushed to the GitHub wiki (…/Corduit.wiki.git).
-  #
-  # Authentication uses the automatic `GITHUB_TOKEN` by default. If your
-  # repository does not allow that token to push to the wiki, define a repo
-  # secret `WIKI_PAT` with a fine-grained PAT that has "Read and write" access
-  # to the wiki — the expression below falls back to it automatically.
   wiki:
     name: Publish Wiki
     needs: [native, msrv, lint, features]

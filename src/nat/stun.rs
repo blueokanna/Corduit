@@ -29,8 +29,8 @@
 //! ## `no_std`
 //!
 //! The codec is `core + alloc` — no sockets, no clock, no allocator beyond
-//! the message buffers. Only [`StunClient`] needs the threaded layer, and it is
-//! gated on the `std` feature.
+//! the message buffers. Only [`client::StunClient`] needs the threaded layer,
+//! and that module is gated on the `std` feature.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -496,9 +496,6 @@ fn encode_address_attribute(
                 None => v6.port(),
             };
             out.extend_from_slice(&port.to_be_bytes());
-            // An unXORed form has no transaction id to mask with. Using an
-            // all-zero mask keeps one code path instead of an `expect` that
-            // would panic on a legitimate IPv6 MappedAddress.
             let mask = match transaction_id {
                 Some(id) => xor_mask_v6(id),
                 None => [0u8; 16],

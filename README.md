@@ -400,11 +400,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo check --no-default-features                 # the no_std protocol core
 cargo check --no-default-features --features std  # engine layer, no optional protocols
+cargo test --no-default-features --features std   # …and its test code
+cargo run --example minimal                       # a real engine, loopback only
 ```
 
 CI runs the default matrix on Linux, macOS and Windows, plus an all-features
-job (so the gated QUIC / TUIC / Hysteria2 code is built and tested as well) and
-the `no_std` core check.
+job (so the gated QUIC / TUIC / Hysteria2 code is built and tested as well),
+the `no_std` core check, the `std`-only configuration (checked *and* tested),
+and an MSRV job that both builds and tests on 1.78. Every desktop job also
+runs the hermetic examples — the only place the crate is driven end to end —
+and builds the docs. `RUSTFLAGS` and `RUSTDOCFLAGS` are both `-D warnings`:
+a warning is a broken build, and a link to an item that no longer exists is a
+broken build too.
 
 MSRV: **Rust 1.78**. No HTTP/TLS/QUIC third-party library and no async runtime:
 the network layer is courierust plus the in-tree codecs above, and concurrency

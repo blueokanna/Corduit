@@ -22,6 +22,9 @@ $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 # sections into the same file.
 $log = if ($LogPath) { $LogPath } else { "target\ci-local-$PID.log" }
 $env:RUSTFLAGS = "-D warnings"
+# Mirrors `RUSTDOCFLAGS` in ci.yml: a broken intra-doc link has to fail the build
+# that broke it, not quietly degrade into plain text.
+$env:RUSTDOCFLAGS = "-D warnings"
 Set-Content -Path $log -Value "local CI replica (RUSTFLAGS=-D warnings)" -Encoding utf8
 
 function Pin-Toolchain([string]$toolchain) {
@@ -63,14 +66,33 @@ Step "check --workspace --all-targets [host]" "stable" @("check", "--workspace",
 Step "check --workspace --all-targets [x86_64-unknown-linux-gnu]" "stable" @("check", "--workspace", "--all-targets") "x86_64-unknown-linux-gnu"
 Step "check --workspace --all-targets [x86_64-apple-darwin]" "stable" @("check", "--workspace", "--all-targets") "x86_64-apple-darwin"
 Step "test --workspace [host]" "stable" @("test", "--workspace")
+
+# The examples are the only place the crate is driven the way an operator drives
+# it, and they are hermetic by construction (loopback ports, no upstream
+# servers). Same list as the workflow's "Examples (offline smoke tests)" step;
+# the two probe examples are excluded because they need a live proxy.
+foreach ($example in @("minimal", "typed_config", "routing_modes", "json_api", "rpc_server", "providers")) {
+    Step "run --example $example [host]" "stable" @("run", "--example", $example)
+}
+
 Step "doc --workspace --no-deps --all-features [host]" "stable" @("doc", "--workspace", "--no-deps", "--all-features")
 
 # --- msrv job (1.78, linux)
 Step "check --workspace --all-targets [1.78.0, x86_64-unknown-linux-gnu]" "1.78.0" @("check", "--workspace", "--all-targets") "x86_64-unknown-linux-gnu"
+# CI pins the MSRV on ubuntu only, so the Linux-target step above is the faithful
+# replica; this host run is the superset — it is the only way to see MSRV problems
+# in the Windows-only code the ubuntu job never compiles.
+Step "check --workspace --all-targets [1.78.0, host]" "1.78.0" @("check", "--workspace", "--all-targets")
+# The MSRV job runs the suite as well, and doc tests are compiled by rustdoc —
+# so this is also where an MSRV-only `RUSTDOCFLAGS=-D warnings` problem shows up.
+Step "test --workspace [1.78.0, host]" "1.78.0" @("test", "--workspace")
 
 # --- feature matrix job (ubuntu)
 Step "check --workspace --all-targets --all-features [x86_64-unknown-linux-gnu]" "stable" @("check", "--workspace", "--all-targets", "--all-features") "x86_64-unknown-linux-gnu"
 Step "check --no-default-features --features std [x86_64-unknown-linux-gnu]" "stable" @("check", "--no-default-features", "--features", "std") "x86_64-unknown-linux-gnu"
+# CI runs this one on ubuntu natively, so the host is the right analogue here —
+# the point is the test code under a feature set, not the target.
+Step "test --workspace --no-default-features --features std [host]" "stable" @("test", "--workspace", "--no-default-features", "--features", "std")
 Step "check --no-default-features [x86_64-unknown-linux-gnu]" "stable" @("check", "--no-default-features") "x86_64-unknown-linux-gnu"
 Step "test --workspace --all-features [host]" "stable" @("test", "--workspace", "--all-features")
 

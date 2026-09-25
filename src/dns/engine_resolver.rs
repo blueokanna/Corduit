@@ -23,7 +23,7 @@
 //! 2. **Country-based answer filtering.** RecurseX ships no country database,
 //!    so the `fallback-filter.geoip` signal has no expression inside it. Rather
 //!    than let a configured security measure quietly do nothing, the decision
-//!    stays here — see [`SuspectPolicy`] — and the fallback servers live in
+//!    stays here — see `SuspectPolicy` below — and the fallback servers live in
 //!    their own resolver so the decision has somewhere to send the query.
 //! 3. **The dial path's error type.** Callers here want an `io::Error` so they
 //!    can fall back to the system resolver.
@@ -1024,7 +1024,7 @@ pub fn resolver() -> Option<Arc<EngineResolver>> {
 /// Deliberately not the same object as [`resolver`]: the engine's resolver
 /// answers dials and owns the country-aware gate, while a listener answers
 /// clients through RecurseX's own server and filter. The two share the profile,
-/// the upstreams and the cache sizing — [`Plan::resolver_config`] is what keeps
+/// the upstreams and the cache sizing — `Plan::resolver_config` is what keeps
 /// them from drifting — and differ only where they must.
 ///
 /// `Err` carries the reason for the caller to log, because a listener that

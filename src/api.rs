@@ -207,6 +207,20 @@ fn set_selector(group_tag: &str, proxy_tag: &str) -> Result<bool> {
 }
 
 // ============== Proxy Control API (Design Document Compliant) ==============
+/// Start the engine from a JSON profile, replacing whatever was running.
+///
+/// The profile is the engine's own shape (see
+/// [`crate::engine::Config`]), not the FFI shape: this is the entry point for a
+/// caller that already speaks the engine's configuration directly, and
+/// `initialize_corduit` is the one for the FFI shape.
+///
+/// Everything the profile asked for comes up: the inbounds, and the external
+/// controller when `external-controller` is set — the engine does not silently
+/// drop half of a configuration.
+///
+/// Errors are strings because this is the C-ABI/JSON-RPC spelling of the
+/// operation; the typed spelling is [`initialize_corduit`] plus
+/// [`start_corduit`].
 pub fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(), String> {
     tracing::info!("Starting proxy from config JSON...");
 
@@ -226,6 +240,7 @@ pub fn start_proxy_from_yaml(yaml_config: String) -> std::result::Result<(), Str
     Ok(())
 }
 
+/// Start the engine from a profile file.
 pub fn start_proxy_from_file(config_path: String) -> std::result::Result<(), String> {
     tracing::info!("Starting proxy from file: {}", config_path);
 
@@ -234,6 +249,11 @@ pub fn start_proxy_from_file(config_path: String) -> std::result::Result<(), Str
     start_proxy_from_yaml(yaml_content)
 }
 
+/// Stop the engine. Idempotent.
+///
+/// Stops the external controller the engine started as well — it is part of
+/// "the proxy is off" — and drops the instance, so a later
+/// [`is_proxy_running`] answers `false` instead of reading a stale engine.
 pub fn stop_proxy() -> std::result::Result<(), String> {
     // `stop_corduit` is the whole operation: the dashboard the engine started
     // goes down with it, the tracker is reset and the instance is dropped.
@@ -554,9 +574,21 @@ pub fn get_dns_config() -> std::result::Result<DnsConfigDto, String> {
 
 /// The client-facing DNS settings in effect.
 ///
-/// Read from the live configuration so the intercepted DNS follows the profile.
-/// Falls back to the responder's default when the engine is not running yet,
-/// which is the behaviour the stack had before these settings existed.
+/// Read from the live configuration so the intercepted DNS follows the profile:
+/// the packet processors terminate DNS for intercepted queries, and which
+/// answers they give is a property of the profile, not of the processor.
+///
+/// If the engine is gone by the time this runs — each caller checks a moment
+/// earlier and releases the read guard in between, so the race is real — the
+/// responder's default is used, which is what the stack had before these
+/// settings existed.
+///
+/// Gated to the platforms that *have* such a processor — Windows, Linux and
+/// Android. macOS refuses TUN mode (it would need a System Extension) and iOS
+/// hands the tunnel to a host-supplied fd, so on those two these settings would
+/// be built and never read. The `cfg` states that; an `allow(dead_code)` would
+/// hide it.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
 fn client_dns_settings() -> crate::netstack::solidtcp::ClientDnsSettings {
     use crate::engine::config::DnsMode;
     use crate::netstack::solidtcp::{ClientDnsMode, ClientDnsSettings};

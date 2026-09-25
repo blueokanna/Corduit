@@ -53,7 +53,7 @@ dashmap = { version = "6", optional = true }
 once_cell = { version = "1", optional = true }
 
 # --- error handling ----------------------------------------------------------
-thiserror = { version = "2.0.20", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
 
 # --- codec / time  -------------------------------
 nextjson = { version = "0.1.4", default-features = false, features = [
@@ -89,7 +89,7 @@ ipnet = { version = "2.12.2", optional = true }
 getrandom = { version = "0.3.2", features = ["std"], optional = true }
 
 # --- networking / system (std only) -----------------------------------------
-bitflags = "2"
+bitflags = "2.13.2"
 bytes = { version = "1", default-features = false }
 regex = { version = "1", optional = true }
 smoltcp = { version = "0.11.0", default-features = false, features = [

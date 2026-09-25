@@ -287,9 +287,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo check --no-default-features                 # no_std 协议核心
 cargo check --no-default-features --features std  # 引擎层，不含可选协议
+cargo test --no-default-features --features std   # …以及该配置下的测试代码
+cargo run --example minimal                       # 真跑一个引擎，只用环回端口
 ```
 
-CI 在 Linux、macOS、Windows 上运行默认矩阵，另有 all-features 作业（覆盖被门控的 QUIC / TUIC / Hysteria2 代码的构建与测试）与 `no_std` 核心检查。
+CI 在 Linux、macOS、Windows 上运行默认矩阵，另有 all-features 作业（覆盖被门控的 QUIC / TUIC / Hysteria2 代码的构建与测试）、`no_std` 核心检查、`std`-only 配置（不仅编译，还跑测试），以及会**构建并测试** 1.78 的 MSRV 作业。每个桌面平台还会跑那些只用环回端口的示例——这是唯一把库真正当一个应用跑起来的地方——并构建文档。`RUSTFLAGS` 与 `RUSTDOCFLAGS` 都是 `-D warnings`：警告就是构建失败，指向已不存在条目的文档链接也同样是构建失败。
 
 MSRV：**Rust 1.78**。不使用任何 HTTP/TLS/QUIC 第三方库，也没有 async runtime：网络层是 courierust 加上表中列出的仓库内编解码，并发是 courierust 的 work-stealing 池加上 `std::thread`。
 
