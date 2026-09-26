@@ -11,7 +11,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// TTL of a fake-IP answer, in seconds.
 ///
@@ -654,26 +654,24 @@ impl DnsHandler {
     }
 
     /// Resolve through the profile's DNS, then the system resolver.
+    ///
+    /// The system resolver gets the last word whenever the engine lookup
+    /// produced nothing — it failed, it answered NODATA or NXDOMAIN, or no
+    /// engine resolver is configured at all. That mirrors the outbound path
+    /// (`common::socket`), which has always retried the engine's "found no
+    /// address" through the system resolver: the engine resolver is a
+    /// convenience over the profile's servers, not a name filter, so a client
+    /// query must not fail where a dial would have succeeded. When both fail,
+    /// the error names the engine's reason first, so the log answers "why"
+    /// instead of "could not resolve".
     fn resolve_real(
         &self,
         domain: &str,
         want_v6: bool,
     ) -> std::result::Result<Vec<IpAddr>, String> {
-        if let Some(result) = resolve_ips(domain, want_v6) {
-            return result.map_err(|error| error.to_string());
-        }
-        let resolved = (domain, 0u16)
-            .to_socket_addrs()
-            .map_err(|error| error.to_string())?;
-        let wanted: Vec<IpAddr> = resolved
-            .map(|address| address.ip())
-            .filter(|ip| matches!(ip, IpAddr::V6(_)) == want_v6)
-            .collect();
-        if wanted.is_empty() {
-            Err("no address of the requested family".to_string())
-        } else {
-            Ok(wanted)
-        }
+        with_system_fallback(domain, resolve_ips(domain, want_v6), || {
+            system_lookup(domain, want_v6)
+        })
     }
 
     /// Build a response carrying every address of the matching family.
@@ -766,6 +764,50 @@ fn select_family(addresses: &[IpAddr], qtype: DnsQueryType) -> Vec<IpAddr> {
         .copied()
         .filter(|ip| matches!(ip, IpAddr::V6(_)) == want_v6)
         .collect()
+}
+
+/// The engine lookup's outcome, with the system resolver as the last word.
+///
+/// Split out as a pure decision so the policy — *when* the system resolver is
+/// asked — is testable without touching a socket. `engine` is exactly what
+/// [`resolve_ips`] hands back: `None` when no engine resolver is configured,
+/// otherwise its result; an engine answer with no address of the wanted
+/// family is already an error by the time it gets here, and is treated like
+/// any other engine failure.
+fn with_system_fallback(
+    domain: &str,
+    engine: Option<std::io::Result<Vec<IpAddr>>>,
+    system: impl FnOnce() -> std::result::Result<Vec<IpAddr>, String>,
+) -> std::result::Result<Vec<IpAddr>, String> {
+    let reason = match engine {
+        Some(Ok(addresses)) if !addresses.is_empty() => return Ok(addresses),
+        Some(Ok(_)) => "the engine DNS returned no addresses".to_string(),
+        Some(Err(error)) => error.to_string(),
+        None => "no engine DNS resolver is configured".to_string(),
+    };
+    debug!(
+        "DNS: the engine lookup for {domain} produced nothing ({reason}); \
+         the system resolver gets the last word"
+    );
+    system().map_err(|system_error| {
+        format!("engine DNS: {reason}; the system resolver failed too: {system_error}")
+    })
+}
+
+/// One system-resolver lookup, restricted to the requested family.
+fn system_lookup(domain: &str, want_v6: bool) -> std::result::Result<Vec<IpAddr>, String> {
+    let resolved = (domain, 0u16)
+        .to_socket_addrs()
+        .map_err(|error| error.to_string())?;
+    let wanted: Vec<IpAddr> = resolved
+        .map(|address| address.ip())
+        .filter(|ip| matches!(ip, IpAddr::V6(_)) == want_v6)
+        .collect();
+    if wanted.is_empty() {
+        Err("no address of the requested family".to_string())
+    } else {
+        Ok(wanted)
+    }
 }
 
 #[cfg(test)]
@@ -1223,5 +1265,83 @@ mod tests {
         // a connection was made to.
         assert_eq!(ClientDnsMode::from_profile(""), ClientDnsMode::Normal);
         assert_eq!(ClientDnsMode::from_profile("typo"), ClientDnsMode::Normal);
+    }
+
+    // -- the system-resolver fallback ---------------------------------------
+
+    fn v4(text: &str) -> IpAddr {
+        text.parse().expect("ipv4 literal")
+    }
+
+    /// The engine answer wins when it has one; the system resolver is not
+    /// asked at all.
+    #[test]
+    fn a_real_engine_answer_never_reaches_the_system_resolver() {
+        let mut asked = 0;
+        let answer = with_system_fallback(
+            "node.example.com",
+            Some(Ok(vec![v4("203.0.113.7")])),
+            || {
+                asked += 1;
+                Ok(vec![v4("198.51.100.1")])
+            },
+        )
+        .expect("engine answer");
+        assert_eq!(answer, vec![v4("203.0.113.7")]);
+        assert_eq!(asked, 0, "the system resolver must stay out of the way");
+    }
+
+    /// The bug this fixes: "engine DNS found no address" used to be the end of
+    /// the story for a client query, even though the outbound path retries the
+    /// system resolver for exactly the same error.
+    #[test]
+    fn an_engine_miss_falls_back_to_the_system_resolver() {
+        let engine_error = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "engine DNS found no address for 'node.example.com'",
+        );
+        for engine in [
+            Some(Err(engine_error)),
+            None, // no engine resolver configured at all
+        ] {
+            let answer =
+                with_system_fallback("node.example.com", engine, || Ok(vec![v4("198.51.100.1")]))
+                    .expect("the system resolver answers");
+            assert_eq!(answer, vec![v4("198.51.100.1")]);
+        }
+    }
+
+    /// An empty engine answer should not happen — `resolve_ips` reports it as
+    /// an error — but if it ever does, it is a miss, not an answer.
+    #[test]
+    fn an_empty_engine_answer_is_treated_like_a_miss() {
+        let answer = with_system_fallback("node.example.com", Some(Ok(Vec::new())), || {
+            Ok(vec![v4("198.51.100.2")])
+        })
+        .expect("fallback answer");
+        assert_eq!(answer, vec![v4("198.51.100.2")]);
+    }
+
+    /// When both resolvers fail, the error names both reasons: the engine's
+    /// first — it is the run's configured resolver — and the system's after it,
+    /// so the log answers "why" instead of "could not resolve".
+    #[test]
+    fn both_resolvers_failing_names_both_reasons() {
+        let engine = Some(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "engine DNS found no address for 'node.example.com'",
+        )));
+        let error = with_system_fallback("node.example.com", engine, || {
+            Err("no address of the requested family".to_string())
+        })
+        .expect_err("nothing resolved");
+        assert!(
+            error.contains("engine DNS found no address"),
+            "the engine reason must survive: {error}"
+        );
+        assert!(
+            error.contains("system resolver failed too"),
+            "the system side must be named: {error}"
+        );
     }
 }
