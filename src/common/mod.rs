@@ -40,10 +40,12 @@
 //!
 //! # Safety
 //!
-//! The crate forbids `unsafe` everywhere except [`roots`]: reading the
-//! Windows certificate store requires calling the Win32 API directly (there
-//! is no safe wrapper in the `windows` crate), and the unsafe surface is a
-//! single, audited function.
+//! The crate forbids `unsafe` everywhere except two audited sites: [`roots`]
+//! (reading the Windows certificate store requires calling the Win32 API
+//! directly) and the socket pin in [`socket`] (binding a socket to an
+//! interface needs `setsockopt`, which has no safe wrapper). Each site is a
+//! single function with the unsafe call spelled out and justified; everything
+//! else stays under `deny(unsafe_code)`.
 
 #![deny(unsafe_code)]
 

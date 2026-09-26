@@ -5,11 +5,23 @@ use crate::crypto::hash::{Blake3, Md5, Sha1};
 use crate::crypto::kdf::Hkdf;
 use crate::engine::config::OutboundConfig;
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{OutboundProxy, TargetAddr};
+use crate::engine::outbound::{OutboundProxy, TargetAddr, UdpReplySink};
 use crate::engine::tls::yaml_value_to_string;
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+/// How long a Shadowsocks UDP session may stay silent before it folds.
+///
+/// The session keeps a socket and a reader thread alive; an association that
+/// is gone must not leave either behind for long.
+const SS_UDP_SESSION_IDLE: Duration = Duration::from_secs(120);
+
+/// Read timeout of the session reader between liveness checks.
+const SS_UDP_POLL: Duration = Duration::from_secs(30);
 
 /// Shadowsocks outbound proxy
 pub struct ShadowsocksOutbound {
@@ -19,11 +31,15 @@ pub struct ShadowsocksOutbound {
     password: String,
     cipher: String,
     udp_enabled: bool,
+    /// One UDP session per destination, shared by every datagram of that
+    /// destination. The session cache is what turns QUIC from "one socket
+    /// and one wait per packet" into a stream of datagrams that answer
+    /// whenever they answer.
+    udp_sessions: parking_lot::Mutex<HashMap<String, Arc<SsUdpSession>>>,
 }
 
 impl OutboundProxy for ShadowsocksOutbound {
     fn connect(&self) -> Result<()> {
-        // Test connection to Shadowsocks server (DNS resolution happens here)
         let _stream =
             crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
                 .map_err(|e| {
@@ -67,6 +83,20 @@ impl OutboundProxy for ShadowsocksOutbound {
         self.relay_udp(target, data)
     }
 
+    /// Session-based submission: the datagram is encrypted onto the target's
+    /// shared socket and this returns without waiting for anything. Replies
+    /// stream back through `sink` from the session's reader thread.
+    fn udp_submit(&self, target: &TargetAddr, data: &[u8], sink: &Arc<UdpReplySink>) -> Result<()> {
+        if !self.udp_enabled {
+            return Err(Error::config(
+                "UDP relay is not enabled for this Shadowsocks proxy",
+            ));
+        }
+        let session = self.udp_session(target)?;
+        session.register_sink(sink);
+        session.send(&self.password, data)
+    }
+
     fn test_http_latency(
         &self,
         test_url: &str,
@@ -98,7 +128,6 @@ impl OutboundProxy for ShadowsocksOutbound {
         let server_addr = format!("{}:{}", self.server, self.port);
         tracing::debug!("SS latency test: resolving {}", server_addr);
 
-        // Connect to the Shadowsocks server
         let mut stream = crate::common::socket::connect_host(&self.server, self.port, timeout)
             .map_err(|e| Error::network(format!("Failed to connect: {}", e)))?;
         stream
@@ -108,7 +137,6 @@ impl OutboundProxy for ShadowsocksOutbound {
             .set_write_timeout(Some(timeout))
             .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
-        // Disable Nagle's algorithm for lower latency
         stream.set_nodelay(true).ok();
 
         tracing::debug!(
@@ -116,36 +144,29 @@ impl OutboundProxy for ShadowsocksOutbound {
             self.cipher
         );
 
-        // Generate client salt for sending
         let mut client_salt = vec![0u8; cipher_spec.salt_len];
         getrandom::fill(&mut client_salt)
             .map_err(|e| Error::network(format!("Failed to generate salt: {}", e)))?;
 
-        // Derive encryption key from client salt
         let enc_subkey = derive_subkey_for_cipher(&self.password, &client_salt, &cipher_spec)?;
         let mut enc = AeadCipher::new(cipher_spec, enc_subkey);
 
-        // Build address header
         let target = crate::engine::outbound::TargetAddr::Domain(host.clone(), url_port);
         let addr_header = self.build_address_header(&target)?;
 
-        // Build HTTP request
         let http_request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n",
             path, host
         );
 
-        // Combine address header and HTTP request into one payload
         let mut first_payload = addr_header;
         first_payload.extend_from_slice(http_request.as_bytes());
 
-        // Encrypt the combined payload
         let len = first_payload.len();
         let len_bytes = (len as u16).to_be_bytes();
         let enc_len = enc.encrypt(&len_bytes)?;
         let enc_data = enc.encrypt(&first_payload)?;
 
-        // Send client_salt + encrypted length + encrypted data in one write
         let mut send_buf = Vec::with_capacity(client_salt.len() + enc_len.len() + enc_data.len());
         send_buf.extend_from_slice(&client_salt);
         send_buf.extend_from_slice(&enc_len);
@@ -162,7 +183,6 @@ impl OutboundProxy for ShadowsocksOutbound {
 
         tracing::debug!("SS latency test: waiting for response");
 
-        // Read the server's salt (server uses its own salt for responses)
         let mut server_salt = vec![0u8; cipher_spec.salt_len];
         let salt_result = stream.read_exact(&mut server_salt);
         match salt_result {
@@ -182,11 +202,9 @@ impl OutboundProxy for ShadowsocksOutbound {
 
         tracing::debug!("SS latency test: received server salt");
 
-        // Derive decryption key from server's salt
         let dec_subkey = derive_subkey_for_cipher(&self.password, &server_salt, &cipher_spec)?;
         let mut dec = AeadCipher::new(cipher_spec, dec_subkey);
 
-        // Now read and decrypt the response
         match recv_decrypted_chunk(&mut stream, &mut dec)? {
             Some(chunk) => {
                 let response = String::from_utf8_lossy(&chunk);
@@ -236,7 +254,6 @@ impl OutboundProxy for ShadowsocksOutbound {
             .set_write_timeout(Some(Duration::from_secs(60)))
             .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
 
-        // Disable Nagle's algorithm for lower latency
         outbound.set_nodelay(true).ok();
 
         tracing::debug!(
@@ -246,16 +263,13 @@ impl OutboundProxy for ShadowsocksOutbound {
             target
         );
 
-        // Generate client salt for sending
         let mut client_salt = vec![0u8; cipher_spec.salt_len];
         getrandom::fill(&mut client_salt)
             .map_err(|e| Error::network(format!("Failed to generate salt: {}", e)))?;
 
-        // Derive encryption key from client salt
         let enc_subkey = derive_subkey_for_cipher(&self.password, &client_salt, &cipher_spec)?;
         let mut enc = AeadCipher::new(cipher_spec, enc_subkey);
 
-        // Send client salt first
         outbound
             .write_all(&client_salt)
             .map_err(|e| Error::network(format!("Failed to send SS salt: {}", e)))?;
@@ -263,8 +277,6 @@ impl OutboundProxy for ShadowsocksOutbound {
         let addr_header = self.build_address_header(&target)?;
         send_encrypted_chunk(&mut outbound, &mut enc, &addr_header)?;
 
-        // Wrap the socket with the Shadowsocks chunked-encryption codec and
-        // let the bidirectional relay drive both directions concurrently.
         let ss_stream = ShadowsocksStream::new(outbound, enc, cipher_spec, self.password.clone());
 
         relay_streams!(inbound, ss_stream, connection)
@@ -283,15 +295,12 @@ impl ShadowsocksOutbound {
             .port
             .ok_or_else(|| Error::config("Missing port for Shadowsocks"))?;
 
-        // Get password from options - handle different YAML value types
         let password = config
             .options
             .get("password")
             .map(yaml_value_to_string)
             .unwrap_or_default();
 
-        // Accept both spellings: profiles in the wild use `cipher` and `method`
-        // interchangeably, so either may be the one that is present.
         let cipher = config
             .options
             .get("cipher")
@@ -299,7 +308,6 @@ impl ShadowsocksOutbound {
             .map(yaml_value_to_string)
             .unwrap_or_else(|| "aes-256-gcm".to_string());
 
-        // Get UDP option - default to true to support QUIC and other UDP protocols
         let udp_enabled = config
             .options
             .get("udp")
@@ -326,46 +334,66 @@ impl ShadowsocksOutbound {
             password,
             cipher,
             udp_enabled,
+            udp_sessions: parking_lot::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The live UDP session for `target`, created on first use.
+    ///
+    /// Dead sessions (their reader has exited) are replaced, and the map is
+    /// pruned of them on the way — one entry per destination, so the prune
+    /// only has to be correct, not frequent.
+    fn udp_session(&self, target: &TargetAddr) -> Result<Arc<SsUdpSession>> {
+        let key = target.to_string();
+        if let Some(existing) = self.udp_sessions.lock().get(&key) {
+            if existing.alive.load(Ordering::Acquire) {
+                return Ok(Arc::clone(existing));
+            }
+        }
+
+        let session = Arc::new(self.create_udp_session(target)?);
+        let password = self.password.clone();
+        let reader_session = Arc::clone(&session);
+        std::thread::Builder::new()
+            .name("corduit-ss-udp".into())
+            .spawn(move || pump_ss_udp_replies(reader_session, password))
+            .map_err(|e| Error::network(format!("Failed to spawn the SS UDP reader: {e}")))?;
+
+        let mut sessions = self.udp_sessions.lock();
+        sessions.retain(|_, session| session.alive.load(Ordering::Acquire));
+        sessions.insert(key, Arc::clone(&session));
+        Ok(session)
+    }
+
+    fn create_udp_session(&self, target: &TargetAddr) -> Result<SsUdpSession> {
+        let cipher_spec = CipherSpec::new(&self.cipher)?;
+        let resolve_timeout = Duration::from_secs(10);
+        let resolved: SocketAddr =
+            crate::common::socket::resolve_host(&self.server, self.port, resolve_timeout)
+                .map_err(|e| Error::network(format!("Failed to resolve SS server: {e}")))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::network("No addresses found for SS server"))?;
+
+        let socket = crate::common::socket::udp_bind("0.0.0.0:0".parse().unwrap(), SS_UDP_POLL)
+            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {e}")))?;
+        socket
+            .connect(resolved)
+            .map_err(|e| Error::network(format!("Failed to connect UDP to SS server: {e}")))?;
+
+        Ok(SsUdpSession {
+            socket,
+            cipher_spec,
+            sinks: parking_lot::Mutex::new(Vec::new()),
+            last_active: parking_lot::Mutex::new(Instant::now()),
+            alive: AtomicBool::new(true),
+            target: target.clone(),
         })
     }
 
     /// Build SOCKS5-style address header for Shadowsocks
     fn build_address_header(&self, target: &TargetAddr) -> Result<Vec<u8>> {
-        let mut header = Vec::new();
-
-        match target {
-            TargetAddr::Domain(domain, port) => {
-                // 0x03 = domain name
-                header.push(0x03);
-                // Domain length (1 byte)
-                if domain.len() > 255 {
-                    return Err(Error::protocol("Domain name too long"));
-                }
-                header.push(domain.len() as u8);
-                // Domain bytes
-                header.extend_from_slice(domain.as_bytes());
-                // Port (big endian)
-                header.extend_from_slice(&port.to_be_bytes());
-            }
-            TargetAddr::Ip(addr) => {
-                match addr {
-                    std::net::SocketAddr::V4(v4) => {
-                        // 0x01 = IPv4
-                        header.push(0x01);
-                        header.extend_from_slice(&v4.ip().octets());
-                        header.extend_from_slice(&v4.port().to_be_bytes());
-                    }
-                    std::net::SocketAddr::V6(v6) => {
-                        // 0x04 = IPv6
-                        header.push(0x04);
-                        header.extend_from_slice(&v6.ip().octets());
-                        header.extend_from_slice(&v6.port().to_be_bytes());
-                    }
-                }
-            }
-        }
-
-        Ok(header)
+        build_ss_address_header(target)
     }
 
     /// Check if UDP relay is enabled
@@ -386,10 +414,8 @@ impl ShadowsocksOutbound {
         }
 
         let cipher_spec = CipherSpec::new(&self.cipher)?;
+        let timeout = Duration::from_secs(5);
 
-        let timeout = Duration::from_secs(30);
-
-        // Resolve server address
         let resolved_addr: SocketAddr =
             crate::common::socket::resolve_host(&self.server, self.port, timeout)
                 .map_err(|e| Error::network(format!("Failed to resolve SS server: {}", e)))?
@@ -397,16 +423,13 @@ impl ShadowsocksOutbound {
                 .next()
                 .ok_or_else(|| Error::network("No addresses found for SS server"))?;
 
-        // Bind a fresh UDP socket (read timeout set by udp_bind)
         let server_socket = crate::common::socket::udp_bind("0.0.0.0:0".parse().unwrap(), timeout)
             .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
 
-        // Connect to server (for send/recv convenience)
         server_socket
             .connect(resolved_addr)
             .map_err(|e| Error::network(format!("Failed to connect UDP to SS server: {}", e)))?;
 
-        // Encrypt and send UDP packet
         let encrypted = self.encrypt_udp_packet(target, data, &cipher_spec)?;
         server_socket
             .send(&encrypted)
@@ -420,7 +443,6 @@ impl ShadowsocksOutbound {
             self.port
         );
 
-        // Receive response with timeout
         let mut recv_buf = vec![0u8; 65535];
         let recv_len =
             crate::common::socket::recv_udp_timeout(&server_socket, &mut recv_buf, timeout)
@@ -432,7 +454,6 @@ impl ShadowsocksOutbound {
                     }
                 })?;
 
-        // Decrypt response
         let (response_data, _response_addr) =
             self.decrypt_udp_packet(&recv_buf[..recv_len], &cipher_spec)?;
 
@@ -452,27 +473,7 @@ impl ShadowsocksOutbound {
         data: &[u8],
         cipher_spec: &CipherSpec,
     ) -> Result<Vec<u8>> {
-        // Generate salt
-        let mut salt = vec![0u8; cipher_spec.salt_len];
-        getrandom::fill(&mut salt)
-            .map_err(|e| Error::network(format!("Failed to generate salt: {}", e)))?;
-
-        // Derive key from salt
-        let key = derive_subkey_for_cipher(&self.password, &salt, cipher_spec)?;
-
-        // Build payload: [address][data]
-        let addr_header = self.build_address_header(target)?;
-        let mut payload = addr_header;
-        payload.extend_from_slice(data);
-
-        // Encrypt payload (UDP uses single-shot encryption, not chunked)
-        let encrypted = encrypt_udp_payload(&key, &payload, cipher_spec)?;
-
-        // Combine: [salt][encrypted_payload]
-        let mut result = salt;
-        result.extend_from_slice(&encrypted);
-
-        Ok(result)
+        encrypt_udp_datagram(&self.password, target, data, cipher_spec)
     }
 
     /// Decrypt a UDP packet from Shadowsocks
@@ -483,26 +484,167 @@ impl ShadowsocksOutbound {
         data: &[u8],
         cipher_spec: &CipherSpec,
     ) -> Result<(Vec<u8>, TargetAddr)> {
-        if data.len() < cipher_spec.salt_len + cipher_spec.tag_len {
-            return Err(Error::protocol("UDP packet too short"));
-        }
-
-        // Extract salt
-        let salt = &data[..cipher_spec.salt_len];
-        let encrypted = &data[cipher_spec.salt_len..];
-
-        // Derive key from salt
-        let key = derive_subkey_for_cipher(&self.password, salt, cipher_spec)?;
-
-        // Decrypt payload
-        let decrypted = decrypt_udp_payload(&key, encrypted, cipher_spec)?;
-
-        // Parse address from decrypted payload
-        let (target, addr_len) = parse_address_header(&decrypted)?;
-        let payload = decrypted[addr_len..].to_vec();
-
-        Ok((payload, target))
+        decrypt_udp_datagram(&self.password, cipher_spec, data)
     }
+}
+
+/// One long-lived Shadowsocks UDP relay for one destination.
+///
+/// The socket carries every datagram of the flow — Shadowsocks puts the
+/// destination in each packet's own header, so one socket serves one target
+/// cleanly — and the reader thread decrypts replies and hands them to every
+/// live sink. Sinks are `Weak` on purpose: the flows that own them come and
+/// go, and a session must not keep a dead flow's socket alive.
+struct SsUdpSession {
+    socket: std::net::UdpSocket,
+    cipher_spec: CipherSpec,
+    sinks: parking_lot::Mutex<Vec<Weak<UdpReplySink>>>,
+    last_active: parking_lot::Mutex<Instant>,
+    alive: AtomicBool,
+    target: TargetAddr,
+}
+
+impl SsUdpSession {
+    fn register_sink(&self, sink: &Arc<UdpReplySink>) {
+        let mut sinks = self.sinks.lock();
+        let pointer = Arc::as_ptr(sink);
+        sinks.retain(|existing| existing.strong_count() > 0);
+        if !sinks
+            .iter()
+            .any(|existing| std::ptr::eq(existing.as_ptr(), pointer))
+        {
+            sinks.push(Arc::downgrade(sink));
+        }
+    }
+
+    fn send(&self, password: &str, data: &[u8]) -> Result<()> {
+        let encrypted = encrypt_udp_datagram(password, &self.target, data, &self.cipher_spec)?;
+        self.socket
+            .send(&encrypted)
+            .map_err(|e| Error::network(format!("Failed to send UDP packet: {e}")))?;
+        *self.last_active.lock() = Instant::now();
+        Ok(())
+    }
+}
+
+/// Read replies until the flow goes quiet for [`SS_UDP_SESSION_IDLE`].
+fn pump_ss_udp_replies(session: Arc<SsUdpSession>, password: String) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        match crate::common::socket::recv_udp_timeout(&session.socket, &mut buf, SS_UDP_POLL) {
+            Ok(len) => {
+                *session.last_active.lock() = Instant::now();
+                match decrypt_udp_datagram(&password, &session.cipher_spec, &buf[..len]) {
+                    Ok((payload, _source)) => {
+                        let sinks: Vec<Arc<UdpReplySink>> = {
+                            let mut guard = session.sinks.lock();
+                            let mut live = Vec::with_capacity(guard.len());
+                            guard.retain(|weak| match weak.upgrade() {
+                                Some(sink) => {
+                                    live.push(sink);
+                                    true
+                                }
+                                None => false,
+                            });
+                            live
+                        };
+                        for sink in sinks {
+                            sink.deliver(&session.target, &payload);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Shadowsocks UDP reply could not be decrypted: {e}");
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                if session.last_active.lock().elapsed() >= SS_UDP_SESSION_IDLE {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Shadowsocks UDP session ended: {e}");
+                break;
+            }
+        }
+    }
+    session.alive.store(false, Ordering::Release);
+}
+
+/// SOCKS5-style address header the Shadowsocks UDP payload starts with.
+fn build_ss_address_header(target: &TargetAddr) -> Result<Vec<u8>> {
+    let mut header = Vec::new();
+
+    match target {
+        TargetAddr::Domain(domain, port) => {
+            header.push(0x03);
+            if domain.len() > 255 {
+                return Err(Error::protocol("Domain name too long"));
+            }
+            header.push(domain.len() as u8);
+            header.extend_from_slice(domain.as_bytes());
+            header.extend_from_slice(&port.to_be_bytes());
+        }
+        TargetAddr::Ip(addr) => match addr {
+            std::net::SocketAddr::V4(v4) => {
+                // 0x01 = IPv4
+                header.push(0x01);
+                header.extend_from_slice(&v4.ip().octets());
+                header.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            std::net::SocketAddr::V6(v6) => {
+                // 0x04 = IPv6
+                header.push(0x04);
+                header.extend_from_slice(&v6.ip().octets());
+                header.extend_from_slice(&v6.port().to_be_bytes());
+            }
+        },
+    }
+
+    Ok(header)
+}
+
+/// Encrypt one UDP datagram: `[salt][encrypted([address][payload])]`.
+fn encrypt_udp_datagram(
+    password: &str,
+    target: &TargetAddr,
+    data: &[u8],
+    cipher_spec: &CipherSpec,
+) -> Result<Vec<u8>> {
+    let mut salt = vec![0u8; cipher_spec.salt_len];
+    getrandom::fill(&mut salt)
+        .map_err(|e| Error::network(format!("Failed to generate salt: {e}")))?;
+
+    let key = derive_subkey_for_cipher(password, &salt, cipher_spec)?;
+
+    let mut payload = build_ss_address_header(target)?;
+    payload.extend_from_slice(data);
+
+    let encrypted = encrypt_udp_payload(&key, &payload, cipher_spec)?;
+
+    let mut result = salt;
+    result.extend_from_slice(&encrypted);
+    Ok(result)
+}
+
+/// Decrypt one UDP datagram; returns `(payload, source address)`.
+fn decrypt_udp_datagram(
+    password: &str,
+    cipher_spec: &CipherSpec,
+    data: &[u8],
+) -> Result<(Vec<u8>, TargetAddr)> {
+    if data.len() < cipher_spec.salt_len + cipher_spec.tag_len {
+        return Err(Error::protocol("UDP packet too short"));
+    }
+
+    let salt = &data[..cipher_spec.salt_len];
+    let encrypted = &data[cipher_spec.salt_len..];
+    let key = derive_subkey_for_cipher(password, salt, cipher_spec)?;
+    let decrypted = decrypt_udp_payload(&key, encrypted, cipher_spec)?;
+
+    let (target, addr_len) = parse_address_header(&decrypted)?;
+    let payload = decrypted[addr_len..].to_vec();
+    Ok((payload, target))
 }
 
 /// A `std::io::Read + Write + SyncStream` adapter over the Shadowsocks

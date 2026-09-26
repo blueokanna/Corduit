@@ -1,6 +1,7 @@
 //! Real-time connection tracking for Corduit
 //! Tracks active connections with traffic statistics
 
+use crate::common::cancel::CancellationToken;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -33,6 +34,7 @@ pub struct TrackedConnection {
     pub rule: String,
     pub rule_payload: String,
     pub process_name: Option<String>,
+    cancel: CancellationToken,
 }
 
 impl TrackedConnection {
@@ -68,6 +70,7 @@ impl TrackedConnection {
             rule,
             rule_payload,
             process_name: None,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -105,7 +108,13 @@ impl TrackedConnection {
             rule,
             rule_payload,
             process_name: None,
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// The token that must be handed to every relay serving this connection.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     pub fn add_upload(&self, bytes: u64) {
@@ -271,21 +280,30 @@ impl ConnectionTracker {
     }
 
     /// Close a connection by ID
+    ///
+    /// Cancels the connection's token first: removing the entry only hides it
+    /// from the list, while the token is what actually tears the relay down
+    /// and frees its sockets.
     pub fn close_connection(&self, id: &str) -> bool {
-        self.connections.remove(id).is_some()
+        let Some((_, conn)) = self.connections.remove(id) else {
+            return false;
+        };
+        conn.cancellation_token().cancel();
+        true
     }
 
     /// Close all connections
     pub fn close_all(&self) {
         let ids: Vec<String> = self.connections.iter().map(|e| e.key().clone()).collect();
         for id in ids {
-            self.untrack(&id);
+            self.close_connection(&id);
         }
     }
 
     /// Reset all statistics (called when service restarts)
     pub fn reset(&self) {
-        // Clear all connections
+        // Clear all connections, tearing down whatever still runs
+        self.close_all();
         self.connections.clear();
 
         // Reset all counters
@@ -354,6 +372,16 @@ static GLOBAL_TRACKER: once_cell::sync::Lazy<Arc<ConnectionTracker>> =
 /// Get the global connection tracker
 pub fn global_tracker() -> Arc<ConnectionTracker> {
     Arc::clone(&GLOBAL_TRACKER)
+}
+
+/// The token a relay should watch for the given tracked connection.
+///
+/// An untracked relay still needs a token, and a fresh one is never
+/// cancelled: same behaviour as before tracking existed.
+pub fn cancellation_for(connection: Option<&Arc<TrackedConnection>>) -> CancellationToken {
+    connection
+        .map(|conn| conn.cancellation_token())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

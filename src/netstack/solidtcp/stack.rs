@@ -6,7 +6,8 @@ use crate::netstack::solidtcp::dns::{ClientDnsSettings, DnsHandler, DnsVerdict, 
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use crate::netstack::solidtcp::nat::{NatConfig, NatTable};
 use crate::netstack::solidtcp::packet::{
-    build_ipv4_tcp, build_ipv4_udp, parse_packet, ParsedPacket, TcpFlags, TcpInfo, TransportInfo,
+    build_tcp, build_udp, parse_packet, ParsedPacket, TcpFlags, TcpInfo, TransportInfo,
+    DEFAULT_MSS_V4, DEFAULT_MSS_V6,
 };
 use crate::netstack::solidtcp::stats::StackStats;
 use crate::netstack::solidtcp::tcp::{
@@ -18,14 +19,54 @@ use parking_lot::{Mutex, RwLock};
 use smoltcp::wire::IpProtocol;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, UdpSocket as StdUdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, UdpSocket as StdUdpSocket,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Ceiling on tunnel connections the stack will dial and hold at once.
+///
+/// One thread pair per proxied flow is the design, so a SYN flood — or an app
+/// opening connections faster than the proxy retires them — has to hit a wall
+/// inside the stack instead of the OS thread limit, which is a system-wide
+/// failure rather than a local one.
+const MAX_TUN_PROXY_CONNECTIONS: usize = 2048;
+static TUN_PROXY_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// One slot in the tunnel's connection budget, returned on drop.
+struct ProxySlot;
+
+impl ProxySlot {
+    fn acquire() -> Option<Self> {
+        let mut current = TUN_PROXY_CONNECTIONS.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_TUN_PROXY_CONNECTIONS {
+                return None;
+            }
+            match TUN_PROXY_CONNECTIONS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for ProxySlot {
+    fn drop(&mut self) {
+        TUN_PROXY_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// How long a UDP association may sit idle before it closes.
 ///
@@ -50,11 +91,7 @@ const UDP_ASSOCIATION_SWEEP_EVERY: u64 = 256;
 struct UdpAssociation {
     relay_addr: SocketAddr,
     socket: StdUdpSocket,
-    /// Held only so the server keeps the relay in place; dropped when the
-    /// association is replaced or swept away.
     _control: TcpStream,
-    /// Cleared by the reply pump when the association ends, so the packet path
-    /// builds a new one instead of writing into a socket nobody is reading.
     alive: Arc<AtomicBool>,
 }
 
@@ -74,9 +111,6 @@ impl UdpAssociation {
         let mut framed = Vec::with_capacity(payload.len() + 262);
         framed.extend_from_slice(&[0x00, 0x00, 0x00]);
 
-        // A domain that cannot be expressed in the wire form is not worth
-        // dropping the datagram over: fall back to the address the flow
-        // resolved to.
         match domain.filter(|domain| domain.len() <= u8::MAX as usize) {
             Some(domain) => {
                 framed.push(0x03);
@@ -151,29 +185,28 @@ fn pump_udp_replies(
                 if n <= header_len {
                     continue;
                 }
-                let (IpAddr::V4(remote_ip), IpAddr::V4(client_ip)) = (remote.ip(), client.ip())
-                else {
-                    continue;
-                };
                 let Some(ref tx) = tun_tx else {
                     continue;
                 };
 
-                let packet = build_ipv4_udp(
-                    remote_ip,
-                    client_ip,
+                let packet = match build_udp(
+                    remote.ip(),
+                    client.ip(),
                     remote.port(),
                     client.port(),
                     &buf[header_len..n],
-                );
+                ) {
+                    Ok(packet) => packet,
+                    Err(e) => {
+                        debug!("UDP reply dropped: {} -> {}: {}", remote, client, e);
+                        continue;
+                    }
+                };
                 stats.record_sent(packet.len());
                 if tx.send(BytesMut::from(&packet[..])).is_err() {
                     break;
                 }
             }
-            // Nothing arrived within the idle budget: the flow is done with
-            // this association. The packet path builds another one if it
-            // comes back.
             Err(e)
                 if matches!(
                     e.kind(),
@@ -227,14 +260,14 @@ fn is_peer_gone(error: &io::Error) -> bool {
     )
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 use std::os::unix::io::AsRawFd;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 static PROTECT_CALLBACK: parking_lot::RwLock<Option<Box<dyn Fn(i32) -> bool + Send + Sync>>> =
     parking_lot::RwLock::new(None);
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub fn set_protect_callback<F>(callback: F)
 where
     F: Fn(i32) -> bool + Send + Sync + 'static,
@@ -244,14 +277,14 @@ where
     info!("SolidStack: Socket protect callback registered");
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub fn clear_protect_callback() {
     let mut guard = PROTECT_CALLBACK.write();
     *guard = None;
     info!("SolidStack: Socket protect callback cleared");
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub fn protect_socket(fd: i32) -> bool {
     debug!("protect_socket called for fd={}", fd);
     let guard = PROTECT_CALLBACK.read();
@@ -272,7 +305,7 @@ pub fn protect_socket(fd: i32) -> bool {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub fn has_protect_callback() -> bool {
     PROTECT_CALLBACK.read().is_some()
 }
@@ -597,8 +630,8 @@ impl SolidStack {
         };
         let domain = fake_ip.and_then(|ip| self.fake_ip_pool.lookup(ip));
 
-        info!(
-            "=== TCP SYN received: {} -> {} (domain: {:?}, is_fake_ip: {}) ===",
+        debug!(
+            "TCP SYN: {} -> {} (domain: {:?}, is_fake_ip: {})",
             src_addr,
             dst_addr,
             domain,
@@ -627,6 +660,28 @@ impl SolidStack {
             return Ok(());
         }
 
+        // The budget is taken before any state is created: a tunnel that
+        // cannot be served is reset right here, so the client fails fast and
+        // no half-open connection is left behind to time out.
+        let Some(slot) = ProxySlot::acquire() else {
+            warn!(
+                "TUN connection budget exhausted ({MAX_TUN_PROXY_CONNECTIONS} live); \
+                 resetting {} -> {}",
+                src_addr, dst_addr
+            );
+            self.send_tcp_packet(
+                dst_addr,
+                src_addr,
+                0,
+                tcp_info.seq.wrapping_add(1),
+                TcpFlags::rst_ack(),
+                MAX_RECV_WINDOW,
+                &[],
+                None,
+            )?;
+            return Ok(());
+        };
+
         let conn = self
             .tcp_manager
             .handle_syn(src_addr, dst_addr, tcp_info, domain.clone())?;
@@ -642,7 +697,7 @@ impl SolidStack {
             )
         };
 
-        info!(
+        debug!(
             "Sending SYN-ACK to {} for connection to {:?}",
             src_addr,
             domain.as_ref().unwrap_or(&dst_addr.to_string())
@@ -665,8 +720,10 @@ impl SolidStack {
         if let Err(e) = std::thread::Builder::new()
             .name("tun-proxy-tcp".into())
             .spawn(move || {
+                // The slot travels with the connection: it is released when
+                // the reader thread that owns the flow ends.
                 if let Err(e) =
-                    stack.establish_proxy_connection(src_addr, dst_addr, domain, conn_clone)
+                    stack.establish_proxy_connection(src_addr, dst_addr, domain, conn_clone, slot)
                 {
                     warn!(
                         "Proxy connection failed: {} -> {}: {}",
@@ -858,7 +915,7 @@ impl SolidStack {
             return Ok(());
         };
 
-        info!(
+        debug!(
             "UDP packet: {} -> {} ({} bytes payload)",
             src_addr,
             dst_addr,
@@ -866,8 +923,8 @@ impl SolidStack {
         );
 
         if dst_addr.port() == 53 && self.config.dns_intercept {
-            info!(
-                "=== DNS query intercepted: {} -> {} ({} bytes) ===",
+            debug!(
+                "DNS query intercepted: {} -> {} ({} bytes)",
                 src_addr,
                 dst_addr,
                 payload.len()
@@ -885,8 +942,8 @@ impl SolidStack {
         payload: &[u8],
     ) -> Result<()> {
         self.stats.record_dns_query();
-        info!(
-            "=== Processing DNS query: {} -> {} ({} bytes) ===",
+        debug!(
+            "Processing DNS query: {} -> {} ({} bytes)",
             src_addr,
             dst_addr,
             payload.len()
@@ -898,11 +955,11 @@ impl SolidStack {
                 faked_domain,
             }) => {
                 if let Some(domain) = faked_domain {
-                    info!("DNS query for domain: {domain} - Fake-IP allocated");
+                    debug!("DNS query for domain: {domain} - Fake-IP allocated");
                     self.stats.record_fake_ip();
                 }
                 self.stats.record_dns_response();
-                info!(
+                debug!(
                     "DNS response ready: {} bytes, sending back to {} from {}",
                     bytes.len(),
                     src_addr,
@@ -911,7 +968,7 @@ impl SolidStack {
 
                 match self.send_udp_packet(dst_addr, src_addr, &bytes) {
                     Ok(()) => {
-                        info!("=== DNS response sent successfully to {} ===", src_addr);
+                        debug!("DNS response sent to {}", src_addr);
                     }
                     Err(e) => {
                         warn!("Failed to send DNS response to {}: {}", src_addr, e);
@@ -978,10 +1035,6 @@ impl SolidStack {
         self.udp_manager
             .record_sent(src_addr, dst_addr, payload.len());
 
-        // Straight into the flow's association: no thread, no TCP connect and
-        // no handshake per packet. Only a missing or dead association pays for
-        // the setup below, and that runs on the packet thread because a
-        // handshake against the engine's own local listener takes microseconds.
         match self.udp_association(src_addr, dst_addr) {
             Ok(association) => {
                 if let Err(e) = association.send(src_addr, dst_addr, domain.as_deref(), payload) {
@@ -996,6 +1049,7 @@ impl SolidStack {
         Ok(())
     }
 
+    /// Send a TCP segment back to the tunnel, for either address family.
     #[allow(clippy::too_many_arguments)]
     fn send_tcp_packet(
         &self,
@@ -1010,14 +1064,9 @@ impl SolidStack {
     ) -> Result<()> {
         let tun_tx = self.tun_tx.as_ref().ok_or(SolidTcpError::DeviceNotReady)?;
 
-        let (src_ip, dst_ip) = match (src_addr.ip(), dst_addr.ip()) {
-            (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
-            _ => return Err(SolidTcpError::Unsupported("IPv6 not supported".to_string())),
-        };
-
-        let packet = build_ipv4_tcp(
-            src_ip,
-            dst_ip,
+        let packet = build_tcp(
+            src_addr.ip(),
+            dst_addr.ip(),
             src_addr.port(),
             dst_addr.port(),
             seq,
@@ -1026,7 +1075,7 @@ impl SolidStack {
             window,
             payload,
             mss,
-        );
+        )?;
 
         self.stats.record_sent(packet.len());
         tun_tx
@@ -1047,30 +1096,27 @@ impl SolidStack {
             SolidTcpError::DeviceNotReady
         })?;
 
-        let (src_ip, dst_ip) = match (src_addr.ip(), dst_addr.ip()) {
-            (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
-            _ => return Err(SolidTcpError::Unsupported("IPv6 not supported".to_string())),
-        };
-
-        info!(
+        debug!(
             "Building UDP packet: {}:{} -> {}:{} ({} bytes payload)",
-            src_ip,
+            src_addr.ip(),
             src_addr.port(),
-            dst_ip,
+            dst_addr.ip(),
             dst_addr.port(),
             payload.len()
         );
 
-        let packet = build_ipv4_udp(src_ip, dst_ip, src_addr.port(), dst_addr.port(), payload);
+        let packet = build_udp(
+            src_addr.ip(),
+            dst_addr.ip(),
+            src_addr.port(),
+            dst_addr.port(),
+            payload,
+        )?;
 
-        info!("Sending UDP packet to TUN: {} bytes total", packet.len());
         self.stats.record_sent(packet.len());
 
         match tun_tx.send(BytesMut::from(&packet[..])) {
-            Ok(()) => {
-                info!("UDP packet sent to TUN successfully");
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(e) => {
                 warn!("Failed to send UDP packet to TUN: {}", e);
                 Err(SolidTcpError::ChannelClosed)
@@ -1152,7 +1198,7 @@ impl StackProxy {
                 SolidTcpError::ProxyError(format!("UDP associate connect failed: {}", e))
             })?;
 
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         {
             let fd = tcp_stream.as_raw_fd();
             if !protect_socket(fd) {
@@ -1184,47 +1230,71 @@ impl StackProxy {
             SolidTcpError::ProxyError(format!("UDP associate request failed: {}", e))
         })?;
 
-        let mut assoc_response = [0u8; 10];
-        tcp_stream.read_exact(&mut assoc_response).map_err(|e| {
+        // The reply is variable length: the bound address dictates the tail.
+        let mut assoc_head = [0u8; 4];
+        tcp_stream.read_exact(&mut assoc_head).map_err(|e| {
             SolidTcpError::ProxyError(format!("UDP associate response failed: {}", e))
         })?;
 
-        if assoc_response[1] != 0x00 {
+        if assoc_head[1] != 0x00 {
             return Err(SolidTcpError::ProxyError(format!(
                 "UDP ASSOCIATE failed: {}",
-                assoc_response[1]
+                assoc_head[1]
             )));
         }
 
-        let relay_addr = match assoc_response[3] {
+        let relay_addr = match assoc_head[3] {
             0x01 => {
-                let ip = Ipv4Addr::new(
-                    assoc_response[4],
-                    assoc_response[5],
-                    assoc_response[6],
-                    assoc_response[7],
-                );
-                let port = u16::from_be_bytes([assoc_response[8], assoc_response[9]]);
+                let mut tail = [0u8; 6];
+                tcp_stream.read_exact(&mut tail).map_err(|e| {
+                    SolidTcpError::ProxyError(format!("UDP associate response failed: {}", e))
+                })?;
+                let ip = Ipv4Addr::new(tail[0], tail[1], tail[2], tail[3]);
+                let port = u16::from_be_bytes([tail[4], tail[5]]);
                 let ip = if ip.is_unspecified() {
-                    Ipv4Addr::new(127, 0, 0, 1)
+                    Ipv4Addr::LOCALHOST
                 } else {
                     ip
                 };
                 SocketAddr::new(IpAddr::V4(ip), port)
             }
-            _ => {
-                return Err(SolidTcpError::ProxyError(
-                    "Unsupported relay address type".to_string(),
-                ));
+            0x04 => {
+                let mut tail = [0u8; 18];
+                tcp_stream.read_exact(&mut tail).map_err(|e| {
+                    SolidTcpError::ProxyError(format!("UDP associate response failed: {}", e))
+                })?;
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&tail[..16]);
+                let ip = Ipv6Addr::from(octets);
+                let port = u16::from_be_bytes([tail[16], tail[17]]);
+                let ip = if ip.is_unspecified() {
+                    Ipv6Addr::LOCALHOST
+                } else {
+                    ip
+                };
+                SocketAddr::new(IpAddr::V6(ip), port)
+            }
+            other => {
+                return Err(SolidTcpError::ProxyError(format!(
+                    "Unsupported relay address type: {}",
+                    other
+                )));
             }
         };
 
         debug!("UDP relay address: {}", relay_addr);
 
-        let udp_socket = StdUdpSocket::bind("0.0.0.0:0")
+        // The relay socket has to be bound in the relay's family, or a v6
+        // relay address has nowhere to be sent from.
+        let bind_addr = if relay_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let udp_socket = StdUdpSocket::bind(bind_addr)
             .map_err(|e| SolidTcpError::ProxyError(format!("UDP socket bind failed: {}", e)))?;
 
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         {
             let fd = udp_socket.as_raw_fd();
             if !protect_socket(fd) {
@@ -1287,16 +1357,17 @@ impl StackProxy {
         dst_addr: SocketAddr,
         domain: Option<String>,
         conn: Arc<RwLock<TcpConnection>>,
+        slot: ProxySlot,
     ) -> Result<()> {
         info!(
-            "=== Establishing proxy connection: {} -> {} (domain: {:?}) ===",
+            "Establishing proxy connection: {} -> {} (domain: {:?})",
             src_addr, dst_addr, domain
         );
 
         let mut stream = crate::common::socket::connect(&self.proxy_addr, PROXY_HANDSHAKE_TIMEOUT)
             .map_err(|e| SolidTcpError::ProxyError(format!("Connect failed: {}", e)))?;
 
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         {
             let fd = stream.as_raw_fd();
             if !protect_socket(fd) {
@@ -1310,7 +1381,7 @@ impl StackProxy {
 
         self.socks5_handshake(&mut stream, dst_addr, domain.as_deref())?;
 
-        info!("SOCKS5 handshake complete: {} -> {}", src_addr, dst_addr);
+        debug!("SOCKS5 handshake complete: {} -> {}", src_addr, dst_addr);
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         // The writer owns this handle: it releases each chunk back to the
@@ -1359,7 +1430,7 @@ impl StackProxy {
                                     if text_lower.contains("upgrade: websocket")
                                         || text_lower.contains("connection: upgrade")
                                     {
-                                        info!(
+                                        debug!(
                                             "WebSocket upgrade detected for {} -> {}",
                                             src_clone, dst_clone
                                         );
@@ -1442,6 +1513,9 @@ impl StackProxy {
         std::thread::Builder::new()
             .name("tun-proxy-read".into())
             .spawn(move || {
+                // Owns the connection's slot in the tunnel budget: released
+                // when this flow's reader ends, however it ends.
+                let _slot = slot;
                 let mut buf = vec![0u8; 65536];
 
                 loop {
@@ -1460,31 +1534,26 @@ impl StackProxy {
                                 let base_seq = conn_guard.snd_nxt();
                                 let ack = conn_guard.rcv_nxt();
                                 let mss = conn_guard.mss() as usize;
+                                // The stack answers the client as the remote
+                                // server, so the roles swap here.
+                                let src_ip = dst_addr.ip();
+                                let dst_ip = src_addr.ip();
 
-                                let ips = match (dst_addr.ip(), src_addr.ip()) {
-                                    (IpAddr::V4(s), IpAddr::V4(d)) => Some((s, d)),
-                                    _ => None,
-                                };
-
-                                if let Some((src_ip, dst_ip)) = ips {
-                                    conn_guard.advance_snd_nxt(n as u32);
-                                    // The window rides on every segment we emit,
-                                    // so a sender that is being throttled on the
-                                    // uplink learns about it here too.
-                                    let window = conn_guard.recv_window() as u16;
-                                    Some((base_seq, ack, mss, window, src_ip, dst_ip))
-                                } else {
-                                    warn!("IPv6 not supported");
-                                    None
-                                }
+                                conn_guard.advance_snd_nxt(n as u32);
+                                // The window rides on every segment we emit,
+                                // so a sender that is being throttled on the
+                                // uplink learns about it here too.
+                                let window = conn_guard.recv_window() as u16;
+                                (base_seq, ack, mss, window, src_ip, dst_ip)
                             };
 
-                            let (base_seq, ack, mss, window, src_ip, dst_ip) = match send_info {
-                                Some(info) => info,
-                                None => break,
-                            };
+                            let (base_seq, ack, mss, window, src_ip, dst_ip) = send_info;
 
-                            let effective_mss = mss.min(1360);
+                            let family_mss = match src_ip {
+                                IpAddr::V4(_) => DEFAULT_MSS_V4,
+                                IpAddr::V6(_) => DEFAULT_MSS_V6,
+                            };
+                            let effective_mss = mss.min(family_mss as usize);
                             let data = &buf[..n];
                             let mut offset = 0;
                             let mut seq = base_seq;
@@ -1501,7 +1570,7 @@ impl StackProxy {
                                     TcpFlags::ack_only()
                                 };
 
-                                let packet = build_ipv4_tcp(
+                                let packet = match build_tcp(
                                     src_ip,
                                     dst_ip,
                                     dst_addr.port(),
@@ -1512,7 +1581,16 @@ impl StackProxy {
                                     window,
                                     chunk,
                                     None,
-                                );
+                                ) {
+                                    Ok(packet) => packet,
+                                    Err(e) => {
+                                        warn!(
+                                            "Segment dropped: {} -> {}: {}",
+                                            dst_addr, src_addr, e
+                                        );
+                                        break;
+                                    }
+                                };
 
                                 packets_to_send.push(packet);
 
@@ -1549,36 +1627,36 @@ impl StackProxy {
 
                 let fin_info = {
                     let conn_guard = conn_clone.read();
-                    let ips = match (dst_addr.ip(), src_addr.ip()) {
-                        (IpAddr::V4(s), IpAddr::V4(d)) => Some((s, d)),
-                        _ => None,
-                    };
-                    ips.map(|(src_ip, dst_ip)| {
-                        (
-                            conn_guard.snd_nxt(),
-                            conn_guard.rcv_nxt(),
-                            conn_guard.recv_window() as u16,
-                            src_ip,
-                            dst_ip,
-                        )
-                    })
+                    (
+                        conn_guard.snd_nxt(),
+                        conn_guard.rcv_nxt(),
+                        conn_guard.recv_window() as u16,
+                        dst_addr.ip(),
+                        src_addr.ip(),
+                    )
                 };
 
-                if let Some((seq, ack, window, src_ip, dst_ip)) = fin_info {
-                    if let Some(ref tx) = tun_tx {
-                        let packet = build_ipv4_tcp(
-                            src_ip,
-                            dst_ip,
-                            dst_addr.port(),
-                            src_addr.port(),
-                            seq,
-                            ack,
-                            TcpFlags::fin_ack(),
-                            window,
-                            &[],
-                            None,
-                        );
-                        let _ = tx.send(BytesMut::from(&packet[..]));
+                let (seq, ack, window, src_ip, dst_ip) = fin_info;
+
+                if let Some(ref tx) = tun_tx {
+                    match build_tcp(
+                        src_ip,
+                        dst_ip,
+                        dst_addr.port(),
+                        src_addr.port(),
+                        seq,
+                        ack,
+                        TcpFlags::fin_ack(),
+                        window,
+                        &[],
+                        None,
+                    ) {
+                        Ok(packet) => {
+                            let _ = tx.send(BytesMut::from(&packet[..]));
+                        }
+                        Err(e) => {
+                            warn!("FIN dropped: {} -> {}: {}", dst_addr, src_addr, e);
+                        }
                     }
                 }
 
@@ -1680,6 +1758,7 @@ impl StackProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::netstack::solidtcp::packet::{build_ipv4_tcp, build_ipv4_udp};
     use std::net::TcpListener;
 
     #[test]
@@ -1855,5 +1934,47 @@ mod tests {
             rx.try_recv().is_err(),
             "a dropped datagram emits nothing towards the TUN"
         );
+    }
+
+    /// IPv6 clients get the same treatment as v4 ones: the SYN is answered in
+    /// its own family rather than being dropped, and the flow is tracked.
+    #[test]
+    fn an_ipv6_syn_is_answered_in_its_own_family() {
+        use crate::netstack::solidtcp::packet::build_ipv6_tcp;
+
+        let (stack, rx) = start_stack_with_tun();
+        let client: Ipv6Addr = "fd7a:115c:a1e0::1".parse().expect("client address");
+        let target: Ipv6Addr = "2001:db8::10".parse().expect("target address");
+        let syn = build_ipv6_tcp(
+            client,
+            target,
+            41000,
+            443,
+            7000,
+            0,
+            TcpFlags::syn_only(),
+            64240,
+            &[],
+            Some(1340),
+        );
+
+        stack.process_packet(&syn).expect("the SYN is processed");
+
+        let reply = rx.try_recv().expect("a v6 SYN-ACK is emitted");
+        let parsed = parse_packet(&reply).expect("the reply parses");
+        assert_eq!(parsed.src_addr, IpAddr::V6(target));
+        assert_eq!(parsed.dst_addr, IpAddr::V6(client));
+        match parsed.transport {
+            TransportInfo::Tcp(tcp) => {
+                assert!(
+                    tcp.flags.syn && tcp.flags.ack,
+                    "expected a SYN-ACK, got flags {:?}",
+                    tcp.flags
+                );
+                assert_eq!((tcp.src_port, tcp.dst_port), (443, 41000));
+            }
+            other => panic!("expected a TCP answer, got {other:?}"),
+        }
+        assert_eq!(stack.tcp_manager().connection_count(), 1);
     }
 }

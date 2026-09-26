@@ -188,6 +188,7 @@ only the layers courierust deliberately does not expose:
 | DNS resolver, semantic cache, UDP/TCP/DoT/DoH/DoH3/DoQ transports, wire codec | [RecurseX](https://crates.io/crates/recurse-x) — the same author's resolver, consumed as a library |
 | Profile → resolver adaptation, upstream bootstrap, bogon/GeoIP answer filter | `dns` (in-tree) |
 | Userspace TCP/IP stack (SolidTCP) + NAT + TUN | `netstack` (in-tree) |
+| Dual-stack (IPv4 + IPv6) netstack data path: v6 packet parsing and reply construction (TCP/UDP, v6 pseudo-header checksums), v6 SOCKS5 targets and v6 UDP relay replies | `netstack` (in-tree) |
 
 The rule applied throughout the workspace is one implementation per
 responsibility: a second RFC 6455 state machine, a second QPACK codec, a second

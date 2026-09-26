@@ -73,25 +73,41 @@ where
     if !auth.required() {
         return true;
     }
-    let Some(value) = headers.lookup("proxy-authorization") else {
+    let Some((username, password)) = proxy_authorization_credentials(headers) else {
         return false;
     };
-    let Some(encoded) = value
+    auth.check(&username, &password)
+}
+
+/// The username a request authenticated with, for `in-user` routing.
+///
+/// `None` when no `Proxy-Authorization: Basic` header is present or it cannot
+/// be decoded. Callers that need the header to be *valid* use
+/// [`check_proxy_authorization`]; this only reports who is asking.
+pub fn proxy_authorization_user<M>(headers: &M) -> Option<String>
+where
+    M: HeaderLookup,
+{
+    proxy_authorization_credentials(headers).map(|(username, _)| username)
+}
+
+/// Decode and bound a `Proxy-Authorization: Basic` header.
+///
+/// One decoder for the two readers above: the check and the `in-user` lookup
+/// used to be separate parses of the same header, which is exactly how the two
+/// drift apart.
+fn proxy_authorization_credentials<M>(headers: &M) -> Option<(String, String)>
+where
+    M: HeaderLookup,
+{
+    let value = headers.lookup("proxy-authorization")?;
+    let encoded = value
         .strip_prefix("Basic ")
-        .or_else(|| value.strip_prefix("basic "))
-    else {
-        return false;
-    };
-    let Some(decoded) = crate::crypto::codec::base64_decode(encoded.trim()) else {
-        return false;
-    };
-    let Ok(decoded) = String::from_utf8(decoded) else {
-        return false;
-    };
-    let Some((username, password)) = decoded.split_once(':') else {
-        return false;
-    };
-    auth.check(username, password)
+        .or_else(|| value.strip_prefix("basic "))?;
+    let decoded = crate::crypto::codec::base64_decode(encoded.trim())?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
 }
 
 /// Look up a header value by (case-insensitive) name.
@@ -108,10 +124,11 @@ impl HeaderLookup for courierust::courierust_http::HeaderMap {
 /// SOCKS5 RFC 1929 username/password sub-negotiation.
 ///
 /// Reads `VER(1) ULEN(1) UNAME ULEN PLEN(1) PASSWD PLEN`, validates against
-/// `auth`, and writes the `[VER, STATUS]` reply. Returns `Ok(true)` only when
-/// the credentials are valid; the caller must close the connection otherwise.
-/// All lengths are single bytes (≤ 255), so reads are inherently bounded.
-pub fn socks5_userpass<S>(stream: &mut S, auth: &InboundAuth) -> Result<bool>
+/// `auth`, and writes the `[VER, STATUS]` reply. Returns the username on
+/// success and `None` when the credentials were refused; the caller must close
+/// the connection on `None`. All lengths are single bytes (≤ 255), so reads
+/// are inherently bounded.
+pub fn socks5_userpass<S>(stream: &mut S, auth: &InboundAuth) -> Result<Option<String>>
 where
     S: Read + Write,
 {
@@ -149,7 +166,7 @@ where
     stream
         .write_all(&[0x01, status])
         .map_err(|e| Error::network(format!("Failed to write SOCKS5 auth reply: {e}")))?;
-    Ok(ok)
+    Ok(ok.then_some(username))
 }
 
 #[cfg(test)]

@@ -227,6 +227,59 @@ pub fn take_android_packet_task() -> Option<std::thread::JoinHandle<()>> {
     ANDROID_PACKET_TASK.lock().take()
 }
 
+/// Global OHOS VPN processor for stats tracking
+#[cfg(all(feature = "std", target_env = "ohos"))]
+static OHOS_VPN_PROCESSOR: once_cell::sync::Lazy<
+    parking_lot::RwLock<Option<Arc<crate::netstack::TunPacketProcessor>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(None));
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+static OHOS_TUN_DEVICE: once_cell::sync::Lazy<
+    parking_lot::Mutex<Option<crate::netstack::TunDevice>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+static OHOS_PACKET_TASK: once_cell::sync::Lazy<
+    parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+pub fn set_ohos_vpn_processor(processor: Arc<crate::netstack::TunPacketProcessor>) {
+    *OHOS_VPN_PROCESSOR.write() = Some(processor);
+    tracing::info!("OHOS VPN processor stored globally for stats tracking");
+}
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+pub fn clear_ohos_vpn_processor() {
+    *OHOS_VPN_PROCESSOR.write() = None;
+    tracing::info!("OHOS VPN processor cleared");
+}
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+pub fn get_ohos_vpn_processor() -> Option<Arc<crate::netstack::TunPacketProcessor>> {
+    OHOS_VPN_PROCESSOR.read().clone()
+}
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+pub fn set_ohos_tun_device(device: crate::netstack::TunDevice) {
+    *OHOS_TUN_DEVICE.lock() = Some(device);
+}
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+pub fn take_ohos_tun_device() -> Option<crate::netstack::TunDevice> {
+    OHOS_TUN_DEVICE.lock().take()
+}
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+pub fn set_ohos_packet_task(task: std::thread::JoinHandle<()>) {
+    *OHOS_PACKET_TASK.lock() = Some(task);
+}
+
+#[cfg(all(feature = "std", target_env = "ohos"))]
+pub fn take_ohos_packet_task() -> Option<std::thread::JoinHandle<()>> {
+    OHOS_PACKET_TASK.lock().take()
+}
+
 #[cfg(all(feature = "std", target_os = "linux"))]
 pub fn set_linux_vpn_processor(processor: Arc<crate::netstack::TunPacketProcessor>) {
     *LINUX_VPN_PROCESSOR.write() = Some(processor);

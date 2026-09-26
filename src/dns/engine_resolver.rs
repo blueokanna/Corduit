@@ -220,16 +220,7 @@ struct Plan {
 
 /// Where an upstream's own hostname is resolved.
 enum Bootstrap {
-    /// A RecurseX resolver over the profile's `default-nameserver` set.
     Resolver(Arc<Resolver>),
-    /// The operating system's resolver.
-    ///
-    /// The last resort, and deliberately not the first: it makes the engine
-    /// depend on `/etc/resolv.conf`, which is the dependency
-    /// `default-nameserver` exists to remove. It is reachable only when the
-    /// profile names no usable bootstrap server — and in a proxy engine that is
-    /// defensible in a way it would not be for a standalone resolver, because
-    /// the machine running the engine is, by definition, already online.
     System,
 }
 
@@ -263,16 +254,8 @@ impl Bootstrap {
 
 /// The live half: what a successful build produced.
 struct Live {
-    /// The servers that answer, and the policy that routes between them.
     primary: Option<Arc<Resolver>>,
-    /// The fallback servers, in their own resolver.
-    ///
-    /// Separate because recurrence cannot be expressed inside one: RecurseX
-    /// routes by *name*, and the decision to use the fallback set is made after
-    /// the primary answer has been seen. One resolver could not be asked "now
-    /// do that again, through the other group".
     fallback: Option<Arc<Resolver>>,
-    /// Earliest time a retry is worth attempting.
     next_attempt: Instant,
 }
 
@@ -475,16 +458,41 @@ impl EngineResolver {
         Ok(ips)
     }
 
-    /// Resolve `host` to socket addresses.
+    /// Resolve `host` to socket addresses, both families.
+    ///
+    /// The two families are queried at the same time: they are independent
+    /// lookups, and a caller that races addresses (`tcp-concurrent`) wants
+    /// both families as candidates — returning only the v4 set would leave
+    /// the race with nothing to race. v4 answers stay first, so a caller
+    /// without racing still dials v4 first and falls back to v6.
     pub fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
 
-        let ips = match self.resolve_ips(host, false) {
-            Ok(ips) => ips,
-            Err(no_v4) => self.resolve_ips(host, true).map_err(|_| no_v4)?,
+        let (v4, v6) = std::thread::scope(|scope| {
+            let v4 = scope.spawn(|| self.resolve_ips(host, false));
+            let v6 = scope.spawn(|| self.resolve_ips(host, true));
+            (
+                v4.join()
+                    .unwrap_or_else(|_| Err(io::Error::other("A lookup thread panicked"))),
+                v6.join()
+                    .unwrap_or_else(|_| Err(io::Error::other("AAAA lookup thread panicked"))),
+            )
+        });
+
+        let (v4, v6) = match (v4, v6) {
+            (Ok(v4), Ok(v6)) => (v4, v6),
+            (Ok(v4), Err(_)) => (v4, Vec::new()),
+            (Err(_), Ok(v6)) => (Vec::new(), v6),
+            (Err(no_v4), Err(_no_v6)) => return Err(no_v4),
         };
+        let mut ips: Vec<IpAddr> = Vec::with_capacity(v4.len() + v6.len());
+        for ip in v4.into_iter().chain(v6) {
+            if !ips.contains(&ip) {
+                ips.push(ip);
+            }
+        }
         Ok(ips
             .into_iter()
             .map(|ip| SocketAddr::new(ip, port))

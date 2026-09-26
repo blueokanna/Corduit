@@ -45,14 +45,15 @@ pub fn tcp_concurrent() -> bool {
     TCP_CONCURRENT.load(Ordering::Relaxed)
 }
 
-/// Exempt an outbound socket from the engine's own tunnel (Android).
+/// Exempt an outbound socket from the engine's own tunnel (Android, OHOS).
 ///
 /// The engine **is** the VPN. On the OEM builds that route the VPN app's
 /// own traffic into its own TUN, an unprotected outbound socket loops
-/// straight back into the netstack — `VpnService.protect` must be called
-/// before `connect`/`bind` for the routing decision to stick. A no-op on
+/// straight back into the netstack — `VpnService.protect` (Android) and the
+/// `vpnConnection.protect` callback behind `set_protect_callback` (OHOS) must be
+/// invoked before `connect`/`bind` for the routing decision to stick. A no-op on
 /// every other platform.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub fn protect_outbound_fd(fd: i32) {
     if crate::netstack::has_protect_callback() && !crate::netstack::protect_socket(fd) {
         tracing::warn!(
@@ -62,17 +63,108 @@ pub fn protect_outbound_fd(fd: i32) {
 }
 
 /// See [`protect_outbound_fd`]; this variant is a no-op.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 pub fn protect_outbound_fd(_fd: i32) {}
+
+/// Interface the engine's own sockets are pinned to while a TUN route table
+/// is in place.
+///
+/// The Windows data path captures every route into the Wintun adapter, which
+/// includes the engine's own dials: a DIRECT connection would enter the TUN,
+/// be routed back to the engine and dial again, forever. Pinning each outbound
+/// socket to the physical interface — the same mechanism sing-box and mihomo
+/// use — is what lets the engine's traffic bypass the tunnel it installed.
+/// `0` means "not pinned", which is the state outside TUN mode.
+#[cfg(windows)]
+static OUTBOUND_INTERFACE_INDEX: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Pin (or unpin) outbound sockets to one interface index.
+///
+/// Called by the Windows route manager right before it installs capture
+/// routes and right after it removes them, so the pin exists exactly while
+/// the tunnel does. A no-op elsewhere.
+#[cfg(windows)]
+pub fn set_outbound_interface_index(index: Option<u32>) {
+    OUTBOUND_INTERFACE_INDEX.store(index.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// See [`set_outbound_interface_index`]; no-op on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn set_outbound_interface_index(_index: Option<u32>) {}
+
+#[cfg(windows)]
+fn outbound_interface_index() -> Option<u32> {
+    let index = OUTBOUND_INTERFACE_INDEX.load(std::sync::atomic::Ordering::SeqCst);
+    (index != 0).then_some(index)
+}
+
+/// Apply `IP_UNICAST_IF` / `IPV6_UNICAST_IF` to a freshly created socket.
+///
+/// The option only affects unicast route selection for the address family it
+/// is set on, and it must carry the index in network byte order (per the
+/// WinSock documentation). A loopback destination never needs the pin and is
+/// left alone, so loopback traffic keeps taking the loopback route.
+///
+/// # Safety
+///
+/// The crate denies `unsafe` in this module tree; this is the single audited
+/// exception, because `setsockopt` has no safe wrapper and there is no other
+/// way to pin a socket to an interface on Windows. The unsafe surface is one
+/// call: a scalar option written from a stack value that outlives the call,
+/// against a socket this function owns, with the result checked.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn apply_outbound_interface(sock: &socket2::Socket, destination: std::net::IpAddr) {
+    use std::os::windows::io::AsRawSocket;
+
+    /// `IP_UNICAST_IF` / `IPV6_UNICAST_IF` share this option number.
+    const UNICAST_IF: libc::c_int = 31;
+    const IPPROTO_IP: libc::c_int = 0;
+    const IPPROTO_IPV6: libc::c_int = 41;
+
+    let Some(index) = outbound_interface_index() else {
+        return;
+    };
+    if destination.is_loopback() {
+        return;
+    }
+
+    let ipv6 = destination.is_ipv6();
+    let value = index.to_be();
+    let level = if ipv6 { IPPROTO_IPV6 } else { IPPROTO_IP };
+    let result = unsafe {
+        libc::setsockopt(
+            sock.as_raw_socket() as libc::SOCKET,
+            level,
+            UNICAST_IF,
+            &value as *const u32 as *const libc::c_char,
+            std::mem::size_of::<u32>() as libc::c_int,
+        )
+    };
+    if result != 0 {
+        // A missing option is not fatal: without it the socket simply takes
+        // the route table as it is, which is the pre-TUN behaviour.
+        tracing::debug!(
+            "IP{}_UNICAST_IF to index {index} was refused: {}",
+            if ipv6 { "V6" } else { "" },
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// See [`apply_outbound_interface`]; no-op on non-Windows platforms.
+#[cfg(not(windows))]
+fn apply_outbound_interface(_sock: &socket2::Socket, _destination: std::net::IpAddr) {}
 
 /// Exempt a `socket2` socket from the engine's own tunnel.
 fn protect_socket2(sock: &socket2::Socket) {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     {
         use std::os::fd::AsRawFd;
         protect_outbound_fd(sock.as_raw_fd());
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     let _ = sock;
 }
 
@@ -88,8 +180,10 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         socket2::Domain::IPV6
     };
     let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    // The tunnel exemption must precede `connect` for the OS to honour it.
+    // Both must precede `connect`: the tunnel exemption for the OS to honour
+    // it, and the interface pin for the route table the tunnel installs.
     protect_socket2(&sock);
+    apply_outbound_interface(&sock, addr.ip());
     sock.set_nonblocking(true)?;
     sock.connect_timeout(&(*addr).into(), timeout)?;
     // `connect_timeout` requires a non-blocking socket but leaves it that
@@ -265,12 +359,24 @@ fn resolve_host_all_with(
 }
 
 /// The engine resolver first, the system resolver as the documented fallback.
+///
+/// The two families are asked for at the same time. They are independent
+/// queries, each with its own budget inside the resolver, and probing them
+/// one after the other would double the worst-case latency of every
+/// dual-stack name — which is the common case.
 fn engine_then_system(host: &str, engine: EngineLookup) -> io::Result<Vec<IpAddr>> {
-    let mut found: Vec<IpAddr> = Vec::new();
-    let mut configured = false;
+    let (v4, v6) = std::thread::scope(|scope| {
+        let v4 = scope.spawn(|| engine(host, false));
+        let v6 = scope.spawn(|| engine(host, true));
+        (v4.join().unwrap_or(None), v6.join().unwrap_or(None))
+    });
 
-    for want_v6 in [false, true] {
-        match engine(host, want_v6) {
+    let mut found: Vec<IpAddr> = Vec::new();
+    // `false` before `true` keeps the engine's own ordering: v4 addresses are
+    // dialled first, v6 rides along as the fallback.
+    let mut configured = false;
+    for outcome in [v4, v6] {
+        match outcome {
             Some(Ok(addresses)) => {
                 configured = true;
                 extend_unique(&mut found, addresses);
@@ -279,9 +385,8 @@ fn engine_then_system(host: &str, engine: EngineLookup) -> io::Result<Vec<IpAddr
                 configured = true;
                 tracing::debug!("engine DNS could not resolve {host}: {error}");
             }
-            // No engine DNS at all: nothing to prefer, and asking for the other
-            // family would learn nothing.
-            None => break,
+            // No engine DNS at all: nothing to prefer.
+            None => {}
         }
     }
     if !found.is_empty() {
@@ -330,8 +435,10 @@ pub fn udp_bind(bind: SocketAddr, read_timeout: Duration) -> io::Result<UdpSocke
         socket2::Domain::IPV6
     };
     let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    // Outbound DNS and relay datagrams bypass the tunnel as well.
+    // Outbound DNS and relay datagrams bypass the tunnel as well; the pin
+    // applies to every datagram the socket will ever send.
     protect_socket2(&sock);
+    apply_outbound_interface(&sock, bind.ip());
     sock.set_reuse_address(true)?;
     sock.bind(&bind.into())?;
     let udp: UdpSocket = sock.into();

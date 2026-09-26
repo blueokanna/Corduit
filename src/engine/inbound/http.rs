@@ -37,11 +37,13 @@ use crate::common::stream::{BoxStream, SyncStream};
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
-use crate::engine::inbound::auth::{check_proxy_authorization, InboundAuth};
+use crate::engine::inbound::auth::{
+    check_proxy_authorization, proxy_authorization_user, InboundAuth,
+};
 use crate::engine::inbound::forward;
 use crate::engine::inbound::{bind_tcp_listener, InboundListener};
 use crate::engine::outbound::{OutboundManager, OutboundProxy, TargetAddr};
-use crate::engine::routing::Router;
+use crate::engine::routing::{InboundContext, RouteRequest, Router};
 use courierust::courierust_body::Body;
 use courierust::courierust_h1 as h1;
 use courierust::courierust_http::{
@@ -177,9 +179,20 @@ fn serve_connect(
         );
     };
 
-    let outbound_tag = handler
-        .router
-        .match_outbound(Some(&host), None, Some(port), None);
+    let outbound_tag = {
+        let decision = handler.router.route(&RouteRequest {
+            domain: Some(&host),
+            dst_port: Some(port),
+            inbound: InboundContext {
+                name: Some(handler.kind),
+                inbound_type: Some("HTTP"),
+                user: proxy_authorization_user(&headers).as_deref(),
+                port: Some(handler.listen_port),
+            },
+            ..RouteRequest::default()
+        });
+        decision.outbound
+    };
     let Some(outbound) = handler.outbound_manager.get_proxy(&outbound_tag) else {
         tracing::error!("Outbound '{outbound_tag}' not found");
         return write_text(
@@ -190,8 +203,6 @@ fn serve_connect(
     };
 
     tracing::info!("CONNECT {host}:{port} -> {outbound_tag}");
-    // `200 OK` and nothing else: from here on the connection carries opaque
-    // bytes (RFC 9110 §9.3.6).
     write_head(&mut stream, StatusCode::OK, &[])?;
 
     ConnectRelay {
@@ -308,11 +319,7 @@ struct ConnectRelay {
 
 impl ConnectRelay {
     fn relay(&self, client: BoxStream) {
-        let destination_ip =
-            crate::common::socket::resolve_host(&self.host, self.port, Duration::from_secs(3))
-                .ok()
-                .and_then(|addrs| addrs.into_iter().next())
-                .map(|addr| addr.ip().to_string());
+        let destination_ip = self.destination_ip();
 
         let tracker = global_tracker();
         let tracked = tracker.track(TrackedConnection::new_with_ip(
@@ -343,6 +350,25 @@ impl ConnectRelay {
             );
         }
     }
+
+    /// The address shown in the connection list.
+    ///
+    /// The engine's resolver answers first: it follows the same nameserver
+    /// policy the connection itself uses, its answers are cached, and it is
+    /// the only resolver that works while a VPN owns the system resolver.
+    /// The system resolver stays as the fallback for a build that has no
+    /// engine resolver configured.
+    fn destination_ip(&self) -> Option<String> {
+        if let Some(result) = crate::dns::engine_resolver::resolve(&self.host, self.port) {
+            return result
+                .ok()
+                .and_then(|addrs| addrs.first().map(|addr| addr.ip().to_string()));
+        }
+        crate::common::socket::resolve_host(&self.host, self.port, Duration::from_secs(3))
+            .ok()
+            .and_then(|addrs| addrs.into_iter().next())
+            .map(|addr| addr.ip().to_string())
+    }
 }
 
 /// The HTTP proxy surface: authenticate, route, then forward.
@@ -354,6 +380,10 @@ pub(crate) struct HttpProxyHandler {
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
     auth: Arc<InboundAuth>,
+    /// Port this inbound listens on, for `in-port` rules and the connection
+    /// list. Captured at bind time, so a config that asked for port 0 reports
+    /// the port the OS actually gave it.
+    listen_port: u16,
 }
 
 impl HttpProxyHandler {
@@ -363,13 +393,20 @@ impl HttpProxyHandler {
         router: Arc<Router>,
         outbound_manager: Arc<OutboundManager>,
         auth: Arc<InboundAuth>,
+        listen_port: u16,
     ) -> Self {
         Self {
             kind,
             router,
             outbound_manager,
             auth,
+            listen_port,
         }
+    }
+
+    /// The port the mixed listener serves both protocols on.
+    pub(crate) fn listen_port(&self) -> u16 {
+        self.listen_port
     }
 
     /// Forward a plain proxy request and return the origin's response.
@@ -377,9 +414,20 @@ impl HttpProxyHandler {
         let (host, port) = parse_http_target(&req)
             .ok_or_else(|| Error::protocol("Invalid HTTP proxy request: missing host"))?;
 
-        let outbound_tag = self
-            .router
-            .match_outbound(Some(&host), None, Some(port), None);
+        let outbound_tag = {
+            let decision = self.router.route(&RouteRequest {
+                domain: Some(&host),
+                dst_port: Some(port),
+                inbound: InboundContext {
+                    name: Some(self.kind),
+                    inbound_type: Some("HTTP"),
+                    user: proxy_authorization_user(&req.headers).as_deref(),
+                    port: Some(self.listen_port),
+                },
+                ..RouteRequest::default()
+            });
+            decision.outbound
+        };
         tracing::info!("HTTP {} -> {}", req.uri.as_str(), outbound_tag);
 
         let outbound = self
@@ -494,6 +542,7 @@ impl HttpInbound {
             Arc::clone(&self.router),
             Arc::clone(&self.outbound_manager),
             Arc::clone(&self.auth),
+            addr.port(),
         ));
         let server_config = Arc::new(proxy_server_config());
 

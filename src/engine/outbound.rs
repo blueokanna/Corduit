@@ -154,6 +154,44 @@ impl From<crate::protocol::Address> for TargetAddr {
 
 pub type ProxyRegistry = Arc<ParkingRwLock<HashMap<String, Arc<dyn OutboundProxy>>>>;
 
+/// Where asynchronous UDP replies are delivered.
+///
+/// UDP is not a request/response protocol: an upstream may answer once, never,
+/// or many times, and it may answer long after the datagram was submitted. A
+/// relay that waits for a reply per datagram therefore stalls everything
+/// behind a segment the peer had no reason to answer — QUIC is full of them —
+/// so the submission path and the reply path are split. Submitters hand the
+/// datagram over, and every reply reaches this sink, possibly from a
+/// background thread and possibly much later.
+///
+/// The sink is held behind an `Arc` so per-target sessions can register it,
+/// and sessions keep only `Weak` handles: when the client flow that owns the
+/// sink ends, the sink dies with it and the session stops caring.
+/// The delivery half of a [`UdpReplySink`].
+///
+/// Named rather than spelled inline: the trait-object type is long enough that
+/// clippy wants a definition, and one name for it is easier to read anyway.
+pub type UdpReplyFn = dyn Fn(&TargetAddr, &[u8]) + Send + Sync + 'static;
+
+pub struct UdpReplySink {
+    deliver: Arc<UdpReplyFn>,
+}
+
+impl UdpReplySink {
+    pub fn new<F>(deliver: F) -> Arc<Self>
+    where
+        F: Fn(&TargetAddr, &[u8]) + Send + Sync + 'static,
+    {
+        Arc::new(Self {
+            deliver: Arc::new(deliver),
+        })
+    }
+
+    pub fn deliver(&self, target: &TargetAddr, payload: &[u8]) {
+        (self.deliver)(target, payload);
+    }
+}
+
 /// A built outbound set: the lifecycle list plus the set of tags owned by
 /// proxy providers (so a background refresh can replace exactly those
 /// registry entries).
@@ -219,6 +257,21 @@ pub trait OutboundProxy: Send + Sync {
             "UDP relay not supported by outbound '{}'",
             self.tag()
         )))
+    }
+
+    /// Submit one datagram to `target`; every reply reaches `sink`.
+    ///
+    /// The default implementation performs the blocking one-shot relay and
+    /// delivers its single reply, so it must be called from a worker rather
+    /// than a packet loop. Outbounds that keep a per-target session override
+    /// this and return as soon as the datagram is on its way out; their
+    /// replies arrive later, from the session's reader thread.
+    fn udp_submit(&self, target: &TargetAddr, data: &[u8], sink: &Arc<UdpReplySink>) -> Result<()> {
+        let response = self.relay_udp_packet(target, data)?;
+        if !response.is_empty() {
+            sink.deliver(target, &response);
+        }
+        Ok(())
     }
 
     /// Measure HTTP latency through this outbound.
@@ -495,8 +548,6 @@ impl OutboundManager {
     }
 
     pub fn start(&self) -> Result<()> {
-        // Don't pre-connect outbounds on startup - this makes startup much faster
-        // Connections will be established on-demand when traffic flows through
         tracing::info!(
             "OutboundManager started with {} proxies (lazy connection mode)",
             self.proxy_list.read().len()

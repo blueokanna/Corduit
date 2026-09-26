@@ -529,15 +529,19 @@ pub fn test_all_proxies_latency(
 pub fn get_rules() -> std::result::Result<Vec<RuleDto>, String> {
     with_instance_legacy(|corduit| {
         let config = corduit.config();
+        // The live hit counters come from the compiled table, which preserves
+        // configuration order — so index `i` is the same rule in both views.
+        let hits = corduit.proxy_manager().router().rule_hits();
 
         let rules: Vec<RuleDto> = config
             .rules
             .iter()
-            .map(|rule| RuleDto {
+            .enumerate()
+            .map(|(index, rule)| RuleDto {
                 rule_type: rule.rule_type.as_str().to_string(),
                 payload: rule.payload.clone(),
                 outbound: rule.outbound.clone(),
-                matched_count: 0,
+                matched_count: hits.get(index).copied().unwrap_or(0),
             })
             .collect();
 
@@ -2484,6 +2488,47 @@ pub fn get_wintun_dll_path() -> Option<String> {
     crate::netstack::get_wintun_path().map(|p| p.to_string_lossy().to_string())
 }
 
+/// Whether this process holds an elevated (administrator) token.
+///
+/// Creating a Wintun adapter requires it, and the app needs the answer before
+/// it even tries: a TUN switch that fails with a bare OS error is a support
+/// ticket, while "restart as administrator" is an instruction. Always `false`
+/// off Windows, where the concept does not exist.
+pub fn is_process_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        unsafe {
+            let mut token = windows::Win32::Foundation::HANDLE::default();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+                return false;
+            }
+            let mut elevation = TOKEN_ELEVATION::default();
+            let mut returned = 0u32;
+            let queried = GetTokenInformation(
+                token,
+                TokenElevation,
+                Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+            .is_ok();
+            let _ = CloseHandle(token);
+            queried && elevation.TokenIsElevated != 0
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 pub fn ensure_wintun_dll() -> Result<String> {
     let path = crate::netstack::ensure_wintun()
         .map_err(|e| CorduitError::Internal(format!("Failed to ensure wintun: {}", e)))?;
@@ -2491,15 +2536,15 @@ pub fn ensure_wintun_dll() -> Result<String> {
 }
 
 pub fn enable_tun_mode() -> Result<TunStatus> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     let mode = "global";
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     let mode = "rule";
 
     enable_tun_mode_with_mode(mode.to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn stop_linux_tun_runtime() -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -2822,7 +2867,7 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         use crate::netstack::{RouteManager, TunConfig, TunDevice, TunPacketProcessor};
         use std::net::ToSocketAddrs;
@@ -3035,11 +3080,27 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         })
     }
 
+    #[cfg(target_env = "ohos")]
+    {
+        crate::engine::set_runtime_proxy_mode(mode_int);
+        let enabled = start_ohos_vpn_inner()?;
+        if !enabled {
+            crate::engine::set_runtime_proxy_mode(0);
+        }
+        Ok(TunStatus {
+            enabled,
+            interface_name: enabled.then(|| "vpn-tun".to_string()),
+            mtu: enabled.then_some(1500),
+            error: (!enabled).then(|| "OHOS VPN runtime failed to start".to_string()),
+        })
+    }
+
     #[cfg(not(any(
         target_os = "windows",
-        target_os = "linux",
         target_os = "macos",
-        target_os = "android"
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_env = "ohos"
     )))]
     {
         let _ = (mode, mode_int);
@@ -3075,7 +3136,19 @@ pub fn disable_tun_mode() -> Result<TunStatus> {
         crate::engine::set_runtime_proxy_mode(0);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(target_env = "ohos")]
+    {
+        if let Err(error) = stop_ohos_vpn_inner() {
+            return Ok(TunStatus {
+                enabled: true,
+                interface_name: Some("vpn-tun".to_string()),
+                mtu: Some(1500),
+                error: Some(format!("failed to stop the OHOS VPN runtime: {error}")),
+            });
+        }
+        crate::engine::set_runtime_proxy_mode(0);
+    }
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         let cleanup_errors = stop_linux_tun_runtime();
         if !cleanup_errors.is_empty() {
@@ -3127,7 +3200,23 @@ pub fn get_tun_status() -> Result<TunStatus> {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(target_env = "ohos")]
+    {
+        if crate::netstack::get_ohos_vpn_fd() >= 0 {
+            if let Some(processor) = crate::get_ohos_vpn_processor() {
+                if processor.is_running() {
+                    return Ok(TunStatus {
+                        enabled: true,
+                        interface_name: Some("vpn-tun".to_string()),
+                        mtu: Some(1500),
+                        error: None,
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         let processor_running =
             crate::get_linux_vpn_processor().is_some_and(|processor| processor.is_running());
@@ -3384,6 +3473,237 @@ pub fn clear_ios_vpn_fd() {
     #[cfg(not(target_os = "ios"))]
     {
         tracing::warn!("clear_ios_vpn_fd called on non-iOS platform");
+    }
+}
+
+// ============== OHOS VPN Support ==============
+pub fn set_ohos_vpn_fd(fd: i32) {
+    #[cfg(target_env = "ohos")]
+    {
+        crate::netstack::set_ohos_vpn_fd(fd);
+        tracing::info!("OHOS VPN fd set to {}", fd);
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    {
+        let _ = fd;
+        tracing::warn!("set_ohos_vpn_fd called on non-OHOS platform");
+    }
+}
+
+pub fn get_ohos_vpn_fd() -> i32 {
+    #[cfg(target_env = "ohos")]
+    {
+        crate::netstack::get_ohos_vpn_fd()
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    {
+        -1
+    }
+}
+
+pub fn clear_ohos_vpn_fd() {
+    #[cfg(target_env = "ohos")]
+    {
+        crate::netstack::clear_ohos_vpn_fd();
+        tracing::info!("OHOS VPN fd cleared");
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    {
+        tracing::warn!("clear_ohos_vpn_fd called on non-OHOS platform");
+    }
+}
+
+/// Record that the VpnExtensionAbility exempted the whole engine process from
+/// its own tunnel (`protectProcessNet`, API 22+). When false, a per-fd
+/// `protect` callback must be registered instead.
+pub fn set_ohos_process_protected(protected: bool) {
+    #[cfg(target_env = "ohos")]
+    {
+        crate::netstack::set_ohos_process_protected(protected);
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    {
+        let _ = protected;
+    }
+}
+
+/// Start the OHOS packet path over the fd set by [`set_ohos_vpn_fd`].
+///
+/// Mirrors the Android path: the engine must already be running and its local
+/// inbound reachable, and the sockets it dials must be exempt from the tunnel —
+/// either by the process-wide exemption or by the registered protect callback.
+/// Without one of the two a dial to the proxy server would re-enter the tunnel
+/// and loop, so this fails instead of degrading quietly.
+pub fn start_ohos_vpn() -> Result<bool> {
+    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock();
+    start_ohos_vpn_inner()
+}
+
+fn start_ohos_vpn_inner() -> Result<bool> {
+    #[cfg(target_env = "ohos")]
+    {
+        use crate::netstack::{TunConfig, TunDevice};
+
+        let fd = crate::netstack::get_ohos_vpn_fd();
+        if fd < 0 {
+            tracing::error!("OHOS VPN fd not set");
+            return Ok(false);
+        }
+
+        tracing::info!("=== Starting OHOS VPN packet processing (fd={fd}) ===");
+
+        if let Some(task) = crate::take_ohos_packet_task() {
+            // A std thread cannot be aborted; it exits once the TUN channel
+            // disconnects (device/processor dropped below). Detach by dropping.
+            drop(task);
+        }
+        if let Some(mut device) = crate::take_ohos_tun_device() {
+            let _ = device.stop();
+        }
+        if let Some(old_processor) = crate::get_ohos_vpn_processor() {
+            old_processor.stop();
+            old_processor.reset();
+        }
+        crate::clear_ohos_vpn_processor();
+
+        let process_protected = crate::netstack::is_ohos_process_protected();
+        if !process_protected && !crate::netstack::has_protect_callback() {
+            tracing::error!(
+                "OHOS VPN has neither a process-wide tunnel exemption nor a protect callback; \
+                 engine dials would loop into the tunnel"
+            );
+            return Ok(false);
+        }
+
+        let (proxy_addr, proxy_port) = {
+            let instance = get_corduit_instance()?;
+            let corduit_guard = instance.read();
+            let Some(corduit) = corduit_guard.as_ref() else {
+                tracing::error!("Corduit instance not initialized! VPN will not work.");
+                return Ok(false);
+            };
+            if !corduit.is_running().unwrap_or(false) {
+                tracing::error!("Corduit proxy service is NOT running! VPN will not work.");
+                return Ok(false);
+            }
+            let config = corduit.config();
+            let port = config
+                .general
+                .mixed_port
+                .or(config.general.socks_port)
+                .unwrap_or(7890);
+            (local_proxy_addr(config, port)?, port)
+        };
+
+        if let Err(error) = std::net::TcpStream::connect(proxy_addr) {
+            tracing::error!("Proxy port {} is NOT listening: {}", proxy_port, error);
+            return Ok(false);
+        }
+
+        let config = TunConfig {
+            name: "vpn-tun".to_string(),
+            address: std::net::Ipv4Addr::new(198, 18, 0, 1),
+            netmask: std::net::Ipv4Addr::new(255, 255, 0, 0),
+            mtu: 1500,
+            gateway: None,
+            dns: vec![std::net::Ipv4Addr::new(198, 18, 0, 2)],
+        };
+        let mut device = TunDevice::with_config(config.clone())
+            .map_err(|error| CorduitError::Internal(error.to_string()))?;
+        if let Err(error) = device.start() {
+            tracing::error!("Failed to start OHOS TUN device: {}", error);
+            return Ok(false);
+        }
+
+        let Some(tun_tx) = device.get_sender() else {
+            let _ = device.stop();
+            return Ok(false);
+        };
+        let Some(mut tun_rx) = device.take_receiver() else {
+            let _ = device.stop();
+            return Ok(false);
+        };
+
+        let processor = std::sync::Arc::new(crate::netstack::TunPacketProcessor::new_with_dns(
+            proxy_addr,
+            config.mtu,
+            tun_tx,
+            client_dns_settings(),
+        ));
+        let packet_processor = std::sync::Arc::clone(&processor);
+        let packet_task = std::thread::Builder::new()
+            .name("corduit-tun-packet".to_string())
+            .spawn(move || {
+                while let Ok(packet) = tun_rx.recv() {
+                    if !packet_processor.is_running() {
+                        break;
+                    }
+                    if let Err(error) = packet_processor.process_packet(&packet) {
+                        tracing::debug!("OHOS TUN packet processing failed: {}", error);
+                    }
+                }
+                packet_processor.stop();
+            })
+            .map_err(|error| {
+                CorduitError::Internal(format!("failed to spawn OHOS TUN packet thread: {error}"))
+            })?;
+
+        crate::set_ohos_vpn_processor(processor);
+        crate::set_ohos_tun_device(device);
+        crate::set_ohos_packet_task(packet_task);
+
+        tracing::info!("=== OHOS VPN packet processing started successfully ===");
+        Ok(true)
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    {
+        tracing::warn!("start_ohos_vpn called on non-OHOS platform");
+        Ok(false)
+    }
+}
+
+pub fn stop_ohos_vpn() -> Result<bool> {
+    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.lock();
+    stop_ohos_vpn_inner()
+}
+
+fn stop_ohos_vpn_inner() -> Result<bool> {
+    #[cfg(target_env = "ohos")]
+    {
+        tracing::info!("=== Stopping OHOS VPN packet processing ===");
+
+        if let Some(mut device) = crate::take_ohos_tun_device() {
+            if let Err(error) = device.stop() {
+                tracing::warn!("Failed to stop OHOS TUN device: {}", error);
+            }
+        }
+        if let Some(task) = crate::take_ohos_packet_task() {
+            drop(task);
+        }
+        if let Some(processor) = crate::get_ohos_vpn_processor() {
+            processor.stop();
+            processor.reset();
+            processor.reset_fake_ip_pool();
+        }
+        crate::clear_ohos_vpn_processor();
+        crate::netstack::clear_ohos_vpn_fd();
+
+        let tracker = crate::engine::connection_tracker::global_tracker();
+        tracker.reset();
+
+        tracing::info!("=== OHOS VPN packet processing stopped completely ===");
+        Ok(true)
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    {
+        tracing::warn!("stop_ohos_vpn called on non-OHOS platform");
+        Ok(false)
     }
 }
 

@@ -92,6 +92,7 @@ impl MixedInbound {
             Arc::clone(&self.router),
             Arc::clone(&self.outbound_manager),
             Arc::clone(&self.auth),
+            addr.port(),
         ));
         let server_config = Arc::new(proxy_server_config());
         let router = Arc::clone(&self.router);
@@ -170,6 +171,7 @@ fn dispatch(
             Arc::clone(outbound_manager),
             Arc::clone(auth),
             "mixed",
+            handler.listen_port(),
         )
     } else {
         tracing::debug!("Detected HTTP protocol from {peer}");

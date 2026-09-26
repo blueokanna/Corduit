@@ -51,7 +51,7 @@ use crate::common::stream::BoxStream;
 use crate::engine::config::{OutboundConfig, OutboundType};
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{
-    get_global_selector_selections, OutboundProxy, ProxyRegistry, TargetAddr,
+    get_global_selector_selections, OutboundProxy, ProxyRegistry, TargetAddr, UdpReplySink,
 };
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -576,6 +576,14 @@ impl OutboundProxy for GroupOutbound {
     fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
         let proxy = self.resolved()?;
         proxy.relay_udp_packet(target, data)
+    }
+
+    /// Delegated so a member's session-based UDP path is used when the group
+    /// is what the rules selected; the default implementation here would fall
+    /// back to the member's blocking one-shot relay instead.
+    fn udp_submit(&self, target: &TargetAddr, data: &[u8], sink: &Arc<UdpReplySink>) -> Result<()> {
+        let proxy = self.resolved()?;
+        proxy.udp_submit(target, data, sink)
     }
 
     fn test_http_latency(&self, test_url: &str, timeout: Duration) -> Result<Duration> {

@@ -140,6 +140,28 @@ impl Network {
     }
 }
 
+/// Which inbound a connection arrived on.
+///
+/// The vocabulary matches the profiles this engine consumes: `in-type` sees
+/// the protocol as the client spoke it (`HTTP` or `SOCKS5`), `in-name` the
+/// inbound it landed on (`http`, `socks`, `mixed`), `in-user` the username
+/// the inbound authenticated, and `in-port` the port the inbound listens on.
+///
+/// A connection the engine dials for itself — a health probe, a rule-set
+/// fetch — carries no inbound at all, so inbound rules cannot match it. That
+/// is deliberate: those connections were not sent to an inbound by anybody.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InboundContext<'a> {
+    /// Inbound name as configured (`http`, `socks`, `mixed`).
+    pub name: Option<&'a str>,
+    /// Protocol the client used (`HTTP`, `SOCKS5`).
+    pub inbound_type: Option<&'a str>,
+    /// Username the inbound authenticated, when it required one.
+    pub user: Option<&'a str>,
+    /// Port the inbound listens on.
+    pub port: Option<u16>,
+}
+
 /// Everything a rule may inspect about one connection attempt.
 ///
 /// A struct rather than a parameter list on purpose. While the inputs were
@@ -164,6 +186,8 @@ pub struct RouteRequest<'a> {
     pub process_name: Option<&'a str>,
     /// Full executable path, when it is resolvable.
     pub process_path: Option<&'a str>,
+    /// Which inbound the connection arrived on.
+    pub inbound: InboundContext<'a>,
 }
 
 /// What one routing decision decided, and how long it took.
@@ -207,26 +231,20 @@ impl CompiledRule {
     /// Whether this rule, or a nested one, can only be decided once the
     /// destination address is known.
     ///
-    /// The router resolves a domain at most once per request, and only when
-    /// this returns `true` somewhere in the rule list — a configuration whose
-    /// IP rules are all `no-resolve` never pays for a lookup.
-    fn wants_dst_ip(&self) -> bool {
+    /// Covers the rules whose need is knowable from the compiled form alone.
+    /// A rule set's need depends on what its provider holds, which is why
+    /// [`Router::wants_dst_ip`] is the entry point that callers use.
+    fn wants_dst_ip_without_provider(&self) -> bool {
         if self.no_resolve {
             return false;
         }
         match self.rule_type {
             RuleType::IpCidr | RuleType::Geoip => true,
-            // A rule set may hold IP entries, but only the provider knows
-            // whether it does, and asking it means doing the lookup this
-            // predicate exists to avoid. Resolving on the chance that some set
-            // contains IP rules would put a system DNS query on every request
-            // of every domain-only config, so it stays off: rule-set entries are
-            // compared against an address the client actually supplied.
             RuleType::RuleSet | RuleType::Geosite => false,
-            // `not` inverts its child, so the child still drives the need.
-            RuleType::And | RuleType::Or | RuleType::Not => {
-                self.children.iter().any(Self::wants_dst_ip)
-            }
+            RuleType::And | RuleType::Or | RuleType::Not => self
+                .children
+                .iter()
+                .any(Self::wants_dst_ip_without_provider),
             _ => false,
         }
     }
@@ -260,8 +278,6 @@ impl CompiledRule {
 struct MatchContext<'a> {
     domain: Option<&'a str>,
     dst_ip: Option<IpAddr>,
-    /// Addresses the destination domain resolved to. Empty when the request
-    /// carried a literal address or when no rule needed a lookup.
     resolved: &'a [IpAddr],
     dst_port: Option<u16>,
     src_ip: Option<IpAddr>,
@@ -269,14 +285,22 @@ struct MatchContext<'a> {
     network: Network,
     process_name: Option<&'a str>,
     process_path: Option<&'a str>,
+    inbound: InboundContext<'a>,
 }
 
 impl MatchContext<'_> {
     /// The subset of this context that a rule set matches against.
-    fn rule_input(&self) -> crate::engine::rule_provider::RuleMatchInput<'_> {
+    ///
+    /// `no_resolve` travels with the rule rather than with the context: two
+    /// rule-set rules can reference the same resolved answer with different
+    /// intents, and the entry a set holds is the only thing that decides which
+    /// addresses it may see.
+    fn rule_input(&self, no_resolve: bool) -> crate::engine::rule_provider::RuleMatchInput<'_> {
         crate::engine::rule_provider::RuleMatchInput {
             domain: self.domain,
             dst_ip: self.dst_ip,
+            resolved: self.resolved,
+            no_resolve,
             src_ip: self.src_ip,
             process_name: self.process_name,
         }
@@ -293,6 +317,28 @@ impl MatchContext<'_> {
 }
 
 impl Router {
+    /// Whether this rule, or a nested one, can only be decided once the
+    /// destination address is known.
+    ///
+    /// The router resolves a domain at most once per request, and only when
+    /// this returns `true` somewhere in the rule list — a configuration whose
+    /// IP rules are all `no-resolve` never pays for a lookup, and nor does one
+    /// whose rule sets hold domain patterns only.
+    fn wants_dst_ip(&self, rule: &CompiledRule) -> bool {
+        if rule.no_resolve {
+            return false;
+        }
+        match rule.rule_type {
+            RuleType::RuleSet | RuleType::Geosite => self
+                .rule_provider_manager
+                .carries_dst_ip_entries(&rule.pattern),
+            RuleType::And | RuleType::Or | RuleType::Not => {
+                rule.children.iter().any(|child| self.wants_dst_ip(child))
+            }
+            _ => rule.wants_dst_ip_without_provider(),
+        }
+    }
+
     pub fn new(config: Arc<RwLock<Config>>) -> Result<Self> {
         let rules = Self::compile_rules(&config.read().rules)?;
         let geoip_manager: Arc<dyn CountryMatcher> =
@@ -452,40 +498,12 @@ impl Router {
         }
 
         let rules = self.rules.read();
-
-        // Resolve the destination domain at most once per request, and only
-        // when a rule that is allowed to see a resolved address could use one.
-        // A literal address needs no lookup, and a config whose IP rules are
-        // all `no-resolve` never triggers one.
-        let resolved: Vec<IpAddr> = match request.dst_ip {
+        let mut resolved: Vec<IpAddr> = match request.dst_ip {
             Some(address) => vec![address],
-            None => {
-                let resolution_is_useful =
-                    rules.is_empty() || rules.iter().any(CompiledRule::wants_dst_ip);
-                if resolution_is_useful {
-                    Self::resolve_destination_ips(request.domain, None)
-                } else {
-                    Vec::new()
-                }
-            }
+            None if rules.is_empty() => Self::resolve_destination_ips(request.domain, None),
+            None => Vec::new(),
         };
-
-        let context = MatchContext {
-            domain: request.domain,
-            dst_ip: request.dst_ip,
-            resolved: &resolved,
-            dst_port: request.dst_port,
-            src_ip: request.src_ip,
-            src_port: request.src_port,
-            network: request.network,
-            process_name: request.process_name,
-            process_path: request.process_path,
-        };
-
-        // The mainland-China auto-direct shortcut is a fallback for configs
-        // with no rules at all. Once rules are configured they are evaluated
-        // strictly in order and the first match wins, so an explicit rule always
-        // wins over the shortcut.
+        let mut resolution_attempted = request.dst_ip.is_some() || rules.is_empty();
         if rules.is_empty() {
             if Self::is_mainland_china_domain(request.domain) {
                 tracing::info!(
@@ -508,6 +526,24 @@ impl Router {
         }
 
         for (index, rule) in rules.iter().enumerate() {
+            if !resolution_attempted && request.dst_ip.is_none() && self.wants_dst_ip(rule) {
+                resolved = Self::resolve_destination_ips(request.domain, None);
+                resolution_attempted = true;
+            }
+
+            let context = MatchContext {
+                domain: request.domain,
+                dst_ip: request.dst_ip,
+                resolved: &resolved,
+                dst_port: request.dst_port,
+                src_ip: request.src_ip,
+                src_port: request.src_port,
+                network: request.network,
+                process_name: request.process_name,
+                process_path: request.process_path,
+                inbound: request.inbound,
+            };
+
             if self.matches_rule_with(rule, &context) {
                 rule.hits.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(
@@ -579,11 +615,6 @@ impl Router {
             }
             cache.pop(&normalized);
         }
-
-        // The engine's own DNS answers first, then the system resolver, with the
-        // lookup bounded by `DNS_LOOKUP_TIMEOUT` either way (see
-        // `socket::resolve_host_all`). Resolution errors degrade to
-        // domain-rule-only matching.
         let addresses =
             match crate::common::socket::resolve_host_all(&normalized, DNS_LOOKUP_TIMEOUT) {
                 Ok(resolved) => resolved,
@@ -818,7 +849,10 @@ impl Router {
             } else {
                 None
             };
-        let port_ranges = if matches!(rule_type, RuleType::SrcPort | RuleType::DstPort) {
+        let port_ranges = if matches!(
+            rule_type,
+            RuleType::SrcPort | RuleType::DstPort | RuleType::InPort
+        ) {
             Self::compile_port_ranges(&rule.payload)?
         } else {
             Vec::new()
@@ -829,8 +863,6 @@ impl Router {
             None
         };
 
-        // Lowercase domain and process patterns once; matching then compares
-        // case-insensitively with zero allocations.
         let pattern = if matches!(
             rule_type,
             RuleType::Domain
@@ -838,6 +870,9 @@ impl Router {
                 | RuleType::DomainKeyword
                 | RuleType::ProcessName
                 | RuleType::ProcessPath
+                | RuleType::InType
+                | RuleType::InUser
+                | RuleType::InName
         ) {
             rule.payload.trim().to_ascii_lowercase()
         } else {
@@ -913,14 +948,28 @@ impl Router {
             RuleType::Geoip => context
                 .dst_candidates(rule.no_resolve)
                 .any(|address| self.geoip_manager.matches_country(&rule.pattern, address)),
-            // The source address is the peer address of the inbound
-            // connection; it is never something the router resolved.
             RuleType::SrcIpCidr => match (rule.ipnet, context.src_ip) {
                 (Some(network), Some(address)) => network.contains(&address),
                 _ => false,
             },
             RuleType::DstPort => context.dst_port.is_some_and(|port| rule.matches_port(port)),
             RuleType::SrcPort => context.src_port.is_some_and(|port| rule.matches_port(port)),
+            RuleType::InPort => context
+                .inbound
+                .port
+                .is_some_and(|port| rule.matches_port(port)),
+            RuleType::InType => context
+                .inbound
+                .inbound_type
+                .is_some_and(|value| value.eq_ignore_ascii_case(&rule.pattern)),
+            RuleType::InUser => context
+                .inbound
+                .user
+                .is_some_and(|value| value.eq_ignore_ascii_case(&rule.pattern)),
+            RuleType::InName => context
+                .inbound
+                .name
+                .is_some_and(|value| value.eq_ignore_ascii_case(&rule.pattern)),
             RuleType::ProcessName => context
                 .process_name
                 .is_some_and(|process| Self::matches_process_name(&rule.pattern, process)),
@@ -928,14 +977,9 @@ impl Router {
                 .process_path
                 .is_some_and(|path| Self::matches_process_path(&rule.pattern, path)),
             RuleType::Network => rule.network == Some(context.network),
-            RuleType::RuleSet | RuleType::Geosite => {
-                // The provider sees the addresses the client actually supplied.
-                // Handing it a resolved one would make the outcome depend on
-                // whether some unrelated rule elsewhere in the list happened to
-                // request a lookup.
-                self.rule_provider_manager
-                    .matches(&rule.pattern, &context.rule_input())
-            }
+            RuleType::RuleSet | RuleType::Geosite => self
+                .rule_provider_manager
+                .matches(&rule.pattern, &context.rule_input(rule.no_resolve)),
             RuleType::And => rule
                 .children
                 .iter()
@@ -979,6 +1023,7 @@ impl Router {
                 network: Network::Tcp,
                 process_name,
                 process_path: None,
+                inbound: InboundContext::default(),
             },
         )
     }
@@ -1015,9 +1060,6 @@ impl Router {
         if basename.eq_ignore_ascii_case(pattern) {
             return true;
         }
-
-        // A rule may name the Windows executable with or without its extension,
-        // and either side may carry it.
         if let Some(without_ext) = strip_suffix_ignore_case(pattern, ".exe") {
             if process_name.eq_ignore_ascii_case(without_ext)
                 || basename.eq_ignore_ascii_case(without_ext)
@@ -1596,6 +1638,136 @@ mod tests {
         let strict = strict.regex.as_ref().expect("a compiled regex");
         assert!(strict.is_match("AD.example.com"));
         assert!(!strict.is_match("ad.example.com"));
+    }
+
+    /// One configured rule, with the boilerplate fields filled in.
+    fn rule(rule_type: RuleType, payload: &str, outbound: &str) -> RuleConfig {
+        RuleConfig {
+            rule_type,
+            payload: payload.to_string(),
+            outbound: outbound.to_string(),
+            process_name: None,
+            ..RuleConfig::default()
+        }
+    }
+
+    /// A router whose table is the test's and whose defaults are fixed: the
+    /// answer of [`Router::route`] is then the rule that matched, or `DIRECT`
+    /// when none did.
+    fn rule_table_router(rules: Vec<RuleConfig>) -> Router {
+        let config = Config {
+            general: crate::engine::config::GeneralConfig {
+                mode: Mode::Rule,
+                ..crate::engine::config::GeneralConfig::default()
+            },
+            rules,
+            ..Config::default()
+        };
+        let rules = Router::compile_rules(&config.rules).expect("the table compiles");
+        Router {
+            config: Arc::new(RwLock::new(config)),
+            rules: RwLock::new(rules),
+            defaults: RwLock::new(DefaultOutbounds {
+                direct: "DIRECT".to_string(),
+                global: None,
+                default: "DIRECT".to_string(),
+            }),
+            geoip_manager: Arc::new(StubCountryMatcher),
+            rule_provider_manager: Arc::new(RuleProviderManager::new()),
+        }
+    }
+
+    /// The inbound rules read where a connection arrived: the protocol it
+    /// spoke, the inbound it landed on, the port that inbound listens on, and
+    /// the user it authenticated as.
+    #[test]
+    fn inbound_rules_read_the_arrival_point() {
+        let _mode_guard = MODE_LOCK.lock();
+        set_runtime_proxy_mode(proxy_mode::CONFIG);
+
+        let router = rule_table_router(vec![
+            rule(RuleType::InType, "socks5", "socks-relay"),
+            rule(RuleType::InName, "mixed", "mixed-relay"),
+            rule(RuleType::InPort, "17897", "lan-relay"),
+            rule(RuleType::InUser, "alice", "alice-rule"),
+            rule(RuleType::Match, "", "fallback"),
+        ]);
+
+        let decide = |inbound: InboundContext<'_>| {
+            router
+                .route(&RouteRequest {
+                    domain: Some("example.com"),
+                    dst_port: Some(443),
+                    inbound,
+                    ..RouteRequest::default()
+                })
+                .outbound
+        };
+
+        // A SOCKS5 client on the socks inbound: the first rule matches.
+        assert_eq!(
+            decide(InboundContext {
+                name: Some("socks"),
+                inbound_type: Some("SOCKS5"),
+                user: None,
+                port: Some(1080),
+            }),
+            "socks-relay"
+        );
+
+        // An HTTP client on the mixed inbound falls through to the name rule.
+        assert_eq!(
+            decide(InboundContext {
+                name: Some("mixed"),
+                inbound_type: Some("HTTP"),
+                user: None,
+                port: Some(7897),
+            }),
+            "mixed-relay"
+        );
+
+        // A dedicated inbound port decides a connection from an http inbound
+        // whose name is not in the table.
+        assert_eq!(
+            decide(InboundContext {
+                name: Some("http"),
+                inbound_type: Some("HTTP"),
+                user: None,
+                port: Some(17897),
+            }),
+            "lan-relay"
+        );
+
+        // An authenticated user is visible even on a port the table does not
+        // name anywhere else.
+        assert_eq!(
+            decide(InboundContext {
+                name: Some("http"),
+                inbound_type: Some("HTTP"),
+                user: Some("Alice"),
+                port: Some(1234),
+            }),
+            "alice-rule"
+        );
+
+        // Engine-initiated dials carry no inbound; nothing above matches and
+        // the table falls through to its catch-all.
+        assert_eq!(decide(InboundContext::default()), "fallback");
+    }
+
+    /// An inbound payload that can never match is a configuration mistake and
+    /// is refused when the table is compiled, not when a connection arrives.
+    #[test]
+    fn unusable_inbound_payloads_are_refused() {
+        assert!(Router::compile_rules(&[rule(RuleType::InPort, "not-a-port", "x")]).is_err());
+        assert!(Router::compile_rules(&[rule(RuleType::InPort, "70000", "x")]).is_err());
+        assert!(Router::compile_rules(&[rule(RuleType::InType, "   ", "x")]).is_err());
+
+        // A range is accepted for `in-port`: the parser is the port parser the
+        // source/destination rules already use, and a superset of the single
+        // port form the Clash profiles write.
+        let ranges = Router::compile_port_ranges("1000-2000,53").expect("parses");
+        assert_eq!(ranges, vec![(1000, 2000), (53, 53)]);
     }
 }
 

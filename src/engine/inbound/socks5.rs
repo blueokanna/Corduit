@@ -12,12 +12,13 @@
 //!
 //! Relays run on the connection's own thread (bounded by the listener's
 //! connection budget), because a relay blocks for as long as the session
-//! lives — the UDP relay gets a thread of its own for the same reason.
+//! lives — the UDP relay owns a small worker pool for the same reason.
 //!
-//! `UDP ASSOCIATE` forwards each datagram as a one-shot request/reply through
-//! the matched outbound and rebuilds the SOCKS5 UDP envelope on the way back.
-//! Only the client that owns the TCP control connection may use its relay
-//! socket (source-IP check), so the bound UDP port is never an open relay.
+//! `UDP ASSOCIATE` submits incoming datagrams to that pool and frames every
+//! reply back to the client, whether it arrives from the synchronous one-shot
+//! relay or later, from a session's reader thread. Only the client that owns
+//! the TCP control connection may use its relay socket (source-IP check), so
+//! the bound UDP port is never an open relay.
 
 use crate::common::listener::ConnectionListener;
 use crate::engine::config::InboundConfig;
@@ -25,12 +26,13 @@ use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
 use crate::engine::error::{Error, Result};
 use crate::engine::inbound::auth::{socks5_userpass, InboundAuth, SOCKS5_AUTH_USERPASS};
 use crate::engine::inbound::{bind_tcp_listener, InboundListener};
-use crate::engine::outbound::{OutboundManager, TargetAddr};
-use crate::engine::routing::Router;
+use crate::engine::outbound::{OutboundManager, TargetAddr, UdpReplySink};
+use crate::engine::routing::{InboundContext, Network, RouteRequest, Router};
 use parking_lot::Mutex;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +50,15 @@ const MAX_CONNECTIONS: usize = 2048;
 const UDP_RELAY_ERROR_PAUSE: Duration = Duration::from_millis(20);
 /// Consecutive receive errors after which the relay gives up.
 const UDP_RELAY_MAX_ERRORS: u32 = 50;
+/// Relay workers an association may run at once.
+///
+/// A worker is only alive while it is useful: the pool starts with one and
+/// adds another only when every existing worker is busy. The cap is what
+/// keeps a burst of QUIC datagrams from turning into an unbounded thread
+/// growth, since beyond it datagrams are shed the way UDP expects.
+const UDP_RELAY_MAX_WORKERS: usize = 24;
+/// Datagrams allowed to wait for a worker; beyond this the association sheds.
+const UDP_RELAY_QUEUE: usize = 256;
 
 /// SOCKS5 protocol version byte.
 const SOCKS5_VERSION: u8 = 0x05;
@@ -76,8 +87,11 @@ enum Socks5Addr {
 
 /// Serve one accepted SOCKS5 connection.
 ///
-/// `kind` labels the connection in the traffic tracker (`socks5` / `mixed`).
-/// Returns after the relay finishes; the caller owns the socket until then.
+/// `kind` labels the connection in the traffic tracker (`socks5` / `mixed`)
+/// and `listen_port` is the inbound's own port; both travel into the routing
+/// request so `in-name` / `in-type` / `in-port` rules see where the
+/// connection arrived. Returns after the relay finishes; the caller owns the
+/// socket until then.
 pub(crate) fn serve_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -85,17 +99,28 @@ pub(crate) fn serve_connection(
     outbound_manager: Arc<OutboundManager>,
     auth: Arc<InboundAuth>,
     kind: &'static str,
+    listen_port: u16,
 ) -> Result<()> {
     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
-    if !perform_handshake(&mut stream, &auth)? {
-        return Err(Error::protocol_with_info(
-            "SOCKS5 handshake failed",
-            "SOCKS5",
-        ));
-    }
+    let user = match perform_handshake(&mut stream, &auth)? {
+        Greeting::Accepted { user } => user,
+        Greeting::Rejected => {
+            return Err(Error::protocol_with_info(
+                "SOCKS5 handshake failed",
+                "SOCKS5",
+            ));
+        }
+    };
     let (target_addr, target_port, command) = read_request(&mut stream)?;
+
+    let inbound = InboundContext {
+        name: Some(kind),
+        inbound_type: Some("SOCKS5"),
+        user: user.as_deref(),
+        port: Some(listen_port),
+    };
 
     match command {
         SOCKS5_CMD_CONNECT => handle_connect(
@@ -105,11 +130,17 @@ pub(crate) fn serve_connection(
             target_port,
             router,
             outbound_manager,
-            kind,
+            inbound,
         ),
-        SOCKS5_CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(stream, peer_addr, router, outbound_manager)
-        }
+        SOCKS5_CMD_UDP_ASSOCIATE => handle_udp_associate(
+            stream,
+            peer_addr,
+            router,
+            outbound_manager,
+            kind,
+            listen_port,
+            user,
+        ),
         _ => {
             send_reply(&mut stream, SOCKS5_REPLY_UNSUPPORTED)?;
             Err(Error::protocol_with_info(
@@ -120,17 +151,26 @@ pub(crate) fn serve_connection(
     }
 }
 
+/// How the SOCKS5 greeting ended.
+enum Greeting {
+    /// The client may proceed; `user` is who it authenticated as, when the
+    /// inbound required credentials.
+    Accepted { user: Option<String> },
+    /// Not (or no longer) a usable SOCKS5 session; the caller closes it.
+    Rejected,
+}
+
 /// RFC 1928 §3: greeting, method selection, optional RFC 1929 credentials.
 ///
-/// Returns `Ok(false)` when the connection is not (or cannot be) a SOCKS5
-/// session; the caller closes it.
-fn perform_handshake(stream: &mut TcpStream, auth: &InboundAuth) -> Result<bool> {
+/// Returns [`Greeting::Rejected`] when the connection is not (or cannot be) a
+/// SOCKS5 session; the caller closes it.
+fn perform_handshake(stream: &mut TcpStream, auth: &InboundAuth) -> Result<Greeting> {
     let mut header = [0u8; 2];
     stream
         .read_exact(&mut header)
         .map_err(|e| Error::network(format!("Failed to read SOCKS5 greeting: {e}")))?;
     if header[0] != SOCKS5_VERSION {
-        return Ok(false);
+        return Ok(Greeting::Rejected);
     }
 
     let mut methods = vec![0u8; header[1] as usize];
@@ -141,22 +181,25 @@ fn perform_handshake(stream: &mut TcpStream, auth: &InboundAuth) -> Result<bool>
     if auth.required() {
         if !methods.contains(&SOCKS5_AUTH_USERPASS) {
             let _ = stream.write_all(&[SOCKS5_VERSION, 0xFF]);
-            return Ok(false);
+            return Ok(Greeting::Rejected);
         }
         stream
             .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_USERPASS])
             .map_err(|e| Error::network(format!("Failed to send method selection: {e}")))?;
-        return socks5_userpass(stream, auth);
+        return Ok(match socks5_userpass(stream, auth)? {
+            Some(user) => Greeting::Accepted { user: Some(user) },
+            None => Greeting::Rejected,
+        });
     }
 
     if !methods.contains(&SOCKS5_AUTH_NONE) {
         let _ = stream.write_all(&[SOCKS5_VERSION, 0xFF]);
-        return Ok(false);
+        return Ok(Greeting::Rejected);
     }
     stream
         .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NONE])
         .map_err(|e| Error::network(format!("Failed to send method selection: {e}")))?;
-    Ok(true)
+    Ok(Greeting::Accepted { user: None })
 }
 
 /// RFC 1928 §4: `VER CMD RSV ATYP DST.ADDR DST.PORT`.
@@ -228,8 +271,11 @@ fn handle_connect(
     target_port: u16,
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
-    kind: &'static str,
+    inbound: InboundContext<'_>,
 ) -> Result<()> {
+    // The traffic list labels a connection the way its inbound does, and that
+    // name is the same one `in-name` rules read out of the request.
+    let kind = inbound.name.unwrap_or("SOCKS5");
     let (domain, ip) = match &target_addr {
         Socks5Addr::Domain(domain) => (Some(domain.clone()), None),
         Socks5Addr::Ipv4(ip) => (None, Some(IpAddr::V4(*ip))),
@@ -241,7 +287,21 @@ fn handle_connect(
         Socks5Addr::Ipv6(ip) => TargetAddr::new_ip(SocketAddr::new(IpAddr::V6(*ip), target_port)),
     };
 
-    let outbound_tag = router.match_outbound(domain.as_deref(), ip, Some(target_port), None);
+    // The full request rather than the domain/address convenience wrapper:
+    // the peer address is what `src-ip` / `src-port` rules match, the
+    // transport is what `network` rules match, and the inbound carries what
+    // the `in-*` rules match.
+    let decision = router.route(&RouteRequest {
+        domain: domain.as_deref(),
+        dst_ip: ip,
+        dst_port: Some(target_port),
+        src_ip: Some(peer_addr.ip()),
+        src_port: Some(peer_addr.port()),
+        network: Network::Tcp,
+        inbound,
+        ..RouteRequest::default()
+    });
+    let outbound_tag = decision.outbound;
     tracing::info!("SOCKS5 CONNECT {target} -> {outbound_tag} (from {peer_addr})");
 
     let Some(outbound) = outbound_manager.get_proxy(&outbound_tag) else {
@@ -313,8 +373,19 @@ fn handle_udp_associate(
     peer_addr: SocketAddr,
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
+    kind: &'static str,
+    listen_port: u16,
+    user: Option<String>,
 ) -> Result<()> {
     tracing::info!("SOCKS5 UDP ASSOCIATE from {peer_addr}");
+
+    // The identity the worker pool needs, in owned form: the relay outlives
+    // this frame, and each job it submits carries a handle of its own.
+    let inbound = UdpInboundIdentity {
+        name: kind,
+        port: listen_port,
+        user: user.map(Arc::from),
+    };
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     let udp_socket = crate::common::socket::udp_bind(bind_addr, UDP_SESSION_TIMEOUT)
@@ -338,6 +409,7 @@ fn handle_udp_associate(
                 router,
                 outbound_manager,
                 relay_cancel,
+                inbound,
             ) {
                 tracing::debug!("UDP relay error for {peer_addr}: {e}");
             }
@@ -381,18 +453,51 @@ fn pause_before_retry(cancel: &crate::common::cancel::CancellationToken) {
     }
 }
 
+/// Identity of the inbound one UDP association belongs to.
+///
+/// Owned rather than borrowed because the association outlives the frame that
+/// created it, and every datagram it relays carries a handle of its own: the
+/// user string must not be allocated again per datagram.
+#[derive(Clone)]
+struct UdpInboundIdentity {
+    name: &'static str,
+    port: u16,
+    user: Option<Arc<str>>,
+}
+
 /// Forward datagrams between the client and the matched outbound.
 ///
 /// Only datagrams whose source IP matches the association's client are
 /// relayed: without that check the bound UDP port would be an open relay for
 /// anyone who can reach it.
+///
+/// Datagrams are handed to a small worker pool instead of being relayed
+/// inline. The inline design was why one QUIC handshake could stall an entire
+/// association: a datagram whose peer had nothing to answer (an ACK-only
+/// segment, a keep-alive) parked the single loop that also had to receive —
+/// for the upstream's whole reply timeout — so the next datagram waited
+/// behind it and QUIC never got far enough to work. Workers keep the receive
+/// loop free, and an outbound that holds a per-target session answers later,
+/// from its own reader thread, through the reply sink built here.
 fn run_udp_relay(
     udp_socket: UdpSocket,
     client_addr: SocketAddr,
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
     cancel: crate::common::cancel::CancellationToken,
+    inbound: UdpInboundIdentity,
 ) -> Result<()> {
+    let reply_socket = udp_socket
+        .try_clone()
+        .map_err(|e| Error::network(format!("Failed to clone the UDP relay socket: {e}")))?;
+    let sink = UdpReplySink::new(move |target, payload| {
+        let packet = build_udp_reply(target, payload);
+        if let Err(e) = reply_socket.send_to(&packet, client_addr) {
+            tracing::debug!("Failed to send UDP reply to {client_addr}: {e}");
+        }
+    });
+
+    let pool = UdpRelayPool::new();
     let mut buf = vec![0u8; 65535];
     let mut consecutive_errors = 0u32;
 
@@ -482,32 +587,159 @@ fn run_udp_relay(
             continue;
         }
 
-        let (domain, ip) = match &target {
-            TargetAddr::Domain(domain, _) => (Some(domain.clone()), None),
-            TargetAddr::Ip(addr) => (None, Some(addr.ip())),
-        };
-        let outbound_tag = router.match_outbound(domain.as_deref(), ip, Some(target.port()), None);
-        let Some(outbound) = outbound_manager.get_proxy(&outbound_tag) else {
-            tracing::warn!("Outbound '{}' not found for UDP", outbound_tag);
-            continue;
-        };
-        if !outbound.supports_udp() {
-            tracing::debug!("Outbound '{}' does not support UDP", outbound_tag);
-            continue;
-        }
-
-        match outbound.relay_udp_packet(&target, payload) {
-            Ok(response) if !response.is_empty() => {
-                let packet = build_udp_reply(&target, &response);
-                if let Err(e) = udp_socket.send_to(&packet, src_addr) {
-                    tracing::debug!("Failed to send UDP reply: {e}");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => tracing::debug!("UDP relay error via '{}': {}", outbound.tag(), e),
-        }
+        pool.submit(UdpRelayJob {
+            target,
+            payload: payload.to_vec(),
+            client: src_addr,
+            router: Arc::clone(&router),
+            outbound_manager: Arc::clone(&outbound_manager),
+            sink: Arc::clone(&sink),
+            inbound_name: inbound.name,
+            inbound_type: "SOCKS5",
+            inbound_port: inbound.port,
+            inbound_user: inbound.user.clone(),
+        });
     }
     Ok(())
+}
+
+/// One datagram waiting for a relay worker.
+///
+/// Everything the worker needs travels with the job, so the receive loop
+/// never touches the router and never blocks on a name lookup.
+struct UdpRelayJob {
+    target: TargetAddr,
+    payload: Vec<u8>,
+    /// Address the datagram arrived from; the source metadata rules may use.
+    client: SocketAddr,
+    router: Arc<Router>,
+    outbound_manager: Arc<OutboundManager>,
+    sink: Arc<UdpReplySink>,
+    /// Inbound the association was opened on, for the `in-*` rules.
+    inbound_name: &'static str,
+    inbound_type: &'static str,
+    inbound_port: u16,
+    /// Shared rather than cloned per datagram: a datagram must not allocate
+    /// just to say who sent it.
+    inbound_user: Option<Arc<str>>,
+}
+
+/// Bounded worker pool owned by one UDP association.
+///
+/// Workers are started on demand and end with the association: when the
+/// relay loop returns, the sender is dropped, every parked worker wakes on
+/// the disconnect and exits. An idle association therefore costs one parked
+/// thread once traffic has flowed, and nothing at all before that.
+struct UdpRelayPool {
+    sender: SyncSender<UdpRelayJob>,
+    receiver: Arc<Mutex<Receiver<UdpRelayJob>>>,
+    workers: Arc<AtomicUsize>,
+}
+
+impl UdpRelayPool {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel(UDP_RELAY_QUEUE);
+        Self {
+            sender,
+            receiver: Arc::new(Mutex::new(receiver)),
+            workers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Hand one datagram to a worker, or shed it when every worker is busy.
+    ///
+    /// Shedding is the UDP-correct answer to overload: a QUIC client
+    /// retransmits what matters, and queueing past the bound would only add
+    /// latency to datagrams that are already stale.
+    fn submit(&self, job: UdpRelayJob) {
+        if self.workers.load(Ordering::Acquire) == 0 {
+            self.spawn_worker();
+        }
+        match self.sender.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                if self.spawn_worker() {
+                    let _ = self.sender.try_send(job);
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// Start one worker. False when the cap is reached or the thread could
+    /// not be spawned; the caller then sheds the datagram.
+    fn spawn_worker(&self) -> bool {
+        let previous = self.workers.fetch_add(1, Ordering::AcqRel);
+        if previous >= UDP_RELAY_MAX_WORKERS {
+            self.workers.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+
+        let receiver = Arc::clone(&self.receiver);
+        let workers = Arc::clone(&self.workers);
+        let spawned = std::thread::Builder::new()
+            .name("corduit-udp-relay".into())
+            .spawn(move || {
+                let rx = receiver;
+                loop {
+                    let job = {
+                        let guard = rx.lock();
+                        guard.recv()
+                    };
+                    match job {
+                        Ok(job) => relay_udp_datagram(job),
+                        Err(_) => break,
+                    }
+                }
+                workers.fetch_sub(1, Ordering::AcqRel);
+            });
+        match spawned {
+            Ok(_) => true,
+            Err(e) => {
+                self.workers.fetch_sub(1, Ordering::AcqRel);
+                tracing::warn!("Failed to spawn a UDP relay worker: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// Route one datagram and hand it to the outbound the rules selected.
+fn relay_udp_datagram(job: UdpRelayJob) {
+    let (domain, ip) = match &job.target {
+        TargetAddr::Domain(domain, _) => (Some(domain.as_str()), None),
+        TargetAddr::Ip(addr) => (None, Some(addr.ip())),
+    };
+    let decision = job.router.route(&RouteRequest {
+        domain,
+        dst_ip: ip,
+        dst_port: Some(job.target.port()),
+        src_ip: Some(job.client.ip()),
+        src_port: Some(job.client.port()),
+        network: Network::Udp,
+        // `in-type` on UDP is always `SOCKS5`: a UDP association is only
+        // reachable through it, whatever `kind` labels the connection list.
+        inbound: InboundContext {
+            name: Some(job.inbound_name),
+            inbound_type: Some(job.inbound_type),
+            user: job.inbound_user.as_deref(),
+            port: Some(job.inbound_port),
+        },
+        ..RouteRequest::default()
+    });
+
+    let Some(outbound) = job.outbound_manager.get_proxy(&decision.outbound) else {
+        tracing::warn!("Outbound '{}' not found for UDP", decision.outbound);
+        return;
+    };
+    if !outbound.supports_udp() {
+        tracing::debug!("Outbound '{}' does not support UDP", decision.outbound);
+        return;
+    }
+
+    if let Err(e) = outbound.udp_submit(&job.target, &job.payload, &job.sink) {
+        tracing::debug!("UDP relay error via '{}': {}", outbound.tag(), e);
+    }
 }
 
 /// Wrap an outbound reply in the SOCKS5 UDP response envelope.
@@ -622,6 +854,7 @@ impl Socks5Inbound {
         let router = Arc::clone(&self.router);
         let outbound_manager = Arc::clone(&self.outbound_manager);
         let auth = Arc::clone(&self.auth);
+        let listen_port = addr.port();
 
         let mut server = ConnectionListener::new(listener, addr, MAX_CONNECTIONS);
         server
@@ -633,6 +866,7 @@ impl Socks5Inbound {
                     Arc::clone(&outbound_manager),
                     Arc::clone(&auth),
                     "socks5",
+                    listen_port,
                 ) {
                     tracing::debug!("SOCKS5 connection error from {peer}: {e}");
                 }
@@ -691,7 +925,10 @@ mod tests {
     fn no_auth_handshake_is_accepted_when_open() {
         let (mut server, mut client) = socket_pair();
         client.write_all(&[0x05, 0x01, 0x00]).unwrap();
-        assert!(perform_handshake(&mut server, &InboundAuth::default()).unwrap());
+        assert!(matches!(
+            perform_handshake(&mut server, &InboundAuth::default()).unwrap(),
+            Greeting::Accepted { user: None }
+        ));
         let mut reply = [0u8; 2];
         client.read_exact(&mut reply).unwrap();
         assert_eq!(reply, [0x05, 0x00]);
@@ -701,7 +938,10 @@ mod tests {
     fn no_auth_only_client_is_refused_when_credentials_are_configured() {
         let (mut server, mut client) = socket_pair();
         client.write_all(&[0x05, 0x01, 0x00]).unwrap();
-        assert!(!perform_handshake(&mut server, &auth_with("user", "pass")).unwrap());
+        assert!(matches!(
+            perform_handshake(&mut server, &auth_with("user", "pass")).unwrap(),
+            Greeting::Rejected
+        ));
         let mut reply = [0u8; 2];
         client.read_exact(&mut reply).unwrap();
         assert_eq!(reply, [0x05, 0xFF], "no acceptable methods");
@@ -724,7 +964,12 @@ mod tests {
         let mut status = [0u8; 2];
         client.read_exact(&mut status).unwrap();
         assert_eq!(status, [0x01, 0x00]);
-        assert!(handle.join().unwrap().unwrap());
+        // The username the client authenticated with is what `in-user`
+        // rules later match, so it has to survive the handshake.
+        assert!(matches!(
+            handle.join().unwrap().unwrap(),
+            Greeting::Accepted { user: Some(user) } if user == "user"
+        ));
     }
 
     #[test]

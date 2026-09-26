@@ -65,16 +65,16 @@ pub use dns::{
 pub use error::{Result, SolidTcpError};
 pub use nat::{NatConfig, NatEntry, NatKey, NatState, NatTable};
 pub use packet::{
-    build_ipv4_tcp, build_ipv4_udp, parse_packet, PacketBuilder, PacketParser, ParsedPacket,
-    TcpFlags,
+    build_ipv4_tcp, build_ipv4_udp, build_ipv6_tcp, build_ipv6_udp, build_tcp, build_udp,
+    parse_packet, PacketBuilder, PacketParser, ParsedPacket, TcpFlags,
 };
 pub use stack::{SolidStack, StackBuilder, StackConfig};
 pub use stats::{ConnectionStats, StackStats, StatsSnapshot};
 pub use tcp::{TcpAction, TcpConfig, TcpConnection, TcpManager, TcpState};
 pub use udp::{UdpConfig, UdpManager, UdpSession, UdpSessionState};
 
-// Android-specific exports for socket protection
-#[cfg(target_os = "android")]
+// Android/OHOS-specific exports for socket protection
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use stack::{
     clear_protect_callback, has_protect_callback, protect_socket, set_protect_callback,
 };

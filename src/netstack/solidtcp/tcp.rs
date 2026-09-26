@@ -2,11 +2,11 @@
 
 use crate::netstack::solidtcp::error::Result;
 use crate::netstack::solidtcp::nat::NatKey;
-use crate::netstack::solidtcp::packet::{TcpInfo, DEFAULT_MSS_V4};
+use crate::netstack::solidtcp::packet::{TcpInfo, DEFAULT_MSS_V4, DEFAULT_MSS_V6};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -206,7 +206,11 @@ impl TcpConnection {
         let mut iss = [0u8; 4];
         getrandom::fill(&mut iss).expect("OS RNG unavailable");
         let iss = u32::from_le_bytes(iss);
-        let mss = their_mss.unwrap_or(DEFAULT_MSS_V4).min(config.mss);
+        let fallback_mss = match key.dst.ip() {
+            IpAddr::V4(_) => DEFAULT_MSS_V4,
+            IpAddr::V6(_) => DEFAULT_MSS_V6,
+        };
+        let mss = their_mss.unwrap_or(fallback_mss).min(config.mss);
         let is_websocket = matches!(key.dst.port(), 80 | 443 | 8080 | 8443 | 9000);
 
         Self {
@@ -293,10 +297,6 @@ impl TcpConnection {
             .config
             .max_recv_buffer
             .saturating_sub(self.queued_bytes());
-        // Whole segments only, and no artificial floor. A window that never
-        // closes cannot bound anything, and a floor would keep the peer
-        // refilling a queue we are refusing on every segment — one
-        // retransmission per segment, for as long as the proxy stays behind.
         let segment = self.segment_size();
         let window = (available / segment * segment).min(MAX_RECV_WINDOW as usize);
         self.recv_window = window as u32;

@@ -20,23 +20,53 @@ const WINTUN_DLL_BYTES: Option<&[u8]> = None;
 #[cfg(windows)]
 const WINTUN_DOWNLOAD_URL: &str = "https://www.wintun.net/builds/wintun-0.14.1.zip";
 
-/// Get the path where wintun.dll should be located
+/// Every place a wintun.dll is looked for, most specific first.
+///
+/// The executable directory is where a bundled copy lands (the Flutter app
+/// installs one there), `wintun/` is where a user who unpacked the official
+/// zip by hand tends to put it, and the per-user application directories are
+/// where the app can still write when it is installed somewhere read-only.
 #[cfg(windows)]
-pub fn get_wintun_dll_path() -> Result<PathBuf> {
+fn wintun_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            return Ok(exe_dir.join("wintun.dll"));
+            candidates.push(exe_dir.join("wintun.dll"));
+            candidates.push(exe_dir.join("wintun").join("wintun.dll"));
         }
     }
-    Ok(std::env::current_dir()
-        .map_err(|e| NetStackError::TunError(format!("Failed to get current directory: {}", e)))?
-        .join("wintun.dll"))
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("wintun.dll"));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(&local).join("ArcadiaPlus").join("wintun.dll"));
+        candidates.push(PathBuf::from(local).join("Corduit").join("wintun.dll"));
+    }
+    candidates
 }
 
-/// Check if wintun.dll exists at the expected location
+/// Get the path where wintun.dll should be located.
+///
+/// Returns the first candidate that exists, so a bundled copy beside the
+/// executable, a manually unpacked one and the cached per-user download are
+/// all found without the caller knowing which is present. When none exists,
+/// the primary location (beside the executable) is returned as the place a
+/// download should land.
+#[cfg(windows)]
+pub fn get_wintun_dll_path() -> Result<PathBuf> {
+    let candidates = wintun_candidates();
+    if let Some(found) = candidates.iter().find(|path| path.exists()) {
+        return Ok(found.clone());
+    }
+    candidates.into_iter().next().ok_or_else(|| {
+        NetStackError::TunError("no writable directory is available for wintun.dll".to_string())
+    })
+}
+
+/// Check if wintun.dll exists at any known location
 #[cfg(windows)]
 pub fn is_wintun_available() -> bool {
-    get_wintun_dll_path().map(|p| p.exists()).unwrap_or(false)
+    wintun_candidates().iter().any(|path| path.exists())
 }
 
 /// Extract embedded wintun.dll to the executable directory

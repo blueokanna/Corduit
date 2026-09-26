@@ -88,10 +88,28 @@ pub struct RuleMatchInput<'a> {
     pub domain: Option<&'a str>,
     /// Destination address.
     pub dst_ip: Option<IpAddr>,
+    /// Addresses the router resolved for `domain`.
+    ///
+    /// An `ipcidr`-style set has to see them, for the same reason a `GEOIP`
+    /// rule does: a connection that arrives as a domain has no literal
+    /// address to match, and a set that exists to describe address ranges
+    /// would otherwise never carry the traffic it names.
+    pub resolved: &'a [IpAddr],
+    /// Whether the rule that carries this input asked for `no-resolve`.
+    pub no_resolve: bool,
     /// Address the connection came from.
     pub src_ip: Option<IpAddr>,
     /// Executable name owning the connection.
     pub process_name: Option<&'a str>,
+}
+
+impl RuleMatchInput<'_> {
+    /// Addresses resolved for the domain that an `ip-cidr` entry may compare
+    /// against; empty when the rule asked for `no-resolve`.
+    fn dst_candidates(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        let resolved: &[IpAddr] = if self.no_resolve { &[] } else { self.resolved };
+        resolved.iter().copied()
+    }
 }
 
 /// Fold ASCII uppercase to lowercase, borrowing when there is nothing to fold.
@@ -261,6 +279,12 @@ impl RuleIndex {
             + self.process_names.len()
     }
 
+    /// Whether this set holds any address entry a resolved answer could
+    /// decide. The router asks before paying for a lookup.
+    fn has_dst_ip_entries(&self) -> bool {
+        !self.dst_nets.is_empty()
+    }
+
     /// A bounded description of what could not be indexed.
     fn rejected_summary(&self) -> String {
         const SHOWN: usize = 3;
@@ -300,6 +324,20 @@ impl RuleIndex {
                 .any(|network| network.contains(&address))
             {
                 return true;
+            }
+        }
+
+        // Addresses the router resolved for the domain count too, unless the
+        // rule opted out with `no-resolve`.
+        if !input.no_resolve {
+            for address in input.resolved {
+                if self
+                    .dst_nets
+                    .iter()
+                    .any(|network| network.contains(address))
+                {
+                    return true;
+                }
             }
         }
 
@@ -704,7 +742,9 @@ impl RuleProvider {
             }
             CompiledRuleEntry::IpCidr(network) => input
                 .dst_ip
-                .is_some_and(|address| network.contains(&address)),
+                .into_iter()
+                .chain(input.dst_candidates())
+                .any(|address| network.contains(&address)),
             CompiledRuleEntry::Classical {
                 rule_type,
                 pattern,
@@ -731,7 +771,9 @@ impl RuleProvider {
                     pattern.trim().parse::<IpNet>().ok().is_some_and(|network| {
                         input
                             .dst_ip
-                            .is_some_and(|address| network.contains(&address))
+                            .into_iter()
+                            .chain(input.dst_candidates())
+                            .any(|address| network.contains(&address))
                     })
                 }
                 ClassicalRuleType::SrcIpCidr => {
@@ -800,6 +842,15 @@ impl RuleProvider {
     pub fn last_update_time(&self) -> Option<Instant> {
         *self.last_update.read()
     }
+
+    /// Whether this set carries destination-address entries.
+    ///
+    /// The router uses it to decide whether a domain-only connection warrants
+    /// a resolution before this set is evaluated; a set of domain patterns
+    /// must not pay for a lookup it cannot use.
+    pub fn has_dst_ip_entries(&self) -> bool {
+        self.index.read().has_dst_ip_entries()
+    }
 }
 
 pub struct RuleProviderManager {
@@ -841,6 +892,14 @@ impl RuleProviderManager {
         } else {
             false
         }
+    }
+
+    /// Whether the named set carries address entries a resolved answer could
+    /// decide. Unknown providers answer `false`, the same default that makes
+    /// their rules never match.
+    pub fn carries_dst_ip_entries(&self, provider_name: &str) -> bool {
+        self.get_provider(provider_name)
+            .is_some_and(|provider| provider.has_dst_ip_entries())
     }
 
     pub fn update_all(&self) -> Vec<Result<bool>> {
@@ -1111,6 +1170,7 @@ mod tests {
                 dst_ip: Some("10.0.0.1".parse().expect("valid")),
                 src_ip: Some("192.168.1.1".parse().expect("valid")),
                 process_name: Some("chrome"),
+                ..RuleMatchInput::default()
             },
         ];
 

@@ -2,7 +2,7 @@ use crate::common::cancel::CancellationToken;
 use crate::netstack::error::{NetStackError, Result};
 use bytes::BytesMut;
 use std::net::Ipv4Addr;
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -125,6 +125,51 @@ pub fn clear_ios_vpn_fd() {
     IOS_VPN_FD.store(-1, Ordering::SeqCst);
 }
 
+/// Global OHOS VPN file descriptor.
+///
+/// Set by the HarmonyOS `VpnExtensionAbility`: the extension creates the VPN
+/// connection, receives the tun fd from `vpnConnection.create()`, and hands it
+/// to the engine through this slot before starting the packet path.
+#[cfg(target_env = "ohos")]
+pub static OHOS_VPN_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Set the OHOS VPN file descriptor from the VpnExtensionAbility layer
+#[cfg(target_env = "ohos")]
+pub fn set_ohos_vpn_fd(fd: i32) {
+    info!("Setting OHOS VPN fd to {}", fd);
+    OHOS_VPN_FD.store(fd, Ordering::SeqCst);
+}
+
+/// Get the current OHOS VPN file descriptor
+#[cfg(target_env = "ohos")]
+pub fn get_ohos_vpn_fd() -> i32 {
+    OHOS_VPN_FD.load(Ordering::SeqCst)
+}
+
+/// Clear the OHOS VPN file descriptor (called when the VPN stops)
+#[cfg(target_env = "ohos")]
+pub fn clear_ohos_vpn_fd() {
+    info!("Clearing OHOS VPN fd");
+    OHOS_VPN_FD.store(-1, Ordering::SeqCst);
+}
+
+/// Whether the OHOS engine process was exempted from its own tunnel through
+/// `protectProcessNet` (API 22+) instead of per-fd `protect` callbacks.
+#[cfg(target_env = "ohos")]
+pub static OHOS_PROCESS_PROTECTED: AtomicBool = AtomicBool::new(false);
+
+/// Record that the whole process was exempted from the tunnel.
+#[cfg(target_env = "ohos")]
+pub fn set_ohos_process_protected(protected: bool) {
+    OHOS_PROCESS_PROTECTED.store(protected, Ordering::SeqCst);
+}
+
+/// Whether the process-level exemption is in force.
+#[cfg(target_env = "ohos")]
+pub fn is_ohos_process_protected() -> bool {
+    OHOS_PROCESS_PROTECTED.load(Ordering::SeqCst)
+}
+
 /// TUN device configuration
 #[derive(Debug, Clone)]
 pub struct TunConfig {
@@ -181,7 +226,7 @@ pub struct TunDevice {
         target_os = "netbsd",
     ))]
     unix_device: Option<tun_rs::SyncDevice>,
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
     vpn_file: Option<std::fs::File>,
 }
 
@@ -215,7 +260,7 @@ impl TunDevice {
                 target_os = "netbsd",
             ))]
             unix_device: None,
-            #[cfg(any(target_os = "android", target_os = "ios"))]
+            #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
             vpn_file: None,
         })
     }
@@ -237,7 +282,7 @@ impl TunDevice {
                 target_os = "netbsd",
             ))]
             unix_device: None,
-            #[cfg(any(target_os = "android", target_os = "ios"))]
+            #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
             vpn_file: None,
         })
     }
@@ -282,6 +327,12 @@ impl TunDevice {
 
         #[cfg(target_os = "ios")]
         if let Err(error) = self.start_ios() {
+            self.running.store(false, Ordering::Release);
+            return Err(error);
+        }
+
+        #[cfg(target_env = "ohos")]
+        if let Err(error) = self.start_ohos() {
             self.running.store(false, Ordering::Release);
             return Err(error);
         }
@@ -544,9 +595,6 @@ impl TunDevice {
         self.unix_device = Some(device);
 
         let running = self.running.clone();
-        // The device is kept alive by `self.unix_device`; worker threads
-        // operate on the underlying fd with poll()-based timeouts so they
-        // can observe shutdown while a packet is not yet available.
         let fd = self.unix_device.as_ref().unwrap().as_raw_fd();
 
         // Read task: poll fd, then read packets into the stack channel.
@@ -668,9 +716,10 @@ impl TunDevice {
 
     /// Shared fd-based TUN implementation for platforms where the OS creates
     /// the TUN device and hands us the file descriptor (Android `VpnService`,
-    /// iOS `NetworkExtension`/`PacketTunnelProvider`). The descriptor is
-    /// duplicated so we never take ownership of the caller's fd.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    /// iOS `NetworkExtension`/`PacketTunnelProvider`, HarmonyOS
+    /// `VpnExtensionAbility`). The descriptor is duplicated so we never take
+    /// ownership of the caller's fd.
+    #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
     fn start_from_fd(&mut self, fd: i32) -> Result<()> {
         use std::os::unix::io::FromRawFd;
 
@@ -840,6 +889,15 @@ impl TunDevice {
         self.start_from_fd(fd)
     }
 
+    /// OHOS TUN implementation: the device is created by the
+    /// `VpnExtensionAbility` (`vpnConnection.create()`) and we receive the
+    /// file descriptor through `set_ohos_vpn_fd`.
+    #[cfg(target_env = "ohos")]
+    fn start_ohos(&mut self) -> Result<()> {
+        let fd = OHOS_VPN_FD.load(Ordering::Relaxed);
+        self.start_from_fd(fd)
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         if !self.is_running() {
             return Ok(());
@@ -928,7 +986,7 @@ impl Drop for TunDevice {
         {
             self.unix_device.take();
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
         {
             self.vpn_file.take();
         }

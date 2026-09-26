@@ -143,8 +143,11 @@ impl WindowsRouteManager {
 
         info!("TUN interface index: {}", if_index);
 
-        // Save original gateway
         self.save_original_gateway()?;
+
+        if let Some(index) = self.original_interface {
+            crate::common::socket::set_outbound_interface_index(Some(index));
+        }
         self.routes_active = true;
 
         let original_gateway = self
@@ -169,8 +172,6 @@ impl WindowsRouteManager {
             }
         }
 
-        // Add routes for 0.0.0.0/1 and 128.0.0.0/1 through TUN
-        // This covers all IPv4 addresses without replacing the default route
         let routes = [
             ("0.0.0.0", "128.0.0.0"),   // 0.0.0.0/1
             ("128.0.0.0", "128.0.0.0"), // 128.0.0.0/1
@@ -237,6 +238,8 @@ impl WindowsRouteManager {
                 self.added_routes.len()
             ));
         }
+
+        crate::common::socket::set_outbound_interface_index(None);
         info!("Global mode routes disabled");
         Ok(())
     }
@@ -361,8 +364,6 @@ pub fn set_tun_dns(interface_name: &str, dns_servers: &[Ipv4Addr]) -> Result<(),
         }
     }
 
-    // Set the TUN interface metric to be lower (higher priority) than other interfaces
-    // This ensures DNS queries prefer the TUN interface
     let _ = Command::new("powershell")
         .args([
             "-Command",

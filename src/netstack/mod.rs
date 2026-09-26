@@ -83,13 +83,19 @@ pub use tun::{
     set_android_vpn_fd, ANDROID_PROXY_MODE, ANDROID_VPN_FD,
 };
 
+#[cfg(target_env = "ohos")]
+pub use tun::{
+    clear_ohos_vpn_fd, get_ohos_vpn_fd, is_ohos_process_protected, set_ohos_process_protected,
+    set_ohos_vpn_fd, OHOS_PROCESS_PROTECTED, OHOS_VPN_FD,
+};
+
 #[cfg(target_os = "ios")]
 pub use tun::{clear_ios_vpn_fd, get_ios_vpn_fd, set_ios_vpn_fd, IOS_VPN_FD};
 
 #[cfg(target_os = "android")]
 pub use android_vpn::{AndroidVpnProcessor, VpnTrafficStats};
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use solidtcp::{
     clear_protect_callback, has_protect_callback, protect_socket, set_protect_callback,
 };

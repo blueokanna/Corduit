@@ -527,15 +527,19 @@ macro_rules! relay_streams {
             $crate::common::cancel::CancellationToken::new(),
         )
     };
-    ($inbound:expr, $outbound:expr, $connection:expr) => {
+    ($inbound:expr, $outbound:expr, $connection:expr) => {{
+        // The token belongs to the tracked connection: a close from the UI or
+        // a service stop cancels it, and the relay below reacts by releasing
+        // both sockets.
+        let tracked = $connection;
         $crate::engine::outbound::relay_bidirectional_with_connection(
             $inbound,
             Box::new($outbound) as $crate::common::stream::BoxStream,
             $crate::engine::connection_tracker::global_tracker(),
-            $connection,
-            $crate::common::cancel::CancellationToken::new(),
+            tracked.clone(),
+            $crate::engine::connection_tracker::cancellation_for(tracked.as_ref()),
         )
-    };
+    }};
 }
 
 #[cfg(test)]
