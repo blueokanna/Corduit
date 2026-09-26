@@ -122,7 +122,7 @@ req = urllib.request.Request(
              "Authorization": "Bearer my-secret-token"},
 )
 print(json.load(urllib.request.urlopen(req)))
-# {'code': 0, 'data': 'Corduit v0.1.5'}
+# {'code': 0, 'data': 'Corduit v0.2.2'}
 ```
 
 ## 限制与安全

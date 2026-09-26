@@ -512,7 +512,7 @@ pub enum DnsMode {
 }
 
 impl_config_enum!(DnsMode {
-    Normal => "normal",
+    Normal => "normal" | "redir-host" | "redir_host" | "redir",
     FakeIp => "fake-ip" | "fakeip" | "fake_ip",
 });
 
@@ -746,6 +746,40 @@ mod tests {
         assert_eq!(kebab.cache_size, 99);
         assert!(!kebab.use_hosts);
         assert_eq!(kebab.nameserver_policy["+.a.com"], vec!["1.1.1.1"]);
+    }
+
+    /// The DNS-mode vocabulary, which three layers spell differently.
+    ///
+    /// mihomo writes `redir-host` and accepts `normal` for the same behaviour,
+    /// this engine's own configs write `normal`, and a hand-edited file may
+    /// write `redir`. All of them mean "answer with real addresses"; only the
+    /// fake-IP family means otherwise. A value outside both families is a
+    /// config mistake and is refused while the document is read — accepting it
+    /// would leave a whole profile unable to start over one word.
+    #[test]
+    fn dns_mode_accepts_every_spelling_of_the_two_behaviours() {
+        for spelling in ["normal", "redir-host", "redir_host", "redir"] {
+            assert_eq!(
+                DnsMode::parse(spelling),
+                Some(DnsMode::Normal),
+                "{spelling} means real answers"
+            );
+        }
+        for spelling in ["fake-ip", "fakeip", "fake_ip"] {
+            assert_eq!(
+                DnsMode::parse(spelling),
+                Some(DnsMode::FakeIp),
+                "{spelling} means the fake pool"
+            );
+        }
+        assert_eq!(DnsMode::parse("bogus"), None);
+        assert_eq!(DnsMode::parse("redir-hosted"), None);
+
+        // The spellings reach the config document too, not just the parser.
+        let clash: DnsConfig =
+            nextjson::from_str(r#"{"enable":true,"enhanced-mode":"redir-host"}"#)
+                .expect("the Clash spelling");
+        assert_eq!(clash.enhanced_mode, DnsMode::Normal);
     }
 
     /// A field the caller never mentions keeps the engine default instead of
