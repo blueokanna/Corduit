@@ -1,7 +1,7 @@
 use crate::common::stream::BoxStream;
 use crate::crypto::aead::{Aead, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305};
 use crate::crypto::digest::Digest;
-use crate::crypto::hash::{Blake3, Md5, Sha1};
+use crate::crypto::hash::{Md5, Sha1};
 use crate::crypto::kdf::Hkdf;
 use crate::engine::config::OutboundConfig;
 use crate::engine::error::{Error, Result};
@@ -23,6 +23,10 @@ const SS_UDP_SESSION_IDLE: Duration = Duration::from_secs(120);
 /// Read timeout of the session reader between liveness checks.
 const SS_UDP_POLL: Duration = Duration::from_secs(30);
 
+/// Hard cap on concurrently live UDP sessions (one thread + one socket each).
+/// Beyond it new flows fail fast instead of exhausting threads and fds.
+const MAX_UDP_SESSIONS: usize = 1024;
+
 /// Shadowsocks outbound proxy
 pub struct ShadowsocksOutbound {
     config: OutboundConfig,
@@ -31,11 +35,21 @@ pub struct ShadowsocksOutbound {
     password: String,
     cipher: String,
     udp_enabled: bool,
-    /// One UDP session per destination, shared by every datagram of that
-    /// destination. The session cache is what turns QUIC from "one socket
-    /// and one wait per packet" into a stream of datagrams that answer
-    /// whenever they answer.
-    udp_sessions: parking_lot::Mutex<HashMap<String, Arc<SsUdpSession>>>,
+    /// One UDP session per (client association, destination), so replies
+    /// reach exactly the association that sent the datagrams.
+    udp_sessions: parking_lot::Mutex<HashMap<(usize, String), Arc<SsUdpSession>>>,
+    /// Sessions whose reader thread has not exited yet.
+    live_udp_sessions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Decrements the live-session count when a reader thread (or a failed
+/// spawn) drops it.
+struct LiveSessionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LiveSessionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl OutboundProxy for ShadowsocksOutbound {
@@ -92,7 +106,7 @@ impl OutboundProxy for ShadowsocksOutbound {
                 "UDP relay is not enabled for this Shadowsocks proxy",
             ));
         }
-        let session = self.udp_session(target)?;
+        let session = self.udp_session(sink, target)?;
         session.register_sink(sink);
         session.send(&self.password, data)
     }
@@ -210,7 +224,7 @@ impl OutboundProxy for ShadowsocksOutbound {
                 let response = String::from_utf8_lossy(&chunk);
                 tracing::debug!(
                     "SS latency test: got response: {}",
-                    &response[..response.len().min(100)]
+                    crate::common::text::truncate_utf8(&response, 100)
                 );
                 if response.starts_with("HTTP/") {
                     let elapsed = start.elapsed();
@@ -219,7 +233,7 @@ impl OutboundProxy for ShadowsocksOutbound {
                 } else {
                     Err(Error::network(format!(
                         "Invalid HTTP response: {}",
-                        &response[..response.len().min(50)]
+                        crate::common::text::truncate_utf8(&response, 50)
                     )))
                 }
             }
@@ -327,6 +341,11 @@ impl ShadowsocksOutbound {
             return Err(Error::config("Missing password for Shadowsocks"));
         }
 
+        // Validate the cipher at construction, not at first use: a config
+        // naming a cipher this build cannot speak (the 2022 suite, a typo)
+        // must fail when the engine is built, not per connection.
+        let _ = CipherSpec::new(&cipher)?;
+
         Ok(Self {
             config,
             server,
@@ -335,28 +354,43 @@ impl ShadowsocksOutbound {
             cipher,
             udp_enabled,
             udp_sessions: parking_lot::Mutex::new(HashMap::new()),
+            live_udp_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
-    /// The live UDP session for `target`, created on first use.
+    /// The live UDP session for `(sink, target)`, created on first use.
     ///
     /// Dead sessions (their reader has exited) are replaced, and the map is
-    /// pruned of them on the way — one entry per destination, so the prune
-    /// only has to be correct, not frequent.
-    fn udp_session(&self, target: &TargetAddr) -> Result<Arc<SsUdpSession>> {
-        let key = target.to_string();
+    /// pruned of them on the way.
+    fn udp_session(
+        &self,
+        sink: &Arc<UdpReplySink>,
+        target: &TargetAddr,
+    ) -> Result<Arc<SsUdpSession>> {
+        let key = (Arc::as_ptr(sink) as usize, target.to_string());
         if let Some(existing) = self.udp_sessions.lock().get(&key) {
             if existing.alive.load(Ordering::Acquire) {
                 return Ok(Arc::clone(existing));
             }
         }
 
+        if self.live_udp_sessions.load(Ordering::Acquire) >= MAX_UDP_SESSIONS {
+            return Err(Error::network(format!(
+                "Shadowsocks UDP session limit reached ({MAX_UDP_SESSIONS})"
+            )));
+        }
+
         let session = Arc::new(self.create_udp_session(target)?);
         let password = self.password.clone();
         let reader_session = Arc::clone(&session);
+        self.live_udp_sessions.fetch_add(1, Ordering::AcqRel);
+        let guard = LiveSessionGuard(Arc::clone(&self.live_udp_sessions));
         std::thread::Builder::new()
             .name("corduit-ss-udp".into())
-            .spawn(move || pump_ss_udp_replies(reader_session, password))
+            .spawn(move || {
+                let _guard = guard;
+                pump_ss_udp_replies(reader_session, password);
+            })
             .map_err(|e| Error::network(format!("Failed to spawn the SS UDP reader: {e}")))?;
 
         let mut sessions = self.udp_sessions.lock();
@@ -375,8 +409,12 @@ impl ShadowsocksOutbound {
                 .next()
                 .ok_or_else(|| Error::network("No addresses found for SS server"))?;
 
-        let socket = crate::common::socket::udp_bind("0.0.0.0:0".parse().unwrap(), SS_UDP_POLL)
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {e}")))?;
+        let socket = crate::common::socket::udp_bind_for(
+            "0.0.0.0:0".parse().unwrap(),
+            SS_UDP_POLL,
+            Some(resolved.ip()),
+        )
+        .map_err(|e| Error::network(format!("Failed to bind UDP socket: {e}")))?;
         socket
             .connect(resolved)
             .map_err(|e| Error::network(format!("Failed to connect UDP to SS server: {e}")))?;
@@ -423,8 +461,12 @@ impl ShadowsocksOutbound {
                 .next()
                 .ok_or_else(|| Error::network("No addresses found for SS server"))?;
 
-        let server_socket = crate::common::socket::udp_bind("0.0.0.0:0".parse().unwrap(), timeout)
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
+        let server_socket = crate::common::socket::udp_bind_for(
+            "0.0.0.0:0".parse().unwrap(),
+            timeout,
+            Some(resolved_addr.ip()),
+        )
+        .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
 
         server_socket
             .connect(resolved_addr)
@@ -771,9 +813,6 @@ pub enum CipherType {
     Aes128Gcm,
     Aes256Gcm,
     Chacha20Poly1305,
-    Aes128Gcm2022,
-    Aes256Gcm2022,
-    Chacha20Poly13052022,
 }
 
 impl CipherSpec {
@@ -797,39 +836,26 @@ impl CipherSpec {
                 tag_len: 16,
                 cipher_type: CipherType::Chacha20Poly1305,
             }),
-            "2022-blake3-aes-128-gcm" => Ok(Self {
-                key_len: 16,
-                salt_len: 16,
-                tag_len: 16,
-                cipher_type: CipherType::Aes128Gcm2022,
-            }),
-            "2022-blake3-aes-256-gcm" => Ok(Self {
-                key_len: 32,
-                salt_len: 32,
-                tag_len: 16,
-                cipher_type: CipherType::Aes256Gcm2022,
-            }),
-            "2022-blake3-chacha20-poly1305" | "2022-blake3-chacha8-poly1305" => Ok(Self {
-                key_len: 32,
-                salt_len: 32,
-                tag_len: 16,
-                cipher_type: CipherType::Chacha20Poly13052022,
-            }),
+            // The 2022 suite is a different wire protocol (SIP022): fixed and
+            // variable headers per datagram, timestamps, session ids and a
+            // replay window. The AEAD primitives alone are not it, and a
+            // build that accepted these names would fail in the field while
+            // pretending to speak the protocol — so it is refused here,
+            // loudly, instead.
+            "2022-blake3-aes-128-gcm"
+            | "2022-blake3-aes-256-gcm"
+            | "2022-blake3-chacha20-poly1305"
+            | "2022-blake3-chacha8-poly1305" => Err(Error::config(
+                "Shadowsocks 2022 ciphers (2022-blake3-*) are not implemented: \
+                 SIP022 framing, timestamps and its replay window are missing. \
+                 Use a 2017 AEAD cipher (aes-256-gcm, aes-128-gcm, \
+                 chacha20-ietf-poly1305)",
+            )),
             _ => Err(Error::config(format!(
                 "Unsupported shadowsocks cipher: {}",
                 method
             ))),
         }
-    }
-
-    /// Check if this is a 2022 cipher
-    pub fn is_2022(&self) -> bool {
-        matches!(
-            self.cipher_type,
-            CipherType::Aes128Gcm2022
-                | CipherType::Aes256Gcm2022
-                | CipherType::Chacha20Poly13052022
-        )
     }
 }
 
@@ -861,43 +887,13 @@ fn derive_subkey(password: &str, salt: &[u8], key_len: usize) -> Result<Vec<u8>>
     Ok(okm)
 }
 
-/// Derive subkey for 2022 ciphers using BLAKE3
-/// The 2022 protocol uses the password directly as the key (base64-encoded)
-/// and derives session keys using BLAKE3
-fn derive_subkey_2022(password: &str, salt: &[u8], key_len: usize) -> Result<Vec<u8>> {
-    // For 2022 ciphers, the password is a base64-encoded key
-    let master_key = crate::crypto::codec::base64_decode(password)
-        .ok_or_else(|| Error::config("Invalid 2022 cipher key (must be base64)"))?;
-
-    if master_key.len() != key_len {
-        return Err(Error::config(format!(
-            "Invalid 2022 cipher key length: expected {}, got {}",
-            key_len,
-            master_key.len()
-        )));
-    }
-
-    // Derive session key using BLAKE3 with salt
-    let mut hasher = Blake3::new_derive_key("shadowsocks 2022 session subkey".as_bytes());
-    hasher.update(&master_key);
-    hasher.update(salt);
-    let mut output = vec![0u8; key_len];
-    hasher.finalize_xof_into(&mut output);
-
-    Ok(output)
-}
-
 /// Derive subkey based on cipher type
 fn derive_subkey_for_cipher(
     password: &str,
     salt: &[u8],
     cipher_spec: &CipherSpec,
 ) -> Result<Vec<u8>> {
-    if cipher_spec.is_2022() {
-        derive_subkey_2022(password, salt, cipher_spec.key_len)
-    } else {
-        derive_subkey(password, salt, cipher_spec.key_len)
-    }
+    derive_subkey(password, salt, cipher_spec.key_len)
 }
 
 /// AEAD cipher with incrementing nonce
@@ -918,17 +914,15 @@ struct AeadCipher {
 impl AeadCipher {
     fn new(spec: CipherSpec, key: Vec<u8>) -> Self {
         let inner = match spec.cipher_type {
-            CipherType::Aes256Gcm | CipherType::Aes256Gcm2022 => AeadCipherInner::Aes256Gcm(
+            CipherType::Aes256Gcm => AeadCipherInner::Aes256Gcm(
                 Aes256Gcm::new_from_slice(&key).expect("validated key length"),
             ),
-            CipherType::Aes128Gcm | CipherType::Aes128Gcm2022 => AeadCipherInner::Aes128Gcm(
+            CipherType::Aes128Gcm => AeadCipherInner::Aes128Gcm(
                 Aes128Gcm::new_from_slice(&key).expect("validated key length"),
             ),
-            CipherType::Chacha20Poly1305 | CipherType::Chacha20Poly13052022 => {
-                AeadCipherInner::ChaCha20Poly1305(
-                    ChaCha20Poly1305::new_from_slice(&key).expect("validated key length"),
-                )
-            }
+            CipherType::Chacha20Poly1305 => AeadCipherInner::ChaCha20Poly1305(
+                ChaCha20Poly1305::new_from_slice(&key).expect("validated key length"),
+            ),
         };
         Self {
             inner,
@@ -1049,19 +1043,19 @@ fn encrypt_udp_payload(key: &[u8], plaintext: &[u8], cipher_spec: &CipherSpec) -
     let nonce = [0u8; 12];
 
     match cipher_spec.cipher_type {
-        CipherType::Aes256Gcm | CipherType::Aes256Gcm2022 => {
+        CipherType::Aes256Gcm => {
             let cipher = Aes256Gcm::new_from_slice(key).expect("validated key length");
             cipher
                 .encrypt(&nonce, plaintext, &[])
                 .map_err(|e| Error::protocol(format!("UDP AEAD encrypt failed: {:?}", e)))
         }
-        CipherType::Aes128Gcm | CipherType::Aes128Gcm2022 => {
+        CipherType::Aes128Gcm => {
             let cipher = Aes128Gcm::new_from_slice(key).expect("validated key length");
             cipher
                 .encrypt(&nonce, plaintext, &[])
                 .map_err(|e| Error::protocol(format!("UDP AEAD encrypt failed: {:?}", e)))
         }
-        CipherType::Chacha20Poly1305 | CipherType::Chacha20Poly13052022 => {
+        CipherType::Chacha20Poly1305 => {
             let cipher = ChaCha20Poly1305::new_from_slice(key).expect("validated key length");
             cipher
                 .encrypt(&nonce, plaintext, &[])
@@ -1076,19 +1070,19 @@ fn decrypt_udp_payload(key: &[u8], ciphertext: &[u8], cipher_spec: &CipherSpec) 
     let nonce = [0u8; 12];
 
     match cipher_spec.cipher_type {
-        CipherType::Aes256Gcm | CipherType::Aes256Gcm2022 => {
+        CipherType::Aes256Gcm => {
             let cipher = Aes256Gcm::new_from_slice(key).expect("validated key length");
             cipher
                 .decrypt(&nonce, ciphertext, &[])
                 .map_err(|e| Error::protocol(format!("UDP AEAD decrypt failed: {:?}", e)))
         }
-        CipherType::Aes128Gcm | CipherType::Aes128Gcm2022 => {
+        CipherType::Aes128Gcm => {
             let cipher = Aes128Gcm::new_from_slice(key).expect("validated key length");
             cipher
                 .decrypt(&nonce, ciphertext, &[])
                 .map_err(|e| Error::protocol(format!("UDP AEAD decrypt failed: {:?}", e)))
         }
-        CipherType::Chacha20Poly1305 | CipherType::Chacha20Poly13052022 => {
+        CipherType::Chacha20Poly1305 => {
             let cipher = ChaCha20Poly1305::new_from_slice(key).expect("validated key length");
             cipher
                 .decrypt(&nonce, ciphertext, &[])
@@ -1166,7 +1160,6 @@ mod tests {
         assert_eq!(spec.salt_len, 32);
         assert_eq!(spec.tag_len, 16);
         assert_eq!(spec.cipher_type, CipherType::Aes256Gcm);
-        assert!(!spec.is_2022());
     }
 
     #[test]
@@ -1176,7 +1169,6 @@ mod tests {
         assert_eq!(spec.salt_len, 16);
         assert_eq!(spec.tag_len, 16);
         assert_eq!(spec.cipher_type, CipherType::Aes128Gcm);
-        assert!(!spec.is_2022());
     }
 
     #[test]
@@ -1186,37 +1178,24 @@ mod tests {
         assert_eq!(spec.salt_len, 32);
         assert_eq!(spec.tag_len, 16);
         assert_eq!(spec.cipher_type, CipherType::Chacha20Poly1305);
-        assert!(!spec.is_2022());
     }
 
     #[test]
-    fn test_cipher_spec_2022_aes_256() {
-        let spec = CipherSpec::new("2022-blake3-aes-256-gcm").unwrap();
-        assert_eq!(spec.key_len, 32);
-        assert_eq!(spec.salt_len, 32);
-        assert_eq!(spec.tag_len, 16);
-        assert_eq!(spec.cipher_type, CipherType::Aes256Gcm2022);
-        assert!(spec.is_2022());
-    }
-
-    #[test]
-    fn test_cipher_spec_2022_aes_128() {
-        let spec = CipherSpec::new("2022-blake3-aes-128-gcm").unwrap();
-        assert_eq!(spec.key_len, 16);
-        assert_eq!(spec.salt_len, 16);
-        assert_eq!(spec.tag_len, 16);
-        assert_eq!(spec.cipher_type, CipherType::Aes128Gcm2022);
-        assert!(spec.is_2022());
-    }
-
-    #[test]
-    fn test_cipher_spec_2022_chacha20() {
-        let spec = CipherSpec::new("2022-blake3-chacha20-poly1305").unwrap();
-        assert_eq!(spec.key_len, 32);
-        assert_eq!(spec.salt_len, 32);
-        assert_eq!(spec.tag_len, 16);
-        assert_eq!(spec.cipher_type, CipherType::Chacha20Poly13052022);
-        assert!(spec.is_2022());
+    fn cipher_spec_2022_names_are_rejected_with_a_reason() {
+        for name in [
+            "2022-blake3-aes-256-gcm",
+            "2022-blake3-aes-128-gcm",
+            "2022-blake3-chacha20-poly1305",
+            "2022-blake3-chacha8-poly1305",
+        ] {
+            let error = CipherSpec::new(name).err().unwrap_or_else(|| {
+                panic!("{name} must not be accepted before SIP022 is implemented")
+            });
+            assert!(
+                error.to_string().contains("not implemented"),
+                "{name}: {error}"
+            );
+        }
     }
 
     #[test]

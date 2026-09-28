@@ -121,6 +121,7 @@ use crate::crypto::digest::Digest;
 use crate::crypto::hash::{Md5, Sha1};
 use crate::crypto::mac::Hmac;
 use crate::crypto::stream::{Cbc, Cfb128, ChaCha20, ChaCha20Legacy, Ctr, Rc4, Salsa20};
+use crate::crypto::util::ct_eq;
 use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
@@ -316,16 +317,24 @@ enum SsrCipher {
 }
 
 impl SsrCipher {
-    fn apply(&mut self, buf: &mut [u8]) {
+    fn apply(&mut self, buf: &mut [u8]) -> std::result::Result<(), String> {
         match self {
             Self::None => {}
             Self::Rc4(cipher) => cipher.apply_keystream(buf),
             Self::Cfb(cipher) => cipher.encrypt(buf),
             Self::Ctr(cipher) => cipher.apply_keystream(buf),
             Self::Chacha20(cipher) => cipher.apply_keystream(buf),
-            Self::Chacha20Ietf(cipher) => cipher.apply_keystream(buf),
+            Self::Chacha20Ietf(cipher) => {
+                if cipher.is_exhausted() {
+                    return Err("the chacha20-ietf keystream is exhausted (2^32 blocks); \
+                         this connection must be re-established before more data is sent"
+                        .to_string());
+                }
+                cipher.apply_keystream(buf);
+            }
             Self::Salsa20(cipher) => cipher.apply_keystream(buf),
         }
+        Ok(())
     }
 }
 
@@ -521,9 +530,6 @@ impl SsrProtocolState {
         mac_key.extend_from_slice(iv);
         mac_key.extend_from_slice(key);
 
-        // `uid:userkey` is the multi-user form: the uid travels in the clear
-        // and the key is hashed, so the server can find the user before it can
-        // verify anything else.
         let (uid, user_key) = match protocol {
             SsrProtocol::AuthAes128 { sha1 } if protocol_param.contains(':') => {
                 let mut parts = protocol_param.splitn(2, ':');
@@ -576,9 +582,6 @@ impl SsrProtocolState {
         let mut rest = buf;
         if !self.sent_header {
             self.sent_header = true;
-            // The first frame keeps the address header together with the
-            // handshake plus a random tail, so the header does not end on a
-            // frame boundary every time.
             let datalen = buf.len().min(head_len + rand_below(32));
             out.extend_from_slice(&self.wrap_first(&buf[..datalen])?);
             rest = &buf[datalen..];
@@ -603,9 +606,6 @@ impl SsrProtocolState {
                 if payload.is_empty() {
                     return Ok(Vec::new());
                 }
-                // The auth data is *inside* the frame, and the random prefix's
-                // length is drawn from the framed length — twelve bytes more
-                // than the payload.
                 let mut framed = self.auth_data.clone();
                 framed.extend_from_slice(payload);
                 let mut data = self.rnd_data_sha1(framed.len());
@@ -635,9 +635,6 @@ impl SsrProtocolState {
                 } else {
                     rand_below(1024)
                 };
-                // The encrypted block is exactly one AES block: the 12 auth
-                // bytes, then the frame length and the random length, both
-                // little-endian.
                 let data_len = 7 + 4 + 16 + 4 + payload.len() + rnd_len + 4;
                 let mut head = self.auth_data.clone();
                 head.extend_from_slice(&(data_len as u16).to_le_bytes());
@@ -720,9 +717,6 @@ impl SsrProtocolState {
             SsrProtocol::AuthAes128 { sha1 } => {
                 let sha1 = *sha1;
                 let rnd_len = rand_below(64);
-                // `rnd_prefix_aes` writes the random run plus its length field,
-                // i.e. `rnd_len + 1` bytes, so the frame is
-                // `2 + 2 + (rnd_len + 1) + payload + 4`.
                 let data_len = (rnd_len + payload.len() + 9) as u16;
                 let mut mac_key = Vec::with_capacity(self.user_key.len() + 4);
                 mac_key.extend_from_slice(&self.user_key);
@@ -1096,13 +1090,6 @@ impl SsrObfsState {
             SsrObfs::Tls12TicketAuth { host } => {
                 let host = pick_obfs_host(host);
                 let mut out = self.tls_client_hello(key, &host);
-                // The fabricated `ChangeCipherSpec` and `Finished`, then the MAC
-                // over exactly those two records, and only then the payload —
-                // itself wrapped in application-data records.
-                //
-                // The `Finished` record declares 32 payload bytes and sends 22
-                // of them; the reader derives the body length as
-                // `declared - 10`, which is why the two numbers stay apart.
                 let mut tail = vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
                 tail.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x20]);
                 tail.extend_from_slice(&random_bytes(22));
@@ -1163,16 +1150,12 @@ impl SsrObfsState {
         body.extend_from_slice(&mac);
         body.push(0x20);
         body.extend_from_slice(&self.client_id);
-        // The reference's exact cipher-suite list and compression byte: a
-        // client that rewrote these would have a fingerprint of its own.
         body.extend_from_slice(&[
             0x00, 0x1c, 0xc0, 0x2b, 0xc0, 0x2f, 0xcc, 0xa9, 0xcc, 0xa8, 0xcc, 0x14, 0xcc, 0x13,
             0xc0, 0x0a, 0xc0, 0x14, 0xc0, 0x09, 0xc0, 0x13, 0x00, 0x9c, 0x00, 0x35, 0x00, 0x2f,
             0x00, 0x0a, 0x01, 0x00,
         ]);
 
-        // Extensions in the reference's order; the ticket is random padding of a
-        // size drawn from its 16-byte-block rule.
         let ticket = random_bytes((rand_below(17) + 8) * 16);
         let host_bytes = host.as_bytes();
         let mut extensions = Vec::new();
@@ -1236,7 +1219,7 @@ impl SsrObfsState {
             return Err(Error::protocol("SSR obfs: malformed ServerHello"));
         }
         let auth_mac = hmac_truncated::<Sha1>(&self.tls_mac_key(key), &buf[11..33], 10);
-        if auth_mac[..] != buf[33..43] {
+        if !ct_eq(&auth_mac, &buf[33..43]) {
             return Err(Error::protocol(
                 "SSR obfs: the ServerHello failed its handshake MAC",
             ));
@@ -1249,7 +1232,7 @@ impl SsrObfsState {
 
         let mut pos = hello_end;
         // A session ticket may sit between the ServerHello and the CCS.
-        if buf.len() < pos + 5 {
+        if buf.len() < pos + 6 {
             return Ok(false);
         }
         if buf[pos] == 0x16 {
@@ -1271,9 +1254,7 @@ impl SsrObfsState {
         if buf[pos..pos + 3] != [0x16, 0x03, 0x03] {
             return Err(Error::protocol("SSR obfs: expected a Finished record"));
         }
-        // The `Finished` declared length is ten bytes longer than the body that
-        // follows it, so the body is `declared - 10`; the peer's own parser
-        // makes the same subtraction.
+
         let declared = usize::from(u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]));
         if declared < 10 {
             return Err(Error::protocol(
@@ -1307,9 +1288,6 @@ impl SsrObfsState {
             match &self.obfs {
                 SsrObfs::Plain => {}
                 SsrObfs::HttpSimple { .. } | SsrObfs::HttpPost { .. } => {
-                    // The peer's fake response head ends at a blank line; the
-                    // stream starts right after it. Nothing is decoded here:
-                    // the percent-encoded bytes only travel the other way.
                     match find_head_end(&self.pending) {
                         Some(end) => {
                             self.pending.drain(..end);
@@ -1490,7 +1468,8 @@ impl SsrStream {
         self.read_cipher
             .as_mut()
             .expect("built above")
-            .apply(&mut buf);
+            .apply(&mut buf)
+            .map_err(Error::protocol)?;
         self.proto.unwrap(&buf, &mut self.ready)?;
         Ok(true)
     }
@@ -1549,7 +1528,9 @@ impl Write for SsrStream {
             .wrap(buf, self.head_len)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut payload = framed;
-        self.write_cipher.apply(&mut payload);
+        self.write_cipher
+            .apply(&mut payload)
+            .map_err(std::io::Error::other)?;
 
         let iv_len = self.crypto.iv.len();
         let mut wire = Vec::with_capacity(payload.len() + iv_len + 64);
@@ -2143,7 +2124,7 @@ mod tests {
             let mut reader = state(protocol.clone(), "aes-256-cfb", "");
             // The reader's user key and counters must line up with the writer's,
             // which the shared constructor gives for the single-user form.
-            reader.user_key = writer.user_key.clone();
+            reader.user_key.clone_from(&writer.user_key);
 
             let frame = writer.wrap_data(b"the payload").unwrap();
             let mut out = Vec::new();
@@ -2167,7 +2148,7 @@ mod tests {
     fn large_writes_are_split_into_unit_sized_frames() {
         let mut writer = state(SsrProtocol::AuthSha1V4, "aes-128-cfb", "");
         let mut reader = state(SsrProtocol::AuthSha1V4, "aes-128-cfb", "");
-        reader.mac_key = writer.mac_key.clone();
+        reader.mac_key.clone_from(&writer.mac_key);
 
         let payload = vec![0x5A; UNIT_LEN * 2 + 17];
         let frame = writer.wrap_data(&payload[..UNIT_LEN]).unwrap();
@@ -2201,7 +2182,7 @@ mod tests {
             let mut writer_proto = make_proto();
             let mut wire = writer_proto.wrap_data(b"hello world").unwrap();
             let mut write_cipher = crypto.cipher(&iv).unwrap();
-            write_cipher.apply(&mut wire);
+            write_cipher.apply(&mut wire).unwrap();
             let mut wire_with_iv = iv.clone();
             wire_with_iv.extend_from_slice(&wire);
             let mut writer_obfs = SsrObfsState::new(SsrObfs::Plain, 0);
@@ -2215,7 +2196,7 @@ mod tests {
             let peer_iv: Vec<u8> = decoded.drain(..iv.len()).collect();
             assert_eq!(peer_iv, iv, "the IV travels in front of the ciphertext");
             let mut read_cipher = crypto.cipher(&peer_iv).unwrap();
-            read_cipher.apply(&mut decoded);
+            read_cipher.apply(&mut decoded).unwrap();
             let mut proto_reader = make_proto();
             let mut out = Vec::new();
             proto_reader.unwrap(&decoded, &mut out).unwrap();
@@ -2236,7 +2217,7 @@ mod tests {
             frame[last] ^= 0x01;
 
             let mut reader = state(protocol.clone(), "aes-256-cfb", "");
-            reader.user_key = writer.user_key.clone();
+            reader.user_key.clone_from(&writer.user_key);
             let mut out = Vec::new();
             assert!(
                 reader.unwrap(&frame, &mut out).is_err(),
@@ -2262,13 +2243,13 @@ mod tests {
         let mut a = material.cipher(&material.iv).unwrap();
         let mut b = material.cipher(&material.iv).unwrap();
         let (mut first, mut second) = (b"identical".to_vec(), b"identical".to_vec());
-        a.apply(&mut first);
-        b.apply(&mut second);
+        a.apply(&mut first).unwrap();
+        b.apply(&mut second).unwrap();
         assert_eq!(first, second, "the same IV gives the same stream");
 
         let mut c = material.cipher(&[0xAB; 16]).unwrap();
         let mut third = b"identical".to_vec();
-        c.apply(&mut third);
+        c.apply(&mut third).unwrap();
         assert_ne!(first, third, "a different IV gives a different stream");
     }
 
@@ -2287,7 +2268,11 @@ mod tests {
             let plaintext: Vec<u8> = (0..=255u8).collect();
 
             let mut whole = plaintext.clone();
-            crypto.cipher(&crypto.iv).unwrap().apply(&mut whole);
+            crypto
+                .cipher(&crypto.iv)
+                .unwrap()
+                .apply(&mut whole)
+                .unwrap();
 
             let mut split = plaintext.clone();
             let mut cipher = crypto.cipher(&crypto.iv).unwrap();
@@ -2299,7 +2284,7 @@ mod tests {
                     }
                     let take = size.min(rest.len());
                     let (chunk, tail) = rest.split_at_mut(take);
-                    cipher.apply(chunk);
+                    cipher.apply(chunk).unwrap();
                     rest = tail;
                 }
             }
@@ -2312,12 +2297,12 @@ mod tests {
         let rc4_material = crypto("rc4", "pass");
         assert_eq!(rc4_material.method.iv_len(), 0);
         let mut buf = b"plaintext".to_vec();
-        rc4_material.cipher(&[]).unwrap().apply(&mut buf);
+        rc4_material.cipher(&[]).unwrap().apply(&mut buf).unwrap();
         assert_ne!(&buf[..], b"plaintext");
 
         let none = crypto("none", "pass");
         let mut buf = b"plaintext".to_vec();
-        none.cipher(&[]).unwrap().apply(&mut buf);
+        none.cipher(&[]).unwrap().apply(&mut buf).unwrap();
         assert_eq!(&buf[..], b"plaintext", "none is the identity");
     }
 

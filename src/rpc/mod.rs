@@ -24,6 +24,7 @@ use nextjson::NsonSerialize;
 use crate::api;
 
 pub mod controller;
+mod http1;
 pub mod server;
 
 // ---------------------------------------------------------------------------

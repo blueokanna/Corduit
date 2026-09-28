@@ -178,16 +178,20 @@ impl VmessUdpSession {
         }
     }
 
-    fn next_chunk_count(&self) -> u16 {
-        (self.chunk_count.fetch_add(1, Ordering::SeqCst) % 65536) as u16
+    /// The next request nonce counter, or `None` once the 2-byte field is
+    /// exhausted: wrapping would repeat a nonce under the same key.
+    fn next_chunk_count(&self) -> Option<u16> {
+        let count = self.chunk_count.fetch_add(1, Ordering::SeqCst);
+        u16::try_from(count).ok()
     }
 
     /// Response chunks carry an independent nonce counter (zero-based for a
     /// fresh session). Reusing the request counter — or any fixed value —
     /// makes every chunk after the first fail its GCM open, because the
     /// nonce is part of the ciphertext's authentication.
-    fn next_response_chunk_count(&self) -> u16 {
-        (self.response_chunk_count.fetch_add(1, Ordering::SeqCst) % 65536) as u16
+    fn next_response_chunk_count(&self) -> Option<u16> {
+        let count = self.response_chunk_count.fetch_add(1, Ordering::SeqCst);
+        u16::try_from(count).ok()
     }
 
     fn touch(&self) {
@@ -875,7 +879,13 @@ impl VmessOutbound {
 
         let session = self.get_or_create_udp_session(target)?;
 
-        let chunk_count = session.next_chunk_count();
+        let Some(chunk_count) = session.next_chunk_count() else {
+            self.udp_sessions.remove(&target.to_string());
+            return Err(Error::network(
+                "VMess UDP session exhausted its 2-byte chunk counter (nonce reuse); \
+                 the session must be re-established",
+            ));
+        };
         let request_key = session.request_key;
         let request_iv = session.request_iv;
         let response_key = session.response_key;
@@ -910,7 +920,14 @@ impl VmessOutbound {
             }
         }
 
-        let response_count = session.next_response_chunk_count();
+        let Some(response_count) = session.next_response_chunk_count() else {
+            drop(stream_guard);
+            self.udp_sessions.remove(&target_str);
+            return Err(Error::network(
+                "VMess UDP response counter exhausted (nonce reuse); \
+                 the session must be re-established",
+            ));
+        };
         let read_result = self.read_response_chunk(
             &mut **stream_guard,
             &response_key,
@@ -941,7 +958,13 @@ impl VmessOutbound {
 
         let session = self.get_or_create_udp_session(target)?;
 
-        let chunk_count = session.next_chunk_count();
+        let Some(chunk_count) = session.next_chunk_count() else {
+            self.udp_sessions.remove(&target.to_string());
+            return Err(Error::network(
+                "VMess UDP session exhausted its 2-byte chunk counter (nonce reuse); \
+                 the session must be re-established",
+            ));
+        };
         let request_key = session.request_key;
         let request_iv = session.request_iv;
         let encrypted_data = self.encrypt_chunk(data, &request_key, &request_iv, chunk_count)?;
@@ -1401,7 +1424,12 @@ struct VmessStream {
     /// takes `&self` and still has to emit the final chunk with the next
     /// counter value.
     enc_count: AtomicU16,
+    /// Set once a chunk used nonce `u16::MAX`: the next one would repeat the
+    /// first nonce of the session, so the stream refuses to write again.
+    enc_exhausted: AtomicBool,
     dec_count: u16,
+    /// As `enc_exhausted`, for the downlink counter.
+    dec_exhausted: bool,
     /// Downlink framing state plus the scratch buffer it is filling (see
     /// [`DownlinkStage`]).
     stage: DownlinkStage,
@@ -1447,7 +1475,9 @@ impl VmessStream {
             dec_key,
             dec_iv,
             enc_count: AtomicU16::new(0),
+            enc_exhausted: AtomicBool::new(false),
             dec_count: 0,
+            dec_exhausted: false,
             stage,
             fill,
             filled: 0,
@@ -1559,6 +1589,12 @@ impl VmessStream {
                 self.stage = DownlinkStage::ChunkPayload;
             }
             DownlinkStage::ChunkPayload => {
+                if self.dec_exhausted {
+                    return Err(std::io::Error::other(
+                        "vmess: response chunk counter is exhausted (nonce reuse); \
+                         reconnect to the server",
+                    ));
+                }
                 let decrypted = decrypt_chunk_static(
                     self.cipher,
                     &self.fill,
@@ -1567,6 +1603,9 @@ impl VmessStream {
                     self.dec_count,
                 )
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+                if self.dec_count == u16::MAX {
+                    self.dec_exhausted = true;
+                }
                 self.dec_count = self.dec_count.wrapping_add(1);
                 if decrypted.is_empty() {
                     self.eof = true;
@@ -1624,11 +1663,30 @@ impl Write for VmessStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut inner = self.inner.lock();
         let mut count = self.enc_count.load(Ordering::Relaxed);
-        for chunk in buf.chunks(VMESS_CHUNK_MAX) {
+        if self.enc_exhausted.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other(
+                "vmess: request chunk counter is exhausted (nonce reuse); \
+                 reconnect to the server",
+            ));
+        }
+        let chunks = buf.chunks(VMESS_CHUNK_MAX);
+        // Counters `count..=u16::MAX` are still unused, and `u16::MAX` is one
+        // of them: the 2-byte field carries 65536 values, not 65535.
+        let remaining = usize::from(u16::MAX) - usize::from(count) + 1;
+        if chunks.len() > remaining {
+            return Err(std::io::Error::other(
+                "vmess: request chunk counter is exhausted (nonce reuse); \
+                 reconnect to the server",
+            ));
+        }
+        for chunk in chunks {
             let encrypted =
                 encrypt_chunk_static(self.cipher, chunk, &self.enc_key, &self.enc_iv, count)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
             inner.write_all(&encrypted)?;
+            if count == u16::MAX {
+                self.enc_exhausted.store(true, Ordering::Relaxed);
+            }
             count = count.wrapping_add(1);
         }
         self.enc_count.store(count, Ordering::Relaxed);
@@ -1646,14 +1704,27 @@ impl crate::common::stream::SyncStream for VmessStream {
         if matches!(how, std::net::Shutdown::Write | std::net::Shutdown::Both)
             && !self.end_chunk_sent.swap(true, Ordering::SeqCst)
         {
-            let count = self.enc_count.fetch_add(1, Ordering::SeqCst);
-            match encrypt_chunk_static(self.cipher, &[], &self.enc_key, &self.enc_iv, count) {
-                Ok(end_chunk) => {
-                    let _ = inner.write_all(&end_chunk);
-                    let _ = inner.flush();
+            if self.enc_exhausted.load(Ordering::Relaxed) {
+                // The end-of-stream chunk would need the wrapped counter's
+                // nonce; half-close the transport without it instead.
+                tracing::debug!(
+                    "VMess: end-of-stream chunk skipped, the nonce counter is exhausted"
+                );
+            } else {
+                let count = self.enc_count.fetch_add(1, Ordering::SeqCst);
+                if count == u16::MAX {
+                    // The counter wrapped to 0 with this chunk; a later write
+                    // would reuse its first nonce, so mark the stream done.
+                    self.enc_exhausted.store(true, Ordering::Relaxed);
                 }
-                Err(e) => {
-                    tracing::debug!("VMess: failed to seal the end-of-stream chunk: {e}");
+                match encrypt_chunk_static(self.cipher, &[], &self.enc_key, &self.enc_iv, count) {
+                    Ok(end_chunk) => {
+                        let _ = inner.write_all(&end_chunk);
+                        let _ = inner.flush();
+                    }
+                    Err(e) => {
+                        tracing::debug!("VMess: failed to seal the end-of-stream chunk: {e}");
+                    }
                 }
             }
         }
@@ -2749,6 +2820,103 @@ mod property_tests {
             }
         }
         assert_eq!(collected, b"backend");
+    }
+
+    /// The 2-byte chunk counter carries 65536 values: the last one is usable,
+    /// and the write after it must refuse rather than repeat nonce 0.
+    #[test]
+    fn the_request_counter_consumes_its_last_value_and_then_refuses() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+
+        let mut stream = VmessStream::new(
+            Box::new(client) as BoxStream,
+            VmessCipher::Aes128Gcm,
+            [0u8; 16],
+            [0u8; 16],
+            [0u8; 16],
+            [0u8; 16],
+            0x5a,
+            false,
+        );
+        // Jump to the boundary instead of pushing 64 KiB through.
+        stream.enc_count.store(u16::MAX - 1, Ordering::Relaxed);
+
+        assert_eq!(stream.write(&[1]).unwrap(), 1);
+        assert!(!stream.enc_exhausted.load(Ordering::Relaxed));
+        assert_eq!(stream.write(&[2]).unwrap(), 1);
+        assert!(stream.enc_exhausted.load(Ordering::Relaxed));
+        let error = stream.write(&[3]).unwrap_err();
+        assert!(error.to_string().contains("exhausted"), "{error}");
+    }
+
+    /// The end-of-stream chunk may claim the last counter; the write that
+    /// follows must not fall back to counter 0 when the `AtomicU16` wraps.
+    #[test]
+    fn the_end_chunk_cannot_resurrect_a_wrapped_counter() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+
+        let mut stream = VmessStream::new(
+            Box::new(client) as BoxStream,
+            VmessCipher::Aes128Gcm,
+            [0u8; 16],
+            [0u8; 16],
+            [0u8; 16],
+            [0u8; 16],
+            0x5a,
+            false,
+        );
+        stream.enc_count.store(u16::MAX, Ordering::Relaxed);
+
+        use crate::common::stream::SyncStream;
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(stream.enc_exhausted.load(Ordering::Relaxed));
+        let error = stream.write(&[3]).unwrap_err();
+        assert!(error.to_string().contains("exhausted"), "{error}");
+    }
+
+    /// A write that would need more counters than remain is refused whole:
+    /// nothing is encrypted, nothing reaches the wire, the counter stands.
+    #[test]
+    fn a_write_that_would_wrap_the_counter_is_refused_before_any_chunk() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+
+        let mut stream = VmessStream::new(
+            Box::new(client) as BoxStream,
+            VmessCipher::Aes128Gcm,
+            [0u8; 16],
+            [0u8; 16],
+            [0u8; 16],
+            [0u8; 16],
+            0x5a,
+            false,
+        );
+        stream.enc_count.store(u16::MAX, Ordering::Relaxed);
+
+        let oversized = vec![0u8; VMESS_CHUNK_MAX + 1];
+        let error = stream.write(&oversized).unwrap_err();
+        assert!(error.to_string().contains("exhausted"), "{error}");
+        // The guard runs before any encryption, so the peer sees nothing.
+        let mut buf = [0u8; 64];
+        assert!(matches!(
+            server.read(&mut buf),
+            Err(ref error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
     }
 
     proptest! {

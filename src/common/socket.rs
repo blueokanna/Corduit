@@ -207,6 +207,13 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
 pub fn connect_host(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     let addrs = match crate::dns::engine_resolver::resolve(host, port) {
         Some(Ok(addrs)) => addrs,
+        Some(Err(e)) if crate::dns::engine_resolver::domain_uses_policy(host) => {
+            // A `nameserver-policy` entry names the only resolver allowed to
+            // answer this name; its verdict is final, and the system resolver
+            // is exactly the decoy the policy exists to bypass.
+            tracing::debug!("engine DNS policy for {host} produced no answer: {e}");
+            return Err(e);
+        }
         Some(Err(e)) => {
             tracing::debug!("engine DNS could not resolve {host}: {e}; trying the system resolver");
             resolve_host(host, port, timeout)?
@@ -428,17 +435,38 @@ pub fn configure(
 }
 
 /// Bind a UDP socket to `bind` and set its read timeout.
+///
+/// No interface pin is applied here: the bind address of a wildcard socket
+/// says nothing about where its datagrams will go, and pinning a socket that
+/// answers a local client would push loopback traffic onto the physical
+/// interface. Callers that dial a known unicast destination use
+/// [`udp_bind_for`].
 pub fn udp_bind(bind: SocketAddr, read_timeout: Duration) -> io::Result<UdpSocket> {
+    udp_bind_for(bind, read_timeout, None)
+}
+
+/// As [`udp_bind`], pinning the socket to the engine's physical interface
+/// when `destination` is a known, non-loopback unicast address.
+///
+/// This is the UDP half of the TUN bypass: without the pin, a datagram sent
+/// by the engine's own outbound takes the capture route, re-enters the TUN
+/// and loops. The pin must be decided *per destination*, which is why it is a
+/// parameter rather than a property of the bind address.
+pub fn udp_bind_for(
+    bind: SocketAddr,
+    read_timeout: Duration,
+    destination: Option<IpAddr>,
+) -> io::Result<UdpSocket> {
     let domain = if bind.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    // Outbound DNS and relay datagrams bypass the tunnel as well; the pin
-    // applies to every datagram the socket will ever send.
     protect_socket2(&sock);
-    apply_outbound_interface(&sock, bind.ip());
+    if let Some(addr) = destination {
+        apply_outbound_interface(&sock, addr);
+    }
     sock.set_reuse_address(true)?;
     sock.bind(&bind.into())?;
     let udp: UdpSocket = sock.into();
@@ -463,7 +491,7 @@ pub fn udp_exchange(
         SocketAddr::V4(_) => SocketAddr::from((IpAddr::V4([0, 0, 0, 0].into()), 0)),
         SocketAddr::V6(_) => SocketAddr::from((IpAddr::V6([0, 0, 0, 0, 0, 0, 0, 0].into()), 0)),
     });
-    let sock = udp_bind(bind, timeout)?;
+    let sock = udp_bind_for(bind, timeout, Some(target.ip()))?;
     sock.connect(target)?;
     sock.send(data)?;
     let mut buf = [0u8; 65536];

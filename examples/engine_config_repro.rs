@@ -19,7 +19,7 @@ fn main() {
         .expect("usage: engine_config_repro <config.json> [node-fragment]");
     let node_fragment = args.next();
 
-    let json = std::fs::read_to_string(&config_path).expect("read config");
+    let json = std::fs::read_to_string(config_path).expect("read config");
     let json = json.replace("\"log_level\":\"info\"", "\"log_level\":\"debug\"");
 
     corduit::initialize_corduit(json).expect("initialize the engine");

@@ -311,12 +311,13 @@ impl Hysteria2Connection {
         Ok(())
     }
 
-    /// Receive the next complete UDP payload (reassembling fragments).
-    pub fn recv_udp_packet(&self) -> Result<(u32, TargetAddr, Vec<u8>)> {
+    /// Receive the next complete UDP payload (reassembling fragments),
+    /// within `timeout`.
+    pub fn recv_udp_packet(&self, timeout: Duration) -> Result<(u32, TargetAddr, Vec<u8>)> {
         loop {
             let datagram = self
                 .connection
-                .read_datagram()
+                .read_datagram_deadline(timeout)
                 .map_err(|e| Error::network(format!("Failed to receive UDP datagram: {e}")))?;
 
             let (session_id, packet_id, frag_id, frag_count, target, payload) =
@@ -620,21 +621,31 @@ fn read_varint_slice(data: &[u8]) -> Result<(u64, &[u8])> {
 /// One in-flight fragmented UDP packet.
 type PendingFragment = (u8, BTreeMap<u8, Vec<u8>>, TargetAddr, Instant);
 
+/// Entry bound of the reassembly buffer.
+const MAX_PENDING_FRAGMENTS: usize = 64;
+/// Byte bound of the reassembly buffer. A hostile peer chooses the keys, so
+/// without this it could park a fragment set per key for the whole TTL.
+const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
+
 /// Reassembly buffer for fragmented UDP relay messages.
 struct FragAssembler {
     /// (session_id, packet_id) -> pending fragment state.
     pending: HashMap<(u32, u16), PendingFragment>,
+    /// Sum of the payload bytes held in `pending`.
+    bytes: usize,
 }
 
 impl FragAssembler {
     fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            bytes: 0,
         }
     }
 
     /// Insert a fragment; returns `(target, reassembled payload)` when the
-    /// whole packet has arrived.
+    /// whole packet has arrived. Fragments that would exceed either bound are
+    /// dropped — for a datagram protocol that is ordinary loss, not an error.
     fn add(
         &mut self,
         session_id: u32,
@@ -649,18 +660,35 @@ impl FragAssembler {
         if self.pending.len() > 64 {
             let cutoff = now - FRAGMENT_TTL;
             self.pending.retain(|_, (_, _, _, at)| *at > cutoff);
+            self.bytes = self
+                .pending
+                .values()
+                .map(|(_, map, _, _)| map.values().map(Vec::len).sum::<usize>())
+                .sum();
         }
 
         let key = (session_id, packet_id);
+        if !self.pending.contains_key(&key) && self.pending.len() >= MAX_PENDING_FRAGMENTS {
+            return None;
+        }
+        if self.bytes + payload.len() > MAX_PENDING_BYTES {
+            return None;
+        }
+
+        let incoming = payload.len();
         let entry = self
             .pending
             .entry(key)
             .or_insert_with(|| (frag_count, BTreeMap::new(), target.clone(), now));
-        entry.1.insert(frag_id, payload);
+        if let Some(previous) = entry.1.insert(frag_id, payload) {
+            self.bytes -= previous.len();
+        }
+        self.bytes += incoming;
         entry.3 = now;
 
         if entry.1.len() as u8 >= entry.0 {
             let (_, map, tgt, _) = self.pending.remove(&key)?;
+            self.bytes -= map.values().map(Vec::len).sum::<usize>();
             let mut full = Vec::new();
             for (_, chunk) in map {
                 full.extend_from_slice(&chunk);
@@ -915,20 +943,8 @@ impl Hysteria2Outbound {
 
         conn.send_udp_packet(session_id, target, data)?;
 
-        // QUIC datagram receive blocks until data; bound it with a dedicated
-        // thread + channel receive timeout.
-        let timeout = Duration::from_secs(30);
-        let conn2 = conn.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(conn2.recv_udp_packet());
-        });
-
-        let (_recv_session_id, _recv_target, payload) = match rx.recv_timeout(timeout) {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(Error::network(format!("UDP receive failed: {e}"))),
-            Err(_) => return Err(Error::network("UDP receive timeout")),
-        };
+        let (_recv_session_id, _recv_target, payload) =
+            conn.recv_udp_packet(Duration::from_secs(30))?;
         Ok(payload)
     }
 }

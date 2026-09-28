@@ -359,14 +359,39 @@ impl Default for ConnectionTracker {
 /// browser makes — the browser's `CONNECT` needs no lookup to be useful, so
 /// the lookup must not hold it back. The answer is dropped when the
 /// connection ends first, which costs nothing.
+/// Cap on concurrent display lookups.
+///
+/// The lookup is cosmetic (it fills the connection list's address column), so
+/// a burst of domain connections sheds these instead of spawning one OS
+/// thread per connection.
+const MAX_DISPLAY_LOOKUPS: usize = 32;
+
+/// Display lookups currently in flight.
+static DISPLAY_LOOKUPS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub fn fill_destination_ip_in_background(
     connection: Arc<TrackedConnection>,
     host: String,
     port: u16,
 ) {
+    struct InFlightGuard;
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            DISPLAY_LOOKUPS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    if DISPLAY_LOOKUPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_DISPLAY_LOOKUPS {
+        DISPLAY_LOOKUPS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+    let guard = InFlightGuard;
     let _ = std::thread::Builder::new()
         .name("corduit-display-ip".into())
         .spawn(move || {
+            let _guard = guard;
             if let Some(address) = resolve_for_display(&host, port) {
                 connection.set_destination_ip(Some(address));
             }

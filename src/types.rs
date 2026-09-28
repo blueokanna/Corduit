@@ -600,9 +600,6 @@ impl ProxyInfoDto {
     pub fn from_outbound_config(config: &crate::engine::OutboundConfig) -> Self {
         Self {
             tag: config.tag.clone(),
-            // `as_str()`, not `format!("{:?}")`: the debug form spells
-            // `Urltest` as `urltest`, which is not the spelling the rest of the
-            // system prints for the same group.
             protocol_type: config.outbound_type.as_str().to_string(),
             server: config.server.clone(),
             port: config.port,
@@ -616,13 +613,10 @@ impl ProxyInfoDto {
 impl ProxyGroupDto {
     /// Create from an OutboundConfig reference (for group types only)
     pub fn from_outbound_config(config: &crate::engine::OutboundConfig) -> Option<Self> {
-        // A group is the one case where the same configuration type means a
-        // policy rather than a proxy, so the check has to come first.
         if !config.outbound_type.is_group() {
             return None;
         }
 
-        // Get proxies list from options
         let proxies: Vec<String> = config
             .options
             .get("proxies")
@@ -634,7 +628,6 @@ impl ProxyGroupDto {
             })
             .unwrap_or_default();
 
-        // Get selected proxy (first one by default)
         let selected = proxies.first().cloned().unwrap_or_default();
 
         Some(Self {
@@ -654,7 +647,7 @@ impl RuleDto {
             rule_type: config.rule_type.as_str().to_string(),
             payload: config.payload.clone(),
             outbound: config.outbound.clone(),
-            matched_count: 0, // Matched count is tracked separately
+            matched_count: 0,
         }
     }
 }
@@ -666,8 +659,6 @@ impl DnsConfigDto {
         Self {
             enable: config.enable,
             listen: config.listen.clone(),
-            // `as_str()`, not `format!("{:?}")`: the debug form spells the mode
-            // `fakeip`, which is not the spelling any profile or caller uses.
             enhanced_mode: config.enhanced_mode.as_str().to_string(),
             nameservers: config.nameservers.clone(),
             fallback: config.fallback.clone(),

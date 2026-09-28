@@ -111,14 +111,33 @@ impl QuicRecvStream {
         self.stream_id
     }
 
-    fn io_err(e: &QuicError) -> io::Error {
-        io::Error::other(e.to_string())
+    /// Read with a wall-clock deadline.
+    ///
+    /// `Read::read` parks until the peer sends something or the connection
+    /// closes; a control-plane read (a server hello, a request response) needs
+    /// a bound that does not depend on the peer's goodwill.
+    pub fn read_with_deadline(
+        &mut self,
+        buf: &mut [u8],
+        deadline: std::time::Instant,
+    ) -> io::Result<usize> {
+        self.read_inner(buf, Some(deadline))
     }
-}
 
-impl io::Read for QuicRecvStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read_inner(
+        &mut self,
+        buf: &mut [u8],
+        deadline: Option<std::time::Instant>,
+    ) -> io::Result<usize> {
         loop {
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "QUIC stream read timed out",
+                    ));
+                }
+            }
             let mut st = self.conn.lock();
             if let Some(e) = &st.closed {
                 return Err(Self::io_err(e));
@@ -139,6 +158,16 @@ impl io::Read for QuicRecvStream {
                 }
             }
         }
+    }
+
+    fn io_err(e: &QuicError) -> io::Error {
+        io::Error::other(e.to_string())
+    }
+}
+
+impl io::Read for QuicRecvStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_inner(buf, None)
     }
 }
 

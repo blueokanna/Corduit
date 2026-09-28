@@ -59,13 +59,27 @@ pub fn normalize_suffix(key: &str) -> String {
 /// domain rule and a substring search, and it is the reason this cannot be
 /// `str::ends_with`. An empty suffix matches everything, which is how "no rule"
 /// is spelled.
+///
+/// DNS names are case-insensitive (RFC 4343), and a query arrives on the wire
+/// with whatever case the sender chose, so the comparison folds ASCII case and
+/// ignores one trailing root dot. Case happens to be the only knob an attacker
+/// has here; getting it wrong would skip the `fake-ip-filter` and hand out a
+/// fake address for a local name.
 pub fn suffix_matches(host: &str, suffix: &str) -> bool {
-    suffix.is_empty()
-        || host == suffix
-        || (host.len() > suffix.len() && host.ends_with(suffix) && {
-            let boundary = host.len() - suffix.len() - 1;
-            host.as_bytes()[boundary] == b'.'
-        })
+    if suffix.is_empty() {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.eq_ignore_ascii_case(suffix) {
+        return true;
+    }
+    if host.len() > suffix.len() {
+        let boundary = host.len() - suffix.len();
+        if host.as_bytes()[boundary - 1] == b'.' && host[boundary..].eq_ignore_ascii_case(suffix) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `host` matches any of `suffixes`, each already normalized.
@@ -106,6 +120,17 @@ mod tests {
     fn a_longer_suffix_never_matches() {
         assert!(!suffix_matches("x.com", "example.com"));
         assert!(!suffix_matches("", "example.com"));
+    }
+
+    #[test]
+    fn matching_folds_ascii_case_and_the_root_dot() {
+        assert!(suffix_matches("ROUTER.LAN", "lan"));
+        assert!(suffix_matches("Router.Lan", "lan"));
+        assert!(suffix_matches("router.lan.", "lan"));
+        assert!(suffix_matches("LAN", "lan"));
+        assert!(suffix_matches("Example.COM", "example.com"));
+        assert!(!suffix_matches("lanx", "lan"));
+        assert!(!suffix_matches("a.lanx", "lan"));
     }
 
     #[test]

@@ -7,16 +7,23 @@
 //!
 //! # Implementation
 //!
-//! Every connection is driven by [`serve_connection`] — courierust's
-//! per-connection engine — on a thread of its own (bounded, see
-//! [`crate::common::listener`]). Nothing about HTTP is hand-written:
+//! Every connection is driven by the private `http1::serve` loop — the
+//! control plane's bounded HTTP/1.1 driver — on a thread of its own
+//! (bounded, see [`crate::common::listener`]). The loop is the codec
+//! courierust already provides plus the budget `serve_connection` does not
+//! have:
 //!
-//! * framing, keep-alive, body caps and the `413` for an oversized request
-//!   come from the server;
-//! * a WebSocket upgrade is validated by the server's WebSocket policy
+//! * a request head must complete within `HEAD_DEADLINE` of its first
+//!   byte, so the drip-feed slowloris a per-read timeout cannot stop is cut
+//!   off mid-line and answered `408`;
+//! * a declared body must arrive within `BODY_DEADLINE`, a keep-alive
+//!   connection may idle for `CONNECTION_LIFETIME`, and at most
+//!   `MAX_REQUESTS` requests are served per connection;
+//! * a WebSocket upgrade is validated by courierust's upgrade policy
 //!   (method, `Upgrade`/`Connection` tokens, key shape, version 13, origin)
-//!   and then served by the **blocking** WebSocket driver, which owns the
-//!   framing, the limits, the keepalive pings and the closing handshake.
+//!   and then served by the engine's own server-side WebSocket session
+//!   ([`crate::protocol::ws::WebSocket::accepted`]), which owns the framing,
+//!   the limits, the keepalive pings and the closing handshake.
 //!
 //! The dispatch itself is synchronous and may block for as long as an
 //! operation takes (`start_proxy`, a config reload); that is why each
@@ -52,37 +59,67 @@
 
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::time::Duration;
 
 use courierust::courierust_body::Body;
 use courierust::courierust_http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
-use courierust::courierust_server::ws::{WsConfig, WsConn, WsData, WsService, WsUpgradeReply};
-use courierust::courierust_server::{serve_connection, Handler, ServerConfig};
+use courierust::courierust_server::ws::{plan, WsConfig};
 use courierust::courierust_ws::{OriginPolicy, PmDeflatePolicy};
 
 use crate::common::listener::ConnectionListener;
 use crate::crypto::util::ct_eq;
+use crate::rpc::http1::{self, Payload, Upgrade, WsLimits};
 
 /// Maximum accepted JSON-RPC request body (config uploads can be large).
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 /// Maximum accepted WebSocket message size.
 const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024;
-/// Cap for a request head (status line + header list).
-const MAX_REQUEST_HEAD: usize = 64 * 1024;
 /// Upper bound on concurrently open connections: a local dashboard needs a
 /// handful, and the bound is what keeps a stuck client from pinning threads.
 const MAX_CONNECTIONS: usize = 64;
-/// Upper bound on a connection's read idle time (keep-alive and WebSocket).
-const CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+/// Upper bound on a connection's idle time: waiting for the next keep-alive
+/// request.
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
+/// Absolute budget for one request head, from its first byte.
+const HEAD_DEADLINE: Duration = Duration::from_secs(30);
+/// Longest a single read may idle inside a request head.
+const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Absolute budget for a declared request body, from the end of the head.
+const BODY_DEADLINE: Duration = Duration::from_secs(300);
+/// Longest a single read may idle inside a request body.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Socket write timeout: a peer that stops reading cannot pin the thread.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Requests served on one connection before it is closed.
+const MAX_REQUESTS: usize = 1000;
 /// Server-side keepalive: a Ping goes out after this much inbound silence,
 /// and a peer that stays silent for twice as long is dropped.
-const WS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The per-connection budgets this server enforces.
+fn default_limits() -> http1::Limits {
+    http1::Limits {
+        max_body: MAX_REQUEST_BODY,
+        max_requests: MAX_REQUESTS,
+        idle_timeout: CONNECTION_LIFETIME,
+        head_deadline: HEAD_DEADLINE,
+        head_read_timeout: HEAD_READ_TIMEOUT,
+        body_deadline: BODY_DEADLINE,
+        body_read_timeout: BODY_READ_TIMEOUT,
+        write_timeout: WRITE_TIMEOUT,
+        ws: Some(WsLimits {
+            max_message: MAX_WS_MESSAGE,
+            ping_interval: WS_PING_INTERVAL,
+        }),
+    }
+}
 
 /// A bound (not yet serving) RPC server.
 pub struct RpcServer {
     listener: Option<TcpListener>,
     addr: SocketAddr,
     token: Arc<str>,
-    config: Arc<ServerConfig>,
+    limits: http1::Limits,
 }
 
 /// A serving RPC server. [`stop`](Self::stop) shuts it down; dropping the
@@ -101,10 +138,28 @@ impl RpcServer {
     /// network, so a non-loopback address is refused here rather than
     /// documented as a rule.
     pub fn bind(addr: SocketAddr, token: String) -> std::io::Result<Self> {
+        Self::bind_with_limits(addr, token, default_limits())
+    }
+
+    /// [`Self::bind`] with explicit connection budgets (the tests use this
+    /// to run the deadlines at a human scale).
+    fn bind_with_limits(
+        addr: SocketAddr,
+        token: String,
+        limits: http1::Limits,
+    ) -> std::io::Result<Self> {
         if !addr.ip().is_loopback() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("RPC server refuses non-loopback address {addr}"),
+            ));
+        }
+        // An empty token is not a token: `?token=` would match it and the
+        // "token required" contract would silently become "no auth at all".
+        if token.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "RPC server refuses an empty token",
             ));
         }
 
@@ -114,23 +169,11 @@ impl RpcServer {
         // request without waiting for a connection.
         listener.set_nonblocking(true)?;
 
-        let config = ServerConfig {
-            read_timeout: Some(CONNECTION_LIFETIME),
-            max_header_list: MAX_REQUEST_HEAD,
-            max_body: MAX_REQUEST_BODY,
-            http2: false,
-            tls: None,
-            handshake_timeout: None,
-            max_connections: MAX_CONNECTIONS,
-            websocket: ws_config(),
-            ..ServerConfig::default()
-        };
-
         Ok(Self {
             listener: Some(listener),
             addr,
             token: Arc::from(token.as_str()),
-            config: Arc::new(config),
+            limits,
         })
     }
 
@@ -148,12 +191,12 @@ impl RpcServer {
         let handler = RpcHandler {
             token: Arc::clone(&self.token),
         };
-        let config = Arc::clone(&self.config);
+        let limits = self.limits;
 
         let mut server = ConnectionListener::new(listener, self.addr, MAX_CONNECTIONS);
         server
             .start("corduit-rpc-conn", move |stream, peer| {
-                if let Err(e) = serve_connection(stream, &handler, config.as_ref()) {
+                if let Err(e) = http1::serve(stream, peer, &handler, &limits) {
                     tracing::debug!("RPC connection from {peer} ended: {e}");
                 }
             })
@@ -216,15 +259,16 @@ struct RpcHandler {
     token: Arc<str>,
 }
 
-impl Handler for RpcHandler {
+impl http1::Handler for RpcHandler {
     fn handle(&self, req: Request<Body>) -> Response<Body> {
         handle_http_request(req, &self.token)
     }
 
-    /// Route a WebSocket upgrade: authenticate, then hand the connection to
-    /// the JSON-RPC service. The framing, the limits, the keepalive and the
-    /// closing handshake are the server's business.
-    fn websocket(&self, req: &Request<Body>) -> WsUpgradeReply {
+    /// Route a WebSocket upgrade: authenticate, validate the handshake with
+    /// courierust's upgrade policy, then hand the connection to the JSON-RPC
+    /// service. The framing, the limits, the keepalive and the closing
+    /// handshake are the driver's business.
+    fn websocket(&self, req: &Request<Body>, peer: SocketAddr) -> Upgrade {
         // Browsers cannot set the Authorization header on a WebSocket
         // connection, so the token travels as `?token=...`.
         let presented = req
@@ -232,35 +276,53 @@ impl Handler for RpcHandler {
             .query()
             .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")));
         let Some(presented) = presented else {
-            return WsUpgradeReply::Refuse(unauthorized("missing token"));
+            return Upgrade::Refuse(unauthorized("missing token"));
         };
         if !ct_eq(presented.as_bytes(), self.token.as_bytes()) {
-            return WsUpgradeReply::Refuse(unauthorized("unauthorized"));
+            return Upgrade::Refuse(unauthorized("unauthorized"));
         }
-        WsUpgradeReply::Accept(Arc::new(RpcWsService))
+        // The same RFC 6455 policy the engine's own WebSocket inbounds run;
+        // a refusal carries its own fully-framed response.
+        match plan(req, peer.ip(), false, &ws_config()) {
+            Ok(plan) => match plan.accept_headers() {
+                Ok(headers) => Upgrade::Accept {
+                    headers,
+                    endpoint: Arc::new(RpcWsService),
+                },
+                Err(e) => {
+                    tracing::warn!("RPC websocket handshake build failed: {e}");
+                    Upgrade::Refuse(json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"code":1,"error":"handshake failed"}"#,
+                    ))
+                }
+            },
+            Err(refusal) => Upgrade::Refuse(refusal.response()),
+        }
     }
 }
 
 /// One WebSocket connection: every message is one JSON-RPC request.
 ///
 /// `on_message` runs on the connection's own thread, so a blocking dispatch
-/// call delays only this connection.
+/// call delays only this connection. A failed write is the driver's to
+/// handle (it closes `1011`).
 struct RpcWsService;
 
-impl WsService for RpcWsService {
-    fn on_message(&self, conn: &mut WsConn, message: WsData) {
+impl http1::Endpoint for RpcWsService {
+    fn on_message(&self, message: Payload) -> Option<Payload> {
         let response = match message {
-            WsData::Text(text) => process_payload(text.as_bytes()),
-            WsData::Binary(data) => process_payload(&data),
+            Payload::Text(text) => process_payload(text.as_bytes()),
+            Payload::Binary(data) => process_payload(&data),
         };
-        if let Err(e) = conn.send_text(&response) {
-            tracing::debug!("RPC WebSocket write failed: {e}");
-            let _ = conn.close(1011, "send failed");
-        }
+        Some(Payload::Text(response))
     }
 }
 
 /// The WebSocket policy the server enforces.
+///
+/// The keepalive cadence is not part of the policy: it lives in the driver's
+/// [`WsLimits`], which is what actually pings and drops.
 fn ws_config() -> WsConfig {
     WsConfig {
         enabled: true,
@@ -277,7 +339,6 @@ fn ws_config() -> WsConfig {
         },
         max_message: MAX_WS_MESSAGE,
         max_frame: MAX_WS_MESSAGE,
-        ping_interval: Some(WS_PING_INTERVAL),
         ..WsConfig::default()
     }
 }
@@ -608,6 +669,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_token_bind_is_refused() {
+        let err = RpcServer::bind(SocketAddr::from(([127, 0, 0, 1], 0)), String::new())
+            .err()
+            .expect("an empty token must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn http_rpc_requires_token() {
         let h = spawn_test_server();
         // No token -> 401
@@ -672,6 +741,30 @@ mod tests {
         h.stop();
     }
 
+    /// Two requests on one connection: the connection stays usable between
+    /// them (a fresh head deadline for each) and every response is framed
+    /// with a `content-length` the client can rely on.
+    #[test]
+    fn keep_alive_connection_serves_sequential_requests() {
+        let h = spawn_test_server();
+        let mut stream = std::net::TcpStream::connect(h.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        for round in 0..2 {
+            let request = format!("GET /health HTTP/1.1\r\nHost: {}\r\n\r\n", h.addr());
+            stream.write_all(request.as_bytes()).unwrap();
+
+            assert_eq!(read_handshake_head(&mut stream), 200, "round {round}");
+            // `{"ok":true}`, exactly as announced.
+            let mut body = [0u8; 11];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"{\"ok\":true}");
+        }
+        h.stop();
+    }
+
     #[test]
     fn websocket_roundtrip() {
         let h = spawn_test_server();
@@ -732,6 +825,138 @@ mod tests {
         let parsed: nextjson::Value =
             nextjson::from_str(&String::from_utf8(payload).unwrap()).unwrap();
         assert_eq!(parsed.get("code").and_then(|v| v.as_i64()), Some(0));
+        h.stop();
+    }
+
+    /// The budgets the slowloris tests run against: absolute deadlines short
+    /// enough to test, per-read timeouts long enough that a drip *below* them
+    /// still has to fail on the absolute deadline.
+    fn tight_limits() -> http1::Limits {
+        http1::Limits {
+            max_body: 1024 * 1024,
+            max_requests: 8,
+            idle_timeout: Duration::from_millis(500),
+            head_deadline: Duration::from_millis(800),
+            head_read_timeout: Duration::from_secs(5),
+            body_deadline: Duration::from_millis(800),
+            body_read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            ws: Some(WsLimits {
+                max_message: 1024 * 1024,
+                ping_interval: Duration::from_millis(300),
+            }),
+        }
+    }
+
+    fn spawn_tight_server() -> RpcServerHandle {
+        RpcServer::bind_with_limits(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            "test-token-123".to_string(),
+            tight_limits(),
+        )
+        .expect("bind")
+        .spawn()
+    }
+
+    /// The slowloris regression: a head dripped one byte at a time stays
+    /// below the per-read timeout on every read, yet must still be cut off
+    /// by the absolute head deadline (the old per-read-only path let it run
+    /// forever).
+    #[test]
+    fn drip_fed_request_head_hits_the_absolute_deadline() {
+        let h = spawn_tight_server();
+        let mut stream = std::net::TcpStream::connect(h.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Five bytes, 200 ms apart: each gap is far under
+        // `head_read_timeout` (5 s), the total (1 s) is over
+        // `head_deadline` (800 ms).
+        for byte in b"POST /rpc HTTP/1.1\r\n".iter().take(5) {
+            stream.write_all(&[*byte]).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        assert_eq!(read_handshake_head(&mut stream), 408);
+        h.stop();
+    }
+
+    /// One byte, then silence: the head deadline (800 ms) fires long before
+    /// the per-read timeout (5 s) would have.
+    #[test]
+    fn stalled_head_is_cut_off_before_the_per_read_timeout() {
+        let h = spawn_tight_server();
+        let mut stream = std::net::TcpStream::connect(h.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"P").unwrap();
+
+        assert_eq!(read_handshake_head(&mut stream), 408);
+        h.stop();
+    }
+
+    /// A connection that never sends anything is closed at the idle budget,
+    /// without an answer: there is nothing to answer.
+    #[test]
+    fn silent_connection_is_closed_at_the_idle_timeout() {
+        let h = spawn_tight_server();
+        let mut stream = std::net::TcpStream::connect(h.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 64];
+        assert_eq!(stream.read(&mut buf).unwrap(), 0, "must close, not answer");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        h.stop();
+    }
+
+    /// A declared body that never arrives is closed at the body deadline.
+    #[test]
+    fn stalled_body_is_closed_at_the_body_deadline() {
+        let h = spawn_tight_server();
+        let mut stream = std::net::TcpStream::connect(h.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let head = format!(
+            "POST /rpc HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-token-123\r\n\
+             Content-Length: 32\r\n\r\n",
+            h.addr()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(b"x").unwrap();
+
+        let mut buf = [0u8; 64];
+        assert_eq!(stream.read(&mut buf).unwrap(), 0, "must close, not answer");
+        h.stop();
+    }
+
+    /// A WebSocket client that answers nothing (not even a Pong) is pinged
+    /// and then dropped with `1001`.
+    #[test]
+    fn silent_websocket_is_dropped_after_the_keepalive() {
+        let h = spawn_tight_server();
+        let (mut ws, status) = ws_handshake(h.addr(), "test-token-123");
+        assert_eq!(status, 101);
+
+        // The driver pings at 300 ms of silence and drops at 600 ms; only a
+        // Ping may precede the close frame, and the code is 1001.
+        loop {
+            let (opcode, payload) = ws_read_frame(&mut ws);
+            if opcode == 0x8 {
+                assert!(
+                    payload.starts_with(&[0x03, 0xe9]),
+                    "going away (1001), got {payload:?}"
+                );
+                break;
+            }
+            assert_eq!(opcode, 0x9, "only a Ping may precede the close");
+        }
         h.stop();
     }
 }

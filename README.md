@@ -52,11 +52,15 @@ Capabilities:
 
 - **Inbounds**: `http`, `socks5` and `mixed` (HTTP + SOCKS5 auto-detection) as
   configured listeners; TUN mode over the in-tree userspace stack, driven
-  through the platform entry points rather than the `inbounds` list. `redir`
-  and `tproxy` parse as types but have no listener: a build logs a warning and
-  starts nothing for them.
+  through the platform entry points rather than the `inbounds` list. `redir`,
+  `tproxy` and a `tun` entry in `inbounds` parse as types and are then
+  **rejected at validation** with an error naming what is missing: none of
+  the three has a listener, and a build that accepted them would answer
+  nothing while claiming otherwise.
 - **Outbounds**: `direct`, `reject`, `socks5`, `socks4` / `socks4a`, `http`
-  (plain or TLS-wrapped), `shadowsocks`, `shadowsocksr`, `snell` (v4 / v5),
+  (plain or TLS-wrapped), `shadowsocks` (the 2017 AEAD ciphers; the 2022
+  suite is refused with a named error rather than half-implemented),
+  `shadowsocksr`, `snell` (v4 / v5),
   `vmess`, `vless`, `trojan`, `wireguard`, `naive` (NaiveProxy), the opt-in
   `shadowtls` (v3), `tuic` (v5), `hysteria` (v1) and `hysteria2`; plus the
   group selectors `selector`, `url-test`, `fallback`, `load-balance` and
@@ -163,7 +167,10 @@ connections, the trade is reasonable.
 A build that lacks `tuic`, `hysteria`, `hysteria2` or `shadowtls` **rejects**
 the matching outbound with a config error naming the missing feature; it never
 falls back to a direct connection. The same rule applies to `security: reality`
-and to `fingerprint` when `tls13` is off.
+and to `fingerprint` when `tls13` is off. It also covers what this engine does
+not implement at all: `redir` / `tproxy` / `tun` inbound entries and
+Shadowsocks 2022 ciphers are refused at the boundary with an error that says
+why — never accepted into a runtime that cannot honour them.
 
 ## Division of labour: courierust vs. in-tree
 
@@ -359,7 +366,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.2.2"}
+# {"code":0,"data":"Corduit v0.2.5"}
 ```
 
 ## Configuration
@@ -389,8 +396,8 @@ src/
 
 The `no_std` core is `crypto/`, `common/url`, `protocol/address` and
 `protocol/error`, which are pure logic with no OS dependency. The threaded
-networking layer (engine, netstack, RPC, transports) is gated behind the `std`
-feature.
+networking layer (engine, DNS listener, netstack, RPC, transports) is gated
+behind the `std` feature.
 
 ## Building and testing
 
@@ -425,18 +432,33 @@ is courierust's work-stealing pool plus `std::thread`.
 This is a local tool that controls network traffic, so the boundary is explicit:
 
 - **FFI**: no panic ever unwinds across `extern "C"`; every argument is
-  type-checked; the binary channel is bounded (`rustbinary`, 64 MiB cap).
-- **RPC server**: loopback bind only, constant-time bearer-token comparison,
-  16 MiB request cap, idle connections reaped, WebSocket upgrades validated
-  against RFC 6455 (`Sec-WebSocket-Key` shape and accept value).
+  type-checked; the binary channel is bounded (`rustbinary`, 64 MiB cap), and
+  the buffers handed to the caller own exactly the allocation their length
+  describes.
+- **RPC server**: loopback bind only, constant-time bearer-token comparison, a
+  refused empty token (never a silently open server), 16 MiB request cap, idle
+  connections reaped, WebSocket upgrades validated against RFC 6455
+  (`Sec-WebSocket-Key` shape and accept value).
+- **Inbound authentication**: `general.authentication` is enforced on every
+  path — HTTP requests and `CONNECT` (with the `407` challenge a client needs
+  to retry), SOCKS5 TCP and UDP association (RFC 1929), and the TUN stack's
+  own SOCKS5 client, which presents the configured credentials instead of
+  failing the tunnel.
 - **Outbound handshakes**: a WebSocket upgrade whose `Sec-WebSocket-Accept`
   does not match is a hard failure, not a warning; config-supplied handshake
-  headers (token name, no CR/LF) are validated before a byte reaches the wire.
+  headers (token name, no CR/LF) are validated before a byte reaches the wire;
+  the QUIC-based outbounds require the server's certificate chain *and* a
+  verified `CertificateVerify` proof before 1-RTT keys are installed.
+- **Windows TUN**: `wintun.dll` is loaded from the executable's directory only
+  (or the `wintun/` directory under it); per-user and working directories are
+  never searched, so an unelevated process cannot plant a DLL for the elevated
+  engine to load.
 - **Data paths**: DNS wire parsing is RecurseX's, which caps section counts
   before any loop, bounds every length field against the message, and follows
   compression pointers only forwards with a hop budget derived from the 255-byte
-  name limit; MMDB reads bounds-checked, HTTP response bodies capped,
-  `skip-cert-verify` off by default.
+  name limit; the in-tree DNS responder enforces the same pointer budget, so a
+  self-referencing name cannot spin the TUN thread. MMDB reads bounds-checked,
+  HTTP response bodies capped, `skip-cert-verify` off by default.
 
 More: [Security](https://github.com/blueokanna/Corduit/wiki/Security).
 

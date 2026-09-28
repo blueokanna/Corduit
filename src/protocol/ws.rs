@@ -296,10 +296,17 @@ impl<S: SyncStream> WebSocket<S> {
 
     /// Start the closing handshake with code 1000. Idempotent.
     pub fn close(&mut self) -> io::Result<()> {
+        self.close_with(1000, "")
+    }
+
+    /// Start the closing handshake with an explicit code (RFC 6455 §7.4:
+    /// `1001` for going away, `1011` for an internal failure the peer should
+    /// be told about). Idempotent.
+    pub fn close_with(&mut self, code: u16, reason: &str) -> io::Result<()> {
         if self.close_sent.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.session_mut(|session| session.close(1000, ""))
+        self.session_mut(|session| session.close(code, reason))
     }
 
     fn session_mut<R>(

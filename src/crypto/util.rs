@@ -65,7 +65,10 @@ pub(crate) fn rotl32(x: u32, n: u32) -> u32 {
 /// difference up to the longer slice).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     let len = a.len().max(b.len());
-    let mut diff = (a.len() ^ b.len()) as u8;
+    // A length *difference* is what must be detected: `(len_a ^ len_b) as u8`
+    // would truncate a 256-byte difference to zero and accept a 256-byte
+    // all-zero suffix.
+    let mut diff = u8::from(a.len() != b.len());
     for i in 0..len {
         let av = a.get(i).copied().unwrap_or(0);
         let bv = b.get(i).copied().unwrap_or(0);
@@ -114,6 +117,19 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"abcd"));
         assert!(!ct_eq(b"a", b"b"));
+    }
+
+    /// A length difference of a multiple of 256 collides in the XOR of the
+    /// byte-strided length term; the comparison must still reject it.
+    #[test]
+    fn ct_eq_rejects_zero_padded_length_multiple_of_256() {
+        let secret = [7u8; 32];
+        let mut padded = secret.to_vec();
+        padded.extend_from_slice(&[0u8; 256]);
+        assert!(!ct_eq(&secret, &padded));
+        assert!(!ct_eq(&padded, &secret));
+        assert!(!ct_eq(b"", &[0u8; 256]));
+        assert!(!ct_eq(&[0u8; 256], b""));
     }
 
     #[test]

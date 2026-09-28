@@ -1,9 +1,15 @@
 //! AES-GCM authenticated encryption (NIST SP 800-38D).
 //!
-//! Only the standard 12-byte nonce (with the GHASH fallback for other
-//! lengths) is supported, mirroring what every consumer in Corduit uses.
-//! GHASH multiplication is branch-free.
+//! The 12-byte nonce (what every consumer in Corduit uses) takes the direct
+//! `J0 = nonce ‖ 0^31 ‖ 1` path; any other non-empty length goes through the
+//! GHASH fallback of SP 800-38D §7.1.
+//!
+//! The GHASH field multiply runs on the CPU's carry-less multiply
+//! instructions when it has them ([`ghash_hw`]: `PCLMULQDQ` / `PMULL`); the
+//! software multiply below is the fallback and takes both operands as
+//! arithmetic masks — branch-free, nothing indexed by secrets.
 
+use super::ghash_hw;
 use crate::crypto::aead::{AeadError, AeadInPlace};
 use crate::crypto::stream::Aes;
 use crate::crypto::util::ct_eq;
@@ -11,7 +17,9 @@ use crate::crypto::util::ct_eq;
 /// Reduction polynomial of GF(2^128) for GHASH: x^128 + x^7 + x^2 + x + 1.
 const R: u128 = 0xe100_0000_0000_0000_0000_0000_0000_0000;
 
-/// Constant-time multiplication in GF(2^128).
+/// Multiplication in GF(2^128): the fallback used when the CPU has no
+/// carry-less multiply (see [`ghash_hw`]), and the oracle the hardware path
+/// is tested against. Branch-free — every bit decision becomes a mask.
 ///
 /// Implements the canonical GCM bit-string multiplication (NIST
 /// SP 800-38D §6.3): Y is consumed most-significant bit first and V is
@@ -23,15 +31,14 @@ fn gf_mul(x: u128, y: u128) -> u128 {
     let mut x = x;
     let mut y = y;
     for _ in 0..128 {
-        if (y >> 127) & 1 == 1 {
-            z ^= x;
-        }
+        // Each bit becomes a 0/all-ones mask, so neither the secret `H`
+        // (riding in `x`) nor a secret intermediate (in `y`) is ever the
+        // subject of a branch the hardware can predict or time.
+        let bit = ((y >> 127) & 1).wrapping_neg();
+        z ^= x & bit;
         y <<= 1;
-        if x & 1 == 1 {
-            x = (x >> 1) ^ R;
-        } else {
-            x >>= 1;
-        }
+        let low = (x & 1).wrapping_neg();
+        x = (x >> 1) ^ (R & low);
     }
     z
 }
@@ -45,6 +52,9 @@ fn inc32(counter: u128) -> u128 {
 /// Streaming GHASH accumulator (AAD then ciphertext).
 struct GHash {
     h: u128,
+    /// The same key readied for the hardware carry-less multiply, when the
+    /// CPU has it; `None` keeps every multiply on [`gf_mul`].
+    hw: Option<ghash_hw::PreparedKey>,
     state: u128,
     buf: [u8; 16],
     buf_len: usize,
@@ -54,9 +64,14 @@ struct GHash {
 }
 
 impl GHash {
-    fn new(h: u128) -> Self {
+    /// A GHASH that uses the hardware multiply only when `hardware` allows
+    /// it (still subject to CPU detection); `false` keeps every multiply on
+    /// [`gf_mul`]. The tests use `false` to run the same data through both
+    /// implementations.
+    fn with_backend(h: u128, hardware: bool) -> Self {
         GHash {
             h,
+            hw: if hardware { ghash_hw::prepare(h) } else { None },
             state: 0,
             buf: [0u8; 16],
             buf_len: 0,
@@ -66,11 +81,21 @@ impl GHash {
         }
     }
 
+    /// The one place a block is multiplied by `H`, on whichever back end
+    /// this accumulator was built with.
+    #[inline]
+    fn mul(&self, x: u128) -> u128 {
+        match &self.hw {
+            Some(prepared) => prepared.mul(x),
+            None => gf_mul(x, self.h),
+        }
+    }
+
     fn absorb_block(&mut self, block: &[u8; 16]) {
         // GCM treats 128-bit blocks as big-endian bit strings (the first
         // byte is the coefficient of x^127).
         let x = u128::from_be_bytes(*block);
-        self.state = gf_mul(self.state ^ x, self.h);
+        self.state = self.mul(self.state ^ x);
     }
 
     fn push(&mut self, mut data: &[u8]) {
@@ -99,8 +124,14 @@ impl GHash {
             data = &data[16..];
         }
 
-        self.buf[..data.len()].copy_from_slice(data);
-        self.buf_len = data.len();
+        // `push` is a stream: a call may leave a partial block for the next
+        // one. Only copy what arrived and add to the fill count — assigning
+        // `data.len()` would silently discard a block filled by an earlier
+        // call when the new data does not complete it.
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+        }
+        self.buf_len += data.len();
     }
 
     /// Zero-pad the current partial block (if any) and absorb it.
@@ -111,9 +142,11 @@ impl GHash {
     /// ciphertext bytes are absorbed.
     fn pad_to_block(&mut self) {
         if self.buf_len > 0 {
-            // The buffer is already zero beyond buf_len, so the partial
-            // block read here is the zero-padded block.
-            let block = self.buf;
+            // Zero-pad the filled prefix explicitly; the tail of `self.buf`
+            // may hold stale bytes from an earlier partial block when callers
+            // push in pieces, and GHASH must only see the new bytes.
+            let mut block = [0u8; 16];
+            block[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
             self.absorb_block(&block);
             self.buf_len = 0;
             self.buf = [0u8; 16];
@@ -127,10 +160,10 @@ impl GHash {
     /// ciphertext, each as a big-endian 64-bit integer.
     fn finalize(mut self) -> u128 {
         if self.buf_len > 0 {
-            let block = self.buf;
-            // zero-pad the remainder (buffer is already zero beyond buf_len)
+            let mut block = [0u8; 16];
+            block[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
             let x = u128::from_be_bytes(block);
-            self.state = gf_mul(self.state ^ x, self.h);
+            self.state = self.mul(self.state ^ x);
         }
         let lb = (((self.aad_len as u128) << 3) << 64) | ((self.ct_len as u128) << 3);
         self.absorb_block(&lb.to_be_bytes());
@@ -141,13 +174,25 @@ impl GHash {
 /// AES-GCM cipher for a fixed key size.
 pub struct AesGcm {
     cipher: Aes,
+    /// Whether GHASH may use the carry-less multiply instructions. Kept on
+    /// the cipher because `j0`'s GHASH fallback (a non-12-byte nonce) needs
+    /// the same decision outside of a [`GHash`].
+    hw_ghash: bool,
 }
 
 impl AesGcm {
     /// Create from a 16/24/32-byte key.
     pub fn new(key: &[u8]) -> Result<Self, crate::crypto::InvalidLength> {
+        Self::with_backend(key, true)
+    }
+
+    /// As [`AesGcm::new`], gating the hardware GHASH on `hardware` (still
+    /// subject to CPU detection). The tests use `false` to run the same
+    /// vectors through both implementations.
+    fn with_backend(key: &[u8], hardware: bool) -> Result<Self, crate::crypto::InvalidLength> {
         Ok(AesGcm {
             cipher: Aes::new(key)?,
+            hw_ghash: hardware && ghash_hw::available(),
         })
     }
 
@@ -171,27 +216,34 @@ impl AesGcm {
             j0[15] = 1;
             Ok(u128::from_be_bytes(j0))
         } else {
-            // J0 = GHASH_H(nonce || 0^pad || 0^64 || bitlen(nonce))
             if nonce.is_empty() {
                 return Err(AeadError::InvalidNonceLength);
             }
             let h = self.h();
+            let prepared = if self.hw_ghash {
+                ghash_hw::prepare(h)
+            } else {
+                None
+            };
+            let mul = |x: u128| match &prepared {
+                Some(prepared) => prepared.mul(x),
+                None => gf_mul(x, h),
+            };
             let mut state = 0u128;
             let mut blocks = nonce.chunks_exact(16);
             for block in &mut blocks {
                 let arr: [u8; 16] = block.try_into().unwrap();
-                state = gf_mul(state ^ u128::from_be_bytes(arr), h);
+                state = mul(state ^ u128::from_be_bytes(arr));
             }
             let rem = blocks.remainder();
             if !rem.is_empty() {
                 let mut block = [0u8; 16];
                 block[..rem.len()].copy_from_slice(rem);
-                // zero-pad the remainder
-                state = gf_mul(state ^ u128::from_be_bytes(block), h);
+                state = mul(state ^ u128::from_be_bytes(block));
             }
             let mut lb = [0u8; 16];
             lb[8..].copy_from_slice(&((nonce.len() as u64) * 8).to_be_bytes());
-            state = gf_mul(state ^ u128::from_be_bytes(lb), h);
+            state = mul(state ^ u128::from_be_bytes(lb));
             Ok(state)
         }
     }
@@ -223,7 +275,7 @@ impl AeadInPlace for AesGcm {
         self.ctr_crypt(j0, buffer);
 
         let s = {
-            let mut g = GHash::new(h);
+            let mut g = GHash::with_backend(h, self.hw_ghash);
             g.push(aad);
             g.pad_to_block();
             g.phase = 1;
@@ -251,7 +303,7 @@ impl AeadInPlace for AesGcm {
         // Compute the tag over the ciphertext first (constant-time check
         // before any plaintext is released).
         let s = {
-            let mut g = GHash::new(h);
+            let mut g = GHash::with_backend(h, self.hw_ghash);
             g.push(aad);
             g.pad_to_block();
             g.phase = 1;
@@ -359,6 +411,25 @@ mod tests {
             .encrypt_in_place_detached(nonce, aad, &mut buf, &mut tag)
             .unwrap();
         (buf, tag)
+    }
+
+    /// GHASH is a stream: feeding the same bytes in different chunks must
+    /// produce the same tag. The regression is the call that ends mid-block
+    /// after an earlier call already filled part of that block.
+    #[test]
+    fn ghash_push_is_chunk_agnostic() {
+        let h = 0x66e94bd4ef8a2c3b884cfa59ca342b2eu128;
+        let data: Vec<u8> = (0..37u8).collect();
+
+        let mut whole = GHash::with_backend(h, true);
+        whole.push(&data);
+
+        let mut split = GHash::with_backend(h, true);
+        split.push(&data[..5]);
+        split.push(&data[5..8]);
+        split.push(&data[8..]);
+
+        assert_eq!(whole.finalize(), split.finalize());
     }
 
     #[test]
@@ -472,5 +543,116 @@ mod tests {
             .decrypt_in_place_detached(&nonce, b"aad", &mut buf, &tag)
             .unwrap();
         assert_eq!(&buf, pt);
+    }
+
+    /// Every hardware multiply must equal the software one bit for bit: the
+    /// hardware path is three carry-less multiplies plus a fixed reduction,
+    /// and this pins down the whole mapping — the `mulx` key transform, the
+    /// POLYVAL core, the absent byte-order conversions — over the field's
+    /// edge values and a deterministic spread of others.
+    #[test]
+    fn hardware_ghash_matches_the_software_multiply() {
+        if !ghash_hw::available() {
+            return;
+        }
+        let mut seed = 0x243f_6a88_85a3_08d3_1319_8a2e_0370_7344u128;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut values = vec![
+            0,
+            1,
+            u128::MAX,
+            1u128 << 127, // the field's one
+            0xe100_0000_0000_0000_0000_0000_0000_0000,
+            0x2562_9347_5892_4276_1d31_f826_ba4b_757b, // RFC 8452's H
+            0x66e9_4bd4_ef8a_2c3b_884c_fa59_ca34_2b2e, // NIST's H
+        ];
+        for _ in 0..25 {
+            values.push(next());
+        }
+        for &h in &values {
+            let prepared = ghash_hw::prepare(h).expect("available() was true");
+            for &x in &values {
+                assert_eq!(prepared.mul(x), gf_mul(x, h), "h={h:032x} x={x:032x}");
+            }
+        }
+    }
+
+    /// Both GHASH back ends must fold the same stream to the same `S`.
+    #[test]
+    fn ghash_backends_agree_on_one_stream() {
+        let h = 0x66e9_4bd4_ef8a_2c3b_884c_fa59_ca34_2b2eu128;
+        let aad = unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        let ct: Vec<u8> = (0..61u8)
+            .map(|i| i.wrapping_mul(7).wrapping_add(3))
+            .collect();
+
+        let mut hardware = GHash::with_backend(h, true);
+        let mut software = GHash::with_backend(h, false);
+        for g in [&mut hardware, &mut software] {
+            g.push(&aad);
+            g.pad_to_block();
+            g.phase = 1;
+            g.push(&ct);
+        }
+        assert_eq!(hardware.finalize(), software.finalize());
+    }
+
+    /// The whole cipher — counter blocks, `j0`'s GHASH fallback for a
+    /// non-12-byte nonce, the tag — must be identical on both GHASH back
+    /// ends, and a message sealed by one must open under the other.
+    #[test]
+    fn aes_gcm_backends_agree_end_to_end() {
+        let key = unhex("feffe9928665731c6d6a8f9467308308");
+        let aad = unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        let pt: Vec<u8> = (0..75u8)
+            .map(|i| i.wrapping_mul(3).wrapping_add(1))
+            .collect();
+
+        let hardware = AesGcm::with_backend(&key, true).unwrap();
+        let software = AesGcm::with_backend(&key, false).unwrap();
+        assert_eq!(hardware.hw_ghash, ghash_hw::available());
+
+        let empty: [u8; 0] = [];
+        let mut nothing = Vec::new();
+        assert_eq!(
+            hardware.encrypt_in_place_detached(&empty, &aad, &mut nothing, &mut [0u8; 16]),
+            Err(AeadError::InvalidNonceLength)
+        );
+
+        for nonce in [
+            unhex("cafebabefacedbaddecaf888"), // 12 bytes: direct `j0`
+            unhex("aabbccddeeff00112233"),     // 10 bytes: GHASH-fallback `j0`
+        ] {
+            let mut hw_buf = pt.clone();
+            let mut hw_tag = [0u8; 16];
+            hardware
+                .encrypt_in_place_detached(&nonce, &aad, &mut hw_buf, &mut hw_tag)
+                .unwrap();
+            let mut sw_buf = pt.clone();
+            let mut sw_tag = [0u8; 16];
+            software
+                .encrypt_in_place_detached(&nonce, &aad, &mut sw_buf, &mut sw_tag)
+                .unwrap();
+            assert_eq!(hw_buf, sw_buf, "ciphertext for nonce {nonce:02x?}");
+            assert_eq!(hw_tag, sw_tag, "tag for nonce {nonce:02x?}");
+
+            // The two ends interoperate: software opens what hardware sealed,
+            // and vice versa.
+            let mut opened = hw_buf.clone();
+            software
+                .decrypt_in_place_detached(&nonce, &aad, &mut opened, &hw_tag)
+                .unwrap();
+            assert_eq!(opened, pt);
+            let mut opened = sw_buf.clone();
+            hardware
+                .decrypt_in_place_detached(&nonce, &aad, &mut opened, &sw_tag)
+                .unwrap();
+            assert_eq!(opened, pt);
+        }
     }
 }

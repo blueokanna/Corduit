@@ -30,8 +30,8 @@ Corduit 是网络工程工具，涵盖代理协议、规则路由、DNS 与用�
 
 能力概览：
 
-- **入站**：`http`、`socks5`、`mixed`（HTTP + SOCKS5 自动识别）三种可配置监听器；TUN 模式基于仓库内的用户态协议栈，通过平台入口启用，而不是写进 `inbounds` 列表。`redir` / `tproxy` 能通过配置解析，但没有监听器实现：构建时打印一条警告，不会为它们启动任何东西。
-- **出站**：`direct`、`reject`、`socks5`、`socks4` / `socks4a`、`http`（明文或 TLS 包裹）、`shadowsocks`、`shadowsocksr`、`snell`（v4 / v5）、`vmess`、`vless`、`trojan`、`wireguard`、`naive`（NaiveProxy），以及需要显式开启的 `shadowtls`（v3）、`tuic`（v5）、`hysteria`（v1）与 `hysteria2`；代理组 `selector`、`url-test`、`fallback`、`load-balance`、`relay`。
+- **入站**：`http`、`socks5`、`mixed`（HTTP + SOCKS5 自动识别）三种可配置监听器；TUN 模式基于仓库内的用户态协议栈，通过平台入口启用，而不是写进 `inbounds` 列表。`redir`、`tproxy` 以及写进 `inbounds` 的 `tun` 条目均可被解析为类型，但会在**校验阶段被直接拒绝**，错误信息明确说明缺什么：三者都没有监听器实现，接受了它们的构建只会“表面启动”却什么都不应答。
+- **出站**：`direct`、`reject`、`socks5`、`socks4` / `socks4a`、`http`（明文或 TLS 包裹）、`shadowsocks`（2017 AEAD 密码套件；2022 套件会以具名错误明确拒绝，而不是半实现）、`shadowsocksr`、`snell`（v4 / v5）、`vmess`、`vless`、`trojan`、`wireguard`、`naive`（NaiveProxy），以及需要显式开启的 `shadowtls`（v3）、`tuic`（v5）、`hysteria`（v1）与 `hysteria2`；代理组 `selector`、`url-test`、`fallback`、`load-balance`、`relay`。
 - **路由**：`domain`、`domain-suffix`、`domain-keyword`、`domain-regex`、`geoip`、`ip-cidr`、`src-ip-cidr`、`src-port`、`dst-port`、`process-name`、`rule-set`、`match`，配合 `rule` / `global` / `direct` 三种模式；规则集与代理集按间隔刷新。
 - **DNS**：解析器是同一作者的 [RecurseX](https://crates.io/crates/recurse-x)，以依赖形式引入：上游支持 UDP / TCP / DoT / DoH / DoH3 / DoQ，带按稳定性度量的分层缓存、请求合并，以及按期望成本排序的服务器选择。Corduit 补上 profile 方言带来的那部分：`nameserver-policy`、`default-nameserver`、`hosts`、`cache-size` 的写法，加密上游的主机名到 IP 的 bootstrap，以及 bogon / GeoIP 应答过滤（RecurseX 不附带国家库）。启用 `dns.enable` 后，`dns.listen` 上会真正启动监听器，UDP 与 TCP 同时可用，并以同一份 profile 应答。
 - **同步执行**：没有 tokio，没有 reactor，引擎内没有 `async` / `await`。并发来自短任务的 work-stealing 池与长连接中继的专用线程。
@@ -96,7 +96,7 @@ flowchart TB
 | `reality` | 关 | VLESS/Trojan/VMess 的 REALITY 客户端认证（`security: reality`）。隐含 `tls13`。 |
 | `shadowtls` | 关 | ShadowTLS v3 出站。隐含 `tls13`。 |
 
-未开启 `tuic`、`hysteria`、`hysteria2` 或 `shadowtls` 的构建会**直接拒绝**对应出站配置，并给出指明缺失 feature 的错误，不会退化为直连。`security: reality` 与 `fingerprint` 在缺少对应 feature 时遵循同一条 fail-closed 规则。
+未开启 `tuic`、`hysteria`、`hysteria2` 或 `shadowtls` 的构建会**直接拒绝**对应出站配置，并给出指明缺失 feature 的错误，不会退化为直连。`security: reality` 与 `fingerprint` 在缺少对应 feature 时遵循同一条 fail-closed 规则。这条规则同样覆盖“彻底没有实现”的能力：`redir` / `tproxy` / `tun` 入站条目与 Shadowsocks 2022 密码套件一律在边界处被拒绝，并给出原因——绝不放进一个无法兑现它们的运行时。
 
 ## 职责划分：courierust 与仓库内实现
 
@@ -249,7 +249,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.2.2"}
+# {"code":0,"data":"Corduit v0.2.5"}
 ```
 
 ## 配置
@@ -300,10 +300,12 @@ MSRV：**Rust 1.78**。不使用任何 HTTP/TLS/QUIC 第三方库，也没有 as
 
 本工具在本机控制网络流量，因此边界是显式的：
 
-- **FFI**：没有任何 panic 能跨越 `extern "C"` 展开；全部参数经类型检查；二进制通道有界（`rustbinary`，64 MiB 上限）。
-- **RPC 服务端**：仅绑回环地址，常量时间 bearer token 比较，请求体 16 MiB 上限，空闲连接回收，WebSocket 升级按 RFC 6455 校验（`Sec-WebSocket-Key` 形状与 accept 值）。
-- **出站握手**：`Sec-WebSocket-Accept` 不匹配按硬失败处理，不会降级成警告；配置提供的握手头（token 名称、值中不得含 CR/LF）在写上线之前完成校验。
-- **数据路径**：DNS 压缩指针有上限、MMDB 读取有边界检查、HTTP 响应体有上限、`skip-cert-verify` 默认关闭。
+- **FFI**：没有任何 panic 能跨越 `extern "C"` 展开；全部参数经类型检查；二进制通道有界（`rustbinary`，64 MiB 上限），交给调用方的缓冲区占用的分配大小与长度精确一致。
+- **RPC 服务端**：仅绑回环地址，常量时间 bearer token 比较，拒绝空 token（绝不静默变成开放服务），请求体 16 MiB 上限，空闲连接回收，WebSocket 升级按 RFC 6455 校验（`Sec-WebSocket-Key` 形状与 accept 值）。
+- **入站认证**：`general.authentication` 在每条路径上强制执行——HTTP 普通请求与 `CONNECT`（407 带客户端重试所需的 challenge）、SOCKS5 的 TCP 与 UDP 关联（RFC 1929），以及 TUN 协议栈自己的 SOCKS5 客户端（它携带配置的凭据，而不是让整条隧道失败）。
+- **出站握手**：`Sec-WebSocket-Accept` 不匹配按硬失败处理，不会降级成警告；配置提供的握手头（token 名称、值中不得含 CR/LF）在写上线之前完成校验；QUIC 系出站要求服务端证书链**且**通过验证的 `CertificateVerify` 证明，缺一不安装 1-RTT 密钥。
+- **Windows TUN**：`wintun.dll` 只从可执行文件所在目录（或其下的 `wintun/` 子目录）加载；不再搜索用户级目录与工作目录，未提权进程无法为提权引擎“种”一个 DLL。
+- **数据路径**：DNS 线解析来自 RecurseX：循环前先限段数、每个长度字段都对报文做边界检查、压缩指针只允许向前且带跳数预算（由 255 字节名字上限推导）；仓库内的 DNS 应答器执行同样的指针预算，自引用名字无法把 TUN 线程转死。MMDB 读取有边界检查、HTTP 响应体有上限、`skip-cert-verify` 默认关闭。
 
 更多：[Security](https://github.com/blueokanna/Corduit/wiki/Security)。
 

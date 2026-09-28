@@ -13,9 +13,18 @@
 //! * **`no_std` first** — the core of every primitive works on fixed-size
 //!   buffers/arrays and needs no allocator. The `alloc` feature only gates
 //!   ergonomic `Vec`-returning helpers.
-//! * **Constant-time by default** — MAC comparisons, GHASH, AES S-box
-//!   lookups and X25519 field arithmetic are written to avoid data-dependent
-//!   branches and indexing.
+//! * **No data-dependent branches in the primitives** — MAC comparisons,
+//!   GHASH and X25519 field arithmetic avoid both branches and indexing;
+//!   AES is table-driven in software (no branches, but a table indexed by
+//!   data — the standard portable trade-off) and table-free on any CPU
+//!   with the AES instructions.
+//! * **Hardware AES and GHASH where the CPU has it** — the `stream` AES
+//!   rounds are replaced at runtime by AES-NI (x86/x86_64) or the ARMv8 AES
+//!   instructions (aarch64), and AES-GCM's GHASH multiplies by `PCLMULQDQ`
+//!   / `PMULL` (see the `ghash_hw` back end inside `aead`), so GCM, CFB128,
+//!   CTR, CBC and VMess's raw ECB blocks all accelerate together; the
+//!   software rounds remain the portable fallback (and the only key
+//!   schedule).
 //! * **Small surface** — one trait per concern (`Digest`, `Aead`, `Mac`),
 //!   concrete types for everything else. No trait-object indirection in the
 //!   hot paths.
@@ -47,7 +56,12 @@
 //!   plaintext; never unwrap a message without checking the result.
 
 // `no_std` is no longer applicable: the merged crate is a std crate.
-#![forbid(unsafe_code)]
+//
+// `unsafe` stays denied, with two audited exceptions: the hardware AES back
+// end in `stream::aes_hw` (AES-NI / ARMv8 AES) and the GHASH carry-less
+// multiply in `aead::ghash_hw` (PCLMULQDQ / PMULL), both listed with the
+// crate's other audited sites in [`crate::common`].
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![allow(clippy::needless_range_loop)]
 

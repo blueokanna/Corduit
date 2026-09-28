@@ -175,6 +175,24 @@ impl Default for Tls13ClientConfig {
 
 /// Perform a TLS 1.3 handshake over `reader`/`writer` (normally the two
 /// handles of one socket).
+/// A server that presents a certificate must prove possession of its private
+/// key with a `CertificateVerify` message (RFC 8446 §4.4.2.4). Without that
+/// proof a replayed public certificate would be accepted, so a flight that
+/// omits `CertificateVerify` must fail even when the chain verifies.
+fn require_certificate_verify(has_certificate: bool, has_certificate_verify: bool) -> Result<()> {
+    if !has_certificate {
+        return Err(Tls13Error::Certificate(
+            "server did not send a Certificate message".into(),
+        ));
+    }
+    if !has_certificate_verify {
+        return Err(Tls13Error::Certificate(
+            "server sent a Certificate without CertificateVerify".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn connect<R: Read, W: Write>(
     reader: R,
     writer: W,
@@ -312,6 +330,7 @@ pub fn connect<R: Read, W: Write>(
     let mut saw_ee = false;
     let mut leaf_der: Option<Vec<u8>> = None;
     let mut leaf: Option<Certificate> = None;
+    let mut saw_cert_verify = false;
     let mut server_finished_msg: Option<Vec<u8>> = None;
     let mut pending: Vec<u8> = Vec::new();
 
@@ -383,6 +402,9 @@ pub fn connect<R: Read, W: Write>(
                     transcript.extend_from_slice(&msg);
                 }
                 HS_CERTIFICATE_VERIFY => {
+                    if saw_cert_verify {
+                        return Err(Tls13Error::Protocol("duplicate CertificateVerify".into()));
+                    }
                     let cert = leaf.as_ref().ok_or_else(|| {
                         Tls13Error::Protocol("CertificateVerify before Certificate".into())
                     })?;
@@ -410,6 +432,7 @@ pub fn connect<R: Read, W: Write>(
                             sh.suite
                         )));
                     }
+                    saw_cert_verify = true;
                     transcript.extend_from_slice(&msg);
                 }
                 codec::HS_FINISHED => {
@@ -444,11 +467,7 @@ pub fn connect<R: Read, W: Write>(
         }
     }
 
-    if leaf.is_none() {
-        return Err(Tls13Error::Certificate(
-            "server did not send a Certificate message".into(),
-        ));
-    }
+    require_certificate_verify(leaf.is_some(), saw_cert_verify)?;
     let server_finished_msg = server_finished_msg.expect("loop exits only on Finished");
 
     // Transcript through the server Finished → application secrets and the
@@ -1119,5 +1138,28 @@ mod tests {
 
         client.close_notify().ok();
         server.join().expect("server thread");
+    }
+
+    /// The flight invariant that closes the certificate-replay hole: a
+    /// verified chain without a `CertificateVerify` proof is a failure.
+    #[test]
+    fn certificate_flight_requires_certificate_verify() {
+        assert!(require_certificate_verify(true, true).is_ok());
+
+        match require_certificate_verify(true, false) {
+            Err(Tls13Error::Certificate(m)) => {
+                assert!(m.contains("without CertificateVerify"), "got: {m}")
+            }
+            other => panic!("expected a Certificate error, got {other:?}"),
+        }
+
+        assert!(matches!(
+            require_certificate_verify(false, false),
+            Err(Tls13Error::Certificate(_))
+        ));
+        assert!(matches!(
+            require_certificate_verify(false, true),
+            Err(Tls13Error::Certificate(_))
+        ));
     }
 }

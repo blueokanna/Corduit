@@ -61,11 +61,8 @@
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `port` | u16 | `7890` | HTTP 代理监听端口 |
 | `socks_port` | u16? | — | SOCKS5 监听端口 |
-| `redir_port` | u16? | — | Linux redir 透明代理端口 |
-| `tproxy_port` | u16? | — | Linux TProxy 端口 |
-| `mixed_port` | u16? | — | HTTP+SOCKS5 混合端口 |
+| `mixed_port` | u16? | — | HTTP+SOCKS5 混合端口（也是 TUN 捕获流量交给本地入站时优先使用的端口） |
 | `authentication` | 数组 | — | `[{username,password}]` 入站认证 |
 | `allow_lan` | bool | `false` | 是否允许局域网访问 |
 | `bind_address` | string | `127.0.0.1` | 入站绑定地址 |
@@ -121,8 +118,10 @@ RecurseX 只接受 **IP 字面量**：主机名上游会先通过 `default_names
 { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "port": 7890 }
 ```
 
-`type` 取值：`http` / `socks5` / `mixed` / `redir`（仅 Linux）/ `tproxy`（仅 Linux）/ `tun`。
+`type` 取值：`http` / `socks5` / `mixed`。
 其余字段会 flatten 进 `options`，如 `authentication` 等。
+
+`redir`、`tproxy` 以及 `tun` 也能被解析为类型，但**会在校验阶段被拒绝**并说明原因：三者都没有监听器实现（TUN 由平台入口启动，透明重定向未实现）。不会出现“启动成功但什么都不应答”的入站。
 
 ## outbounds（出站）
 
@@ -209,7 +208,8 @@ RecurseX 只接受 **IP 字面量**：主机名上游会先通过 `default_names
 - 端口必须在 `1..=65535`，`0` 报错；
 - `bind_address` 非空；启用 IPv6 前不能绑裸 IPv6 地址；
 - 至少一个 inbound；inbound/outbound 的 `tag` 非空且唯一；
-- `redir`/`tproxy` 只在 Linux 上允许；
+- `redir` / `tproxy` / `tun` 入站类型一律拒绝（无监听器实现）；
+- Shadowsocks 的 `2022-blake3-*` 密码套件在出站构建（引擎启动）时报错拒绝（SIP022 未实现，不会半实现互操作）；
 - 普通出站必须有 `server` 和合法 `port`；代理组必须有 `outbounds`，成员必须可解析（静态 outbound / `DIRECT` / `REJECT` / 已声明的 provider 名；存在 provider 时也允许 provider 动态注入的 tag）；
 - 所有规则的 `outbound` 必须通过交叉引用解析；`rule-set` 规则引用的名字必须存在于 `rule_providers`；
 - provider 的 `interval ≥ 60`、`http` 必须 https、`file` 必须有 `path`。

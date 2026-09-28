@@ -401,12 +401,17 @@ pub(crate) struct Tls13Client {
     client_hs_secret: Vec<u8>,
     /// Server handshake traffic secret.
     server_hs_secret: Vec<u8>,
+    /// Handshake secret (the input of the master-secret derivation,
+    /// RFC 8446 §7.1).
+    handshake_secret: Vec<u8>,
     /// ECDHE shared secret (for the master-secret derivation).
     ecdhe_shared: Vec<u8>,
     /// Transcript hash of ClientHello..ServerHello.
     ch_sh_hash: Vec<u8>,
     /// Parsed leaf certificate (for CertificateVerify).
     leaf: Option<Certificate>,
+    /// Set once a valid CertificateVerify was received.
+    cert_verify_done: bool,
     /// Queued crypto-stream bytes to send (the client Finished).
     pub(crate) crypto_pending: Vec<u8>,
 }
@@ -529,9 +534,11 @@ impl Tls13Client {
             client_finished_msg: None,
             client_hs_secret: Vec::new(),
             server_hs_secret: Vec::new(),
+            handshake_secret: Vec::new(),
             ecdhe_shared: Vec::new(),
             ch_sh_hash: Vec::new(),
             leaf: None,
+            cert_verify_done: false,
             crypto_pending: client_hello,
         })
     }
@@ -580,12 +587,18 @@ impl Tls13Client {
                 self.on_server_finished(body, &before)?;
                 return Ok(pos); // handshake complete; no further messages
             }
+            if msg_type == HS_CERTIFICATE_VERIFY {
+                // The signature covers the transcript up to (but not
+                // including) the CertificateVerify itself (RFC 8446 §4.4.3).
+                self.on_certificate_verify(body)?;
+                self.transcript.update(msg_bytes);
+                continue;
+            }
             self.transcript.update(msg_bytes);
             match msg_type {
                 HS_SERVER_HELLO => self.on_server_hello(body)?,
                 HS_ENCRYPTED_EXTENSIONS => self.on_encrypted_extensions(body)?,
                 HS_CERTIFICATE => self.on_certificate(body)?,
-                HS_CERTIFICATE_VERIFY => self.on_certificate_verify(body)?,
                 HS_CLIENT_HELLO => {
                     return Err(QuicError::Protocol(
                         "unexpected ClientHello from server".into(),
@@ -615,9 +628,11 @@ impl Tls13Client {
         self.client_finished_msg = None;
         self.client_hs_secret.clear();
         self.server_hs_secret.clear();
+        self.handshake_secret.clear();
         self.ecdhe_shared.clear();
         self.ch_sh_hash.clear();
         self.leaf = None;
+        self.cert_verify_done = false;
         self.crypto_pending.clear();
         self.transcript = Box::new(Sha256::new());
         self.transcript.update(&self.client_hello);
@@ -716,6 +731,7 @@ impl Tls13Client {
 
         self.client_hs_secret.clone_from(&client_hs);
         self.server_hs_secret.clone_from(&server_hs);
+        self.handshake_secret.clone_from(&hs_secret);
         self.ecdhe_shared = shared.to_vec();
         self.ch_sh_hash = ch_sh_hash;
         self.hs_write = Some(PacketKey::from_secret(suite, &client_hs)?);
@@ -859,6 +875,9 @@ impl Tls13Client {
     }
 
     fn on_certificate_verify(&mut self, body: &[u8]) -> Result<()> {
+        if self.cert_verify_done {
+            return Err(QuicError::Protocol("duplicate CertificateVerify".into()));
+        }
         let leaf = self
             .leaf
             .as_ref()
@@ -875,8 +894,9 @@ impl Tls13Client {
         }
         let signature = &body[4..4 + sig_len];
 
-        // Content to be signed: Transcript-Hash(..., Certificate).
-        let content = self.transcript_hash();
+        // Content to be signed: Transcript-Hash(..., Certificate) behind the
+        // RFC 8446 §4.4.3 context string.
+        let content = cert_verify_content(&self.transcript_hash(), false);
 
         // Signers must have the digitalSignature key usage (checked in
         // validate_chain for non-skip mode; here we verify the signature).
@@ -886,12 +906,26 @@ impl Tls13Client {
                 "CertificateVerify signature verification failed".into(),
             ));
         }
+        self.cert_verify_done = true;
         Ok(())
     }
 
     fn on_server_finished(&mut self, body: &[u8], before_finished: &[u8]) -> Result<()> {
         if self.server_finished {
             return Err(QuicError::Protocol("duplicate Finished".into()));
+        }
+        // A server that presents a certificate must prove possession of the
+        // private key; Finished alone only proves knowledge of the ECDHE
+        // secret, which a MITM terminating the handshake also has.
+        if self.leaf.is_none() {
+            return Err(QuicError::Certificate(
+                "server did not send a Certificate message".into(),
+            ));
+        }
+        if !self.cert_verify_done {
+            return Err(QuicError::Certificate(
+                "server sent a Certificate without CertificateVerify".into(),
+            ));
         }
         let hash_len = self.suite.map(suite_hash_len).unwrap_or(32);
         if body.len() != hash_len {
@@ -921,14 +955,15 @@ impl Tls13Client {
         }
         self.server_finished = true;
 
-        // Master secret + application traffic secrets.
+        // Master secret + application traffic secrets (RFC 8446 §7.1):
+        // Master = Extract(Derive-Secret(Handshake Secret, "derived", ""), 0).
         let hash_len = self.suite.map(suite_hash_len).unwrap_or(32);
         let empty_hash = {
             let mut d = self.suite_digest();
             d.finalize()
         };
         let derived =
-            self.derive_secret_from(&self.server_hs_secret, b"derived", &empty_hash, hash_len);
+            self.derive_secret_from(&self.handshake_secret, b"derived", &empty_hash, hash_len);
         let master = hmac::extract(self.suite_digest().as_mut(), &derived, &vec![0u8; hash_len]);
 
         // Transcript up to and including the server Finished.
@@ -988,6 +1023,20 @@ fn seed_from(bytes: &[u8]) -> [u8; 44] {
 fn rand32(rng: &mut rng::ChaChaRng) -> [u8; 32] {
     let mut out = [0u8; 32];
     rng.fill(&mut out);
+    out
+}
+
+/// The content signed by CertificateVerify (RFC 8446 §4.4.3): 64 spaces,
+/// the role context string, a zero byte, then the transcript hash.
+fn cert_verify_content(transcript_hash: &[u8], client: bool) -> Vec<u8> {
+    let context: &[u8] = if client {
+        b"TLS 1.3, client CertificateVerify\x00"
+    } else {
+        b"TLS 1.3, server CertificateVerify\x00"
+    };
+    let mut out = vec![0x20u8; 64];
+    out.extend_from_slice(context);
+    out.extend_from_slice(transcript_hash);
     out
 }
 

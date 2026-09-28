@@ -127,11 +127,10 @@ impl WireguardOutbound {
             endpoint,
         );
 
-        // Read timeout keeps the relay poll loop (and the handshake deadline
-        // loop below) from blocking forever.
-        let socket = crate::common::socket::udp_bind(
+        let socket = crate::common::socket::udp_bind_for(
             "0.0.0.0:0".parse().unwrap(),
             Duration::from_millis(1000),
+            Some(endpoint.ip()),
         )
         .map_err(|e| Error::network(format!("Failed to bind UDP socket: {}", e)))?;
 
@@ -402,7 +401,6 @@ impl OutboundProxy for WireguardOutbound {
         let mut seq: u32 = crate::engine::random::u32();
 
         loop {
-            // Poll the inbound side (bounded by its read timeout).
             match inbound.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {

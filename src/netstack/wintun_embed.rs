@@ -22,10 +22,12 @@ const WINTUN_DOWNLOAD_URL: &str = "https://www.wintun.net/builds/wintun-0.14.1.z
 
 /// Every place a wintun.dll is looked for, most specific first.
 ///
-/// The executable directory is where a bundled copy lands (the Flutter app
-/// installs one there), `wintun/` is where a user who unpacked the official
-/// zip by hand tends to put it, and the per-user application directories are
-/// where the app can still write when it is installed somewhere read-only.
+/// Only directories the *installer* controls are considered. The working
+/// directory and `%LOCALAPPDATA%` used to be on this list; both are writable
+/// by the same unelevated user, and the TUN path runs elevated, so a planted
+/// DLL there would be loaded with the administrator token — a local
+/// privilege-escalation vector. A copy must ship beside the executable (or
+/// in `wintun/` under it) to be loadable at all.
 #[cfg(windows)]
 fn wintun_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
@@ -35,23 +37,15 @@ fn wintun_candidates() -> Vec<PathBuf> {
             candidates.push(exe_dir.join("wintun").join("wintun.dll"));
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("wintun.dll"));
-    }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(&local).join("ArcadiaPlus").join("wintun.dll"));
-        candidates.push(PathBuf::from(local).join("Corduit").join("wintun.dll"));
-    }
     candidates
 }
 
 /// Get the path where wintun.dll should be located.
 ///
 /// Returns the first candidate that exists, so a bundled copy beside the
-/// executable, a manually unpacked one and the cached per-user download are
-/// all found without the caller knowing which is present. When none exists,
-/// the primary location (beside the executable) is returned as the place a
-/// download should land.
+/// executable or a manually unpacked one in `wintun/` is found without the
+/// caller knowing which is present. When none exists, the primary location
+/// (beside the executable) is returned as the place a download should land.
 #[cfg(windows)]
 pub fn get_wintun_dll_path() -> Result<PathBuf> {
     let candidates = wintun_candidates();
@@ -59,7 +53,11 @@ pub fn get_wintun_dll_path() -> Result<PathBuf> {
         return Ok(found.clone());
     }
     candidates.into_iter().next().ok_or_else(|| {
-        NetStackError::TunError("no writable directory is available for wintun.dll".to_string())
+        NetStackError::TunError(
+            "cannot locate the directory of the running executable, so there is no \
+             trusted place to look for wintun.dll"
+                .to_string(),
+        )
     })
 }
 
@@ -106,7 +104,12 @@ pub fn ensure_wintun_available() -> Result<PathBuf> {
     }
 }
 
-/// Download wintun.dll from the official source
+/// Download wintun.dll from the official source.
+///
+/// The archive lands beside the executable, the only directory this module
+/// will later load from; an install directory that cannot be written is an
+/// error the user has to resolve (install Wintun system-wide, or run from a
+/// writable directory), not a reason to fall back to a user-writable one.
 #[cfg(windows)]
 pub fn download_wintun_dll() -> Result<PathBuf> {
     use std::io::Write;

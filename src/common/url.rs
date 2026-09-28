@@ -35,6 +35,12 @@ pub enum UrlError {
     BareIpv6,
     /// The scheme is not one of the supported network schemes.
     UnsupportedScheme(String),
+    /// A raw control byte (`< 0x20` or `0x7f`) appeared in the input.
+    ///
+    /// Control bytes are forbidden by RFC 3986, and consumers splice
+    /// components like [`Url::path`] straight into request lines, where a
+    /// CR/LF is a header injection.
+    ControlByte(u8),
 }
 
 impl fmt::Display for UrlError {
@@ -53,6 +59,10 @@ impl fmt::Display for UrlError {
                 )
             }
             UrlError::UnsupportedScheme(s) => write!(f, "unsupported URL scheme '{s}'"),
+            UrlError::ControlByte(byte) => write!(
+                f,
+                "URL contains a raw control byte (0x{byte:02x}); percent-encode it"
+            ),
         }
     }
 }
@@ -92,6 +102,14 @@ impl Url {
     pub fn parse(input: &str) -> Result<Self, UrlError> {
         if input.is_empty() {
             return Err(UrlError::Empty);
+        }
+        // Raw control bytes are rejected up front: `path()` and the other
+        // components are spliced into request lines by the latency probes and
+        // the HTTP gateway, and a CR/LF there injects headers into a request
+        // this engine signs. Refusing the whole class here is the one place
+        // every consumer is covered — RFC 3986 does not allow them anyway.
+        if let Some(byte) = input.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+            return Err(UrlError::ControlByte(byte));
         }
         let raw = input.to_string();
 
@@ -384,6 +402,30 @@ mod tests {
         assert_eq!(Url::parse("https://host:99999"), Err(UrlError::InvalidPort));
         assert_eq!(Url::parse("http://[::1"), Err(UrlError::InvalidIpv6));
         assert_eq!(Url::parse("http://2001:db8::1"), Err(UrlError::BareIpv6));
+    }
+
+    #[test]
+    fn control_bytes_are_rejected() {
+        // A raw CR/LF in any component is a header-injection primitive for
+        // the consumers that splice `path()` into request lines, so the
+        // parser refuses the byte before any component split happens.
+        for url in [
+            "http://host/\r\nX-Injected: 1",
+            "http://host/a\nb",
+            "http://host/a\tb",
+            "http://host/a\x00b",
+            "http://host/a\x7fb",
+            "http://ho\rst/",
+            "http://host/?q=\r",
+        ] {
+            assert!(
+                matches!(Url::parse(url), Err(UrlError::ControlByte(_))),
+                "{url:?} must be rejected as a control byte"
+            );
+        }
+        // A space is not a control byte; provider configs do embed spaces in
+        // paths, and rejecting those is not this check's job.
+        assert!(Url::parse("http://host/a b").is_ok());
     }
 
     #[test]

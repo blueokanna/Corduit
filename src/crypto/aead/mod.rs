@@ -5,6 +5,7 @@
 
 mod aes_gcm;
 mod chacha20poly1305;
+mod ghash_hw;
 
 pub use aes_gcm::{Aes128Gcm, Aes192Gcm, Aes256Gcm, AesGcm};
 pub use chacha20poly1305::ChaCha20Poly1305;

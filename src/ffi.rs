@@ -63,21 +63,28 @@ impl FfiResponse {
 }
 
 impl FfiBinaryResponse {
+    fn from_bytes(bytes: Vec<u8>, code: i32) -> Self {
+        let boxed = bytes.into_boxed_slice();
+        let len = boxed.len();
+        if boxed.is_empty() {
+            return Self {
+                code,
+                data: ptr::null_mut(),
+                len: 0,
+            };
+        }
+        // `into_boxed_slice` reallocates to exactly `len` bytes, so the
+        // caller can rebuild a `Box<[u8]>` from `(data, len)` alone.
+        let data = Box::into_raw(boxed) as *mut u8;
+        Self { code, data, len }
+    }
+
     fn ok(bytes: Vec<u8>) -> Self {
-        let mut bytes = bytes;
-        let len = bytes.len();
-        let data = if bytes.is_empty() {
-            ptr::null_mut()
-        } else {
-            let p = bytes.as_mut_ptr();
-            std::mem::forget(bytes); // ownership transferred to the caller
-            p
-        };
-        Self { code: 0, data, len }
+        Self::from_bytes(bytes, 0)
     }
 
     fn err(s: String) -> Self {
-        Self::ok(s.into_bytes())
+        Self::from_bytes(s.into_bytes(), 1)
     }
 }
 
@@ -114,7 +121,9 @@ pub unsafe extern "C" fn corduit_string_free(ptr: *mut c_char) {
 #[no_mangle]
 pub unsafe extern "C" fn corduit_binary_free(resp: FfiBinaryResponse) {
     if !resp.data.is_null() && resp.len > 0 {
-        drop(Vec::from_raw_parts(resp.data, resp.len, resp.len));
+        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+            resp.data, resp.len,
+        )));
     }
 }
 
@@ -125,7 +134,9 @@ pub unsafe extern "C" fn corduit_binary_free(resp: FfiBinaryResponse) {
 /// Initialize the bridge (logging, tracing, platform hooks).
 #[no_mangle]
 pub extern "C" fn corduit_init() {
-    api::init_app();
+    // Nothing here is expected to panic, but an unwind across `extern "C"`
+    // would be UB; initialisation failure must not abort the host process.
+    let _ = std::panic::catch_unwind(api::init_app);
 }
 
 /// Return the bridge ABI version as a C string (caller frees with
@@ -299,5 +310,34 @@ mod tests {
                 let _ = v;
             }
         }
+    }
+
+    /// The binary channel must transfer an allocation whose size is exactly
+    /// `len` (so the caller can rebuild it from `(data, len)` alone), and
+    /// failures must be distinguishable from successes by `code`.
+    #[test]
+    fn binary_response_owns_exact_allocation_and_errors_carry_code() {
+        let mut padded = Vec::with_capacity(4096);
+        padded.extend_from_slice(b"corduit");
+        let resp = FfiBinaryResponse::ok(padded);
+        assert_eq!(resp.code, 0);
+        assert_eq!(resp.len, 7);
+        assert!(!resp.data.is_null());
+        let seen = unsafe { std::slice::from_raw_parts(resp.data, resp.len) };
+        assert_eq!(seen, b"corduit");
+        unsafe { corduit_binary_free(resp) };
+
+        let err = FfiBinaryResponse::err("boom".to_string());
+        assert_ne!(
+            err.code, 0,
+            "error responses must not carry the success code"
+        );
+        assert_eq!(err.len, 4);
+        unsafe { corduit_binary_free(err) };
+
+        let empty = FfiBinaryResponse::ok(Vec::new());
+        assert_eq!(empty.len, 0);
+        assert!(empty.data.is_null());
+        unsafe { corduit_binary_free(empty) };
     }
 }

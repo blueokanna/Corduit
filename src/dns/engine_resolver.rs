@@ -401,6 +401,19 @@ impl EngineResolver {
         }
     }
 
+    /// Whether a `nameserver-policy` entry selected the resolver for `host`.
+    ///
+    /// A policy is an operator statement about *where* a name resolves. A
+    /// caller that would otherwise retry the system resolver must not do so
+    /// for such a name: the system answer is exactly what the policy exists
+    /// to bypass (a decoy for a subscription node, typically).
+    pub fn uses_policy(&self, host: &str) -> bool {
+        self.plan
+            .policy
+            .iter()
+            .any(|(suffix, _)| suffix_matches(host, suffix))
+    }
+
     /// Resolve `host` into addresses of a single family.
     ///
     /// Used by the netstack's client-facing responder, which has to answer an
@@ -1054,6 +1067,15 @@ pub fn resolve_ips(host: &str, want_v6: bool) -> Option<io::Result<Vec<IpAddr>>>
     Some(resolver.resolve_ips(host, want_v6))
 }
 
+/// Whether `host` is governed by a `nameserver-policy` entry.
+///
+/// Resolvers that fall back to the system resolver on failure must treat a
+/// policy-covered name as authoritative: the policy names where the name is
+/// resolved, and a second opinion is how a node domain ends up at a decoy.
+pub fn domain_uses_policy(host: &str) -> bool {
+    resolver().map(|r| r.uses_policy(host)).unwrap_or(false)
+}
+
 /// Resolve `host` through the engine's configured DNS.
 ///
 /// `None` means the engine has no DNS configuration — the caller falls back to
@@ -1103,7 +1125,7 @@ pub(crate) mod testing {
                 response.flags.opcode = query.flags.opcode;
                 response.flags.rd = query.flags.rd;
                 response.flags.ra = true;
-                response.questions = query.questions.clone();
+                response.questions.clone_from(&query.questions);
 
                 if question.qclass == RrClass::IN && question.qtype == RrType::A {
                     if let Some(address) = lookup(&question.qname) {

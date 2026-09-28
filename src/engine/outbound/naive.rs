@@ -81,6 +81,11 @@ const WRITE_BUDGET: Duration = Duration::from_secs(30);
 /// Received `DATA` credit is handed back once this much has piled up: the peer
 /// never stalls on a round trip, and the window updates stay rare.
 const CREDIT_THRESHOLD: u32 = 32 * 1024;
+/// Hard cap on undelivered `DATA`. Credit is returned as the caller consumes
+/// bytes (see `H2Tunnel::read`), so a peer that respects its window can never
+/// hold more than the 65535-byte initial window's worth here; four times that
+/// is a peer ignoring the window, and the tunnel fails instead of buffering.
+const MAX_READY_BYTES: usize = 4 * 65535;
 /// The initial flow-control window, fixed by RFC 9113 §6.9.2 until a
 /// `SETTINGS_INITIAL_WINDOW_SIZE` changes it.
 const INITIAL_WINDOW: i64 = 65535;
@@ -110,7 +115,8 @@ const USER_AGENT: &str =
 /// * frames are read and dispatched one at a time, and only the frames a
 ///   one-stream tunnel can see are meaningful,
 /// * both flow-control windows are tracked and obeyed, and the credit for
-///   received `DATA` is handed back,
+///   received `DATA` is handed back as the caller consumes it — a caller
+///   that stops reading stops the peer instead of growing a buffer,
 /// * `SETTINGS`, `PING`, `WINDOW_UPDATE`, `RST_STREAM` and `GOAWAY` are
 ///   answered or obeyed, so a real server sees a well-behaved peer.
 ///
@@ -135,7 +141,8 @@ struct H2Tunnel {
     /// The peer's current settings, and the two this client acts on.
     peer_settings: Settings,
     peer_initial_window: i64,
-    /// `DATA` received and not yet credited back.
+    /// Window credit owed to the peer: padding as it arrives, payload as the
+    /// caller consumes it (see `read`).
     uncredited: u32,
     /// The response head, once seen.
     status: Option<u16>,
@@ -149,15 +156,9 @@ struct H2Tunnel {
 }
 
 impl H2Tunnel {
-    /// Send the connection preface, our settings and the `CONNECT` request,
-    /// then read the verdict.
-    fn connect(
-        io: BoxStream,
-        authority: &str,
-        fields: &HeaderList,
-        timeout: Duration,
-    ) -> Result<Self> {
-        let mut tunnel = Self {
+    /// A tunnel over a fresh transport, before anything is on the wire.
+    fn bare(io: BoxStream) -> Self {
+        Self {
             io,
             encoder: Encoder::new(),
             decoder: Decoder::new(4096, 16 * 1024 * 1024),
@@ -176,7 +177,18 @@ impl H2Tunnel {
             padding_reply: None,
             peer_closed: false,
             reset: None,
-        };
+        }
+    }
+
+    /// Send the connection preface, our settings and the `CONNECT` request,
+    /// then read the verdict.
+    fn connect(
+        io: BoxStream,
+        authority: &str,
+        fields: &HeaderList,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let mut tunnel = Self::bare(io);
 
         // The preface and the settings that say how this client wants to be
         // spoken to. `enable_push: 0` is required of a client that does not
@@ -393,7 +405,13 @@ impl H2Tunnel {
                 ..
             } => {
                 if stream_id != self.stream_id {
-                    return Ok(());
+                    // This client advertised `SETTINGS_ENABLE_PUSH=0` and a
+                    // concurrency of one, so no other stream can exist; a
+                    // HEADERS elsewhere is a stream the peer opened, which is
+                    // the same connection error DATA on a foreign stream is.
+                    return Err(protocol_error(format!(
+                        "HEADERS on stream {stream_id}, which this client never opened"
+                    )));
                 }
                 self.header_block = Some(block.to_vec());
                 if end_headers {
@@ -435,11 +453,18 @@ impl H2Tunnel {
                     return Err(protocol_error("DATA on a stream this client never opened"));
                 }
                 self.ready.extend_from_slice(&data);
-                self.uncredited = self
-                    .uncredited
-                    .saturating_add(data.len() as u32)
-                    .saturating_add(padding as u32);
-                if self.uncredited >= CREDIT_THRESHOLD || end_stream {
+                if self.ready.len() > MAX_READY_BYTES {
+                    return Err(protocol_error(format!(
+                        "the peer has {} bytes of `DATA` in flight past the window this client \
+                         granted",
+                        self.ready.len()
+                    )));
+                }
+                // Padding never reaches the caller, so its credit goes back
+                // immediately; the payload's credit goes back in `read`, as
+                // the caller consumes it.
+                self.uncredited = self.uncredited.saturating_add(padding as u32);
+                if self.uncredited >= CREDIT_THRESHOLD {
                     self.credit()?;
                 }
                 if end_stream {
@@ -867,6 +892,13 @@ impl Read for H2Tunnel {
                 if self.ready_pos == self.ready.len() {
                     self.ready.clear();
                     self.ready_pos = 0;
+                }
+                // Credit follows consumption, not arrival: that is what makes
+                // a stalled caller apply backpressure to the peer instead of
+                // letting `ready` grow.
+                self.uncredited = self.uncredited.saturating_add(take as u32);
+                if self.uncredited >= CREDIT_THRESHOLD {
+                    self.credit()?;
                 }
                 return Ok(take);
             }
@@ -1372,5 +1404,118 @@ mod tests {
 
         let plaintext = build(&[("tls", nextjson::Value::Bool(false))]).expect("plaintext builds");
         assert!(plaintext.is_plaintext());
+    }
+
+    /// A connected pair where the tunnel side never needs the server to
+    /// speak: frames are driven straight into `handle`.
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        server
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("timeout");
+        (client, server)
+    }
+
+    fn data_frame(stream_id: u32, len: usize) -> Frame {
+        let payload = vec![0x5au8; len];
+        Frame::Data {
+            stream_id,
+            data: Bytes::from(payload.as_slice()),
+            end_stream: false,
+            padding: 0,
+        }
+    }
+
+    /// `DATA` is credited as the caller consumes it, so bytes that arrive
+    /// while nobody reads must not draw a `WINDOW_UPDATE`.
+    #[test]
+    fn credit_follows_consumption_not_arrival() {
+        let (client, mut server) = socket_pair();
+        let mut tunnel = H2Tunnel::bare(Box::new(client) as BoxStream);
+
+        let in_flight = 40 * 1024;
+        let mut sent = 0;
+        while sent < in_flight {
+            let len = (16 * 1024).min(in_flight - sent);
+            tunnel
+                .handle(data_frame(1, len))
+                .expect("a legal window's worth is accepted");
+            sent += len;
+        }
+
+        // Nothing consumed yet: no window update may be on the wire.
+        let mut buf = [0u8; 64];
+        assert!(
+            server.read(&mut buf).is_err(),
+            "arrival alone must not return credit"
+        );
+
+        // Consume everything; crossing the threshold hands the credit back —
+        // the connection's window first, then the stream's.
+        let mut sink = vec![0u8; in_flight];
+        let mut got = 0;
+        while got < in_flight {
+            got += tunnel.read(&mut sink[got..]).expect("read");
+        }
+        for expected_stream in [0u32, 1] {
+            let mut header = [0u8; frame::FRAME_HEADER_LEN];
+            server.read_exact(&mut header).expect("a window update");
+            let header = frame::decode_header(&header);
+            let mut payload = vec![0u8; header.len as usize];
+            server.read_exact(&mut payload).expect("payload");
+            match Frame::parse(header, &payload, 1 << 20).expect("parses") {
+                Frame::WindowUpdate {
+                    stream_id,
+                    increment,
+                } => {
+                    assert_eq!(stream_id, expected_stream);
+                    assert_eq!(increment as usize, in_flight);
+                }
+                _ => panic!("expected a WINDOW_UPDATE frame"),
+            }
+        }
+    }
+
+    /// A peer that ignores the window it was granted is cut off, not
+    /// buffered: `DATA` past the cap fails the tunnel.
+    #[test]
+    fn data_past_the_window_cap_is_a_connection_error() {
+        let (client, _server) = socket_pair();
+        let mut tunnel = H2Tunnel::bare(Box::new(client) as BoxStream);
+
+        let mut sent = 0usize;
+        let outcome = loop {
+            match tunnel.handle(data_frame(1, 16 * 1024)) {
+                Ok(()) => sent += 16 * 1024,
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            sent >= MAX_READY_BYTES - 16 * 1024,
+            "the cap must sit above a legal window's worth"
+        );
+        assert!(outcome.to_string().contains("past the window"), "{outcome}");
+    }
+
+    /// A `HEADERS` frame on a stream this client never opened is a connection
+    /// error — push was disabled and concurrency is one, so such a stream
+    /// cannot exist and must not be silently dropped.
+    #[test]
+    fn headers_on_a_foreign_stream_is_a_connection_error() {
+        let (client, _server) = socket_pair();
+        let mut tunnel = H2Tunnel::bare(Box::new(client) as BoxStream);
+        let error = tunnel
+            .handle(Frame::Headers {
+                stream_id: 2,
+                block: Bytes::from(vec![0u8; 4]),
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+            })
+            .expect_err("must be refused");
+        assert!(error.to_string().contains("never opened"), "{error}");
     }
 }

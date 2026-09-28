@@ -1,9 +1,14 @@
 //! AES block cipher (FIPS 197).
 //!
-//! Software implementation with fixed S-box tables and no data-dependent
-//! branches (the standard portable approach used by OpenSSL/RustCrypto when
-//! no AES-NI is available).
+//! Round functions: the hardware when the CPU has it — AES-NI on
+//! x86/x86_64, the ARMv8 AES instructions on aarch64 (runtime-detected, see
+//! [`aes_hw`](super::aes_hw)) — and the software rounds below otherwise. The
+//! key schedule has exactly one implementation (the table-driven FIPS 197
+//! reference) and both paths consume the same round-key bytes, so they
+//! cannot disagree; the software rounds use fixed S-box tables and no
+//! data-dependent branches, the standard portable fallback.
 
+use super::aes_hw;
 use crate::crypto::util::load_u32_be;
 
 /// The AES S-box (generated from the multiplicative inverse in GF(2^8) plus
@@ -50,18 +55,34 @@ const INV_SBOX: [u8; 256] = [
 /// Round constants.
 const RCON: [u32; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
-/// AES key schedule for a 128/192/256-bit key.
-///
-/// The expanded key occupies `4 * (rounds + 1)` 32-bit words.
+/// AES key schedule for a 128/192/256-bit key, with the round functions on
+/// the hardware when the CPU provides them.
 pub struct Aes {
-    /// Round keys (big-endian words), `4*(Nr+1)` of them.
-    round_keys: [u32; 60],
+    /// Round keys in FIPS 197 byte order: `rounds + 1` blocks of 16 bytes,
+    /// the layout the hardware instructions load and `add_round_key` XORs.
+    round_keys: [[u8; 16]; 15],
     rounds: usize,
+    /// Whether the round functions may take the hardware path. Only ever
+    /// `true` when `aes_hw::available()` said so for this CPU; on
+    /// architectures without a back end the field is always `false` and the
+    /// reader below is compiled out.
+    #[cfg_attr(
+        not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    hw: bool,
 }
 
 impl Aes {
     /// Construct from a 16, 24 or 32-byte key.
     pub fn new(key: &[u8]) -> Result<Self, crate::crypto::InvalidLength> {
+        Self::with_backend(key, true)
+    }
+
+    /// Construct from a key, gating the hardware path on `hw` (still
+    /// subject to CPU detection). The tests use `false` to run the same
+    /// vectors through both paths side by side.
+    fn with_backend(key: &[u8], hw: bool) -> Result<Self, crate::crypto::InvalidLength> {
         let nk = match key.len() {
             16 => 4,
             24 => 6,
@@ -79,7 +100,6 @@ impl Aes {
         for i in nk..total {
             let mut temp = w[i - 1];
             if i % nk == 0 {
-                // RotWord + SubWord + Rcon
                 let r = temp.rotate_left(8);
                 temp = u32::from_be_bytes([
                     SBOX[(r >> 24) as usize],
@@ -98,27 +118,37 @@ impl Aes {
             w[i] = w[i - nk] ^ temp;
         }
 
+        let mut round_keys = [[0u8; 16]; 15];
+        for (block, words) in round_keys.iter_mut().zip(w[..total].chunks_exact(4)) {
+            for (word, out) in words.iter().zip(block.chunks_exact_mut(4)) {
+                out.copy_from_slice(&word.to_be_bytes());
+            }
+        }
+
         Ok(Aes {
-            round_keys: w,
+            round_keys,
             rounds,
+            hw: hw && aes_hw::available(),
         })
     }
 
     #[inline]
-    fn add_round_key(state: &mut [u8; 16], round_key: &[u32; 4]) {
-        for (i, word) in round_key.iter().enumerate() {
-            let k = word.to_be_bytes();
-            state[i * 4..i * 4 + 4]
-                .iter_mut()
-                .zip(k.iter())
-                .for_each(|(s, k)| *s ^= k);
+    fn add_round_key(state: &mut [u8; 16], round_key: &[u8; 16]) {
+        for (s, k) in state.iter_mut().zip(round_key.iter()) {
+            *s ^= k;
         }
     }
 
-    /// Encrypt one 16-byte block in place.
+    /// Encrypt one 16-byte block in place, on the hardware rounds when the
+    /// CPU has them.
     pub fn encrypt_block(&self, block: &mut [u8; 16]) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        if self.hw && aes_hw::encrypt_block(self.rounds, &self.round_keys, block) {
+            return;
+        }
+
         let mut state = *block;
-        Self::add_round_key(&mut state, self.round_key(0));
+        Self::add_round_key(&mut state, &self.round_keys[0]);
 
         for round in 1..self.rounds {
             // SubBytes
@@ -135,7 +165,7 @@ impl Aes {
             state = t;
             // MixColumns
             mix_columns(&mut state);
-            Self::add_round_key(&mut state, self.round_key(round));
+            Self::add_round_key(&mut state, &self.round_keys[round]);
         }
 
         // Final round (no MixColumns).
@@ -149,22 +179,28 @@ impl Aes {
             }
         }
         state = t;
-        Self::add_round_key(&mut state, self.round_key(self.rounds));
+        Self::add_round_key(&mut state, &self.round_keys[self.rounds]);
 
         *block = state;
     }
 
-    /// Decrypt one 16-byte block in place.
+    /// Decrypt one 16-byte block in place, on the hardware rounds when the
+    /// CPU has them.
     pub fn decrypt_block(&self, block: &mut [u8; 16]) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        if self.hw && aes_hw::decrypt_block(self.rounds, &self.round_keys, block) {
+            return;
+        }
+
         let mut state = *block;
-        Self::add_round_key(&mut state, self.round_key(self.rounds));
+        Self::add_round_key(&mut state, &self.round_keys[self.rounds]);
 
         for round in (1..self.rounds).rev() {
             inv_shift_rows(&mut state);
             for b in state.iter_mut() {
                 *b = INV_SBOX[*b as usize];
             }
-            Self::add_round_key(&mut state, self.round_key(round));
+            Self::add_round_key(&mut state, &self.round_keys[round]);
             inv_mix_columns(&mut state);
         }
 
@@ -172,15 +208,9 @@ impl Aes {
         for b in state.iter_mut() {
             *b = INV_SBOX[*b as usize];
         }
-        Self::add_round_key(&mut state, self.round_key(0));
+        Self::add_round_key(&mut state, &self.round_keys[0]);
 
         *block = state;
-    }
-
-    #[inline]
-    fn round_key(&self, round: usize) -> &[u32; 4] {
-        let base = round * 4;
-        self.round_keys[base..base + 4].try_into().expect("4 words")
     }
 }
 
@@ -263,12 +293,14 @@ mod tests {
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
         ];
-        let aes = Aes::new(&key).unwrap();
-        let mut block = pt;
-        aes.encrypt_block(&mut block);
-        assert_eq!(hex(&block), "69c4e0d86a7b0430d8cdb78070b4c55a");
-        aes.decrypt_block(&mut block);
-        assert_eq!(block, pt);
+        for hw in [true, false] {
+            let aes = Aes::with_backend(&key, hw).unwrap();
+            let mut block = pt;
+            aes.encrypt_block(&mut block);
+            assert_eq!(hex(&block), "69c4e0d86a7b0430d8cdb78070b4c55a");
+            aes.decrypt_block(&mut block);
+            assert_eq!(block, pt);
+        }
     }
 
     #[test]
@@ -281,12 +313,14 @@ mod tests {
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
         ];
-        let aes = Aes::new(&key).unwrap();
-        let mut block = pt;
-        aes.encrypt_block(&mut block);
-        assert_eq!(hex(&block), "dda97ca4864cdfe06eaf70a0ec0d7191");
-        aes.decrypt_block(&mut block);
-        assert_eq!(block, pt);
+        for hw in [true, false] {
+            let aes = Aes::with_backend(&key, hw).unwrap();
+            let mut block = pt;
+            aes.encrypt_block(&mut block);
+            assert_eq!(hex(&block), "dda97ca4864cdfe06eaf70a0ec0d7191");
+            aes.decrypt_block(&mut block);
+            assert_eq!(block, pt);
+        }
     }
 
     #[test]
@@ -300,12 +334,14 @@ mod tests {
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
         ];
-        let aes = Aes::new(&key).unwrap();
-        let mut block = pt;
-        aes.encrypt_block(&mut block);
-        assert_eq!(hex(&block), "8ea2b7ca516745bfeafc49904b496089");
-        aes.decrypt_block(&mut block);
-        assert_eq!(block, pt);
+        for hw in [true, false] {
+            let aes = Aes::with_backend(&key, hw).unwrap();
+            let mut block = pt;
+            aes.encrypt_block(&mut block);
+            assert_eq!(hex(&block), "8ea2b7ca516745bfeafc49904b496089");
+            aes.decrypt_block(&mut block);
+            assert_eq!(block, pt);
+        }
     }
 
     #[test]
@@ -320,6 +356,51 @@ mod tests {
                 assert_ne!(block, orig);
                 aes.decrypt_block(&mut block);
                 assert_eq!(block, orig);
+            }
+        }
+    }
+
+    /// The hardware round functions and the software rounds must agree on
+    /// every key size, in both directions. On a CPU without a hardware back
+    /// end this only runs the software path twice; on one with it (x86_64
+    /// here, aarch64 anywhere the crate is built for ARM) it is the cross
+    /// check between the two implementations — including the ARMv8 round
+    /// ordering, which an x86 development machine cannot execute.
+    #[test]
+    fn hardware_rounds_match_the_software_rounds() {
+        if !aes_hw::available() {
+            return;
+        }
+        for len in [16usize, 24, 32] {
+            let mut key = [0u8; 32];
+            for (i, b) in key.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(37).wrapping_add(len as u8);
+            }
+            let hw = Aes::with_backend(&key[..len], true).unwrap();
+            let sw = Aes::with_backend(&key[..len], false).unwrap();
+            assert!(hw.hw, "hardware backend not selected for a {len}-byte key");
+            for seed in 0u8..=32 {
+                let mut orig = [0u8; 16];
+                for (i, b) in orig.iter_mut().enumerate() {
+                    *b = seed ^ (i as u8).wrapping_mul(23);
+                }
+                let mut hw_block = orig;
+                let mut sw_block = orig;
+                hw.encrypt_block(&mut hw_block);
+                sw.encrypt_block(&mut sw_block);
+                assert_eq!(
+                    hw_block, sw_block,
+                    "encrypt mismatch, {len}-byte key, seed {seed}"
+                );
+                let mut hw_back = hw_block;
+                let mut sw_back = hw_block;
+                hw.decrypt_block(&mut hw_back);
+                sw.decrypt_block(&mut sw_back);
+                assert_eq!(
+                    hw_back, sw_back,
+                    "decrypt mismatch, {len}-byte key, seed {seed}"
+                );
+                assert_eq!(hw_back, orig);
             }
         }
     }

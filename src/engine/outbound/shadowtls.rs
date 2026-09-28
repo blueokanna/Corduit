@@ -81,6 +81,7 @@ use crate::common::socket::connect_host;
 use crate::common::stream::{is_benign_shutdown_error, BoxStream, SyncStream};
 use crate::crypto::hash::{Sha1, Sha256};
 use crate::crypto::mac::Hmac;
+use crate::crypto::util::ct_eq;
 use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
@@ -385,7 +386,7 @@ impl HandshakeReader {
             Some(record) => record,
             None => return Ok(()),
         };
-        self.ready = record.clone();
+        self.ready.clone_from(&record);
         self.ready_pos = 0;
 
         if record[0] != RECORD_APP_DATA {
@@ -408,10 +409,6 @@ impl HandshakeReader {
 
         let state = match self.state.as_mut() {
             Some(state) => state,
-            // Application data before the ServerHello cannot be unwrapped; it
-            // cannot happen in a TLS handshake either, but passing it through
-            // would feed the TLS client garbage, so it is dropped as a record
-            // the handshake did not produce.
             None => return Ok(()),
         };
 
@@ -421,7 +418,7 @@ impl HandshakeReader {
             .as_mut()
             .expect("the handshake phase keeps it");
         let tag = stragglers.tag(payload);
-        if tag[..] != record[RECORD_HEADER..FRAME_HEADER] {
+        if !ct_eq(&tag, &record[RECORD_HEADER..FRAME_HEADER]) {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 "ShadowTLS: a handshake record failed its MAC",
@@ -429,8 +426,6 @@ impl HandshakeReader {
         }
         stragglers.observe(payload);
 
-        // The payload is a real TLS record XORed with the keystream, so what the
-        // TLS client gets back is that record.
         let mut plain = payload.to_vec();
         for (byte, key) in plain.iter_mut().zip(state.keystream.iter().cycle()) {
             *byte ^= key;
@@ -559,7 +554,7 @@ impl ShadowTlsStream {
         let payload = &record[FRAME_HEADER..];
         if let Some(stragglers) = self.state.stragglers.as_mut() {
             let tag = stragglers.tag(payload);
-            if tag[..] == record[RECORD_HEADER..FRAME_HEADER] {
+            if ct_eq(&tag, &record[RECORD_HEADER..FRAME_HEADER]) {
                 stragglers.observe(payload);
                 debug!("ShadowTLS: dropped a record the handshake destination sent late");
                 return Ok(None);
@@ -568,7 +563,7 @@ impl ShadowTlsStream {
         }
 
         let tag = self.state.from_server.tag(payload);
-        if tag[..] != record[RECORD_HEADER..FRAME_HEADER] {
+        if !ct_eq(&tag, &record[RECORD_HEADER..FRAME_HEADER]) {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 "ShadowTLS: a frame failed its MAC, so the connection was not tunnelled by a peer \
@@ -626,8 +621,6 @@ impl Write for ShadowTlsStream {
         let payload = &buf[..take];
 
         let tag = self.state.to_server.tag(payload);
-        // The MAC moves even if the socket write fails: a truncated frame has
-        // already desynchronised the peer, so the connection is over either way.
         self.state.to_server.commit(payload, &tag);
 
         let mut record = Vec::with_capacity(FRAME_HEADER + take);
@@ -718,7 +711,6 @@ fn unix_now() -> i64 {
 pub struct ShadowTlsConfig {
     pub server: String,
     pub port: u16,
-    /// The handshake destinations the `ClientHello` may present.
     pub sni: Vec<String>,
     pub fingerprint: String,
     pub alpn: Vec<String>,
@@ -884,10 +876,6 @@ impl ShadowTlsOutbound {
 
 impl OutboundProxy for ShadowTlsOutbound {
     fn connect(&self) -> Result<()> {
-        // A wrong password still completes the handshake — the server proxies it
-        // to the real site either way — so the only thing a probe can establish
-        // is reachability and that the peer speaks TLS 1.3 here. The first frame
-        // is what proves the password, and that only happens with traffic.
         let _probe = self.open(CONNECT_TIMEOUT)?;
         Ok(())
     }
@@ -1101,8 +1089,6 @@ mod tests {
         let hello = server_hello_record();
         peer.write_all(&hello).expect("write hello");
 
-        // The inner record is a real TLS application-data record; the wire
-        // carries it XORed, with the tag over the XORed bytes.
         let inner = {
             let mut record = vec![RECORD_APP_DATA, 0x03, 0x03, 0x00, 0x09];
             record.extend_from_slice(b"ciphertxt");

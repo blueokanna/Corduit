@@ -230,16 +230,27 @@ impl ConfigValidator {
                     // These types are supported
                 }
                 InboundType::Redir | InboundType::Tproxy => {
-                    // These require specific platform support
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        return Err(Error::config(format!(
-                            "Inbound type {:?} is only supported on Linux",
-                            inbound.inbound_type
-                        )));
-                    }
+                    // No listener is implemented for transparent redirection
+                    // on any platform. Rejecting the config is the honest
+                    // outcome; accepting it would start an engine that answers
+                    // nothing while claiming the inbound exists.
+                    return Err(Error::config(format!(
+                        "Inbound type {:?} has no listener in this engine: transparent \
+                         redirection is not implemented (use an http/socks5/mixed listener, \
+                         or TUN mode)",
+                        inbound.inbound_type
+                    )));
                 }
-                InboundType::Tun => {}
+                InboundType::Tun => {
+                    // TUN is driven by the platform entry points
+                    // (`start_tun` / the VPN service hooks), never by the
+                    // `inbounds` list.
+                    return Err(Error::config(
+                        "A `tun` entry in `inbounds` is not supported: TUN mode is started \
+                         through the platform entry points, not the listener list"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -554,6 +565,42 @@ mod tests {
         };
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// Inbound types without a listener must be rejected at validation time
+    /// rather than accepted and skipped at startup: a config that "starts" a
+    /// listener that answers nothing is worse than one that fails.
+    #[test]
+    fn listenerless_inbound_types_are_rejected() {
+        for inbound_type in [InboundType::Redir, InboundType::Tproxy, InboundType::Tun] {
+            let config = Config {
+                general: GeneralConfig::default(),
+                dns: DnsConfig::default(),
+                inbounds: vec![InboundConfig {
+                    inbound_type,
+                    tag: "in".to_string(),
+                    listen: "127.0.0.1".to_string(),
+                    port: 7890,
+                    options: Default::default(),
+                }],
+                outbounds: vec![OutboundConfig {
+                    outbound_type: OutboundType::Direct,
+                    tag: "direct".to_string(),
+                    server: None,
+                    port: None,
+                    options: Default::default(),
+                }],
+                rules: vec![],
+            };
+
+            let error = ConfigValidator::validate(&config)
+                .expect_err("an inbound without a listener must be rejected")
+                .to_string();
+            assert!(
+                error.contains("not") || error.contains("not supported"),
+                "unexpected error for {inbound_type:?}: {error}"
+            );
+        }
     }
 
     #[test]

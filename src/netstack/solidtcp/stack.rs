@@ -318,6 +318,9 @@ pub struct StackConfig {
     pub nat: NatConfig,
     pub dns: ClientDnsSettings,
     pub proxy_addr: SocketAddr,
+    /// Credentials for the engine's own SOCKS5 inbound, when the profile
+    /// configures `general.authentication` (RFC 1929).
+    pub proxy_credentials: Option<(String, String)>,
     pub dns_intercept: bool,
     pub cleanup_interval: Duration,
 }
@@ -331,6 +334,7 @@ impl Default for StackConfig {
             nat: NatConfig::default(),
             dns: ClientDnsSettings::default(),
             proxy_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7890),
+            proxy_credentials: None,
             dns_intercept: true,
             cleanup_interval: Duration::from_secs(30),
         }
@@ -355,6 +359,14 @@ impl StackBuilder {
 
     pub fn proxy_addr(mut self, addr: SocketAddr) -> Self {
         self.config.proxy_addr = addr;
+        self
+    }
+
+    /// Credentials for the local SOCKS5 inbound, when the profile requires
+    /// authentication; without them a TUN build cannot even complete the
+    /// method negotiation and every flow fails.
+    pub fn proxy_auth(mut self, username: String, password: String) -> Self {
+        self.config.proxy_credentials = Some((username, password));
         self
     }
 
@@ -563,10 +575,21 @@ impl SolidStack {
         };
 
         let payload_start = ip_header_len + tcp_data_offset;
-        let ip_total_len = if raw.len() >= 4 {
-            u16::from_be_bytes([raw[2], raw[3]]) as usize
-        } else {
-            raw.len()
+        // The IPv6 payload-length field sits at bytes 4..6 (bytes 2..4 are
+        // the flow label) and excludes the fixed 40-byte header.
+        let ip_total_len = match parsed.version {
+            smoltcp::wire::IpVersion::Ipv4 if raw.len() >= 4 => {
+                u16::from_be_bytes([raw[2], raw[3]]) as usize
+            }
+            smoltcp::wire::IpVersion::Ipv6 if raw.len() >= 6 => {
+                let payload_len = u16::from_be_bytes([raw[4], raw[5]]) as usize;
+                if payload_len == 0 {
+                    raw.len()
+                } else {
+                    payload_len + 40
+                }
+            }
+            _ => raw.len(),
         };
 
         let payload_end = ip_total_len.min(raw.len());
@@ -624,6 +647,34 @@ impl SolidStack {
         tcp_info: &TcpInfo,
         _parsed: &ParsedPacket,
     ) -> Result<()> {
+        // A retransmitted SYN for a flow that already exists must not acquire
+        // a second budget slot or dial a second upstream connection: a client
+        // on a lossy path retransmits routinely, and duplicate SYNs would
+        // otherwise multiply dials until the whole tunnel budget is spent and
+        // every other flow is reset. Re-answer from the tracked state instead.
+        if let Some(conn) = self.tcp_manager.get_connection(src_addr, dst_addr) {
+            let (our_seq, their_seq, mss, window) = {
+                let conn = conn.read();
+                (
+                    conn.snd_nxt().wrapping_sub(1),
+                    conn.rcv_nxt(),
+                    conn.mss(),
+                    conn.recv_window() as u16,
+                )
+            };
+            self.send_tcp_packet(
+                dst_addr,
+                src_addr,
+                our_seq,
+                their_seq,
+                TcpFlags::syn_ack(),
+                window,
+                &[],
+                Some(mss),
+            )?;
+            return Ok(());
+        }
+
         let fake_ip = match dst_addr.ip() {
             IpAddr::V4(ip) if self.fake_ip_pool.is_fake_ip(ip) => Some(ip),
             _ => None,
@@ -741,6 +792,7 @@ impl SolidStack {
     fn clone_for_proxy(&self) -> StackProxy {
         StackProxy {
             proxy_addr: self.config.proxy_addr,
+            proxy_credentials: self.config.proxy_credentials.clone(),
             tun_tx: self.tun_tx.clone(),
             tcp_manager: self.tcp_manager.clone(),
             stats: self.stats.clone(),
@@ -1139,6 +1191,7 @@ impl SolidStack {
 
 struct StackProxy {
     proxy_addr: SocketAddr,
+    proxy_credentials: Option<(String, String)>,
     tun_tx: Option<mpsc::Sender<BytesMut>>,
     tcp_manager: Arc<TcpManager>,
     stats: Arc<StackStats>,
@@ -1146,6 +1199,58 @@ struct StackProxy {
 }
 
 impl StackProxy {
+    /// Negotiate the SOCKS5 method (RFC 1928) and, when the inbound asks for
+    /// it, the username/password sub-negotiation (RFC 1929).
+    ///
+    /// Offering user/pass when nothing is configured changes nothing: the
+    /// server simply selects NO-AUTH. The reverse — offering only NO-AUTH to
+    /// a server that requires credentials — is the failure this avoids.
+    fn socks5_negotiate_auth(
+        stream: &mut TcpStream,
+        credentials: Option<&(String, String)>,
+    ) -> Result<()> {
+        let greeting: &[u8] = if credentials.is_some() {
+            &[0x05, 0x02, 0x00, 0x02]
+        } else {
+            &[0x05, 0x01, 0x00]
+        };
+        stream
+            .write_all(greeting)
+            .map_err(|e| SolidTcpError::ProxyError(format!("Greeting failed: {e}")))?;
+
+        let mut response = [0u8; 2];
+        stream
+            .read_exact(&mut response)
+            .map_err(|e| SolidTcpError::ProxyError(format!("Response failed: {e}")))?;
+        if response[0] != 0x05 {
+            return Err(SolidTcpError::ProxyAuthFailed);
+        }
+        match response[1] {
+            0x00 => Ok(()),
+            0x02 => {
+                let (user, pass) = credentials.ok_or(SolidTcpError::ProxyAuthFailed)?;
+                if user.len() > 255 || pass.len() > 255 {
+                    return Err(SolidTcpError::ProxyAuthFailed);
+                }
+                let mut request = vec![0x01, user.len() as u8];
+                request.extend_from_slice(user.as_bytes());
+                request.push(pass.len() as u8);
+                request.extend_from_slice(pass.as_bytes());
+                stream
+                    .write_all(&request)
+                    .map_err(|e| SolidTcpError::ProxyError(format!("Auth request failed: {e}")))?;
+                let mut auth = [0u8; 2];
+                stream
+                    .read_exact(&mut auth)
+                    .map_err(|e| SolidTcpError::ProxyError(format!("Auth response failed: {e}")))?;
+                if auth[0] != 0x01 || auth[1] != 0x00 {
+                    return Err(SolidTcpError::ProxyAuthFailed);
+                }
+                Ok(())
+            }
+            _ => Err(SolidTcpError::ProxyAuthFailed),
+        }
+    }
     /// Write the entire buffer to the shared TCP stream, looping on partial
     /// writes. `Write` is implemented for `&TcpStream`, so the same stream
     /// can be shared between the reader and writer threads.
@@ -1212,18 +1317,7 @@ impl StackProxy {
         let _ = tcp_stream.set_read_timeout(Some(PROXY_HANDSHAKE_TIMEOUT));
         let _ = tcp_stream.set_write_timeout(Some(PROXY_HANDSHAKE_TIMEOUT));
 
-        tcp_stream
-            .write_all(&[0x05, 0x01, 0x00])
-            .map_err(|e| SolidTcpError::ProxyError(format!("UDP greeting failed: {}", e)))?;
-
-        let mut response = [0u8; 2];
-        tcp_stream
-            .read_exact(&mut response)
-            .map_err(|e| SolidTcpError::ProxyError(format!("UDP response failed: {}", e)))?;
-
-        if response[0] != 0x05 || response[1] != 0x00 {
-            return Err(SolidTcpError::ProxyAuthFailed);
-        }
+        Self::socks5_negotiate_auth(&mut tcp_stream, self.proxy_credentials.as_ref())?;
 
         let request = [0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         tcp_stream.write_all(&request).map_err(|e| {
@@ -1673,22 +1767,16 @@ impl StackProxy {
         target: SocketAddr,
         domain: Option<&str>,
     ) -> Result<()> {
-        stream
-            .write_all(&[0x05, 0x01, 0x00])
-            .map_err(|e| SolidTcpError::ProxyError(format!("Greeting failed: {}", e)))?;
-
-        let mut response = [0u8; 2];
-        stream
-            .read_exact(&mut response)
-            .map_err(|e| SolidTcpError::ProxyError(format!("Response failed: {}", e)))?;
-
-        if response[0] != 0x05 || response[1] != 0x00 {
-            return Err(SolidTcpError::ProxyAuthFailed);
-        }
+        Self::socks5_negotiate_auth(stream, self.proxy_credentials.as_ref())?;
 
         let mut request = vec![0x05, 0x01, 0x00];
 
         if let Some(domain) = domain {
+            if domain.len() > 255 {
+                return Err(SolidTcpError::ProxyError(
+                    "domain name longer than the SOCKS5 address field".to_string(),
+                ));
+            }
             request.push(0x03);
             request.push(domain.len() as u8);
             request.extend_from_slice(domain.as_bytes());

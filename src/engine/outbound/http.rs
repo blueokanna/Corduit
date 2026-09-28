@@ -514,11 +514,7 @@ fn truncate_for_log(s: &str) -> String {
     if s.len() <= MAX {
         return s.to_string();
     }
-    let mut end = MAX;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    format!("{}…", crate::common::text::truncate_utf8(s, MAX))
 }
 
 #[cfg(test)]

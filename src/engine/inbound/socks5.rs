@@ -36,7 +36,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// UDP ASSOCIATE lifetime: the relay socket gives up after this much
 /// silence, so a client that vanishes without closing its control
@@ -137,6 +137,7 @@ pub(crate) fn serve_connection(
         SOCKS5_CMD_UDP_ASSOCIATE => handle_udp_associate(
             stream,
             peer_addr,
+            declared_udp_peer(&target_addr, target_port),
             router,
             outbound_manager,
             kind,
@@ -371,11 +372,19 @@ fn handle_connect(
     Ok(())
 }
 
+/// How often the UDP relay wakes to look at its cancellation token and at
+/// its idle deadline. Short enough that closing the control connection
+/// tears the association down within a quarter second; long enough that an
+/// idle association costs four wakeups per second.
+const UDP_RELAY_POLL: Duration = Duration::from_millis(250);
+
 /// `UDP ASSOCIATE`: bind a relay socket, tell the client where it is, and
 /// keep the association alive for as long as the TCP control connection is.
+#[allow(clippy::too_many_arguments)]
 fn handle_udp_associate(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
+    declared_peer: Option<SocketAddr>,
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
     kind: &'static str,
@@ -393,7 +402,7 @@ fn handle_udp_associate(
     };
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-    let udp_socket = crate::common::socket::udp_bind(bind_addr, UDP_SESSION_TIMEOUT)
+    let udp_socket = crate::common::socket::udp_bind(bind_addr, UDP_RELAY_POLL)
         .map_err(|e| Error::network(format!("Failed to bind UDP relay socket: {e}")))?;
     let _ = udp_socket.set_write_timeout(Some(UDP_SESSION_TIMEOUT));
     let local_addr = udp_socket
@@ -411,6 +420,7 @@ fn handle_udp_associate(
             if let Err(e) = run_udp_relay(
                 udp_socket,
                 peer_addr,
+                declared_peer,
                 router,
                 outbound_manager,
                 relay_cancel,
@@ -470,11 +480,35 @@ struct UdpInboundIdentity {
     user: Option<Arc<str>>,
 }
 
+/// The endpoint a `UDP ASSOCIATE` request declares it will send from.
+///
+/// RFC 1928 has the client put its UDP source here; most send `0.0.0.0:0`
+/// ("unknown"), which leaves the relay to learn the endpoint from the first
+/// datagram. An unspecified address or a zero port is therefore not a
+/// constraint.
+fn declared_udp_peer(addr: &Socks5Addr, port: u16) -> Option<SocketAddr> {
+    if port == 0 {
+        return None;
+    }
+    match addr {
+        Socks5Addr::Ipv4(ip) if !ip.is_unspecified() => {
+            Some(SocketAddr::new(IpAddr::V4(*ip), port))
+        }
+        Socks5Addr::Ipv6(ip) if !ip.is_unspecified() => {
+            Some(SocketAddr::new(IpAddr::V6(*ip), port))
+        }
+        _ => None,
+    }
+}
+
 /// Forward datagrams between the client and the matched outbound.
 ///
-/// Only datagrams whose source IP matches the association's client are
-/// relayed: without that check the bound UDP port would be an open relay for
-/// anyone who can reach it.
+/// Only datagrams whose source matches the association's client are relayed:
+/// without that check the bound UDP port would be an open relay for anyone
+/// who can reach it. When the association declared the endpoint it will send
+/// from, that endpoint is required; when it declared `0.0.0.0:0` (the common
+/// case) the first datagram's source address is pinned, so a second local
+/// process cannot inject into this association.
 ///
 /// Datagrams are handed to a small worker pool instead of being relayed
 /// inline. The inline design was why one QUIC handshake could stall an entire
@@ -487,6 +521,7 @@ struct UdpInboundIdentity {
 fn run_udp_relay(
     udp_socket: UdpSocket,
     client_addr: SocketAddr,
+    declared_peer: Option<SocketAddr>,
     router: Arc<Router>,
     outbound_manager: Arc<OutboundManager>,
     cancel: crate::common::cancel::CancellationToken,
@@ -505,6 +540,8 @@ fn run_udp_relay(
     let pool = UdpRelayPool::new();
     let mut buf = vec![0u8; 65535];
     let mut consecutive_errors = 0u32;
+    let mut pinned_peer = declared_peer;
+    let mut last_activity = Instant::now();
 
     while !cancel.is_cancelled() {
         let (len, src_addr) = match udp_socket.recv_from(&mut buf) {
@@ -520,6 +557,14 @@ fn run_udp_relay(
                         | std::io::ErrorKind::ConnectionReset
                 ) =>
             {
+                // The socket wakes every `UDP_RELAY_POLL`; a session that
+                // has been silent for the idle timeout folds right here, so
+                // a killed control connection never pins a worker thread
+                // for the whole 300 s budget.
+                if last_activity.elapsed() >= UDP_SESSION_TIMEOUT {
+                    tracing::debug!("UDP association for {client_addr} idle-expired");
+                    break;
+                }
                 if e.kind() != std::io::ErrorKind::TimedOut {
                     pause_before_retry(&cancel);
                 }
@@ -546,6 +591,17 @@ fn run_udp_relay(
             );
             continue;
         }
+        match pinned_peer {
+            Some(expected) if expected != src_addr => {
+                tracing::debug!(
+                    "Dropping UDP datagram from {src_addr} (association peer is {expected})"
+                );
+                continue;
+            }
+            Some(_) => {}
+            None => pinned_peer = Some(src_addr),
+        }
+        last_activity = Instant::now();
 
         if len < 10 {
             continue;

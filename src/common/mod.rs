@@ -40,12 +40,15 @@
 //!
 //! # Safety
 //!
-//! The crate forbids `unsafe` everywhere except two audited sites: [`roots`]
-//! (reading the Windows certificate store requires calling the Win32 API
-//! directly) and the socket pin in [`socket`] (binding a socket to an
-//! interface needs `setsockopt`, which has no safe wrapper). Each site is a
-//! single function with the unsafe call spelled out and justified; everything
-//! else stays under `deny(unsafe_code)`.
+//! The crate forbids `unsafe` everywhere except four audited sites:
+//! [`roots`] (reading the Windows certificate store requires calling the
+//! Win32 API directly), the socket pin in [`socket`] (binding a socket to an
+//! interface needs `setsockopt`, which has no safe wrapper), and the two
+//! instruction back ends inside [`crypto`](crate::crypto) (the AES rounds
+//! and the GHASH carry-less multiply — AES-NI / ARMv8 AES / PCLMULQDQ /
+//! PMULL have no safe form; each sits behind a safe wrapper that consults
+//! the runtime detection). Every unsafe call is spelled out and justified at
+//! its site; everything else stays under `deny(unsafe_code)`.
 
 #![deny(unsafe_code)]
 
@@ -73,6 +76,8 @@ pub mod socket;
 pub mod stream;
 #[cfg(feature = "std")]
 pub mod sync;
+#[cfg(feature = "std")]
+pub mod text;
 #[cfg(feature = "std")]
 pub mod throttle;
 #[cfg(feature = "std")]

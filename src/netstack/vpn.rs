@@ -57,12 +57,27 @@ impl TunPacketProcessor {
         tun_tx: mpsc::Sender<BytesMut>,
         dns: ClientDnsSettings,
     ) -> Self {
-        let mut stack = StackBuilder::new()
+        Self::new_with_dns_and_auth(proxy_addr, mtu, tun_tx, dns, None)
+    }
+
+    /// As [`Self::new_with_dns`], with credentials for the local SOCKS5
+    /// inbound when the profile configures `general.authentication`.
+    pub fn new_with_dns_and_auth(
+        proxy_addr: SocketAddr,
+        mtu: u16,
+        tun_tx: mpsc::Sender<BytesMut>,
+        dns: ClientDnsSettings,
+        credentials: Option<(String, String)>,
+    ) -> Self {
+        let mut builder = StackBuilder::new()
             .proxy_addr(proxy_addr)
             .mtu(usize::from(mtu))
             .dns_intercept(true)
-            .client_dns(dns)
-            .build();
+            .client_dns(dns);
+        if let Some((username, password)) = credentials {
+            builder = builder.proxy_auth(username, password);
+        }
+        let mut stack = builder.build();
         stack.set_tun_tx(tun_tx);
         stack.start();
 

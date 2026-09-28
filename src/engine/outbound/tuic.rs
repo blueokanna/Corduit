@@ -264,20 +264,22 @@ impl TuicConnection {
         Ok(())
     }
 
-    pub fn recv_udp_packet(&self) -> Result<(u16, TargetAddr, Vec<u8>)> {
+    /// Receive the next complete UDP payload (reassembling fragments),
+    /// within `timeout`.
+    pub fn recv_udp_packet(&self, timeout: Duration) -> Result<(u16, TargetAddr, Vec<u8>)> {
+        let deadline = Instant::now() + timeout;
         loop {
             let data = match self.udp_relay_mode {
                 UdpRelayMode::Native => self
                     .connection
-                    .read_datagram()
+                    .read_datagram_deadline(timeout)
                     .map_err(|e| Error::network(format!("Failed to receive UDP datagram: {e}")))?,
                 UdpRelayMode::Quic => {
                     let mut stream = self
                         .connection
-                        .accept_uni()
+                        .accept_uni_deadline(timeout)
                         .map_err(|e| Error::network(format!("Failed to accept UDP stream: {e}")))?;
-                    read_all_limited(&mut stream, 65536)
-                        .map_err(|e| Error::network(format!("Failed to read UDP stream: {e}")))?
+                    read_all_limited_deadline(&mut stream, 65536, deadline)?
                 }
             };
 
@@ -480,17 +482,27 @@ type PendingTuicFragment = (u8, BTreeMap<u8, Vec<u8>>, TargetAddr, Instant);
 struct TuicFragAssembler {
     /// assoc_id -> pending fragment state.
     pending: HashMap<u16, PendingTuicFragment>,
+    /// Sum of the payload bytes held in `pending`.
+    bytes: usize,
 }
+
+/// Entry bound of the reassembly buffer.
+const MAX_PENDING_FRAGMENTS: usize = 64;
+/// Byte bound of the reassembly buffer; the association id is chosen by the
+/// server, so without it a hostile peer parks fragment sets for a whole TTL.
+const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
 impl TuicFragAssembler {
     fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            bytes: 0,
         }
     }
 
     /// Insert a fragment; returns `(target, reassembled payload)` when the
-    /// whole packet has arrived.
+    /// whole packet has arrived. Fragments that would exceed either bound are
+    /// dropped — for a datagram protocol that is ordinary loss.
     fn add(
         &mut self,
         assoc_id: u16,
@@ -503,17 +515,34 @@ impl TuicFragAssembler {
         if self.pending.len() > 64 {
             let cutoff = now - FRAGMENT_TTL;
             self.pending.retain(|_, (_, _, _, at)| *at > cutoff);
+            self.bytes = self
+                .pending
+                .values()
+                .map(|(_, map, _, _)| map.values().map(Vec::len).sum::<usize>())
+                .sum();
         }
 
+        if !self.pending.contains_key(&assoc_id) && self.pending.len() >= MAX_PENDING_FRAGMENTS {
+            return None;
+        }
+        if self.bytes + payload.len() > MAX_PENDING_BYTES {
+            return None;
+        }
+
+        let incoming = payload.len();
         let entry = self
             .pending
             .entry(assoc_id)
             .or_insert_with(|| (frag_total, BTreeMap::new(), target.clone(), now));
-        entry.1.insert(frag_id, payload);
+        if let Some(previous) = entry.1.insert(frag_id, payload) {
+            self.bytes -= previous.len();
+        }
+        self.bytes += incoming;
         entry.3 = now;
 
         if entry.1.len() as u8 >= entry.0 {
             let (_, map, tgt, _) = self.pending.remove(&assoc_id)?;
+            self.bytes -= map.values().map(Vec::len).sum::<usize>();
             let mut full = Vec::new();
             for (_, chunk) in map {
                 full.extend_from_slice(&chunk);
@@ -741,20 +770,8 @@ impl TuicOutbound {
 
         conn.send_udp_packet(assoc_id, target, data, 0, 1)?;
 
-        // The QUIC datagram receive blocks until data (or close), so bound
-        // it with a dedicated thread + channel receive timeout.
-        let timeout = Duration::from_secs(30);
-        let conn2 = conn.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(conn2.recv_udp_packet());
-        });
-
-        let (_recv_assoc_id, _recv_target, payload) = match rx.recv_timeout(timeout) {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(Error::network(format!("UDP receive failed: {e}"))),
-            Err(_) => return Err(Error::network("UDP receive timeout")),
-        };
+        let (_recv_assoc_id, _recv_target, payload) =
+            conn.recv_udp_packet(Duration::from_secs(30))?;
         conn.dissociate(assoc_id).ok();
 
         Ok(payload)
@@ -918,22 +935,29 @@ impl crate::common::stream::SyncStream for QuicStreamPair {
     }
 }
 
-/// Read the whole stream, capping at `limit` bytes (defends against a
-/// malicious peer that never sends FIN).
-fn read_all_limited<R: Read>(reader: &mut R, limit: usize) -> std::io::Result<Vec<u8>> {
+/// Read the whole stream, capping at `limit` bytes and bounded by a
+/// wall-clock deadline: a peer that sends a fragment header and then nothing
+/// must not park the caller, and one that never sends FIN must not grow the
+/// buffer forever.
+fn read_all_limited_deadline(
+    stream: &mut QuicRecvStream,
+    limit: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = stream
+            .read_with_deadline(&mut buf, deadline)
+            .map_err(|e| Error::network(format!("Failed to read UDP stream: {e}")))?;
         if n == 0 {
             break;
         }
         out.extend_from_slice(&buf[..n]);
         if out.len() > limit {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("stream exceeded {limit} bytes"),
-            ));
+            return Err(Error::protocol(format!(
+                "TUIC UDP stream exceeded {limit} bytes"
+            )));
         }
     }
     Ok(out)

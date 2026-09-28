@@ -176,8 +176,10 @@ impl WireguardSession {
             packet[15],
         ]);
 
-        // Reject replayed / too-old / exhausted nonces before spending any
-        // work on decryption (WireGuard counter-mode semantics).
+        let ciphertext = &packet[16..];
+        let plaintext = aead_decrypt(&self.transport_keys.recv_key, nonce, ciphertext, &[])
+            .ok_or(WireGuardError::DecryptionFailed)?;
+
         {
             let mut filter = self
                 .recv_filter
@@ -187,11 +189,6 @@ impl WireguardSession {
                 return Err(WireGuardError::ReplayDetected);
             }
         }
-
-        let ciphertext = &packet[16..];
-
-        let plaintext = aead_decrypt(&self.transport_keys.recv_key, nonce, ciphertext, &[])
-            .ok_or(WireGuardError::DecryptionFailed)?;
 
         self.last_received.store(
             std::time::SystemTime::now()

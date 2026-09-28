@@ -642,6 +642,22 @@ fn client_dns_settings() -> crate::netstack::solidtcp::ClientDnsSettings {
     }
 }
 
+/// The credentials the TUN stack must present to the engine's own SOCKS5
+/// inbound when the profile configures `general.authentication`.
+///
+/// Without them the negotiation can only offer NO-AUTH, the inbound answers
+/// `0xFF`, and every TUN flow fails — TUN mode must mirror the profile it
+/// runs under.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
+fn tun_proxy_credentials() -> Option<(String, String)> {
+    let instance = get_corduit_instance().ok()?;
+    let guard = instance.read();
+    let corduit = guard.as_ref()?;
+    let config = corduit.config();
+    let first = config.general.authentication.as_ref()?.first()?;
+    Some((first.username.clone(), first.password.clone()))
+}
+
 pub fn set_proxy_mode(mode: i32) -> std::result::Result<(), String> {
     crate::engine::set_runtime_proxy_mode(mode);
 
@@ -1189,7 +1205,9 @@ pub fn start_rpc_server(port: u16, token: Option<String>) -> std::result::Result
         }
     }
 
-    let token = token.unwrap_or_else(generate_rpc_token);
+    let token = token
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(generate_rpc_token);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let server = crate::rpc::server::RpcServer::bind(addr, token)
         .map_err(|e| format!("Failed to bind RPC server on {addr}: {e}"))?;
@@ -2125,7 +2143,7 @@ pub fn test_shadowsocks_latency(
                 } else {
                     Err(format!(
                         "Invalid HTTP response: {}",
-                        &response[..response.len().min(50)]
+                        crate::common::text::truncate_utf8(&response, 50)
                     ))
                 }
             }
@@ -2785,11 +2803,12 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             }
         };
 
-        let processor = std::sync::Arc::new(WindowsVpnProcessor::new_with_dns(
+        let processor = std::sync::Arc::new(WindowsVpnProcessor::new_with_dns_and_auth(
             proxy_addr,
             config.mtu,
             tun_tx.clone(),
             client_dns_settings(),
+            tun_proxy_credentials(),
         ));
 
         let processor_clone = processor.clone();
@@ -2995,11 +3014,12 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             });
         };
 
-        let processor = std::sync::Arc::new(TunPacketProcessor::new_with_dns(
+        let processor = std::sync::Arc::new(TunPacketProcessor::new_with_dns_and_auth(
             proxy_addr,
             config.mtu,
             tun_tx,
             client_dns_settings(),
+            tun_proxy_credentials(),
         ));
         let packet_processor = std::sync::Arc::clone(&processor);
         let packet_task = std::thread::Builder::new()
@@ -3628,12 +3648,14 @@ fn start_ohos_vpn_inner() -> Result<bool> {
             return Ok(false);
         };
 
-        let processor = std::sync::Arc::new(crate::netstack::TunPacketProcessor::new_with_dns(
-            proxy_addr,
-            config.mtu,
-            tun_tx,
-            client_dns_settings(),
-        ));
+        let processor =
+            std::sync::Arc::new(crate::netstack::TunPacketProcessor::new_with_dns_and_auth(
+                proxy_addr,
+                config.mtu,
+                tun_tx,
+                client_dns_settings(),
+                tun_proxy_credentials(),
+            ));
         let packet_processor = std::sync::Arc::clone(&processor);
         let packet_task = std::thread::Builder::new()
             .name("corduit-tun-packet".to_string())
@@ -3828,12 +3850,14 @@ fn start_android_vpn_inner() -> Result<bool> {
             return Ok(false);
         };
 
-        let processor = std::sync::Arc::new(crate::netstack::AndroidVpnProcessor::new_with_dns(
-            proxy_addr,
-            config.mtu,
-            tun_tx,
-            client_dns_settings(),
-        ));
+        let processor =
+            std::sync::Arc::new(crate::netstack::AndroidVpnProcessor::new_with_dns_and_auth(
+                proxy_addr,
+                config.mtu,
+                tun_tx,
+                client_dns_settings(),
+                tun_proxy_credentials(),
+            ));
         let packet_processor = std::sync::Arc::clone(&processor);
         let packet_task = std::thread::Builder::new()
             .name("corduit-tun-packet".to_string())

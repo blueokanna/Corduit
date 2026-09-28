@@ -8,6 +8,7 @@
 //! available — the outbounds that use them authenticate separately.
 
 mod aes;
+mod aes_hw;
 mod chacha20;
 mod modes;
 mod rc4;

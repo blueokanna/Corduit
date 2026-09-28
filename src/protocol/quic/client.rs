@@ -167,7 +167,23 @@ impl ClientConnection {
     /// Wait for and return the next server-initiated unidirectional stream
     /// that has data (or a FIN) available.
     pub fn accept_uni(&self) -> Result<QuicRecvStream> {
+        self.accept_uni_inner(None)
+    }
+
+    /// As [`Self::accept_uni`], waiting no longer than `timeout`.
+    pub fn accept_uni_deadline(&self, timeout: Duration) -> Result<QuicRecvStream> {
+        self.accept_uni_inner(Some(std::time::Instant::now() + timeout))
+    }
+
+    fn accept_uni_inner(&self, deadline: Option<std::time::Instant>) -> Result<QuicRecvStream> {
         loop {
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    return Err(QuicError::Io(
+                        "timed out waiting for a server stream".to_string(),
+                    ));
+                }
+            }
             {
                 let mut st = self.conn.lock();
                 if let Some(id) = self.conn.accept_uni_ready(&mut st) {
@@ -193,7 +209,23 @@ impl ClientConnection {
 
     /// Receive a datagram (RFC 9221).
     pub fn read_datagram(&self) -> Result<Vec<u8>> {
+        self.read_datagram_inner(None)
+    }
+
+    /// Receive a datagram, waiting no longer than `timeout`.
+    pub fn read_datagram_deadline(&self, timeout: Duration) -> Result<Vec<u8>> {
+        self.read_datagram_inner(Some(std::time::Instant::now() + timeout))
+    }
+
+    fn read_datagram_inner(&self, deadline: Option<std::time::Instant>) -> Result<Vec<u8>> {
         loop {
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    return Err(QuicError::Io(
+                        "timed out waiting for a UDP datagram".to_string(),
+                    ));
+                }
+            }
             {
                 let mut st = self.conn.lock();
                 if let Some(d) = self.conn.pop_datagram(&mut st) {

@@ -36,14 +36,12 @@
 //! them up front, not after a timeout.
 //!
 //! * `/traffic` and `/memory` answer with a **single sample** instead of a
-//!   stream. Streamed bodies built with `courierust_body::channel` deliver
-//!   nothing through `serve_connection` (measured: no response bytes at all in
-//!   ten seconds, while every buffered route answers immediately, and the
-//!   connection then fails to shut down cleanly). A route that hangs a
-//!   dashboard is worse than one that does not stream.
+//!   stream: the control-plane driver frames every response with a
+//!   `content-length` and refuses a streamed body outright, so a streaming
+//!   route would need a second framing mode that nothing else uses. A route
+//!   that hangs a dashboard is worse than one that does not stream.
 //! * There is no `/logs` route. The reference streams it; the engine's log
-//!   accessor returns a snapshot, and the same streamed-body limitation
-//!   applies.
+//!   accessor returns a snapshot, and the same framing limitation applies.
 //! * `GET /connections` reports the engine's rule string whole in `rule` and
 //!   leaves `rulePayload` empty, and `chains` holds the single outbound the
 //!   connection left through rather than the full selection chain — that is
@@ -62,24 +60,34 @@ use std::time::Duration;
 
 use courierust::courierust_body::Body;
 use courierust::courierust_http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
-use courierust::courierust_server::{serve_connection, Handler, ServerConfig};
 
 use crate::common::listener::ConnectionListener;
 use crate::crypto::util::ct_eq;
+use crate::rpc::http1;
 
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
 
-/// Largest request head we will parse.
-const MAX_REQUEST_HEAD: usize = 64 * 1024;
 /// Largest request body we will read. `PUT /configs` carries a path, not a
 /// whole configuration, so this stays small on purpose.
 const MAX_REQUEST_BODY: usize = 1024 * 1024;
 /// Concurrent connections served at once.
 const MAX_CONNECTIONS: usize = 64;
-/// Ceiling on a single connection's lifetime.
+/// How long a keep-alive connection may wait for its next request.
 const CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
+/// Absolute budget for one request head, from its first byte.
+const HEAD_DEADLINE: Duration = Duration::from_secs(30);
+/// Longest a single read may idle inside a request head.
+const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Absolute budget for a declared request body, from the end of the head.
+const BODY_DEADLINE: Duration = Duration::from_secs(300);
+/// Longest a single read may idle inside a request body.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Socket write timeout: a peer that stops reading cannot pin the thread.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Requests served on one connection before it is closed.
+const MAX_REQUESTS: usize = 1000;
 /// Default timeout for `GET /proxies/:name/delay` when the client does not
 /// ask for one.
 const DEFAULT_DELAY_TIMEOUT_MS: u64 = 5000;
@@ -87,6 +95,24 @@ const DEFAULT_DELAY_TIMEOUT_MS: u64 = 5000;
 /// long a complete round trip takes, so the endpoint answers `204` and nothing
 /// else is transferred.
 const DEFAULT_DELAY_URL: &str = "http://www.gstatic.com/generate_204";
+
+/// The per-connection budgets this server enforces.
+///
+/// No WebSocket budgets: the controller speaks plain HTTP, and the driver
+/// fails closed if a handler ever accepts an upgrade without them.
+fn default_limits() -> http1::Limits {
+    http1::Limits {
+        max_body: MAX_REQUEST_BODY,
+        max_requests: MAX_REQUESTS,
+        idle_timeout: CONNECTION_LIFETIME,
+        head_deadline: HEAD_DEADLINE,
+        head_read_timeout: HEAD_READ_TIMEOUT,
+        body_deadline: BODY_DEADLINE,
+        body_read_timeout: BODY_READ_TIMEOUT,
+        write_timeout: WRITE_TIMEOUT,
+        ws: None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -168,7 +194,7 @@ pub struct ExternalController {
     addr: SocketAddr,
     secret: Arc<str>,
     secret_required: bool,
-    config: Arc<ServerConfig>,
+    limits: http1::Limits,
 }
 
 impl ExternalController {
@@ -183,23 +209,12 @@ impl ExternalController {
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
 
-        let server_config = ServerConfig {
-            read_timeout: Some(CONNECTION_LIFETIME),
-            max_header_list: MAX_REQUEST_HEAD,
-            max_body: MAX_REQUEST_BODY,
-            http2: false,
-            tls: None,
-            handshake_timeout: None,
-            max_connections: MAX_CONNECTIONS,
-            ..ServerConfig::default()
-        };
-
         Ok(Self {
             listener: Some(listener),
             addr,
             secret: Arc::from(config.secret.as_str()),
             secret_required: !config.secret.is_empty(),
-            config: Arc::new(server_config),
+            limits: default_limits(),
         })
     }
 
@@ -217,12 +232,12 @@ impl ExternalController {
         let handler = ControllerHandler {
             secret: Arc::clone(&self.secret),
         };
-        let config = Arc::clone(&self.config);
+        let limits = self.limits;
 
         let mut server = ConnectionListener::new(listener, self.addr, MAX_CONNECTIONS);
         server
             .start("corduit-controller", move |stream, peer| {
-                if let Err(e) = serve_connection(stream, &handler, config.as_ref()) {
+                if let Err(e) = http1::serve(stream, peer, &handler, &limits) {
                     tracing::debug!("external controller connection from {peer} ended: {e}");
                 }
             })
@@ -294,7 +309,7 @@ struct ControllerHandler {
     secret: Arc<str>,
 }
 
-impl Handler for ControllerHandler {
+impl http1::Handler for ControllerHandler {
     fn handle(&self, req: Request<Body>) -> Response<Body> {
         route(req, &self.secret)
     }

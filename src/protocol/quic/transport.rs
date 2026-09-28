@@ -53,6 +53,16 @@ const MAX_RECV_BUFFER: u64 = 16 * 1024 * 1024;
 /// permits implementations to limit ACK ranges; without a cap a long-lived
 /// connection would accumulate every received packet number forever.
 const MAX_ACK_QUEUE: usize = 256;
+
+/// Hard cap on tracked streams per connection; finished streams are swept
+/// before the cap is enforced, so a peer cannot exhaust it with completed
+/// transfers.
+const MAX_TRACKED_STREAMS: usize = 1024;
+/// Run the finished-stream sweep once the table grows past this size.
+const STREAM_TABLE_SWEEP_THRESHOLD: usize = 768;
+/// Bound on queued inbound datagrams; when full the oldest is dropped, the
+/// same loss semantics a UDP socket gives a slow reader (RFC 9221 §5).
+const MAX_DATAGRAM_QUEUE: usize = 64;
 /// Per-packet overhead reserved when sizing a DATAGRAM frame (short header +
 /// connection ID + packet number + AEAD tag + frame header). Conservative so
 /// an accepted datagram always fits its own packet.
@@ -575,8 +585,12 @@ impl QuicConn {
                 0x01 => return Ok(()), // 0-RTT: not offered
                 _ => PnSpace::Handshake,
             };
-            let pn_offset = long_pn_offset(data)
-                .ok_or_else(|| QuicError::Protocol("malformed long header".into()))?;
+            // The long header is not authenticated yet: a packet we cannot
+            // even locate the number in is stray (or injected) traffic, and
+            // RFC 9000 §5.2 says to discard it, not to close the connection.
+            let Some(pn_offset) = long_pn_offset(data) else {
+                return Ok(());
+            };
             return self.process_packet(st, data, space, pn_offset, true);
         }
 
@@ -589,30 +603,34 @@ impl QuicConn {
     }
 
     fn process_retry(&self, st: &mut ConnState, data: &[u8]) -> Result<()> {
+        // A Retry is unauthenticated until its integrity tag checks out
+        // (RFC 9001 §5.8); a truncated one is discarded like any stray UDP.
         let mut pos = 5usize; // first byte + version
         if data.len() < pos + 2 {
-            return Err(QuicError::Protocol("truncated Retry".into()));
+            return Ok(());
         }
         let dcid_len = data[pos] as usize;
         pos += 1;
         if data.len() < pos + dcid_len + 1 {
-            return Err(QuicError::Protocol("truncated Retry".into()));
+            return Ok(());
         }
         let retry_dcid = &data[pos..pos + dcid_len];
         pos += dcid_len;
         let scid_len = data[pos] as usize;
         pos += 1;
         if data.len() < pos + scid_len + 2 {
-            return Err(QuicError::Protocol("truncated Retry".into()));
+            return Ok(());
         }
         let retry_scid = &data[pos..pos + scid_len];
         pos += scid_len;
-        let (token_len, used) = courierust::courierust_quic::varint::decode(&data[pos..])
-            .map_err(|e| QuicError::Protocol(e.to_string()))?;
+        let Ok((token_len, used)) = courierust::courierust_quic::varint::decode(&data[pos..])
+        else {
+            return Ok(());
+        };
         pos += used;
         let token_len = token_len as usize;
         if data.len() < pos + token_len + 16 {
-            return Err(QuicError::Protocol("truncated Retry".into()));
+            return Ok(());
         }
         let token = &data[pos..pos + token_len];
         pos += token_len;
@@ -675,15 +693,22 @@ impl QuicConn {
         };
 
         let mut packet = data.to_vec();
-        key.unprotect_header(&mut packet, pn_offset, long)
-            .map_err(|e| QuicError::Protocol(e.to_string()))?;
+        if key.unprotect_header(&mut packet, pn_offset, long).is_err() {
+            // Header protection is not authentication: a scribbled packet
+            // from an on-path sender must be dropped, never tear the
+            // connection down (RFC 9000 §5.2). Real corruption on the path
+            // is retransmitted by the peer.
+            return Ok(());
+        }
 
-        let parsed = packet::parse(
+        let parsed = match packet::parse(
             &packet,
             st.spaces[space.index()].largest_recv_pn,
             st.scid.len(),
-        )
-        .map_err(|e| QuicError::Protocol(e.to_string()))?;
+        ) {
+            Ok(parsed) => parsed,
+            Err(_) => return Ok(()),
+        };
         let (pn, pn_len) = match &parsed {
             ParsedPacket::Long(h) => (h.packet_number, h.pn_len),
             ParsedPacket::Short(h) => (h.packet_number, h.pn_len),
@@ -825,6 +850,9 @@ impl QuicConn {
                 Ok(())
             }
             Frame::Datagram { data, .. } => {
+                if st.datagram_rx.len() >= MAX_DATAGRAM_QUEUE {
+                    st.datagram_rx.pop_front();
+                }
                 st.datagram_rx.push_back(data);
                 st.datagram_notify.notify_waiters();
                 Ok(())
@@ -898,9 +926,18 @@ impl QuicConn {
         fin: bool,
     ) -> Result<()> {
         let recv_window = recv_window_for(st, stream_id);
-        st.streams
-            .entry(stream_id)
-            .or_insert_with(|| StreamState::new(0, recv_window));
+        if !st.streams.contains_key(&stream_id) {
+            if st.streams.len() >= STREAM_TABLE_SWEEP_THRESHOLD {
+                st.streams.retain(|id, s| !stream_fully_closed(*id, s));
+            }
+            if st.streams.len() >= MAX_TRACKED_STREAMS {
+                return Err(QuicError::Protocol(
+                    "peer stream table limit reached".into(),
+                ));
+            }
+            st.streams
+                .insert(stream_id, StreamState::new(0, recv_window));
+        }
         let s = st
             .streams
             .get_mut(&stream_id)
@@ -951,22 +988,14 @@ impl QuicConn {
         ack_delay: u64,
         ranges: Vec<(u64, u64)>,
     ) -> Result<()> {
-        let mut acked = BTreeSet::new();
-        acked.insert(largest_acked);
-        let first_len = ranges.first().map(|(_, l)| *l).unwrap_or(0);
-        for i in 1..=first_len {
-            acked.insert(largest_acked - i);
-        }
-        let mut cur = largest_acked - first_len;
-        for (gap, len) in ranges.iter().skip(1) {
-            cur = cur.saturating_sub(*gap + 1);
-            for i in 0..=*len {
-                acked.insert(cur.saturating_sub(i));
-            }
-            cur = cur.saturating_sub(*len);
-        }
+        // RFC 9000 §13.1: only packets this endpoint actually sent may be
+        // acknowledged. The ranges are expanded into a bounded interval list
+        // and matched against the sent-packet table, so a peer that claims a
+        // huge `largest_acked` cannot drive attacker-sized loops.
+        let intervals = ack_intervals(largest_acked, &ranges);
 
         // Drain sent packets, classifying into acked / lost / retained.
+        let mut acked_count: u64 = 0;
         let mut acked_frames: Vec<Frame> = Vec::new();
         let mut lost_frames: Vec<Frame> = Vec::new();
         let mut newest_acked_time: Option<(Instant, bool)> = None;
@@ -977,7 +1006,8 @@ impl QuicConn {
         {
             let sp = &mut st.spaces[space.index()];
             for p in sp.sent.drain(..) {
-                if acked.contains(&p.pn) {
+                if ack_covers(&intervals, p.pn) {
+                    acked_count += 1;
                     if p.in_flight {
                         st.bytes_in_flight = st.bytes_in_flight.saturating_sub(p.size as u64);
                     }
@@ -1007,8 +1037,8 @@ impl QuicConn {
         }
 
         // Congestion: grow the window per acked ack-eliciting packet.
-        if !acked.is_empty() {
-            self.on_acks_cc(st, acked.len() as u64);
+        if acked_count > 0 {
+            self.on_acks_cc(st, acked_count);
         }
 
         if let Some((sent_at, _)) = newest_acked_time {
@@ -1681,6 +1711,55 @@ fn recv_window_for(st: &ConnState, stream_id: u64) -> u64 {
     } else {
         st.my_max_stream_data_bidi_remote
     }
+}
+
+/// Decoded ACK ranges → inclusive `[smallest, largest]` packet-number
+/// intervals. The range count is capped so a malicious frame cannot grow the
+/// interval list arbitrarily; ignoring extra ranges can only delay loss
+/// detection, never break correctness.
+fn ack_intervals(largest_acked: u64, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    const MAX_ACK_RANGES: usize = 256;
+    let mut out = Vec::with_capacity(ranges.len().min(MAX_ACK_RANGES));
+    let mut largest = largest_acked;
+    for (i, (gap, len)) in ranges.iter().enumerate() {
+        if i >= MAX_ACK_RANGES {
+            break;
+        }
+        let smallest = if i == 0 {
+            largest.saturating_sub(*len)
+        } else {
+            largest.saturating_sub(*gap + 1).saturating_sub(*len)
+        };
+        out.push((smallest, largest));
+        largest = smallest.saturating_sub(1);
+    }
+    out
+}
+
+fn ack_covers(intervals: &[(u64, u64)], pn: u64) -> bool {
+    intervals.iter().any(|&(lo, hi)| pn >= lo && pn <= hi)
+}
+
+/// A tracked stream with both directions finished can be dropped from the
+/// table; the application has already observed everything it will ever see
+/// (uniformly the same outcomes as a retained entry: EOF / closed send side).
+fn stream_fully_closed(id: u64, s: &StreamState) -> bool {
+    let client_initiated = id & 1 == 0;
+    let uni = id & 2 != 0;
+    let recv_done = if uni && client_initiated {
+        true
+    } else {
+        s.fin_recv
+            && s.recv_contig >= s.fin_recv_offset
+            && s.recv_prefix.is_empty()
+            && s.recv_gaps.is_empty()
+    };
+    let send_done = if uni && !client_initiated {
+        true
+    } else {
+        s.fin_acked
+    };
+    recv_done && send_done
 }
 
 fn wake_all(st: &mut ConnState) {

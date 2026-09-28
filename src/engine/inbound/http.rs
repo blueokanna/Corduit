@@ -126,6 +126,7 @@ const CONNECT_PREFIX: &[u8] = b"CONNECT ";
 fn peek_connect_head(stream: &TcpStream) -> std::result::Result<Option<usize>, String> {
     let mut probe = vec![0u8; PROXY_MAX_HEAD];
     let deadline = Instant::now() + PROXY_PROLOGUE_TIMEOUT;
+    let mut backoff = Duration::from_millis(2);
     loop {
         let available = match stream.peek(&mut probe) {
             Ok(0) => return Ok(None), // the peer closed before saying anything
@@ -143,7 +144,10 @@ fn peek_connect_head(stream: &TcpStream) -> std::result::Result<Option<usize>, S
         if Instant::now() > deadline {
             return Err("timed out waiting for the request head".to_string());
         }
-        std::thread::sleep(Duration::from_millis(2));
+        // A client that trickles its prologue must not turn this into a
+        // busy loop: back off to at most one poll per 50 ms.
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(50));
     }
 }
 
@@ -170,7 +174,14 @@ fn serve_connect(
 
     if !check_proxy_authorization(&headers, &handler.auth) {
         tracing::info!("Rejecting unauthenticated CONNECT request");
-        return write_head(&mut stream, StatusCode::PROXY_AUTHENTICATION_REQUIRED, &[]);
+        return write_head(
+            &mut stream,
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            &[
+                ("proxy-authenticate", "Basic realm=\"corduit\""),
+                ("content-length", "0"),
+            ],
+        );
     }
     let Some((host, port)) = parse_authority(authority) else {
         tracing::warn!("Invalid CONNECT target: {authority}");

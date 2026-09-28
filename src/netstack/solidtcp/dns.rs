@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -61,9 +61,16 @@ impl FakeIpConfig {
                  /16 through /24"
             ));
         }
+        let range_start = network.network();
+        let pool_size = 1u32 << (32 - u32::from(prefix));
+        if u64::from(u32::from(range_start)) + u64::from(pool_size) > u64::from(u32::MAX) + 1 {
+            return Err(format!(
+                "fake-ip-range '{cidr}' runs past 255.255.255.255 and cannot be addressed"
+            ));
+        }
         Ok(Self {
-            range_start: network.network(),
-            pool_size: 1u32 << (32 - u32::from(prefix)),
+            range_start,
+            pool_size,
             ttl: Self::default().ttl,
         })
     }
@@ -82,7 +89,7 @@ pub struct FakeIpPool {
     config: FakeIpConfig,
     domain_to_ip: DashMap<String, FakeIpEntry>,
     ip_to_domain: DashMap<Ipv4Addr, String>,
-    next_offset: AtomicU32,
+    next_offset: AtomicU64,
     lru: Mutex<LruCache<String, Ipv4Addr>>,
 }
 
@@ -98,9 +105,18 @@ impl FakeIpPool {
             config,
             domain_to_ip: DashMap::new(),
             ip_to_domain: DashMap::new(),
-            next_offset: AtomicU32::new(3),
+            next_offset: AtomicU64::new(0),
             lru: Mutex::new(LruCache::new(sz)),
         }
+    }
+
+    /// The first three slots are reserved; the counter is a monotonic `u64`
+    /// taken modulo the usable slot count, so a wrap-around can never hand
+    /// the same slot to two racing allocations.
+    fn allocate_offset(&self) -> u32 {
+        let slots = u64::from(self.config.pool_size.saturating_sub(3).max(1));
+        let count = self.next_offset.fetch_add(1, Ordering::Relaxed);
+        3 + (count % slots) as u32
     }
 
     pub fn allocate(&self, domain: &str) -> Result<Ipv4Addr> {
@@ -112,22 +128,14 @@ impl FakeIpPool {
             }
         }
 
-        let offset = self.next_offset.fetch_add(1, Ordering::Relaxed);
-        let effective_offset = if offset >= self.config.pool_size {
-            self.next_offset.store(3, Ordering::Relaxed);
+        if self.domain_to_ip.len() >= self.config.pool_size as usize - 3 {
             self.cleanup();
             if self.domain_to_ip.len() >= self.config.pool_size as usize - 3 {
                 return Err(SolidTcpError::FakeIpPoolExhausted);
             }
-            3
-        } else if offset < 3 {
-            self.next_offset.store(3, Ordering::Relaxed);
-            3
-        } else {
-            offset
-        };
+        }
 
-        let ip = self.offset_to_ip(effective_offset);
+        let ip = self.offset_to_ip(self.allocate_offset());
         if let Some((_, old)) = self.ip_to_domain.remove(&ip) {
             self.domain_to_ip.remove(&old);
         }
@@ -149,13 +157,14 @@ impl FakeIpPool {
     }
 
     pub fn is_fake_ip(&self, ip: Ipv4Addr) -> bool {
-        let start = u32::from(self.config.range_start);
-        let val = u32::from(ip);
-        val >= start && val < start + self.config.pool_size
+        let start = u64::from(u32::from(self.config.range_start));
+        let val = u64::from(u32::from(ip));
+        let end = start + u64::from(self.config.pool_size);
+        val >= start && val < end
     }
 
     fn offset_to_ip(&self, offset: u32) -> Ipv4Addr {
-        Ipv4Addr::from(u32::from(self.config.range_start) + offset)
+        Ipv4Addr::from(u32::from(self.config.range_start).wrapping_add(offset))
     }
 
     pub fn cleanup(&self) {
@@ -465,10 +474,18 @@ impl DnsHandler {
     }
 
     fn parse_name(&self, data: &[u8], start: usize) -> Result<(String, usize)> {
+        // Compression pointers may only point backwards, but without a hop
+        // budget a self-referencing pointer (`C0 0C` at offset 12) spins the
+        // parser forever on a 14-byte datagram. RFC 1035 caps a name at 255
+        // bytes, which also bounds the number of labels we can see.
+        const MAX_NAME_BYTES: usize = 255;
+        const MAX_POINTERS: usize = 128;
         let mut labels = Vec::new();
         let mut pos = start;
         let mut jumped = false;
         let mut jump_pos = 0;
+        let mut pointers = 0usize;
+        let mut name_bytes = 0usize;
         loop {
             if pos >= data.len() {
                 return Err(SolidTcpError::DnsError("Name truncated".into()));
@@ -484,6 +501,10 @@ impl DnsHandler {
                 if pos + 1 >= data.len() {
                     return Err(SolidTcpError::DnsError("Ptr truncated".into()));
                 }
+                pointers += 1;
+                if pointers > MAX_POINTERS {
+                    return Err(SolidTcpError::DnsError("Compression pointer loop".into()));
+                }
                 let ptr = ((len & 0x3F) << 8) | data[pos + 1] as usize;
                 if !jumped {
                     jump_pos = pos + 2;
@@ -495,6 +516,10 @@ impl DnsHandler {
             pos += 1;
             if pos + len > data.len() {
                 return Err(SolidTcpError::DnsError("Label truncated".into()));
+            }
+            name_bytes += len + 1;
+            if name_bytes > MAX_NAME_BYTES {
+                return Err(SolidTcpError::DnsError("Name too long".into()));
             }
             labels.push(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
             pos += len;
@@ -669,9 +694,18 @@ impl DnsHandler {
         domain: &str,
         want_v6: bool,
     ) -> std::result::Result<Vec<IpAddr>, String> {
-        with_system_fallback(domain, resolve_ips(domain, want_v6), || {
-            system_lookup(domain, want_v6)
-        })
+        let engine = resolve_ips(domain, want_v6);
+        if crate::dns::engine_resolver::domain_uses_policy(domain) {
+            // A `nameserver-policy` entry names the only resolver that may
+            // answer this name; its verdict (including "no answer") is final.
+            return match engine {
+                Some(Ok(addresses)) if !addresses.is_empty() => Ok(addresses),
+                Some(Ok(_)) => Err("the engine DNS returned no addresses".to_string()),
+                Some(Err(error)) => Err(error.to_string()),
+                None => Err("no engine DNS resolver is configured".to_string()),
+            };
+        }
+        with_system_fallback(domain, engine, || system_lookup(domain, want_v6))
     }
 
     /// Build a response carrying every address of the matching family.
@@ -836,6 +870,43 @@ mod tests {
     fn handler(settings: ClientDnsSettings) -> (DnsHandler, Arc<FakeIpPool>) {
         let pool = Arc::new(FakeIpPool::with_config(settings.fake_ip.clone()));
         (DnsHandler::new(pool.clone(), &settings), pool)
+    }
+
+    /// A 14-byte datagram whose name is a pointer to itself used to spin the
+    /// parser forever on the TUN packet thread.
+    #[test]
+    fn self_referencing_compression_pointer_is_rejected() {
+        let (handler, _pool) = handler(normal_mode());
+        let mut query = vec![0u8; 12];
+        query[0] = 0x12;
+        query[1] = 0x34;
+        query[2] = 0x01;
+        query.extend_from_slice(&[0xC0, 0x0C]);
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        assert!(
+            handler.parse_query(&query).is_err(),
+            "a self-referencing pointer must be rejected"
+        );
+    }
+
+    /// A pointer loop through a real label grows `labels` on every turn; the
+    /// 255-byte name budget and the pointer budget both stop it.
+    #[test]
+    fn compression_pointer_loop_through_labels_is_rejected() {
+        let (handler, _pool) = handler(normal_mode());
+        let mut query = vec![0u8; 12];
+        query[0] = 0x12;
+        query[1] = 0x34;
+        query[2] = 0x01;
+        // offset 12: label "a", then a pointer back to offset 12
+        query.extend_from_slice(&[0x01, b'a', 0xC0, 0x0C]);
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        assert!(
+            handler.parse_query(&query).is_err(),
+            "a pointer loop must be rejected"
+        );
     }
 
     fn fake_ip_mode() -> ClientDnsSettings {

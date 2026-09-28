@@ -22,11 +22,27 @@ use std::time::{Duration, Instant};
 const DIRECT_UDP_SESSION_IDLE: Duration = Duration::from_secs(120);
 /// Read timeout of the session reader between liveness checks.
 const DIRECT_UDP_POLL: Duration = Duration::from_secs(30);
+/// Hard cap on concurrently live UDP sessions (one thread + one socket each).
+/// Beyond it new flows fail fast instead of exhausting threads and fds.
+const MAX_UDP_SESSIONS: usize = 1024;
 
 pub struct DirectOutbound {
     config: OutboundConfig,
-    /// One session per destination; see [`DirectUdpSession`].
-    udp_sessions: parking_lot::Mutex<HashMap<String, Arc<DirectUdpSession>>>,
+    /// One session per (client association, destination); see
+    /// [`DirectUdpSession`].
+    udp_sessions: parking_lot::Mutex<HashMap<(usize, String), Arc<DirectUdpSession>>>,
+    /// Sessions whose reader thread has not exited yet.
+    live_udp_sessions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Decrements the live-session count when a reader thread (or a failed
+/// spawn) drops it.
+struct LiveSessionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LiveSessionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl OutboundProxy for DirectOutbound {
@@ -81,7 +97,7 @@ impl OutboundProxy for DirectOutbound {
 
     /// Session-based submission; replies stream back through `sink`.
     fn udp_submit(&self, target: &TargetAddr, data: &[u8], sink: &Arc<UdpReplySink>) -> Result<()> {
-        let session = self.udp_session(target)?;
+        let session = self.udp_session(sink, target)?;
         session.register_sink(sink);
         session.send(data)
     }
@@ -198,16 +214,32 @@ impl DirectOutbound {
         Self {
             config,
             udp_sessions: parking_lot::Mutex::new(HashMap::new()),
+            live_udp_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
-    /// The live session for `target`, created on first use.
-    fn udp_session(&self, target: &TargetAddr) -> Result<Arc<DirectUdpSession>> {
-        let key = target.to_string();
+    /// The live session for `(sink, target)`, created on first use.
+    ///
+    /// The sink identifies one UDP association: a session is never shared
+    /// between associations, so replies from the destination reach exactly
+    /// the client that sent the matching datagrams. (Keying sessions by
+    /// destination alone would fan every reply out to every association.)
+    fn udp_session(
+        &self,
+        sink: &Arc<UdpReplySink>,
+        target: &TargetAddr,
+    ) -> Result<Arc<DirectUdpSession>> {
+        let key = (Arc::as_ptr(sink) as usize, target.to_string());
         if let Some(existing) = self.udp_sessions.lock().get(&key) {
             if existing.alive.load(Ordering::Acquire) {
                 return Ok(Arc::clone(existing));
             }
+        }
+
+        if self.live_udp_sessions.load(Ordering::Acquire) >= MAX_UDP_SESSIONS {
+            return Err(Error::network(format!(
+                "DIRECT UDP session limit reached ({MAX_UDP_SESSIONS})"
+            )));
         }
 
         let resolved = match target {
@@ -221,8 +253,12 @@ impl DirectOutbound {
             }
         };
 
-        let socket = crate::common::socket::udp_bind("0.0.0.0:0".parse().unwrap(), DIRECT_UDP_POLL)
-            .map_err(|e| Error::network(format!("Failed to bind UDP socket: {e}")))?;
+        let socket = crate::common::socket::udp_bind_for(
+            "0.0.0.0:0".parse().unwrap(),
+            DIRECT_UDP_POLL,
+            Some(resolved.ip()),
+        )
+        .map_err(|e| Error::network(format!("Failed to bind UDP socket: {e}")))?;
         socket
             .connect(resolved)
             .map_err(|e| Error::network(format!("Failed to connect UDP socket: {e}")))?;
@@ -236,9 +272,14 @@ impl DirectOutbound {
         });
 
         let reader_session = Arc::clone(&session);
+        self.live_udp_sessions.fetch_add(1, Ordering::AcqRel);
+        let guard = LiveSessionGuard(Arc::clone(&self.live_udp_sessions));
         std::thread::Builder::new()
             .name("corduit-direct-udp".into())
-            .spawn(move || pump_direct_udp_replies(reader_session))
+            .spawn(move || {
+                let _guard = guard;
+                pump_direct_udp_replies(reader_session);
+            })
             .map_err(|e| Error::network(format!("Failed to spawn the UDP reader: {e}")))?;
 
         let mut sessions = self.udp_sessions.lock();

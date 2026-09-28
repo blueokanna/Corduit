@@ -14,6 +14,9 @@ pub struct ChaCha20 {
     pending: [u8; 64],
     /// How many bytes of `pending` are still unused (0 = none).
     pending_left: usize,
+    /// Set once the 32-bit block counter reaches `u32::MAX`: the next block
+    /// would repeat the keystream, so callers must re-key instead.
+    exhausted: bool,
 }
 
 impl ChaCha20 {
@@ -38,6 +41,7 @@ impl ChaCha20 {
             rounds,
             pending: [0u8; 64],
             pending_left: 0,
+            exhausted: false,
         }
     }
 
@@ -61,10 +65,21 @@ impl ChaCha20 {
     pub fn next_block(&mut self, out: &mut [u8; 64]) {
         core_block(&self.state, self.rounds, out);
         self.pending_left = 0;
-        // The IETF counter is 32-bit and wraps; the nonce is fixed, so a wrap
-        // repeats the keystream. Callers that can write 256 GiB under one key
-        // must re-key instead (Shadowsocks 2022 does).
-        self.state[12] = self.state[12].wrapping_add(1);
+        // The IETF counter is 32-bit. Advancing past `u32::MAX` would repeat
+        // the keystream under the same key/nonce, so the counter stops there
+        // and [`Self::is_exhausted`] reports it; re-keying is the caller's job
+        // (SSR streams check this and fail instead of reusing bytes).
+        if self.state[12] == u32::MAX {
+            self.exhausted = true;
+        } else {
+            self.state[12] += 1;
+        }
+    }
+
+    /// Whether the 32-bit block counter has reached its maximum; the current
+    /// block is still valid, but no new one may be generated under this key.
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// XOR `buf` with the keystream, advancing the counter as needed.

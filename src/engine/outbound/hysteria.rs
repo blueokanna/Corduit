@@ -61,10 +61,10 @@ use crate::protocol::quic::{
     QuicSendStream, QuicStreamPair, XPlus,
 };
 use parking_lot::Mutex;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// First byte of the control stream.
@@ -73,6 +73,12 @@ const PROTOCOL_VERSION: u8 = 3;
 const DEFAULT_ALPN: &str = "hysteria";
 /// Bound on any length-prefixed string a server can ask us to allocate.
 const MAX_MESSAGE: usize = 8192;
+/// Bound on a control-plane read (server hello, per-stream response).
+///
+/// The QUIC connection stays alive while a silent server withholds the
+/// hello, and those reads happen under the connection mutex — an unbounded
+/// read would park every subsequent relay behind it forever.
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Hysteria 1 outbound settings (kept for introspection and tests).
 #[derive(Debug, Clone)]
@@ -315,7 +321,8 @@ impl HysteriaOutbound {
         send.flush()
             .map_err(|e| Error::network(format!("Failed to flush the client hello: {e}")))?;
 
-        let (ok, send_bps, recv_bps, message) = read_server_hello(&mut recv)?;
+        let (ok, send_bps, recv_bps, message) =
+            read_server_hello(&mut recv, Instant::now() + CONTROL_READ_TIMEOUT)?;
         if !ok {
             return Err(Error::network(format!(
                 "Hysteria server rejected the auth string: {}",
@@ -401,24 +408,34 @@ impl OutboundProxy for HysteriaOutbound {
         send.flush()
             .map_err(|e| Error::network(format!("Failed to flush probe request: {e}")))?;
 
-        // A QUIC stream read parks until data arrives, and the stream API does
-        // not take a deadline. Reading on a worker thread and waiting on a
-        // channel keeps the bound at the caller's timeout, at the cost of one
-        // parked thread when the peer is silent.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut first = [0u8; 5];
-            let _ = tx.send(recv.read_exact(&mut first).map(|_| first));
-        });
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(first)) if &first == b"HTTP/" => Ok(start.elapsed()),
-            Ok(Ok(_)) => Err(Error::protocol(
+        // A QUIC stream read parks until data arrives; the control-plane
+        // reads carry a deadline, so a silent peer costs ten seconds rather
+        // than the caller's whole budget.
+        let deadline = Instant::now() + timeout;
+        let mut first = [0u8; 5];
+        let mut filled = 0usize;
+        while filled < first.len() {
+            let n = match recv.read_with_deadline(&mut first[filled..], deadline) {
+                Ok(0) => {
+                    return Err(Error::network(
+                        "Hysteria latency probe: the stream closed before a status line",
+                    ))
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(Error::network(format!(
+                        "Failed to read probe response: {e}"
+                    )))
+                }
+            };
+            filled += n;
+        }
+        if first == *b"HTTP/" {
+            Ok(start.elapsed())
+        } else {
+            Err(Error::protocol(
                 "Hysteria latency probe did not get an HTTP status line",
-            )),
-            Ok(Err(e)) => Err(Error::network(format!(
-                "Failed to read probe response: {e}"
-            ))),
-            Err(_) => Err(Error::network("Hysteria latency probe timed out")),
+            ))
         }
     }
 
@@ -456,7 +473,7 @@ impl HysteriaConnection {
         send.flush()
             .map_err(|e| Error::network(format!("Failed to flush the TCP request: {e}")))?;
 
-        let response = read_server_response(&mut recv)?;
+        let response = read_server_response(&mut recv, Instant::now() + CONTROL_READ_TIMEOUT)?;
         if !response.ok {
             return Err(Error::network(format!(
                 "Hysteria server refused {target}: {}",
@@ -517,12 +534,15 @@ pub(crate) fn encode_client_request(udp: bool, host: &str, port: u16) -> Vec<u8>
 ///
 /// Returns `(ok, send_bps, recv_bps, message)` and borrows the stream only for
 /// the duration of the read, so the caller keeps ownership of it — the stream
-/// outlives the handshake.
-fn read_server_hello(stream: &mut QuicRecvStream) -> Result<(bool, u64, u64, String)> {
-    let ok = read_u8(stream)? != 0;
-    let send_bps = read_u64(stream)?;
-    let recv_bps = read_u64(stream)?;
-    let message = read_string(stream)?;
+/// outlives the handshake. Every read is bounded by `deadline`.
+fn read_server_hello(
+    stream: &mut QuicRecvStream,
+    deadline: Instant,
+) -> Result<(bool, u64, u64, String)> {
+    let ok = read_u8(stream, deadline)? != 0;
+    let send_bps = read_u64(stream, deadline)?;
+    let recv_bps = read_u64(stream, deadline)?;
+    let message = read_string(stream, deadline)?;
     Ok((ok, send_bps, recv_bps, message))
 }
 
@@ -536,10 +556,10 @@ struct ServerResponse {
 }
 
 /// `[u8 ok][u32 udp_session_id][u16 msg_len][msg]`
-fn read_server_response(stream: &mut QuicRecvStream) -> Result<ServerResponse> {
-    let ok = read_u8(stream)? != 0;
-    let udp_session_id = read_u32(stream)?;
-    let message = read_string(stream)?;
+fn read_server_response(stream: &mut QuicRecvStream, deadline: Instant) -> Result<ServerResponse> {
+    let ok = read_u8(stream, deadline)? != 0;
+    let udp_session_id = read_u32(stream, deadline)?;
+    let message = read_string(stream, deadline)?;
     Ok(ServerResponse {
         ok,
         udp_session_id,
@@ -547,25 +567,36 @@ fn read_server_response(stream: &mut QuicRecvStream) -> Result<ServerResponse> {
     })
 }
 
-fn read_exactly(stream: &mut QuicRecvStream, n: usize) -> Result<Vec<u8>> {
+fn read_exactly(stream: &mut QuicRecvStream, n: usize, deadline: Instant) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
-    stream
-        .read_exact(&mut buf)
-        .map_err(|e| Error::network(format!("Failed to read {n} bytes from the stream: {e}")))?;
+    let mut filled = 0usize;
+    while filled < n {
+        let read = stream
+            .read_with_deadline(&mut buf[filled..], deadline)
+            .map_err(|e| {
+                Error::network(format!("Failed to read {n} bytes from the stream: {e}"))
+            })?;
+        if read == 0 {
+            return Err(Error::network(
+                "The Hysteria control stream closed mid-message",
+            ));
+        }
+        filled += read;
+    }
     Ok(buf)
 }
 
-fn read_u8(stream: &mut QuicRecvStream) -> Result<u8> {
-    Ok(read_exactly(stream, 1)?[0])
+fn read_u8(stream: &mut QuicRecvStream, deadline: Instant) -> Result<u8> {
+    Ok(read_exactly(stream, 1, deadline)?[0])
 }
 
-fn read_u32(stream: &mut QuicRecvStream) -> Result<u32> {
-    let b = read_exactly(stream, 4)?;
+fn read_u32(stream: &mut QuicRecvStream, deadline: Instant) -> Result<u32> {
+    let b = read_exactly(stream, 4, deadline)?;
     Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-fn read_u64(stream: &mut QuicRecvStream) -> Result<u64> {
-    let b = read_exactly(stream, 8)?;
+fn read_u64(stream: &mut QuicRecvStream, deadline: Instant) -> Result<u64> {
+    let b = read_exactly(stream, 8, deadline)?;
     let mut arr = [0u8; 8];
     arr.copy_from_slice(&b);
     Ok(u64::from_be_bytes(arr))
@@ -574,14 +605,17 @@ fn read_u64(stream: &mut QuicRecvStream) -> Result<u64> {
 /// A `u16`-length-prefixed string, with the length checked before allocating:
 /// a hostile length field must not be able to reserve memory the frame cannot
 /// fill.
-fn read_string(stream: &mut QuicRecvStream) -> Result<String> {
-    let len = usize::from(u16::from_be_bytes([read_u8(stream)?, read_u8(stream)?]));
+fn read_string(stream: &mut QuicRecvStream, deadline: Instant) -> Result<String> {
+    let len = usize::from(u16::from_be_bytes([
+        read_u8(stream, deadline)?,
+        read_u8(stream, deadline)?,
+    ]));
     if len > MAX_MESSAGE {
         return Err(Error::protocol(format!(
             "Hysteria string of {len} bytes exceeds the {MAX_MESSAGE}-byte cap"
         )));
     }
-    let bytes = read_exactly(stream, len)?;
+    let bytes = read_exactly(stream, len, deadline)?;
     String::from_utf8(bytes)
         .map_err(|e| Error::protocol(format!("Hysteria string is not UTF-8: {e}")))
 }
