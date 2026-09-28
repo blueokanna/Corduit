@@ -582,7 +582,7 @@ impl ConnectionDto {
         Self {
             id: conn.id.clone(),
             src_addr: format!("{}:{}", conn.host, conn.destination_port),
-            dst_addr: conn.destination_ip.clone().unwrap_or_default(),
+            dst_addr: conn.destination_ip().unwrap_or_default(),
             dst_domain: Some(conn.host.clone()),
             protocol: conn.protocol.clone(),
             outbound: conn.outbound_tag.clone(),

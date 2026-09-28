@@ -330,7 +330,7 @@ pub fn get_connections_dto() -> std::result::Result<Vec<ConnectionDto>, String> 
         .map(|conn| ConnectionDto {
             id: conn.id.clone(),
             src_addr: format!("{}:{}", conn.host, conn.destination_port),
-            dst_addr: conn.destination_ip.clone().unwrap_or_default(),
+            dst_addr: conn.destination_ip().unwrap_or_default(),
             dst_domain: Some(conn.host.clone()),
             protocol: conn.protocol.clone(),
             outbound: conn.outbound_tag.clone(),
@@ -977,7 +977,7 @@ pub fn get_connections() -> Result<Vec<ConnectionInfo>> {
         .map(|conn| ConnectionInfo {
             id: conn.id.clone(),
             host: conn.host.clone(),
-            destination: match conn.destination_ip.as_deref() {
+            destination: match conn.destination_ip().as_deref() {
                 Some(ip) => format!("{ip}:{}", conn.destination_port),
                 None => format!("{}:{}", conn.host, conn.destination_port),
             },
@@ -2372,7 +2372,7 @@ pub fn get_active_connections() -> Result<Vec<ActiveConnection>> {
             inbound_tag: conn.inbound_tag.clone(),
             outbound_tag: conn.outbound_tag.clone(),
             host: conn.host.clone(),
-            destination_ip: conn.destination_ip.clone(),
+            destination_ip: conn.destination_ip(),
             destination_port: conn.destination_port,
             protocol: conn.protocol.clone(),
             network: conn.network.clone(),

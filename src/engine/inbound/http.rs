@@ -35,7 +35,9 @@
 use crate::common::listener::ConnectionListener;
 use crate::common::stream::{BoxStream, SyncStream};
 use crate::engine::config::InboundConfig;
-use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
+use crate::engine::connection_tracker::{
+    fill_destination_ip_in_background, global_tracker, TrackedConnection,
+};
 use crate::engine::error::{Error, Result};
 use crate::engine::inbound::auth::{
     check_proxy_authorization, proxy_authorization_user, InboundAuth,
@@ -319,20 +321,25 @@ struct ConnectRelay {
 
 impl ConnectRelay {
     fn relay(&self, client: BoxStream) {
-        let destination_ip = self.destination_ip();
-
+        // Track first, resolve later: the connection list wants an address,
+        // but the tunnel does not need one, so the lookup runs behind the
+        // relay (see `fill_destination_ip_in_background`). Doing it here
+        // instead put a full engine-DNS lookup — a remote DoH round trip on a
+        // cold name — in front of every HTTPS connection a browser opens,
+        // because browsers `CONNECT` by name without resolving it first.
         let tracker = global_tracker();
         let tracked = tracker.track(TrackedConnection::new_with_ip(
             self.kind.to_string(),
             self.outbound_tag.clone(),
             self.host.clone(),
-            destination_ip,
+            None,
             self.port,
             "HTTPS".to_string(),
             "tcp".to_string(),
             "HTTP-CONNECT".to_string(),
             format!("{}:{}", self.host, self.port),
         ));
+        fill_destination_ip_in_background(Arc::clone(&tracked), self.host.clone(), self.port);
 
         let result = self.outbound.relay_tcp_with_connection(
             client,
@@ -349,25 +356,6 @@ impl ConnectRelay {
                 e
             );
         }
-    }
-
-    /// The address shown in the connection list.
-    ///
-    /// The engine's resolver answers first: it follows the same nameserver
-    /// policy the connection itself uses, its answers are cached, and it is
-    /// the only resolver that works while a VPN owns the system resolver.
-    /// The system resolver stays as the fallback for a build that has no
-    /// engine resolver configured.
-    fn destination_ip(&self) -> Option<String> {
-        if let Some(result) = crate::dns::engine_resolver::resolve(&self.host, self.port) {
-            return result
-                .ok()
-                .and_then(|addrs| addrs.first().map(|addr| addr.ip().to_string()));
-        }
-        crate::common::socket::resolve_host(&self.host, self.port, Duration::from_secs(3))
-            .ok()
-            .and_then(|addrs| addrs.into_iter().next())
-            .map(|addr| addr.ip().to_string())
     }
 }
 

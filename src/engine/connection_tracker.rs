@@ -23,7 +23,13 @@ pub struct TrackedConnection {
     pub inbound_tag: String,
     pub outbound_tag: String,
     pub host: String,
-    pub destination_ip: Option<String>,
+    /// The address behind [`host`](Self::host), as far as anyone has looked
+    /// it up.
+    ///
+    /// Written by whoever resolves the name, which is deliberately never the
+    /// code path of the connection itself: the value feeds the connection
+    /// list, and a list field is not worth a lookup in front of a relay.
+    destination_ip: parking_lot::RwLock<Option<String>>,
     pub destination_port: u16,
     pub protocol: String,
     pub network: String,
@@ -59,7 +65,7 @@ impl TrackedConnection {
             inbound_tag,
             outbound_tag,
             host,
-            destination_ip: None,
+            destination_ip: parking_lot::RwLock::new(None),
             destination_port,
             protocol,
             network,
@@ -97,7 +103,7 @@ impl TrackedConnection {
             inbound_tag,
             outbound_tag,
             host,
-            destination_ip,
+            destination_ip: parking_lot::RwLock::new(destination_ip),
             destination_port,
             protocol,
             network,
@@ -115,6 +121,21 @@ impl TrackedConnection {
     /// The token that must be handed to every relay serving this connection.
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    /// The address the connection list shows, once it is known.
+    pub fn destination_ip(&self) -> Option<String> {
+        self.destination_ip.read().clone()
+    }
+
+    /// Record the resolved address.
+    ///
+    /// Called after the connection is already running —
+    /// [`fill_destination_ip_in_background`] is the intended caller — so the
+    /// relay never waits for a lookup that exists for the connection list's
+    /// sake.
+    pub fn set_destination_ip(&self, address: Option<String>) {
+        *self.destination_ip.write() = address;
     }
 
     pub fn add_upload(&self, bytes: u64) {
@@ -328,6 +349,51 @@ impl Default for ConnectionTracker {
     }
 }
 
+/// Fill in a connection's display address without anyone waiting for it.
+///
+/// The lookup runs on a thread of its own, so the relay behind it starts
+/// immediately. That ordering is the whole point: on a profile whose
+/// resolver is a remote DoH endpoint, a cold name costs a network round
+/// trip (up to the engine resolver's full budget), and paying it **before**
+/// the tunnel opens puts a DNS latency in front of every HTTPS connection a
+/// browser makes — the browser's `CONNECT` needs no lookup to be useful, so
+/// the lookup must not hold it back. The answer is dropped when the
+/// connection ends first, which costs nothing.
+pub fn fill_destination_ip_in_background(
+    connection: Arc<TrackedConnection>,
+    host: String,
+    port: u16,
+) {
+    let _ = std::thread::Builder::new()
+        .name("corduit-display-ip".into())
+        .spawn(move || {
+            if let Some(address) = resolve_for_display(&host, port) {
+                connection.set_destination_ip(Some(address));
+            }
+        });
+}
+
+/// The address that stands for `host:port` in the connection list.
+///
+/// The engine's resolver answers first for the same reason the dial path
+/// prefers it — a profile may make a name resolvable only through its own
+/// `nameserver-policy` — with the system resolver as the documented
+/// fallback, exactly as on the dial path.
+fn resolve_for_display(host: &str, port: u16) -> Option<String> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    if let Some(Ok(addresses)) = crate::dns::engine_resolver::resolve(host, port) {
+        if let Some(address) = addresses.first() {
+            return Some(address.ip().to_string());
+        }
+    }
+    crate::common::socket::resolve_host(host, port, std::time::Duration::from_secs(3))
+        .ok()
+        .and_then(|addresses| addresses.into_iter().next())
+        .map(|address| address.ip().to_string())
+}
+
 /// Connection handle that auto-untracks when dropped
 pub struct ConnectionHandle {
     tracker: Arc<ConnectionTracker>,
@@ -387,6 +453,53 @@ pub fn cancellation_for(connection: Option<&Arc<TrackedConnection>>) -> Cancella
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_display_address_is_writable_after_tracking() {
+        let tracker = ConnectionTracker::new();
+        let conn = TrackedConnection::new_with_ip(
+            "mixed".to_string(),
+            "proxy".to_string(),
+            "example.com".to_string(),
+            None,
+            443,
+            "HTTPS".to_string(),
+            "tcp".to_string(),
+            "MATCH".to_string(),
+            "MATCH".to_string(),
+        );
+        let tracked = tracker.track(conn);
+        assert_eq!(tracked.destination_ip(), None);
+
+        tracked.set_destination_ip(Some("203.0.113.10".to_string()));
+        assert_eq!(tracked.destination_ip().as_deref(), Some("203.0.113.10"));
+    }
+
+    #[test]
+    fn the_background_fill_lands_without_anyone_waiting() {
+        let tracker = ConnectionTracker::new();
+        let conn = TrackedConnection::new_with_ip(
+            "mixed".to_string(),
+            "proxy".to_string(),
+            "203.0.113.7".to_string(),
+            None,
+            443,
+            "HTTPS".to_string(),
+            "tcp".to_string(),
+            "MATCH".to_string(),
+            "MATCH".to_string(),
+        );
+        let tracked = tracker.track(conn);
+        fill_destination_ip_in_background(Arc::clone(&tracked), "203.0.113.7".to_string(), 443);
+
+        // A literal needs no lookup, so this settles almost immediately; the
+        // loop only bounds the thread hand-off.
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while tracked.destination_ip().is_none() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(tracked.destination_ip().as_deref(), Some("203.0.113.7"));
+    }
 
     #[test]
     fn test_connection_tracking() {

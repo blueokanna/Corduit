@@ -212,6 +212,15 @@ impl ConnectionListener {
                                 if let Err(error) = stream.set_nonblocking(false) {
                                     tracing::warn!("accepted socket keeps its mode: {error}");
                                 }
+                                // Every listener here fronts a relay, and a
+                                // relay writes in small pieces — a request
+                                // head, a record. Nagle would hold the second
+                                // piece behind the first one's ACK, which is
+                                // queueing latency added to the local hop of
+                                // a path whose remote half is tuned for
+                                // latency. It costs nothing when idle: with
+                                // nothing unacknowledged it never delays.
+                                let _ = stream.set_nodelay(true);
                                 let Some(slot) = Slots::acquire(&slots, &cancel) else {
                                     drop(stream);
                                     break;

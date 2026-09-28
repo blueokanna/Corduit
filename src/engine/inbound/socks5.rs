@@ -22,7 +22,9 @@
 
 use crate::common::listener::ConnectionListener;
 use crate::engine::config::InboundConfig;
-use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
+use crate::engine::connection_tracker::{
+    fill_destination_ip_in_background, global_tracker, TrackedConnection,
+};
 use crate::engine::error::{Error, Result};
 use crate::engine::inbound::auth::{socks5_userpass, InboundAuth, SOCKS5_AUTH_USERPASS};
 use crate::engine::inbound::{bind_tcp_listener, InboundListener};
@@ -315,14 +317,14 @@ fn handle_connect(
     let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     send_reply_with_addr(&mut stream, SOCKS5_REPLY_SUCCESS, unspecified)?;
 
+    // A literal destination is its own display address; a name is resolved
+    // behind the relay, never in front of it — a lookup here used to sit
+    // between the success reply and the relay's first byte, holding the
+    // client's pipelined data (a TLS ClientHello, typically) for up to the
+    // lookup's whole budget. See `fill_destination_ip_in_background`.
     let destination_ip = match &target {
         TargetAddr::Ip(addr) => Some(addr.ip().to_string()),
-        TargetAddr::Domain(domain, _) => {
-            crate::common::socket::resolve_host(domain, target.port(), Duration::from_secs(3))
-                .ok()
-                .and_then(|addrs| addrs.into_iter().next())
-                .map(|addr| addr.ip().to_string())
-        }
+        TargetAddr::Domain(_, _) => None,
     };
 
     let tracker = global_tracker();
@@ -337,6 +339,9 @@ fn handle_connect(
         "SOCKS5".to_string(),
         target.to_string(),
     ));
+    if let TargetAddr::Domain(domain, _) = &target {
+        fill_destination_ip_in_background(Arc::clone(&tracked), domain.clone(), target.port());
+    }
 
     let _ = stream.set_read_timeout(Some(RELAY_TIMEOUT));
     let _ = stream.set_write_timeout(Some(RELAY_TIMEOUT));
