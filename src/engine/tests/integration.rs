@@ -2,8 +2,8 @@
 //! synchronous engine to a real TCP echo server.
 //!
 //! These exercise the whole synchronous pipeline — accept thread, SOCKS5
-//! handshake, routing, DIRECT outbound and the two-thread bidirectional
-//! relay — over real sockets, no mocks.
+//! handshake, routing, DIRECT outbound and the relay (one copy thread plus the
+//! connection's own thread) — over real sockets, no mocks.
 
 use crate::engine::config::{
     Config, GeneralConfig, InboundConfig, InboundType, LogLevel, OutboundConfig, OutboundType,

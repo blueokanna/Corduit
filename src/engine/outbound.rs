@@ -5,9 +5,10 @@
 //! [`crate::common::stream::BoxStream`] and a target, establishes
 //! the upstream connection, and returns once the relay finishes.
 //!
-//! Concurrency model: every method is blocking; long-lived relays run on
-//! dedicated threads spawned by [`relay`](crate::common::stream::relay) and
-//! are bounded by the engine's session gate.
+//! Concurrency model: every method is blocking; a long-lived relay runs on the
+//! one copy thread spawned by [`relay`](crate::common::stream::relay) plus the
+//! connection thread that called it, and the listener's connection budget bounds
+//! how many are live.
 //!
 //! WireGuard, TUIC v5 and Hysteria2 sit behind the `wireguard`, `tuic` and
 //! `hysteria2` cargo features: with a feature off the corresponding outbound is
