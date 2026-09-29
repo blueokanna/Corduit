@@ -3,7 +3,7 @@
 ## 编译 / 环境
 
 **Q: `cargo build` 报 `error: the `no_std` attribute may only be used at the crate root`？**
-不会——crypto 模块的 `no_std` 已在合并时移除。若遇到，确认你在 `main` 最新代码上。
+不会——`no_std` 只出现在 crate 根（`lib.rs` 的 `#![cfg_attr(not(feature = "std"), no_std)]`），子模块里没有这个属性。若遇到，确认你在 `main` 最新代码上。
 
 **Q: Windows 下 wintun 相关报错？**
 TUN 功能需要 `wintun.dll`。`ensure_wintun_dll` 会自动下载；离线环境请手动把 wintun.dll 放到可执行文件目录。非 TUN 场景不影响。

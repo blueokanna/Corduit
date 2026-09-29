@@ -31,7 +31,7 @@ Corduit 是网络工程工具，涵盖代理协议、规则路由、DNS 与用�
 能力概览：
 
 - **入站**：`http`、`socks5`、`mixed`（HTTP + SOCKS5 自动识别）三种可配置监听器；TUN 模式基于仓库内的用户态协议栈，通过平台入口启用，而不是写进 `inbounds` 列表。`redir`、`tproxy` 以及写进 `inbounds` 的 `tun` 条目均可被解析为类型，但会在**校验阶段被直接拒绝**，错误信息明确说明缺什么：三者都没有监听器实现，接受了它们的构建只会“表面启动”却什么都不应答。
-- **出站**：`direct`、`reject`、`socks5`、`socks4` / `socks4a`、`http`（明文或 TLS 包裹）、`shadowsocks`（2017 AEAD 密码套件；2022 套件会以具名错误明确拒绝，而不是半实现）、`shadowsocksr`、`snell`（v4 / v5）、`vmess`、`vless`、`trojan`、`wireguard`、`naive`（NaiveProxy），以及需要显式开启的 `shadowtls`（v3）、`tuic`（v5）、`hysteria`（v1）与 `hysteria2`；代理组 `selector`、`url-test`、`fallback`、`load-balance`、`relay`。
+- **出站**：`direct`、`reject`、`socks5`、`socks4` / `socks4a`、`http`（明文或 TLS 包裹）、`shadowsocks`（2017 AEAD 密码套件；2022 套件会以具名错误明确拒绝，而不是半实现）、`shadowsocksr`、`snell`（v4 / v5，`obfs: http` / `obfs: tls`）、`vmess`、`vless`、`trojan`、`wireguard`、`naive`（NaiveProxy），以及需要显式开启的 `shadowtls`（v3）、`tuic`（v5）、`hysteria`（v1）与 `hysteria2`；代理组 `selector`、`url-test`、`fallback`、`load-balance`、`relay`。Shadowsocks 节点可携带 SIP003 插件——`obfs`（simple-obfs 的 `http` / `tls`）、`v2ray-plugin`（`websocket` 模式）或 `shadow-tls`（v3）——全部以仓库内流实现，不拉起外部插件进程。
 - **路由**：`domain`、`domain-suffix`、`domain-keyword`、`domain-regex`、`geoip`、`ip-cidr`、`src-ip-cidr`、`src-port`、`dst-port`、`process-name`、`rule-set`、`match`，配合 `rule` / `global` / `direct` 三种模式；规则集与代理集按间隔刷新。
 - **DNS**：解析器是同一作者的 [RecurseX](https://crates.io/crates/recurse-x)，以依赖形式引入：上游支持 UDP / TCP / DoT / DoH / DoH3 / DoQ，带按稳定性度量的分层缓存、请求合并，以及按期望成本排序的服务器选择。Corduit 补上 profile 方言带来的那部分：`nameserver-policy`、`default-nameserver`、`hosts`、`cache-size` 的写法，加密上游的主机名到 IP 的 bootstrap，以及 bogon / GeoIP 应答过滤（RecurseX 不附带国家库）。启用 `dns.enable` 后，`dns.listen` 上会真正启动监听器，UDP 与 TCP 同时可用，并以同一份 profile 应答。
 - **同步执行**：没有 tokio，没有 reactor，引擎内没有 `async` / `await`。并发来自短任务的 work-stealing 池与长连接中继的专用线程。
@@ -109,6 +109,7 @@ flowchart TB
 | HTTP 客户端（连接池、重定向、TLS 设置） | `courierust_client` |
 | TLS 1.2 / 1.3、X.509 校验、加密原语 | `courierust_tls` |
 | WebSocket RFC 6455（分帧、掩码、分片、关闭） | `courierust_ws`，由 `protocol::ws` 单点封装 |
+| Snell obfs 与 simple-obfs 共用的 HTTP/TLS 混淆流 | `protocol::obfs`（仓库内） |
 | QUIC 线路编解码（包、帧、varint、包保护） | `courierust_quic` |
 | work-stealing 调度器 | `courierust_pool` |
 | base64 | `courierust_crypto::base64` |
@@ -249,7 +250,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.2.5"}
+# {"code":0,"data":"Corduit v0.2.6"}
 ```
 
 ## 配置
@@ -305,7 +306,7 @@ MSRV：**Rust 1.78**。不使用任何 HTTP/TLS/QUIC 第三方库，也没有 as
 - **入站认证**：`general.authentication` 在每条路径上强制执行——HTTP 普通请求与 `CONNECT`（407 带客户端重试所需的 challenge）、SOCKS5 的 TCP 与 UDP 关联（RFC 1929），以及 TUN 协议栈自己的 SOCKS5 客户端（它携带配置的凭据，而不是让整条隧道失败）。
 - **出站握手**：`Sec-WebSocket-Accept` 不匹配按硬失败处理，不会降级成警告；配置提供的握手头（token 名称、值中不得含 CR/LF）在写上线之前完成校验；QUIC 系出站要求服务端证书链**且**通过验证的 `CertificateVerify` 证明，缺一不安装 1-RTT 密钥。
 - **Windows TUN**：`wintun.dll` 只从可执行文件所在目录（或其下的 `wintun/` 子目录）加载；不再搜索用户级目录与工作目录，未提权进程无法为提权引擎“种”一个 DLL。
-- **数据路径**：DNS 线解析来自 RecurseX：循环前先限段数、每个长度字段都对报文做边界检查、压缩指针只允许向前且带跳数预算（由 255 字节名字上限推导）；仓库内的 DNS 应答器执行同样的指针预算，自引用名字无法把 TUN 线程转死。MMDB 读取有边界检查、HTTP 响应体有上限、`skip-cert-verify` 默认关闭。
+- **数据路径**：DNS 线解析来自 RecurseX：循环前先限段数、每个长度字段都对报文做边界检查、压缩指针只允许向前且带跳数预算（由 255 字节名字上限推导）；仓库内的 DNS 应答器执行同样的指针预算，自引用名字无法把 TUN 线程转死。引擎自身的回退解析器只接受事务 ID 与问题完全匹配的应答，截断应答按失败处理、不作为答案。SOCKS5 客户端的域名若携带空白或控制字节，会收到失败应答而不是被拼进伪造的请求行；同一条规则守护一切会进入文本行的配置名（WebSocket 握手、Snell obfs、simple-obfs、SSR 的 `obfs-host`）。MMDB 读取有边界检查、HTTP 响应体有上限、`skip-cert-verify` 默认关闭。
 
 更多：[Security](https://github.com/blueokanna/Corduit/wiki/Security)。
 

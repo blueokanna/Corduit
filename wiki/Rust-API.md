@@ -4,7 +4,7 @@
 
 引擎是同步的：不需要 async runtime、不需要 `.await`、不需要 `#[tokio::main]`。阻塞操作由 socket 超时约束，长连接由专用线程承载。
 
-> 需要先 `api::init_app()`（幂等）初始化日志与 TLS provider；`start_proxy_*` / `initialize_corduit` 内部会自动处理。
+> `api::init_app()`（幂等）安装日志订阅器；`start_proxy_*` / `initialize_corduit` 内部会自动处理。
 
 ## 生命周期
 
@@ -119,9 +119,8 @@ let mode = api::get_proxy_mode()?;
 ## 日志
 
 ```rust,no_run
-// 查询 / 清空日志
-let logs = api::get_logs(100)?;                 // Vec<LogEntry>
-api::clear_logs()?;
+// 最近 N 条日志（缺省 100；环形缓冲区上限 5000 条）
+let logs = api::get_logs(Some(100))?;            // Vec<String>
 ```
 
 ## 直接使用引擎（不经过 api 层）

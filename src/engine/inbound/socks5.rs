@@ -240,6 +240,17 @@ fn read_request(stream: &mut TcpStream) -> Result<(Socks5Addr, u16, u8)> {
                 .map_err(|e| Error::network(format!("Failed to read domain: {e}")))?;
             let domain = String::from_utf8(domain)
                 .map_err(|_| Error::protocol("Invalid domain encoding"))?;
+            // The name travels further than this file — outbounds splice it
+            // into fabricated request lines and h2 authorities — so a byte
+            // that could end a line (space, CR/LF, any control) is refused
+            // here, where the client's request is still fully in hand.
+            // A hostname cannot contain one.
+            if crate::common::text::has_line_breaking_byte(&domain) {
+                send_reply(stream, SOCKS5_REPLY_BAD_ADDRESS)?;
+                return Err(Error::protocol(
+                    "Illegal byte in the SOCKS5 destination name",
+                ));
+            }
             (Socks5Addr::Domain(domain), read_port(stream)?)
         }
         0x04 => {
@@ -628,6 +639,11 @@ fn run_udp_relay(
                 let Ok(domain) = String::from_utf8(buf[5..5 + domain_len].to_vec()) else {
                     continue;
                 };
+                // Same rule as the request path: a name that could end a line
+                // never leaves this handler.
+                if crate::common::text::has_line_breaking_byte(&domain) {
+                    continue;
+                }
                 let port = u16::from_be_bytes([buf[5 + domain_len], buf[6 + domain_len]]);
                 (TargetAddr::new_domain(domain, port), 7 + domain_len)
             }
@@ -1040,6 +1056,43 @@ mod tests {
             .write_all(&[0x05, SOCKS5_CMD_CONNECT, 0x01, 0x01])
             .unwrap();
         assert!(read_request(&mut server).is_err());
+    }
+
+    /// A destination name is spliced into fabricated request lines by the
+    /// text-protocol outbounds, so a name holding CR/LF (or any space/control
+    /// byte) is refused with a failure reply before it can reach one.
+    #[test]
+    fn a_destination_name_with_a_line_breaking_byte_is_refused() {
+        let (mut server, mut client) = socket_pair();
+        let name = b"ok.example\r\nX-Injected: 1";
+        client
+            .write_all(&[0x05, SOCKS5_CMD_CONNECT, 0x00, 0x03, name.len() as u8])
+            .unwrap();
+        client.write_all(name).unwrap();
+        client.write_all(&[0x01, 0xBB]).unwrap();
+        assert!(read_request(&mut server).is_err());
+
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).expect("a failure reply");
+        assert_eq!(reply[1], SOCKS5_REPLY_BAD_ADDRESS);
+    }
+
+    #[test]
+    fn a_plain_destination_name_still_parses() {
+        let (mut server, mut client) = socket_pair();
+        let name = b"ok.example";
+        client
+            .write_all(&[0x05, SOCKS5_CMD_CONNECT, 0x00, 0x03, name.len() as u8])
+            .unwrap();
+        client.write_all(name).unwrap();
+        client.write_all(&[0x01, 0xBB]).unwrap();
+        let (target, port, command) = read_request(&mut server).expect("a valid request");
+        assert_eq!(command, SOCKS5_CMD_CONNECT);
+        assert_eq!(port, 443);
+        match target {
+            Socks5Addr::Domain(name) => assert_eq!(name, "ok.example"),
+            other => panic!("expected a domain target, got {other:?}"),
+        }
     }
 
     #[test]

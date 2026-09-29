@@ -16,13 +16,13 @@ flowchart TB
     ROOT --> COMMON["common/<br/>同步调度器 + socket 原语 + 双向中继<br/>+ 定时器 + 取消 + URL 解析<br/>+ 阻塞监听器 + courierust HTTP 客户端 + 根证书"]
     ROOT --> ENGINE["engine/<br/>代理引擎核心"]
     ROOT --> CRYPTO["crypto/<br/>加密原语 + 文本编解码"]
-    ROOT --> PROTOCOL["protocol/<br/>线缆协议（QUIC v1 客户端、TLS 1.2/1.3、TLS 1.3+REALITY、WebSocket、WireGuard）"]
+    ROOT --> PROTOCOL["protocol/<br/>线缆协议（QUIC v1 客户端、TLS 1.2/1.3、TLS 1.3+REALITY、WebSocket、HTTP/TLS obfs、WireGuard）"]
     ROOT --> DNS["dns/<br/>profile → RecurseX 适配"]
     ROOT --> NETSTACK["netstack/<br/>用户态 TCP/IP + TUN"]
 
     ENGINE --> EC["config/<br/>校验过的配置模型"]
     ENGINE --> EI["inbound/<br/>HTTP / SOCKS5 / mixed 监听"]
-    ENGINE --> EO["outbound/<br/>Direct/SS/VMess/VLESS/Trojan/WireGuard/HTTP(S)/SOCKS5<br/>TUIC · Hysteria2（可选 feature）<br/>+ proxy-provider 节点注册表"]
+    ENGINE --> EO["outbound/<br/>Direct / SS（含 SIP003 插件）/ SSR / Snell / Naive<br/>VMess / VLESS / Trojan / ShadowTLS / WireGuard<br/>HTTP(S) / SOCKS4·5 / 代理组<br/>TUIC · Hysteria v1 · Hysteria2（可选 feature）"]
     ENGINE --> ER["routing.rs<br/>规则 → 出站匹配 + rule-provider 管理"]
     ENGINE --> EG["geoip.rs + mmdb.rs<br/>CountryMatcher + MMDB 读取"]
     ENGINE --> EP["proxy.rs<br/>ProxyManager 协调器"]
@@ -52,7 +52,7 @@ flowchart LR
         T13["protocol::tls13<br/>数据驱动 ClientHello"]
         REAL["protocol::reality<br/>REALITY 认证"]
         WSM["protocol::ws<br/>WS 封装（唯一入口）"]
-        OB["engine::outbound<br/>SS/VMess/VLESS/Trojan/TUIC/Hysteria2/WireGuard"]
+        OB["engine::outbound<br/>SS（含 SIP003）/ SSR / Snell / Naive<br/>VMess / VLESS / Trojan / ShadowTLS<br/>TUIC / Hysteria / Hysteria2 / WireGuard"]
         DNS["dns/<br/>profile → RecurseX 适配<br/>上游 · bootstrap · bogon"]
         NS["netstack/<br/>用户态 TCP/IP"]
     end
@@ -70,11 +70,13 @@ flowchart LR
 
 Corduit 没有 async runtime。并发是分层的，每一层只做它擅长的事：
 
-1. **短任务**（accept 分发、握手、DNS 查询、控制面、周期刷新）跑在 courierust 的
+1. **短任务**（DNS 查询、控制面、周期刷新、定时器回调）跑在 courierust 的
    work-stealing 线程池上（每 worker 私有 LIFO、全局 FIFO、跨 worker 偷取、空闲零 CPU）。
 2. **长连接中继**跑在专用线程上（每连接两条、每方向一条、带半关闭），由会话门限
    （`SessionGate`）限制并发数，避免中继饿死握手容量。
-3. **accept 循环**每个监听器一条专用线程，把接到的 socket 交给池。
+3. **accept 循环**每个监听器一条专用线程；接到的 socket 由 courierust 的
+   per-connection 引擎（`serve_connection`）在专属线程上服务，活跃连接达到监听器配额时
+   accept 线程自身阻塞，形成背压（空闲监听器在 `accept` 上阻塞，不轮询）。
 
 阻塞由 socket 超时（`SO_RCVTIMEO` / `SO_SNDTIMEO`）约束：`WouldBlock`/`TimedOut` 即
 “暂时无事”，循环在两次操作之间检查 `CancellationToken`。
@@ -172,8 +174,9 @@ ProviderUpdater 在 `Corduit::start` 时启动、`stop` 时停止，默认 60 �
 `protocol/{address,error}` 零 OS 依赖；线程化网络层（engine、DNS 服务器、
 netstack、RPC、传输）由 `std` feature 门控。
 
-可选 feature：`quic`（仓库内自研 QUIC v1 传输）、`tuic`、`hysteria2`（两者隐含 `quic`）——
-默认全部关闭，默认构建里不包含任何 QUIC / TUIC / Hysteria2 代码。
+可选 feature：`quic`（仓库内自研 QUIC v1 传输）、`tuic`、`hysteria`、`hysteria2`（三者隐含 `quic`）、
+`tls13`（数据驱动 ClientHello）、`reality`、`shadowtls`（后两者隐含 `tls13`）——默认全部关闭，
+默认构建里不包含这些代码。
 
 ## 安全边界
 

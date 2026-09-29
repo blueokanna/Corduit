@@ -527,7 +527,7 @@ mod cancellation_kind_tests {
 
 /// Validate the `Host` header value.
 fn validate_host(host: &str) -> io::Result<()> {
-    if host.is_empty() || host.bytes().any(|b| b <= b' ' || b == b'\x7f') {
+    if host.is_empty() || crate::common::text::has_line_breaking_byte(host) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "websocket: illegal Host value",
@@ -538,7 +538,7 @@ fn validate_host(host: &str) -> io::Result<()> {
 
 /// Validate the request target.
 fn validate_path(path: &str) -> io::Result<()> {
-    if !path.starts_with('/') || path.bytes().any(|b| b <= b' ' || b == b'\x7f') {
+    if !path.starts_with('/') || crate::common::text::has_line_breaking_byte(path) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "websocket: the request path must start with '/' and hold no control byte",

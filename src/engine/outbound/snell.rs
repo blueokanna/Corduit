@@ -230,31 +230,38 @@ impl SnellOutbound {
             .filter(|s| !s.is_empty())
         {
             None => SnellObfs::None,
-            Some(mode) if mode == "http" => SnellObfs::Http {
-                host: config
+            Some(mode) if mode == "http" => {
+                let host = config
                     .options
                     .get("obfs-host")
                     .map(yaml_value_to_string)
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "bing.com".to_string()),
-                uri: config
+                    .unwrap_or_else(|| "bing.com".to_string());
+                let uri = config
                     .options
                     .get("obfs-uri")
                     .map(yaml_value_to_string)
                     .map(|s| s.trim().to_string())
-                    .filter(|s| s.starts_with('/'))
-                    .unwrap_or_else(|| "/".to_string()),
-            },
-            Some(mode) if mode == "tls" => SnellObfs::Tls {
-                host: config
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "/".to_string());
+                crate::protocol::obfs::validate_obfs_host(&host)
+                    .and_then(|()| crate::protocol::obfs::validate_obfs_uri(&uri))
+                    .map_err(|e| Error::config(format!("Snell obfs: {e}")))?;
+                SnellObfs::Http { host, uri }
+            }
+            Some(mode) if mode == "tls" => {
+                let host = config
                     .options
                     .get("obfs-host")
                     .map(yaml_value_to_string)
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| DEFAULT_TLS_OBFS_HOST.to_string()),
-            },
+                    .unwrap_or_else(|| DEFAULT_TLS_OBFS_HOST.to_string());
+                crate::protocol::obfs::validate_obfs_host(&host)
+                    .map_err(|e| Error::config(format!("Snell obfs: {e}")))?;
+                SnellObfs::Tls { host }
+            }
             Some(other) => {
                 return Err(Error::config(format!(
                     "Unknown Snell obfs mode `{other}`; the reference defines `http` and `tls`"
@@ -322,12 +329,14 @@ impl SnellOutbound {
 
         let inner: BoxStream = match &self.settings.obfs {
             SnellObfs::None => Box::new(stream),
-            SnellObfs::Http { host, uri } => Box::new(HttpObfsStream::snell(
-                Box::new(stream),
-                host.clone(),
-                uri.clone(),
-            )),
-            SnellObfs::Tls { host } => Box::new(TlsObfsStream::new(Box::new(stream), host.clone())),
+            SnellObfs::Http { host, uri } => Box::new(
+                HttpObfsStream::snell(Box::new(stream), host.clone(), uri.clone())
+                    .map_err(|e| Error::config(format!("Snell obfs: {e}")))?,
+            ),
+            SnellObfs::Tls { host } => Box::new(
+                TlsObfsStream::new(Box::new(stream), host.clone())
+                    .map_err(|e| Error::config(format!("Snell obfs: {e}")))?,
+            ),
         };
         Ok(inner)
     }
@@ -1028,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn http_obfs_is_accepted_with_its_defaults_and_tls_obfs_is_refused() {
+    fn http_and_tls_obfs_are_accepted_with_their_defaults() {
         let cfg = build(&[("psk", string("x")), ("obfs", string("HTTP"))]).unwrap();
         assert_eq!(
             cfg.obfs,
@@ -1080,21 +1089,37 @@ mod tests {
         assert!(other.contains("Unknown Snell obfs"), "{other}");
     }
 
+    /// A relative URI and a value that could rewrite the fabricated request
+    /// are refused at build time: the head is assembled by text substitution,
+    /// so a silent fallback would hide a profile that can never work.
     #[test]
-    fn a_relative_obfs_uri_falls_back_to_the_root() {
-        let cfg = build(&[
+    fn obfs_values_that_cannot_sit_in_the_head_are_refused() {
+        let relative = build(&[
             ("psk", string("x")),
             ("obfs", string("http")),
             ("obfs-uri", string("ws")),
         ])
-        .unwrap();
-        assert_eq!(
-            cfg.obfs,
-            SnellObfs::Http {
-                host: "bing.com".to_string(),
-                uri: "/".to_string()
-            }
-        );
+        .unwrap_err()
+        .to_string();
+        assert!(relative.contains("must start with '/'"), "{relative}");
+
+        let injected = build(&[
+            ("psk", string("x")),
+            ("obfs", string("http")),
+            ("obfs-host", string("ok.example\r\nX-Injected: 1")),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(injected.contains("obfs host"), "{injected}");
+
+        let long = build(&[
+            ("psk", string("x")),
+            ("obfs", string("tls")),
+            ("obfs-host", string(&"a".repeat(300))),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(long.contains("obfs host"), "{long}");
     }
 
     #[test]

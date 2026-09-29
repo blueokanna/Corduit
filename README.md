@@ -60,11 +60,14 @@ Capabilities:
 - **Outbounds**: `direct`, `reject`, `socks5`, `socks4` / `socks4a`, `http`
   (plain or TLS-wrapped), `shadowsocks` (the 2017 AEAD ciphers; the 2022
   suite is refused with a named error rather than half-implemented),
-  `shadowsocksr`, `snell` (v4 / v5),
-  `vmess`, `vless`, `trojan`, `wireguard`, `naive` (NaiveProxy), the opt-in
+  `shadowsocksr`, `snell` (v4 / v5, `obfs: http` / `obfs: tls`), `vmess`,
+  `vless`, `trojan`, `wireguard`, `naive` (NaiveProxy), the opt-in
   `shadowtls` (v3), `tuic` (v5), `hysteria` (v1) and `hysteria2`; plus the
   group selectors `selector`, `url-test`, `fallback`, `load-balance` and
-  `relay`.
+  `relay`. A Shadowsocks node can carry a SIP003 plugin — `obfs`
+  (simple-obfs `http` / `tls`), `v2ray-plugin` (`websocket` mode) or
+  `shadow-tls` (v3) — resolved as an in-tree stream, never as an external
+  binary.
 - **Routing**: `domain`, `domain-suffix`, `domain-keyword`, `domain-regex`,
   `geoip`, `ip-cidr`, `src-ip-cidr`, `src-port`, `dst-port`, `process-name`,
   `rule-set` and `match`, with `rule` / `global` / `direct` modes; rule
@@ -185,6 +188,7 @@ only the layers courierust deliberately does not expose:
 | HTTP client (pools, redirects, TLS settings) | `courierust_client` |
 | TLS 1.2 / 1.3, X.509 validation, crypto primitives | `courierust_tls` |
 | WebSocket RFC 6455 (framing, masking, fragmentation, close) | `courierust_ws`, wrapped once by `protocol::ws` |
+| HTTP/TLS obfuscation streams shared by Snell obfs and simple-obfs | `protocol::obfs` (in-tree) |
 | QUIC wire codecs (packets, frames, varint, packet protection) | `courierust_quic` |
 | Work-stealing scheduler | `courierust_pool` |
 | base64 | `courierust_crypto::base64` |
@@ -366,7 +370,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.2.5"}
+# {"code":0,"data":"Corduit v0.2.6"}
 ```
 
 ## Configuration
@@ -457,8 +461,15 @@ This is a local tool that controls network traffic, so the boundary is explicit:
   before any loop, bounds every length field against the message, and follows
   compression pointers only forwards with a hop budget derived from the 255-byte
   name limit; the in-tree DNS responder enforces the same pointer budget, so a
-  self-referencing name cannot spin the TUN thread. MMDB reads bounds-checked,
-  HTTP response bodies capped, `skip-cert-verify` off by default.
+  self-referencing name cannot spin the TUN thread. The engine's own fallback
+  resolver accepts a reply only when its transaction id and question match the
+  query it sent, and treats a truncated reply as a failure rather than an
+  answer. A SOCKS5 client's destination name is refused with a failure reply
+  when it carries a space or control byte, so it can never be spliced into a
+  fabricated request line; the same rule guards every configured name that
+  reaches one (WebSocket handshake, Snell obfs, simple-obfs, SSR obfs-host).
+  MMDB reads bounds-checked, HTTP response bodies capped, `skip-cert-verify`
+  off by default.
 
 More: [Security](https://github.com/blueokanna/Corduit/wiki/Security).
 

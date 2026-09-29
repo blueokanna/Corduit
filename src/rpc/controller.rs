@@ -207,7 +207,6 @@ impl ExternalController {
 
         let listener = std::net::TcpListener::bind(config.addr)?;
         let addr = listener.local_addr()?;
-        listener.set_nonblocking(true)?;
 
         Ok(Self {
             listener: Some(listener),

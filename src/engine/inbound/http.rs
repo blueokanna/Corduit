@@ -257,7 +257,7 @@ fn parse_connect_head(head: &[u8]) -> std::result::Result<(&str, HeaderMap), Str
     }
     let authority =
         std::str::from_utf8(target).map_err(|_| "non-ASCII CONNECT target".to_string())?;
-    if authority.bytes().any(|b| b < 0x21 || b == 0x7f) {
+    if crate::common::text::has_line_breaking_byte(authority) {
         return Err("control character in the CONNECT target".to_string());
     }
 

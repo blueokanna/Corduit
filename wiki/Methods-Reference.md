@@ -108,8 +108,8 @@ curl -s -X POST http://127.0.0.1:8765/rpc -H "Authorization: Bearer $T" -H "Cont
 | `set_windows_proxy_mode` | `mode: string` | `null` | Windows（系统代理） |
 | `get_windows_proxy_mode_str` | — | `string` | Windows |
 | `get_windows_tun_stats` | — | 统计对象 | Windows |
-| `enable_uwp_loopback` | — | `bool` | Windows UWP 回环 |
-| `open_uwp_loopback_utility` | — | `bool` | Windows |
+| `list_uwp_loopback` | — | `[UwpLoopbackEntry]` | Windows；`{name,family,exempt}`，由 `Get-AppxPackage` 与 `CheckNetIsolation LoopbackExempt -s` 联表得到 |
+| `set_uwp_loopback` | `family: string, exempt: bool` | `null` | Windows；family 按 `<name>_<13位哈希>` 形状校验后才进命令行（CWE-78），切换需要提权 |
 
 ## Android / iOS / VPN fd
 
@@ -129,6 +129,14 @@ curl -s -X POST http://127.0.0.1:8765/rpc -H "Authorization: Bearer $T" -H "Cont
 | `start_rpc_server` | `port: u16, token?: string` | `null` | 起服务（token 缺省自动生成） |
 | `stop_rpc_server` | — | `null` | 停服务 |
 | `get_rpc_server_status` | — | `RpcServerStatus` | `{running,addr,token_set}`（**不含 token**） |
+
+## 外部控制器
+
+| method | params | 返回 data | 说明 |
+|---|---|---|---|
+| `start_external_controller` | `external_controller: string, secret?: string` | `null` | 按 `host:port` 起外部控制器；**非回环地址必须给非空 `secret`**，否则拒绝绑定（profile 的 `general.external_controller` 会在启动时自动走这条路） |
+| `stop_external_controller` | — | `null` | 停外部控制器（幂等） |
+| `get_external_controller_status` | — | `ExternalControllerStatus` | `{running,addr,secret_required}` |
 
 ## 参数类型规则
 

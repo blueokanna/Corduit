@@ -240,10 +240,10 @@ RPC / FFI 提供 `set_proxy_mode(mode)`，参数是整数：`0`=CONFIG、`1`=GLO
 
 ## 6. 后台 ProviderUpdater
 
-引擎启动（`Corduit::start`）时启动一个后台任务，默认每 **60 秒** tick 一次，做三件事：
+引擎启动（`Corduit::start`）时启动一条专用线程（`provider-updater`），默认每 **60 秒** tick 一次，做三件事：
 
 1. 代理订阅：按各自的 `interval` 刷新（`update_if_needed`）；
 2. 规则集：按各自的 `interval` 刷新；
 3. 健康检查：对启用了 `health_check` 的代理订阅跑延迟探测。
 
-tick 用 `MissedTickBehavior::Skip`（追不上就跳过，不堆积）；停引擎（`stop`）时通过 oneshot 信号优雅退出。代理订阅/规则集由引擎组件持有共享 `Arc`，所以刷新直接作用于正在用的节点和规则，不用重载配置。
+tick 由 `mpsc::Receiver::recv_timeout` 兼任间隔睡眠与停机信号（二者同一个等待，不空转）；`stop` 时发送停机信号，线程走完当前轮即退出。代理订阅/规则集由引擎组件持有共享 `Arc`，所以刷新直接作用于正在用的节点和规则，不用重载配置。

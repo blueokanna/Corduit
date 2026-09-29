@@ -6,7 +6,7 @@ Corduit 同时做**依赖图审计**与**源码级加固**。
 
 - 整个依赖图零 serde（`Cargo.lock` 里没有 `serde*`），序列化只走 `nextjson` / `rustbinary`（两者都 `#![deny(unsafe_code)]`）；
 - 时间用仓库内的 UTC 时钟（`common/clock.rs`，Hinnant 历法算法）格式化；
-- `cargo audit` 无已知漏洞。
+- `cargo audit`：**0 个已知漏洞**（2026-09-29 实测，1277 条公告扫描 210 个依赖）；唯一告警是 `paste`（unmaintained），它由 Linux 目标的 `tun-rs → route_manager → netlink-packet-*` 链引入，是编译期 proc-macro，不在运行路径上。
 
 ## 远程控制面
 
@@ -31,8 +31,9 @@ Corduit 同时做**依赖图审计**与**源码级加固**。
 | CWE-74 URL 注入 | `Url::parse` 统一拒绝全部原始控制字节（CR/LF/NUL 等）：`path()` 会被拼进多处探测请求行（`GET {path} HTTP/1.1`），此前任何一处都可能被 CRLF 注入头；现在一类问题在解析器一层关掉 |
 | CWE-190 整数截断 | SOCKS5 凭据按 RFC 1929 校验长度；WebSocket 帧长与分片上限由 `courierust_ws` 会话强制（≤16 MiB） |
 | CWE-345 伪装升级 | 出站 WebSocket 握手校验 `Sec-WebSocket-Accept`（`base64(SHA-1(key‖GUID))`），不匹配即硬失败，绝不“告警后继续” |
-| CWE-93 头注入 | 出站 WS 握手头在写线之前校验（token 名称、值中不得含 CR/LF 或 NUL），保留头（Host/Upgrade/Connection/Sec-WebSocket-*）不允许被配置覆盖 |
+| CWE-93 头注入 | 所有"把名字拼进文本行"的边界共用同一条判定（`common::text::has_line_breaking_byte`）：出站 WS 握手头（token 名称、值中不得含 CR/LF 或 NUL，保留头不允许被配置覆盖）、Snell obfs 与 SIP003 simple-obfs 的伪造请求（host/uri/method 校验，host 长度上限保证 `ClientHello` 的 16 位长度字段不溢出）、SSR 的 `obfs-host`、SOCKS5 入站的域名（CR/LF/NUL/空白直接拒绝并回失败应答） |
 | CWE-295 TLS 校验 | `skip_cert_verify` 默认关；只有显式配置才绕过；默认用系统根证书；QUIC 出站（TUIC/Hysteria/Hysteria2）在装 1-RTT 密钥前要求证书链**且**通过验证的 `CertificateVerify`，仓库内 TLS 1.3 客户端同样强制 |
+| CWE-345 DNS 应答（引擎自用回退解析器） | 只接受事务 ID 与问题（名字/类型/类）完全匹配的应答，截断（TC）按失败处理并换下一台——竞态或伪造的应答不会被当成地址（`dns::trusted`） |
 | CWE-400 资源耗尽 | DNS 压缩指针 ≤128 跳（内置应答器同样）；MMDB 读取全程边界检查；HTTP body ≤64 MiB；RPC body/WS 消息 ≤16 MiB；RPC 连接 600s 上限；重定向 ≤8 跳；UDP 会话（direct/shadowsocks）并发上限 1024，QUIC 流表 1024、datagram 队列 64，hysteria2/tuic 分片重组 4 MiB/64 条 |
 | CWE-306 缺少鉴权 | RPC 必须 token |
 | CWE-502 反序列化 | FFI 二进制走 rustbinary 有界 profile（64MiB + 集合上限 + 拒绝尾部字节） |

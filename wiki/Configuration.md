@@ -131,11 +131,11 @@ RecurseX 只接受 **IP 字面量**：主机名上游会先通过 `default_names
 |---|---|---|
 | 直连 | `direct` | — |
 | 拒绝 | `reject` | — |
-| Shadowsocks | `shadowsocks` / `ss` | `password`, `cipher`（如 `aes-256-gcm`、`chacha20-poly1305`） |
-| ShadowsocksR | `shadowsocksr` / `ssr` | `password`, `cipher`（SSR 方法名，如 `aes-256-cfb`、`chacha20-ietf`、`rc4-md5`）, `protocol`（`origin` / `auth_sha1_v4` / `auth_aes128_md5` / `auth_aes128_sha1`）, `obfs`（`plain` / `http_simple` / `http_post` / `tls1.2_ticket_auth`）, `obfs-host`（伪装域名；逗号分隔时每次连接随机取一个，末位是数字的域名会被丢弃——SNI 里出现 IP 本身就是特征）, `protocol-param`（`uid:key`） |
+| Shadowsocks | `shadowsocks` / `ss` | `password`, `cipher`（如 `aes-256-gcm`、`chacha20-poly1305`）, `plugin` + `plugin-opts`（SIP003：`obfs` / `simple-obfs` / `obfs-local`、`v2ray-plugin`、`shadow-tls`，见下） |
+| ShadowsocksR | `shadowsocksr` / `ssr` | `password`, `cipher`（SSR 方法名，如 `aes-256-cfb`、`chacha20-ietf`、`rc4-md5`）, `protocol`（`origin` / `auth_sha1_v4` / `auth_aes128_md5` / `auth_aes128_sha1`）, `obfs`（`plain` / `http_simple` / `http_post` / `tls1.2_ticket_auth`）, `obfs-host`（伪装域名；逗号分隔时每次连接随机取一个，末位是数字的域名会被丢弃——SNI 里出现 IP 本身就是特征；含空白/控制字节或超长的值在解析时直接报错）, `protocol-param`（`uid:key`） |
 | ShadowTLS v3（需 `shadowtls` feature） | `shadowtls` / `shadow-tls` | `password`, `sni`（要伪装成哪个真实站点，`;`/`,` 分隔可随机取一个；必填）, `fingerprint`（`chrome`/`randomized`/`off`，默认 `chrome`）, `alpn`, `insecure`/`skip-cert-verify`, `version`（只接受 `3`） |
 | NaiveProxy | `naive` / `naiveproxy` / `naive-proxy` / `naive+https` | `username`, `password`（两者要成对出现）, `sni`, `skip-cert-verify`/`insecure`, `alpn`（必须包含 `h2`）, `tls`（写 `false` 只对本地回环监听器有意义） |
-| Snell | `snell` | `psk`, `version`（`4` 或 `5`，默认 4）, `obfs`（`http`；`tls` 会报错，见下）, `obfs-host`（默认 `bing.com`）, `obfs-uri`（默认 `/`）, `client-id`（默认空）, `reuse`（未实现，配了会警告） |
+| Snell | `snell` | `psk`, `version`（`4` 或 `5`，默认 4）, `obfs`（`http` / `tls`）, `obfs-host`（http 默认 `bing.com`，tls 默认 `cloudfront.net`）, `obfs-uri`（默认 `/`，必须以 `/` 开头）, `client-id`（默认空）, `reuse`（未实现，配了会警告） |
 | VMess | `vmess` | `uuid`, `alter_id`/`alterId`（**`> 0` 自动使用 legacy（pre-AEAD）握手**，因为这类服务器只认旧握手；`= 0` 使用 AEAD）, `cipher`, `tls`, `network`（`tcp`/`ws`；`h2`/`grpc`/`kcp`/`quic` 尚未实现——创建出站时会显式报错，不会静默按裸 TCP 连接）, `ws-opts`（`path`/`headers.Host`）, `alpn`（可选；缺省时 WebSocket 传输只宣告 `http/1.1`，其余传输宣告 `h2` + `http/1.1`）, `sni`, `skip-cert-verify` |
 | VLESS | `vless` | `uuid`, `flow`, `tls` 等 |
 | Trojan | `trojan` | `password`, `sni` |
@@ -163,7 +163,9 @@ RecurseX 只接受 **IP 字面量**：主机名上游会先通过 `default_names
 
 > **NaiveProxy 的边界**：ALPN 必须包含 `h2`（服务端用 HTTP/1.1 应答时这个隧道根本没法跑），`CONNECT` 只带 `:method` 与 `:authority`（RFC 9113 §8.3.1 禁止 `CONNECT` 携带 `:scheme`/`:path`），凭据走 `Proxy-Authorization: Basic`，并显式发 `padding-type-request: 0`。隧道是**自研的单流 h2 驱动**（帧编解码复用 `courierust_h2::frame` 与 HPACK，双向流控与窗口归还自己管）：仓库用的 h2 会话编解码器把 `CONNECT` 流当作无 body——收到 `DATA` 会回 `PROTOCOL_ERROR`——而 RFC 9113 §8.3.1 里 `DATA` 就是隧道本身，单流隧道需要的也不是复用与优先级。UDP 不支持：一条 `CONNECT` 只承载一条 TCP 流。
 >
-> **Snell 的边界**：实现 v4/v5（二者线格式相同）；`version: 6` 会报错（v6 的 shaped 记录需要按 Profile 生成盐块与记录前缀，猜错会表现为认证失败）；`obfs: tls` 也会报错（它靠伪造 ClientHello 的扩展序列骗过检测，那段序列无法逐字节核实，猜错是真服务器上的静默失败）。padding 长度由发送方自描述，因此任何一致策略都是协议正确的——本实现只用参考实现的初始区间，不复制其后继自适应算法，否则等于凭空发明一个指纹。
+> **Snell 的边界**：实现 v4/v5（二者线格式相同）；`version: 6` 会报错（v6 的 shaped 记录需要按 Profile 生成盐块与记录前缀，猜错会表现为认证失败）；`obfs: http` / `obfs: tls` 均按 `sing-snell` 的实现复刻（tls 的首包是伪造 `ClientHello`，首个记录的载荷藏在 session ticket 里），三个长度字段由单测对着参考常量钉死。padding 长度由发送方自描述，因此任何一致策略都是协议正确的——本实现只用参考实现的初始区间，不复制其后继自适应算法，否则等于凭空发明一个指纹。
+>
+> **Shadowsocks SIP003 `plugin` 的边界**：`obfs`（simple-obfs）以 `mode: http | tls` 塑形 TCP 流；`v2ray-plugin` 只实现 `websocket` 模式（`tls: true` 即 wss，`host`/`path`/`sni` 可配）；`shadow-tls` 要求 `host` + `password`，且只接受 `version: 3`（需 `shadowtls` feature）。host / uri / method 在配置解析时校验：含空白、CR/LF/NUL 或超长的值直接报错，不会拼进伪造请求（CWE-93）；未实现的插件名（如 `kcptun`）按名拒绝，不会当作裸 Shadowsocks 拨号。插件只塑形 TCP——启用后该节点的 UDP 自动禁用并给出警告（simple-obfs 本就只有 TCP；`v2ray-plugin` / `shadow-tls` 的 UDP 是另一套线格式）。Snell 的 `obfs: http` / `obfs: tls` 与 simple-obfs 共用同一份伪造流实现（`protocol::obfs`），两种协议只在伪造的请求形状上不同。
 >
 > 同样地，`fingerprint` 需要 `tls13` feature，`security: reality` 需要 `reality` feature（隐含 `tls13`）。REALITY 只实现客户端：session id 按参考格式密封（version/时间/short-id + AES-256-GCM，AAD 为 session-id 清零后的 ClientHello），服务端认证用临时证书证明（证书签名字段 = HMAC-SHA512）；`mldsa65-verify` 未实现，配置里出现会直接报错，收到真证书（回落/MITM）是硬错误。不宣告证书压缩（RFC 8879）与 ALPS。
 >
@@ -210,6 +212,7 @@ RecurseX 只接受 **IP 字面量**：主机名上游会先通过 `default_names
 - 至少一个 inbound；inbound/outbound 的 `tag` 非空且唯一；
 - `redir` / `tproxy` / `tun` 入站类型一律拒绝（无监听器实现）；
 - Shadowsocks 的 `2022-blake3-*` 密码套件在出站构建（引擎启动）时报错拒绝（SIP022 未实现，不会半实现互操作）；
+- SIP003 `plugin` 按名解析，未实现的名字直接报错；`plugin-opts` 与 Snell obfs 的 host / uri / method 在解析时校验（空白、CR/LF/NUL、超长值一律拒绝，不会拼进伪造请求）；
 - 普通出站必须有 `server` 和合法 `port`；代理组必须有 `outbounds`，成员必须可解析（静态 outbound / `DIRECT` / `REJECT` / 已声明的 provider 名；存在 provider 时也允许 provider 动态注入的 tag）；
 - 所有规则的 `outbound` 必须通过交叉引用解析；`rule-set` 规则引用的名字必须存在于 `rule_providers`；
 - provider 的 `interval ≥ 60`、`http` 必须 https、`file` 必须有 `path`。

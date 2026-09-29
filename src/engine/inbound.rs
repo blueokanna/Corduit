@@ -53,9 +53,6 @@ fn bind_tcp_listener(listen: &str, port: u16, name: &str) -> Result<(TcpListener
         })?;
     }
 
-    socket
-        .set_nonblocking(true)
-        .map_err(|error| Error::network(format!("Failed to set non-blocking: {error}")))?;
     socket.bind(&addr.into()).map_err(|error| {
         Error::network(format!("Failed to bind {name} listener to {addr}: {error}"))
     })?;

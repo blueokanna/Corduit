@@ -25,11 +25,68 @@
 //! The read sides are byte-counting state machines rather than `read_exact`s:
 //! a relay read may time out between records, and a partial header must
 //! resume where it stopped rather than being mistaken for a new record.
+//!
+//! The host, URI and method are spliced into the fabricated request by text
+//! substitution, so each is validated before a byte reaches the wire
+//! (`validate_*` below): a space would split a request line, CR/LF/NUL would
+//! let a profile value write its own headers, and an over-long host would
+//! overflow the `ClientHello`'s 16-bit length fields.
 
 use crate::common::stream::{BoxStream, SyncStream};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Fabricated-head field validation
+// ---------------------------------------------------------------------------
+
+/// Longest `Host` / SNI value the fabricated head accepts. A DNS name cannot
+/// exceed 253 bytes, and the `ClientHello`'s length fields would overflow
+/// before this bound anyway.
+pub(crate) const MAX_OBFS_HOST_LEN: usize = 255;
+/// Longest request target the fabricated head accepts.
+pub(crate) const MAX_OBFS_URI_LEN: usize = 2048;
+/// Longest request method the fabricated head accepts.
+pub(crate) const MAX_OBFS_METHOD_LEN: usize = 16;
+
+/// Reject anything that cannot sit in a request line or header as-is.
+///
+/// The rule is the one the WebSocket upgrade path already applies: a byte at
+/// or below `0x20` (space and every control character, CR/LF included) or
+/// `0x7f` ends a line or splits a token, and a value the profile supplied
+/// has no business doing either (CWE-93).
+fn check_field(field: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.is_empty() || value.len() > max || crate::common::text::has_line_breaking_byte(value) {
+        return Err(format!(
+            "the obfs {field} cannot be used in a fabricated request: {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the `Host` header / SNI value.
+pub(crate) fn validate_obfs_host(host: &str) -> Result<(), String> {
+    check_field("host", host, MAX_OBFS_HOST_LEN)
+}
+
+/// Validate the request target: printable, and rooted like an HTTP origin-form.
+pub(crate) fn validate_obfs_uri(uri: &str) -> Result<(), String> {
+    check_field("uri", uri, MAX_OBFS_URI_LEN)?;
+    if !uri.starts_with('/') {
+        return Err(format!("the obfs uri must start with '/': {uri:?}"));
+    }
+    Ok(())
+}
+
+/// Validate the request method.
+pub(crate) fn validate_obfs_method(method: &str) -> Result<(), String> {
+    check_field("method", method, MAX_OBFS_METHOD_LEN)
+}
+
+fn invalid_field(error: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
+}
 
 // ---------------------------------------------------------------------------
 // TLS obfs
@@ -105,8 +162,9 @@ pub(crate) struct TlsObfsStream {
 }
 
 impl TlsObfsStream {
-    pub(crate) fn new(inner: BoxStream, host: String) -> Self {
-        Self {
+    pub(crate) fn new(inner: BoxStream, host: String) -> io::Result<Self> {
+        validate_obfs_host(&host).map_err(invalid_field)?;
+        Ok(Self {
             inner,
             host,
             client_hello_sent: false,
@@ -115,7 +173,7 @@ impl TlsObfsStream {
             length_filled: 0,
             payload_remaining: 0,
             first_record: true,
-        }
+        })
     }
 
     /// Wrap `payload` in one or more application-data records.
@@ -330,8 +388,10 @@ pub(crate) struct HttpObfsStream {
 }
 
 impl HttpObfsStream {
-    pub(crate) fn snell(inner: BoxStream, host: String, uri: String) -> Self {
-        Self {
+    pub(crate) fn snell(inner: BoxStream, host: String, uri: String) -> io::Result<Self> {
+        validate_obfs_host(&host).map_err(invalid_field)?;
+        validate_obfs_uri(&uri).map_err(invalid_field)?;
+        Ok(Self {
             inner,
             host,
             uri,
@@ -339,7 +399,7 @@ impl HttpObfsStream {
             flavor: HttpObfsFlavor::Snell,
             header_sent: false,
             response_skipped: false,
-        }
+        })
     }
 
     pub(crate) fn simple_obfs(
@@ -348,8 +408,11 @@ impl HttpObfsStream {
         uri: String,
         port: u16,
         method: String,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        validate_obfs_host(&host).map_err(invalid_field)?;
+        validate_obfs_uri(&uri).map_err(invalid_field)?;
+        validate_obfs_method(&method).map_err(invalid_field)?;
+        Ok(Self {
             inner,
             host,
             uri,
@@ -357,7 +420,7 @@ impl HttpObfsStream {
             flavor: HttpObfsFlavor::SimpleObfs { method },
             header_sent: false,
             response_skipped: false,
-        }
+        })
     }
 
     /// The fabricated request head, with the flavour's fingerprint rules.
@@ -560,7 +623,8 @@ mod tests {
         let stream = TlsObfsStream::new(
             Box::new(scripted_stream(Vec::new(), 4096)),
             host.to_string(),
-        );
+        )
+        .expect("a hostname is a valid obfs host");
         let hello = stream.client_hello(&payload);
 
         assert_eq!(&hello[..3], &[0x16, 0x03, 0x01]);
@@ -612,7 +676,8 @@ mod tests {
     fn the_tls_obfs_first_write_is_a_single_hello() {
         let inner = scripted_stream(Vec::new(), 4096);
         let writes = Arc::clone(&inner.writes);
-        let mut stream = TlsObfsStream::new(Box::new(inner), "cloudfront.net".to_string());
+        let mut stream = TlsObfsStream::new(Box::new(inner), "cloudfront.net".to_string())
+            .expect("a hostname is a valid obfs host");
         stream.write_all(b"first record bytes").unwrap();
         let recorded = writes.lock().clone();
         assert_eq!(recorded.len(), 1, "hello and payload leave in one write");
@@ -634,7 +699,8 @@ mod tests {
         let mut stream = TlsObfsStream::new(
             Box::new(scripted_stream(wire, 1)),
             "cloudfront.net".to_string(),
-        );
+        )
+        .expect("a hostname is a valid obfs host");
         let mut got = vec![0u8; first.len() + second.len()];
         stream.read_exact(&mut got).unwrap();
         assert_eq!(&got[..first.len()], &first[..]);
@@ -655,7 +721,8 @@ mod tests {
             "/".to_string(),
             8443,
             "GET".to_string(),
-        );
+        )
+        .expect("the reference's own values are valid");
         stream.write_all(b"payload").unwrap();
         let recorded = writes.lock().clone();
         assert_eq!(recorded.len(), 1, "head and body leave in one write");
@@ -671,12 +738,57 @@ mod tests {
         assert!(head.contains("Content-Length: 7\r\n\r\npayload"), "{head}");
     }
 
+    /// A profile value that could rewrite the fabricated request is refused at
+    /// the constructors, not silently spliced into the head: a space splits a
+    /// request line, CR/LF/NUL would add headers, and an over-long host would
+    /// overflow the hello's 16-bit length fields.
+    #[test]
+    fn obfs_fields_that_could_rewrite_the_head_are_refused() {
+        for bad in ["", "a b", "a\r\nX-Injected: 1", "a\x00b", "a\x7fb"] {
+            assert!(validate_obfs_host(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(validate_obfs_host(&"a".repeat(MAX_OBFS_HOST_LEN + 1)).is_err());
+        assert!(validate_obfs_host(&"a".repeat(MAX_OBFS_HOST_LEN)).is_ok());
+        assert!(validate_obfs_host("cdn.example.com").is_ok());
+
+        assert!(validate_obfs_uri("").is_err());
+        assert!(validate_obfs_uri("ws").is_err(), "must be rooted");
+        assert!(validate_obfs_uri("/a b").is_err());
+        assert!(validate_obfs_uri("/a\r\nHost: evil").is_err());
+        assert!(validate_obfs_uri("/ws?ed=2048").is_ok());
+
+        assert!(validate_obfs_method("").is_err());
+        assert!(validate_obfs_method("GE T").is_err());
+        assert!(validate_obfs_method("POST").is_ok());
+
+        // The constructors are the enforcement point, so a caller that skips
+        // the config-time check still cannot build an injectable head.
+        let inner = || Box::new(scripted_stream(Vec::new(), 4096)) as BoxStream;
+        assert!(
+            TlsObfsStream::new(inner(), "a\r\nb".to_string()).is_err(),
+            "a CRLF host must not reach the hello"
+        );
+        assert!(
+            HttpObfsStream::snell(inner(), "ok.example".to_string(), "no-slash".to_string())
+                .is_err()
+        );
+        assert!(HttpObfsStream::simple_obfs(
+            inner(),
+            "ok.example".to_string(),
+            "/".to_string(),
+            443,
+            "GET\r\nHost: evil".to_string(),
+        )
+        .is_err());
+    }
+
     #[test]
     fn the_snell_head_keeps_its_own_order_and_omits_the_port() {
         let inner = scripted_stream(Vec::new(), 4096);
         let writes = Arc::clone(&inner.writes);
         let mut stream =
-            HttpObfsStream::snell(Box::new(inner), "bing.com".to_string(), "/ws".to_string());
+            HttpObfsStream::snell(Box::new(inner), "bing.com".to_string(), "/ws".to_string())
+                .expect("the reference's own values are valid");
         stream.write_all(b"payload").unwrap();
         let recorded = writes.lock().clone();
         let head = String::from_utf8_lossy(&recorded[0]);

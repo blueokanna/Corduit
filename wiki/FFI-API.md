@@ -77,8 +77,9 @@ int main(void) {
 用 `dart:ffi` 直接绑定：
 
 ```dart
-import 'dart:ffi';
 import 'dart:convert';
+import 'dart:ffi';
+import 'dart:io';
 import 'package:ffi/ffi.dart';
 
 final class FfiResponse extends Struct {
@@ -86,25 +87,32 @@ final class FfiResponse extends Struct {
   external Pointer<Utf8> data;
 }
 
-typedef _Call = Pointer<FfiResponse> Function(Pointer<Utf8>, Pointer<Utf8>);
+// `corduit_call` returns the struct **by value** — not a pointer to it.
+typedef _Call = FfiResponse Function(Pointer<Utf8>, Pointer<Utf8>);
 
 late final DynamicLibrary _lib = Platform.isAndroid
     ? DynamicLibrary.open('libcorduit.so')
     : DynamicLibrary.process();
 
-final _call = _lib.lookupFunction<Pointer<FfiResponse> Function(Pointer<Utf8>, Pointer<Utf8>),
-    Pointer<FfiResponse> Function(Pointer<Utf8>, Pointer<Utf8>)>('corduit_call');
+final _call = _lib.lookupFunction<_Call, _Call>('corduit_call');
 final _free = _lib.lookupFunction<Void Function(Pointer<Utf8>), void Function(Pointer<Utf8>)>('corduit_string_free');
 
+/// JSON payload on success; throws with the message on failure.
 String? invoke(String method, [Map<String, Object?>? args]) {
   final m = method.toNativeUtf8();
   final a = (args == null) ? nullptr : jsonEncode(args).toNativeUtf8();
   final resp = _call(m, a);
-  final code = resp.ref.code;
-  final text = code == 0 ? resp.ref.data.toDartString() : null;
-  calloc.free(resp);
   malloc.free(m);
   if (a != nullptr) malloc.free(a);
+
+  // `data` is heap memory owned by the caller, on success and failure alike;
+  // the struct itself is a by-value copy and owns nothing further.
+  final data = resp.data;
+  final text = data == nullptr ? null : data.toDartString();
+  if (data != nullptr) _free(data);
+  if (resp.code != 0) {
+    throw StateError(text ?? 'corduit_call failed with code ${resp.code}');
+  }
   return text;
 }
 
@@ -114,7 +122,8 @@ void main() {
 }
 ```
 
-> 注意：Dart FFI 里 `FfiResponse` 要按 C 布局定义；释放顺序是先 `corduit_string_free(data)` 再释放外层结构体。
+> 注意：Dart FFI 里 `FfiResponse` 要按 C 布局定义；`corduit_call` 按值返回结构体，返回的 `data`
+> 指针无论 `code` 是否为 0 都要 `corduit_string_free`（结构体本身不额外分配内存）。
 
 ## 二进制通道（rustbinary）
 

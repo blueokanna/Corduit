@@ -30,7 +30,7 @@
 //! change is picked up on the next dial rather than at the next restart.
 
 use parking_lot::Mutex;
-use recurse_x::{Message, Name, RData, RrType};
+use recurse_x::{Message, Name, RData, RrClass, RrType};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -221,7 +221,8 @@ fn resolve_uncached(domain: &str, want_v6: bool) -> io::Result<Vec<IpAddr>> {
 
 /// One question to one server, over a pinned one-shot UDP socket.
 fn exchange(server: SocketAddr, name: &Name, rr_type: RrType) -> io::Result<Vec<IpAddr>> {
-    let query = Message::query(next_query_id(), name.clone(), rr_type, true)
+    let query_id = next_query_id();
+    let query = Message::query(query_id, name.clone(), rr_type, true)
         .to_bytes()
         .map_err(|e| io::Error::other(format!("encode query: {e}")))?;
     let reply = crate::common::socket::udp_exchange(&server, &query, ATTEMPT_TIMEOUT, None)?;
@@ -229,6 +230,31 @@ fn exchange(server: SocketAddr, name: &Name, rr_type: RrType) -> io::Result<Vec<
         Message::parse(&reply).map_err(|e| io::Error::other(format!("parse reply: {e}")))?;
     if !response.flags.qr {
         return Err(io::Error::other("reply is a query, not a response"));
+    }
+    // Answer only *this* question. Anything else is a stray, a race or an
+    // injection, and taking its addresses would be exactly the race the
+    // query id exists to prevent.
+    if response.id != query_id {
+        return Err(io::Error::other(format!(
+            "reply id {} does not match the query id {query_id}",
+            response.id
+        )));
+    }
+    match response.question() {
+        Some(question)
+            if question.qname == *name
+                && question.qtype == rr_type
+                && question.qclass == RrClass::IN => {}
+        _ => {
+            return Err(io::Error::other(
+                "reply does not echo the question that was asked",
+            ))
+        }
+    }
+    if response.flags.tc {
+        // Truncated: this path has no TCP retry, so the partial answer is
+        // not usable — report it and let the next server try.
+        return Err(io::Error::other("reply is truncated (TC set)"));
     }
     let mut addresses = Vec::new();
     for record in &response.answers {
@@ -319,6 +345,95 @@ mod tests {
         // The second call is answered from the cache, which must agree.
         let again = resolve("example.test", false).expect("cached answer");
         assert_eq!(again, found);
+    }
+
+    /// A loopback server that answers with whatever the closure builds from
+    /// the query — the tool for proving that replies which do not belong to
+    /// the question are thrown away rather than trusted.
+    fn spawn_responder(respond: impl Fn(&Message) -> Option<Message> + Send + 'static) -> u16 {
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a loopback socket");
+        server
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("a read timeout, so the thread cannot outlive the test forever");
+        let port = server.local_addr().expect("bound address").port();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((len, peer)) = server.recv_from(&mut buf) {
+                let Ok(query) = Message::parse(&buf[..len]) else {
+                    continue;
+                };
+                if let Some(response) = respond(&query) {
+                    if let Ok(bytes) = response.to_bytes() {
+                        let _ = server.send_to(&bytes, peer);
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    fn poisoned_answer() -> recurse_x::Record {
+        recurse_x::Record {
+            name: Name::from_ascii("example.test").expect("a record name"),
+            rr_type: RrType::A,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::A(Ipv4Addr::new(203, 0, 113, 9)),
+        }
+    }
+
+    /// A raced or injected reply with the wrong transaction id is discarded,
+    /// addresses and all — accepting it is exactly what the random id exists
+    /// to prevent.
+    #[test]
+    fn a_reply_with_the_wrong_transaction_id_is_discarded() {
+        let _exclusive = exclusive();
+        let port = spawn_responder(|query| {
+            let mut response = Message::new(query.id.wrapping_add(1));
+            response.flags.qr = true;
+            response.questions.clone_from(&query.questions);
+            response.answers.push(poisoned_answer());
+            Some(response)
+        });
+        let _armed = Armed::new(vec![SocketAddr::from(([127, 0, 0, 1], port))]);
+        assert!(resolve("example.test", false).is_err());
+    }
+
+    /// A reply that does not echo the question is discarded even when it
+    /// carries syntactically valid answers.
+    #[test]
+    fn a_reply_to_another_question_is_discarded() {
+        let _exclusive = exclusive();
+        let port = spawn_responder(|query| {
+            let mut response = Message::new(query.id);
+            response.flags.qr = true;
+            response.questions.push(recurse_x::Question {
+                qname: Name::from_ascii("evil.test").expect("a question name"),
+                qtype: RrType::A,
+                qclass: RrClass::IN,
+            });
+            response.answers.push(poisoned_answer());
+            Some(response)
+        });
+        let _armed = Armed::new(vec![SocketAddr::from(([127, 0, 0, 1], port))]);
+        assert!(resolve("example.test", false).is_err());
+    }
+
+    /// A truncated reply is not an answer: this path cannot retry over TCP,
+    /// so it must move on to the next server instead of caching the gap.
+    #[test]
+    fn a_truncated_reply_is_discarded() {
+        let _exclusive = exclusive();
+        let port = spawn_responder(|query| {
+            let mut response = Message::new(query.id);
+            response.flags.qr = true;
+            response.flags.tc = true;
+            response.questions.clone_from(&query.questions);
+            response.answers.push(poisoned_answer());
+            Some(response)
+        });
+        let _armed = Armed::new(vec![SocketAddr::from(([127, 0, 0, 1], port))]);
+        assert!(resolve("example.test", false).is_err());
     }
 
     #[test]

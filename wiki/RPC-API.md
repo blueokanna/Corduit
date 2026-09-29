@@ -122,7 +122,7 @@ req = urllib.request.Request(
              "Authorization": "Bearer my-secret-token"},
 )
 print(json.load(urllib.request.urlopen(req)))
-# {'code': 0, 'data': 'Corduit v0.2.2'}
+# {'code': 0, 'data': 'Corduit v0.2.6'}
 ```
 
 ## 限制与安全
@@ -131,11 +131,11 @@ print(json.load(urllib.request.urlopen(req)))
 - token 比较是常数时间（`ct_eq`），抗时序侧信道；
 - 请求体 / WebSocket 消息上限 16 MiB，超出返回 `413`（`Content-Length` 声明超限时一个字节都不读）；
 - 连接生命周期上限 600 秒，空闲连接自动回收；
-- 每个连接由 courierust 的 per-connection 引擎（`serve_connection`）在独占线程上驱动：
-  HTTP/1.1 帧、keep-alive、分块体、`413` 都由服务端处理，没有手写解析器；
-- WebSocket 升级按 RFC 6455 校验（方法、`Upgrade`/`Connection`令牌、`Sec-WebSocket-Key` 形状、
-  `Sec-WebSocket-Version: 13`、`Origin` 策略），由 `courierust_server::ws` 阻塞驱动运行：
-  分帧、掩码方向、分片重组、UTF-8 校验、保活 `Ping`（30 秒）与关闭握手全在驱动内完成；
+- 每个连接由仓库内的有界 HTTP/1.1 驱动（`rpc::http1`，复用 courierust 的公开编解码原语）在独占线程上服务：
+  请求头 30 秒绝对截止（drip-feed slowloris 会收到 `408`）、请求体 300 秒、keep-alive 空闲 600 秒、单连接最多 1000 个请求；
+- WebSocket 升级用 courierust 的升级校验策略（方法、`Upgrade`/`Connection` 令牌、`Sec-WebSocket-Key` 形状、
+  `Sec-WebSocket-Version: 13`、`Origin`），随后交给 `protocol::ws::WebSocket::accepted`（服务端角色）承载：
+  分帧、掩码方向、分片重组、消息上限、保活 `Ping`（30 秒）与关闭握手全在会话里完成；
 - CORS 全放开（本地服务 + token 门控），允许 `Authorization` 头；
 - 响应里的错误消息由 `nextjson` 转义，不会破坏 JSON。
 

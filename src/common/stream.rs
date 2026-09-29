@@ -1046,15 +1046,18 @@ mod tests {
     /// relay owns it — which is the property under test. The drop flag is the
     /// only cross-platform way to tell a joined thread from a stray one: a
     /// thread that outlives `relay` still holds its `Arc<Side>`, and therefore
-    /// still holds the transport.
+    /// still holds the transport. `reads` counts calls so a test can watch the
+    /// poll rate instead of the CPU it burned.
     struct Parking {
         released: std::sync::Arc<std::sync::atomic::AtomicBool>,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
         panic_on_read: bool,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Read for Parking {
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert!(
                 !self.panic_on_read,
                 "the upstream direction was told to panic"
@@ -1284,11 +1287,13 @@ mod tests {
             released: std::sync::Arc::clone(&up_released),
             dropped: std::sync::Arc::clone(&up_dropped),
             panic_on_read: true,
+            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let downstream: BoxStream = Box::new(Parking {
             released: std::sync::Arc::clone(&down_released),
             dropped: std::sync::Arc::clone(&down_dropped),
             panic_on_read: false,
+            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
 
         let outcome = relay(upstream, downstream, CancellationToken::new());
@@ -1314,53 +1319,52 @@ mod tests {
     /// A relay that never sees data must poll, not spin: the no-progress path
     /// has to sleep, so a silent connection costs a wake-up per poll interval
     /// rather than a saturated core.
+    ///
+    /// The signal is the read-call count, not CPU time: `copy_direction`
+    /// sleeps twice per quiet cycle (`Side::read` after a bounded read,
+    /// `copy_direction` on the `Ok(None)` it returns), so a parked direction
+    /// reads once per ~4 ms — about 75 calls per direction in this window,
+    /// while a loop that lost its sleep counts into the millions. Counting is
+    /// immune to the CPU other tests are burning on the same process, which a
+    /// process-wide `utime` delta is not.
     #[test]
     fn a_silent_relay_parks_between_polls() {
+        let upstream_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downstream_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let upstream: BoxStream = Box::new(Parking {
             released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panic_on_read: false,
+            reads: std::sync::Arc::clone(&upstream_reads),
         });
         let downstream: BoxStream = Box::new(Parking {
             released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dropped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panic_on_read: false,
+            reads: std::sync::Arc::clone(&downstream_reads),
         });
 
         let token = CancellationToken::new();
         let relay_token = token.clone();
         let relayed = std::thread::spawn(move || relay(upstream, downstream, relay_token));
-        let start = std::time::Instant::now();
-        let before = cpu_time();
+
+        // Let both directions settle into their loops, then sample the rate.
+        std::thread::sleep(Duration::from_millis(50));
+        let count = || {
+            upstream_reads.load(std::sync::atomic::Ordering::SeqCst)
+                + downstream_reads.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let before = count();
         std::thread::sleep(Duration::from_millis(300));
-        let burned = cpu_time().saturating_sub(before);
-        let elapsed = start.elapsed();
+        let reads = count().saturating_sub(before);
 
         token.cancel();
         let _ = relayed.join().expect("relay thread");
 
         assert!(
-            burned < 150_000,
-            "a silent relay burned {burned:?} of CPU in {elapsed:?}"
+            reads < 2_000,
+            "a silent relay read {reads} times in 300 ms: the no-progress path is not sleeping"
         );
-    }
-
-    /// This process's own CPU time, in microseconds.
-    #[cfg(target_os = "linux")]
-    fn cpu_time() -> u64 {
-        let stat = std::fs::read_to_string("/proc/self/stat").expect("own stat");
-        let rest = stat.split_once(") ").expect("comm").1;
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        let utime: u64 = fields[11].parse().expect("utime");
-        let stime: u64 = fields[12].parse().expect("stime");
-        // 100 ticks per second on every Linux kernel this runs on.
-        (utime + stime) * 10_000
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn cpu_time() -> u64 {
-        std::thread::sleep(Duration::from_millis(1));
-        0
     }
 
     /// A stream that hands out fixed bytes and then EOFs, refusing to be read

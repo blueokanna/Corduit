@@ -937,8 +937,23 @@ impl SsrObfs {
     /// Parse the plugin name; `host` comes from the profile's `obfs-host`.
     pub fn parse(name: &str, host: Option<String>) -> Result<Self> {
         let host = host.unwrap_or_else(|| "bing.com".to_string());
-        match name.trim().to_ascii_lowercase().as_str() {
-            "" | "plain" => Ok(Self::Plain),
+        let normalized = name.trim().to_ascii_lowercase();
+        if normalized.is_empty() || normalized == "plain" {
+            return Ok(Self::Plain);
+        }
+        // From here on the host is spliced into the fabricated request head
+        // (and the TLS hello): `pick_obfs_host` later selects one of the
+        // comma-separated candidates, so each is checked now. A byte that
+        // could end a line must not arrive from configuration (CWE-93), and
+        // the length bound keeps the hello's 16-bit fields in range.
+        for candidate in host.split(',').map(str::trim) {
+            if candidate.len() > 255 || crate::common::text::has_line_breaking_byte(candidate) {
+                return Err(Error::config(format!(
+                    "SSR obfs-host cannot be used in a fabricated request: {candidate:?}"
+                )));
+            }
+        }
+        match normalized.as_str() {
             "http_simple" => Ok(Self::HttpSimple {
                 host,
                 uri: "/".to_string(),
@@ -2387,6 +2402,31 @@ mod tests {
             let picked = pick_obfs_host("a.test, b.test");
             assert!(picked == "a.test" || picked == "b.test", "{picked}");
         }
+    }
+
+    /// A configured host that could end a line (or overflow the hello's
+    /// length fields) is refused when the obfs layer is parsed, not spliced
+    /// into the fabricated request.
+    #[test]
+    fn an_unusable_obfs_host_is_refused() {
+        for bad in ["a\r\nX-Injected: 1", "a b", "a\u{7f}b"] {
+            assert!(
+                SsrObfs::parse("http_simple", Some(bad.to_string())).is_err(),
+                "{bad:?} must be refused"
+            );
+            assert!(
+                SsrObfs::parse("tls1.2_ticket_auth", Some(bad.to_string())).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(
+            SsrObfs::parse("http_simple", Some("a".repeat(256))).is_err(),
+            "an over-long host must be refused"
+        );
+        // A comma-separated list is the reference's spelling; a pathological
+        // member still fails the whole list.
+        assert!(SsrObfs::parse("http_simple", Some("ok.test, bad\r\ntest".to_string())).is_err());
+        assert!(SsrObfs::parse("http_simple", Some("ok.test, also.test".to_string())).is_ok());
     }
 
     /// The `tls1.2_ticket_auth` first packet: a ClientHello record, the CCS and

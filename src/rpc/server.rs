@@ -165,9 +165,6 @@ impl RpcServer {
 
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
-        // The accept loop polls the listener so it can observe a stop
-        // request without waiting for a connection.
-        listener.set_nonblocking(true)?;
 
         Ok(Self {
             listener: Some(listener),

@@ -201,6 +201,17 @@ pub fn connect<R: Read, W: Write>(
     if config.server_name.is_empty() {
         return Err(Tls13Error::InvalidConfig("server_name is empty".into()));
     }
+    // The name travels in the `server_name` extension behind a 16-bit length
+    // field, and a DNS name cannot legally exceed 253 bytes; a longer or
+    // control-bearing value can only produce a malformed hello, so it is a
+    // configuration error rather than something to send.
+    if config.server_name.len() > 255 || config.server_name.bytes().any(|b| b <= b' ' || b == 0x7f)
+    {
+        return Err(Tls13Error::InvalidConfig(format!(
+            "server_name is not a hostname: {:?}",
+            config.server_name
+        )));
+    }
 
     // Entropy: client random + ephemeral X25519 key.
     let mut random = [0u8; 32];
@@ -1084,6 +1095,39 @@ mod tests {
         // The server side fails its handshake too; joining keeps the test
         // from leaking the thread.
         let _ = server.join();
+    }
+
+    /// A name the `server_name` extension cannot carry is refused before any
+    /// byte is built: over the 16-bit length field's bound, or holding a byte
+    /// that would only end up as a malformed hello.
+    #[test]
+    fn a_server_name_that_cannot_be_a_hostname_is_refused() {
+        for bad in ["", "a b", "a\r\nX: 1", "a\u{7f}b", &"a".repeat(256)] {
+            let mut reader: &[u8] = &[];
+            let result = connect(
+                &mut reader,
+                Vec::new(),
+                Tls13ClientConfig {
+                    server_name: bad.to_string(),
+                    alpn: Vec::new(),
+                    fingerprint: Fingerprint::Off,
+                    now: 0,
+                    roots: None,
+                    verify: false,
+                    auth: None,
+                    hello_hook: None,
+                    compatibility_ccs: true,
+                    shutdown_hook: None,
+                },
+            );
+            match result {
+                Err(Tls13Error::InvalidConfig(message)) => {
+                    assert!(message.contains("server_name"), "{bad:?}: {message}");
+                }
+                Err(other) => panic!("{bad:?}: unexpected error {other}"),
+                Ok(_) => panic!("{bad:?} must be refused"),
+            }
+        }
     }
 
     /// A custom `ServerAuth` replaces the x509 path, and the transcript still

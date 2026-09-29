@@ -695,6 +695,17 @@ mod tests {
             let (mut sock, _) = listener.accept().unwrap();
             let mut head = [0u8; 8];
             let _ = sock.read_exact(&mut head);
+            // Drain the empty user-id's NUL terminator as well: closing a
+            // socket with even one unread byte makes Windows answer with RST,
+            // and the RST can overtake the reply below, surfacing as
+            // WSAECONNRESET instead of the CD=91 this test is about.
+            let mut byte = [0u8; 1];
+            loop {
+                match sock.read(&mut byte) {
+                    Ok(1) if byte[0] != 0 => continue,
+                    _ => break,
+                }
+            }
             let _ = sock.write_all(&[0, 91, 0, 0, 0, 0, 0, 0]);
         });
 

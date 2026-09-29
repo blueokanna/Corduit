@@ -114,19 +114,26 @@ impl Plugin {
                     .unwrap_or_else(|| "http".to_string())
                     .to_ascii_lowercase();
                 match mode.as_str() {
-                    "http" => Ok(Plugin::ObfsHttp {
-                        host: opt("host")
-                            .unwrap_or_else(|| DEFAULT_SIMPLE_OBFS_HTTP_HOST.to_string()),
-                        uri: opt("uri")
+                    "http" => {
+                        let host = opt("host")
+                            .unwrap_or_else(|| DEFAULT_SIMPLE_OBFS_HTTP_HOST.to_string());
+                        let uri = opt("uri")
                             .or_else(|| opt("path"))
-                            .filter(|uri| uri.starts_with('/'))
-                            .unwrap_or_else(|| "/".to_string()),
-                        method: opt("method").unwrap_or_else(|| "GET".to_string()),
-                    }),
-                    "tls" => Ok(Plugin::ObfsTls {
-                        host: opt("host")
-                            .unwrap_or_else(|| DEFAULT_SIMPLE_OBFS_TLS_HOST.to_string()),
-                    }),
+                            .unwrap_or_else(|| "/".into());
+                        let method = opt("method").unwrap_or_else(|| "GET".to_string());
+                        crate::protocol::obfs::validate_obfs_host(&host)
+                            .and_then(|()| crate::protocol::obfs::validate_obfs_uri(&uri))
+                            .and_then(|()| crate::protocol::obfs::validate_obfs_method(&method))
+                            .map_err(|e| Error::config(format!("simple-obfs: {e}")))?;
+                        Ok(Plugin::ObfsHttp { host, uri, method })
+                    }
+                    "tls" => {
+                        let host =
+                            opt("host").unwrap_or_else(|| DEFAULT_SIMPLE_OBFS_TLS_HOST.to_string());
+                        crate::protocol::obfs::validate_obfs_host(&host)
+                            .map_err(|e| Error::config(format!("simple-obfs: {e}")))?;
+                        Ok(Plugin::ObfsTls { host })
+                    }
                     other => Err(Error::config(format!(
                         "simple-obfs mode `{other}` is not implemented; `http` and `tls` are"
                     ))),
@@ -150,9 +157,14 @@ impl Plugin {
                 let host = opt("host")
                     .map(|host| host.split(':').next().unwrap_or(&host).to_string())
                     .unwrap_or_else(|| server.to_string());
-                let path = opt("path")
-                    .filter(|path| path.starts_with('/'))
-                    .unwrap_or_else(|| "/".to_string());
+                let path = opt("path").unwrap_or_else(|| "/".to_string());
+                // The WebSocket handshake writes this value into its request
+                // line; the same rule as every other fabricated head applies.
+                if !path.starts_with('/') || crate::common::text::has_line_breaking_byte(&path) {
+                    return Err(Error::config(format!(
+                        "v2ray-plugin path must start with '/' and hold no control byte: {path:?}"
+                    )));
+                }
                 let sni = opt("sni").unwrap_or_else(|| host.clone());
                 Ok(Plugin::V2rayWs {
                     tls,
@@ -180,6 +192,8 @@ impl Plugin {
                     let password = opt("password").ok_or_else(|| {
                         Error::config("shadow-tls requires `plugin-opts.password`")
                     })?;
+                    crate::protocol::obfs::validate_obfs_host(&host)
+                        .map_err(|e| Error::config(format!("shadow-tls: {e}")))?;
                     let version = opt("version").unwrap_or_else(|| "3".to_string());
                     if version.trim() != "3" {
                         return Err(Error::config(format!(
@@ -212,17 +226,20 @@ impl Plugin {
     pub(crate) fn wrap(&self, server: &str, port: u16, timeout: Duration) -> Result<BoxStream> {
         match self {
             Plugin::None => Ok(Box::new(dial(server, port, timeout)?)),
-            Plugin::ObfsHttp { host, uri, method } => Ok(Box::new(HttpObfsStream::simple_obfs(
-                Box::new(dial(server, port, timeout)?),
-                host.clone(),
-                uri.clone(),
-                port,
-                method.clone(),
-            ))),
-            Plugin::ObfsTls { host } => Ok(Box::new(TlsObfsStream::new(
-                Box::new(dial(server, port, timeout)?),
-                host.clone(),
-            ))),
+            Plugin::ObfsHttp { host, uri, method } => Ok(Box::new(
+                HttpObfsStream::simple_obfs(
+                    Box::new(dial(server, port, timeout)?),
+                    host.clone(),
+                    uri.clone(),
+                    port,
+                    method.clone(),
+                )
+                .map_err(|e| Error::config(format!("simple-obfs: {e}")))?,
+            )),
+            Plugin::ObfsTls { host } => Ok(Box::new(
+                TlsObfsStream::new(Box::new(dial(server, port, timeout)?), host.clone())
+                    .map_err(|e| Error::config(format!("simple-obfs: {e}")))?,
+            )),
             Plugin::V2rayWs {
                 tls,
                 host,
@@ -364,6 +381,38 @@ mod tests {
         assert!(err.contains("simple-obfs mode"), "{err}");
     }
 
+    /// A relative URI, a method or host holding CR/LF, and an over-long host
+    /// are refused by name at build time: the fabricated head is assembled by
+    /// text substitution, and a silent fallback would hide a profile that
+    /// cannot work (or, worse, write the injected headers).
+    #[test]
+    fn plugin_values_that_cannot_sit_in_the_head_are_refused() {
+        let cases: &[(&str, Value)] = &[
+            ("uri", string("ws")),
+            ("uri", string("/a\r\nHost: evil")),
+            ("method", string("GET\r\nHost: evil")),
+            ("host", string("a b")),
+            ("host", string("a\x00b")),
+        ];
+        for (key, value) in cases {
+            let opts = options(&[
+                ("plugin", string("obfs")),
+                ("plugin-opts", object(&[(key, value.clone())])),
+            ]);
+            let err = Plugin::parse(&opts, "example.com").unwrap_err().to_string();
+            assert!(err.contains("simple-obfs"), "{key}: {err}");
+        }
+
+        let too_long = options(&[
+            ("plugin", string("obfs")),
+            (
+                "plugin-opts",
+                object(&[("mode", string("tls")), ("host", string(&"a".repeat(300)))]),
+            ),
+        ]);
+        assert!(Plugin::parse(&too_long, "example.com").is_err());
+    }
+
     #[test]
     fn v2ray_plugin_defaults_to_the_node_and_wants_websocket() {
         let plain = options(&[("plugin", string("v2ray-plugin"))]);
@@ -405,6 +454,24 @@ mod tests {
         ]);
         let err = Plugin::parse(&bad, "node.example").unwrap_err().to_string();
         assert!(err.contains("v2ray-plugin mode"), "{err}");
+
+        let relative = options(&[
+            ("plugin", string("v2ray-plugin")),
+            ("plugin-opts", object(&[("path", string("ray"))])),
+        ]);
+        let err = Plugin::parse(&relative, "node.example")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path must start"), "{err}");
+
+        let injected = options(&[
+            ("plugin", string("v2ray-plugin")),
+            (
+                "plugin-opts",
+                object(&[("path", string("/ray\r\nX-Injected: 1"))]),
+            ),
+        ]);
+        assert!(Plugin::parse(&injected, "node.example").is_err());
     }
 
     #[cfg(feature = "shadowtls")]
