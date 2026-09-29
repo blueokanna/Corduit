@@ -62,6 +62,11 @@ impl QuicClient {
             use std::os::fd::AsRawFd;
             crate::common::socket::protect_outbound_fd(udp.as_raw_fd());
         }
+        // A TUN whose route table captures everything captures this socket's
+        // datagrams too, unless the socket is pinned to the physical
+        // interface — and a QUIC handshake that re-enters the tunnel never
+        // completes. The pin is a no-op on every platform but Windows.
+        crate::common::socket::pin_outbound_udp_socket(&udp, self.config.server_addr.ip());
         udp.connect(self.config.server_addr)
             .map_err(|e| QuicError::Io(format!("connect UDP: {e}")))?;
 

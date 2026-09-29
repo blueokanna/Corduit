@@ -830,6 +830,13 @@ fn with_system_fallback(
 
 /// One system-resolver lookup, restricted to the requested family.
 fn system_lookup(domain: &str, want_v6: bool) -> std::result::Result<Vec<IpAddr>, String> {
+    if crate::dns::trusted::is_active() {
+        // While a TUN is up the OS resolver is pointed at the tunnel's own
+        // DNS address — this responder. Asking it from in here would hand
+        // the query straight back to this function; the physical servers
+        // captured before the tunnel was raised answer instead.
+        return crate::dns::trusted::resolve(domain, want_v6).map_err(|error| error.to_string());
+    }
     let resolved = (domain, 0u16)
         .to_socket_addrs()
         .map_err(|error| error.to_string())?;

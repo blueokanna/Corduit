@@ -2592,6 +2592,10 @@ fn stop_linux_tun_runtime() -> Vec<String> {
 
 #[cfg(windows)]
 fn stop_windows_tun_runtime() -> Vec<String> {
+    // The fallback resolver belongs to the tunnel's lifetime: once the
+    // capture below is gone the system resolver is honest again.
+    crate::dns::trusted::clear();
+
     if let Some(mut routes) = crate::take_windows_route_manager() {
         if let Err(error) = routes.disable_global_mode() {
             crate::set_windows_route_manager(routes);
@@ -2613,6 +2617,74 @@ fn stop_windows_tun_runtime() -> Vec<String> {
     crate::engine::set_runtime_proxy_mode(0);
     crate::netstack::set_windows_proxy_mode(0);
     Vec::new()
+}
+
+/// The physical network's DNS servers, read before the tunnel's own capture.
+///
+/// The default route's interface answers first — that is the interface the
+/// engine's own dials leave through — and any interface with servers answers
+/// as the fallback. Addresses that belong to a virtual adapter are skipped by
+/// name, although none should be present at this point: the whole reason the
+/// snapshot runs now is that it stops being possible once the tunnel is up.
+#[cfg(windows)]
+fn snapshot_physical_dns_servers() -> Vec<std::net::SocketAddr> {
+    use std::process::Command;
+
+    let script = "\
+        $out = @(); \
+        $routes = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | \
+            Where-Object { $_.NextHop -ne '0.0.0.0' } | \
+            Sort-Object -Property @{ Expression = { $_.RouteMetric + $_.InterfaceMetric } }; \
+        foreach ($route in $routes) { \
+            $addresses = (Get-DnsClientServerAddress -InterfaceIndex $route.InterfaceIndex \
+                -ErrorAction SilentlyContinue | \
+                Where-Object { $_.ServerAddresses }).ServerAddresses; \
+            if ($addresses) { $out = $addresses; break } \
+        } \
+        if (-not $out) { \
+            $out = (Get-DnsClientServerAddress -ErrorAction SilentlyContinue | \
+                Where-Object { $_.ServerAddresses -and $_.InterfaceAlias -notlike 'Corduit*' \
+            }).ServerAddresses \
+        } \
+        $out | Where-Object { $_ } | Select-Object -Unique";
+
+    let output = match Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!("could not run Get-DnsClientServerAddress: {error}");
+            return Vec::new();
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            "Get-DnsClientServerAddress failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Vec::new();
+    }
+
+    let mut servers = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        let Ok(address) = line.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let server = std::net::SocketAddr::new(address, 53);
+        if !servers.contains(&server) {
+            servers.push(server);
+        }
+    }
+    servers
 }
 
 pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
@@ -2702,14 +2774,19 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             });
         }
 
+        // Both capture modes raise the same route table and differ only in
+        // how the engine routes what it captures (`rule` matches the profile,
+        // `global` ignores it). `direct` captures nothing at all.
+        let capture_traffic = mode_int == crate::engine::proxy_mode::GLOBAL
+            || mode_int == crate::engine::proxy_mode::RULE;
         let mut excluded_addresses = std::collections::HashSet::new();
-        if mode_int == 1 {
+        if capture_traffic {
             if proxy_servers.is_empty() {
                 return Ok(TunStatus {
                     enabled: false,
                     interface_name: None,
                     mtu: None,
-                    error: Some("Global mode has no configured proxy server".to_string()),
+                    error: Some("TUN capture has no configured proxy server".to_string()),
                 });
             }
             for (server, port) in proxy_servers {
@@ -2737,10 +2814,28 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
                     interface_name: None,
                     mtu: None,
                     error: Some(
-                        "Global mode has no routable IPv4 proxy server address".to_string(),
+                        "TUN capture found no routable IPv4 address for any proxy server"
+                            .to_string(),
                     ),
                 });
             }
+        }
+
+        // The snapshot must be taken before the adapter exists: the moment
+        // the tunnel's DNS is configured the system resolver stops being an
+        // honest answer to "where are the name servers", and the engine's own
+        // dials would come back through the tunnel with fake addresses.
+        if capture_traffic {
+            let servers = snapshot_physical_dns_servers();
+            if servers.is_empty() {
+                tracing::warn!(
+                    "no physical DNS server could be captured; the engine's own dials will \
+                     fall back to the system resolver, which now points at the tunnel"
+                );
+            }
+            crate::dns::trusted::set_servers(servers);
+        } else {
+            crate::dns::trusted::clear();
         }
 
         let tun_address = std::net::Ipv4Addr::new(198, 18, 0, 1);
@@ -2756,6 +2851,7 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         let mut tun = match TunDevice::with_config(config.clone()) {
             Ok(t) => t,
             Err(e) => {
+                crate::dns::trusted::clear();
                 return Ok(TunStatus {
                     enabled: false,
                     interface_name: None,
@@ -2766,6 +2862,7 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         };
 
         if let Err(e) = tun.start() {
+            crate::dns::trusted::clear();
             return Ok(TunStatus {
                 enabled: false,
                 interface_name: None,
@@ -2782,6 +2879,8 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         let tun_tx = match tun.get_sender() {
             Some(tx) => tx,
             None => {
+                let _ = tun.stop();
+                crate::dns::trusted::clear();
                 return Ok(TunStatus {
                     enabled: false,
                     interface_name: None,
@@ -2794,6 +2893,8 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         let mut tun_rx = match tun.take_receiver() {
             Some(rx) => rx,
             None => {
+                let _ = tun.stop();
+                crate::dns::trusted::clear();
                 return Ok(TunStatus {
                     enabled: false,
                     interface_name: None,
@@ -2843,19 +2944,20 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
 
         let mut route_manager = WindowsRouteManager::new(&config.name, tun_address);
 
-        if mode_int == 1 {
+        if capture_traffic {
             let excluded_addresses = excluded_addresses.into_iter().collect::<Vec<_>>();
             if let Err(error) = route_manager.enable_global_mode(&excluded_addresses) {
                 processor.stop();
                 processor.reset();
                 let _ = tun.stop();
+                crate::dns::trusted::clear();
                 crate::engine::set_runtime_proxy_mode(0);
                 crate::netstack::set_windows_proxy_mode(0);
                 return Ok(TunStatus {
                     enabled: false,
                     interface_name: None,
                     mtu: None,
-                    error: Some(format!("Failed to enable global mode routes: {error}")),
+                    error: Some(format!("Failed to install the capture routes: {error}")),
                 });
             }
         }
@@ -3318,69 +3420,236 @@ pub fn get_windows_tun_stats() -> Result<(u64, u64, u64, u64, usize, usize)> {
 }
 
 // ============== UWP Loopback ==============
-pub fn enable_uwp_loopback() -> Result<bool> {
+
+/// Whether `value` is a package family name (`<name>_<13-char hash>`).
+///
+/// A family name is `<identity name>_<publisher hash>`, where the identity
+/// name is alphanumerics, dots and dashes and the hash is thirteen lower-case
+/// alphanumerics. Accepting only that shape is what keeps the value out of the
+/// command line's shoes (CWE-78): there is no room in it for whitespace,
+/// quotes, `=`, a path separator or a newline, so `-n=<family>` cannot grow a
+/// second argument or another option.
+#[cfg(target_os = "windows")]
+fn is_package_family_name(value: &str) -> bool {
+    let Some((name, hash)) = value.rsplit_once('_') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && hash.len() == 13
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// The families `CheckNetIsolation.exe LoopbackExempt -s` reports as exempt.
+///
+/// The tool prints numbered blocks whose `Name:` line carries the package
+/// family name; the `SID:` line beside it is ignored. Values are compared
+/// case-folded because the tool renders the stored name in lower case.
+#[cfg(target_os = "windows")]
+fn parse_loopback_exemptions(output: &str) -> std::collections::HashSet<String> {
+    let mut exempt = std::collections::HashSet::new();
+    for line in output.lines() {
+        let lower = line.trim().to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("name:") {
+            let value = rest.trim();
+            if is_package_family_name(value) {
+                exempt.insert(value.to_string());
+            }
+        }
+    }
+    exempt
+}
+
+/// Installed, non-framework AppContainer packages as `name|family` pairs.
+///
+/// The pipe separator cannot occur in either field, so a line that does not
+/// split into exactly two valid fields is skipped rather than guessed at.
+#[cfg(target_os = "windows")]
+fn parse_installed_packages(output: &str) -> Vec<(String, String)> {
+    let mut packages = Vec::new();
+    for line in output.lines() {
+        let Some((name, family)) = line.trim().split_once('|') else {
+            continue;
+        };
+        let name = name.trim();
+        let family = family.trim().to_ascii_lowercase();
+        if name.is_empty() || !is_package_family_name(&family) {
+            continue;
+        }
+        packages.push((name.to_string(), family));
+    }
+    packages
+}
+
+/// List the AppContainer packages and whether each one holds a loopback
+/// exemption.
+///
+/// `Get-AppxPackage` is the authority on what is installed; the exemption
+/// state comes from `CheckNetIsolation`, which stores package family names.
+/// The two are joined here so a caller renders one switch per package without
+/// running either query itself — and because the state can only be changed by
+/// `CheckNetIsolation`, that is the side that decides the reported value.
+pub fn list_uwp_loopback() -> Result<Vec<UwpLoopbackEntry>> {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
 
-        tracing::info!("Enabling UWP loopback exemption");
-        let result = Command::new("CheckNetIsolation.exe")
+        let packages = Command::new("powershell")
             .args([
-                "LoopbackExempt",
-                "-a",
-                "-n=Microsoft.MicrosoftEdge_8wekyb3d8bbwe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "Get-AppxPackage | Where-Object { -not $_.IsFramework } | \
+                 Sort-Object -Property Name | \
+                 ForEach-Object { $_.Name + '|' + $_.PackageFamilyName }",
             ])
-            .output();
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    tracing::info!("UWP loopback exemption enabled successfully");
-                    Ok(true)
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!("UWP loopback exemption failed: {}", stderr);
-                    Ok(false)
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to run CheckNetIsolation: {}", e);
-                Ok(false)
-            }
+            .output()
+            .map_err(|e| CorduitError::Io(format!("failed to run Get-AppxPackage: {e}")))?;
+        if !packages.status.success() {
+            return Err(CorduitError::Io(format!(
+                "Get-AppxPackage failed: {}",
+                String::from_utf8_lossy(&packages.stderr).trim()
+            )));
         }
+
+        let exemptions = Command::new("CheckNetIsolation.exe")
+            .args(["LoopbackExempt", "-s"])
+            .output()
+            .map_err(|e| CorduitError::Io(format!("failed to run CheckNetIsolation: {e}")))?;
+        // Reading the list does not need elevation, but a policy can still
+        // refuse it; treating that as "nothing is exempt" would mis-render
+        // every switch, so it is reported instead.
+        if !exemptions.status.success() {
+            return Err(CorduitError::Io(format!(
+                "CheckNetIsolation LoopbackExempt -s failed: {}",
+                String::from_utf8_lossy(&exemptions.stderr).trim()
+            )));
+        }
+        let exempt = parse_loopback_exemptions(&String::from_utf8_lossy(&exemptions.stdout));
+
+        Ok(
+            parse_installed_packages(&String::from_utf8_lossy(&packages.stdout))
+                .into_iter()
+                .map(|(name, family)| UwpLoopbackEntry {
+                    exempt: exempt.contains(&family),
+                    name,
+                    family,
+                })
+                .collect(),
+        )
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(true)
+        Ok(Vec::new())
     }
 }
 
-pub fn open_uwp_loopback_utility() -> Result<bool> {
+/// Add or remove one package's loopback exemption.
+///
+/// The family name is validated before it reaches the command line, and the
+/// toggle itself needs an elevated token — `CheckNetIsolation` says so on
+/// stderr, and that text is returned rather than replaced with a code.
+pub fn set_uwp_loopback(family: &str, exempt: bool) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        tracing::info!("Opening UWP loopback exemption utility");
-        let result = Command::new("cmd")
-            .args(["/C", "start", "ms-settings:developers"])
-            .spawn();
 
-        match result {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                tracing::warn!("Failed to open developer settings: {}", e);
-                let fallback = Command::new("CheckNetIsolation.exe")
-                    .arg("LoopbackExempt")
-                    .arg("-s")
-                    .spawn();
-                Ok(fallback.is_ok())
-            }
+        let family = family.trim().to_ascii_lowercase();
+        if !is_package_family_name(&family) {
+            return Err(CorduitError::Config(format!(
+                "'{family}' is not a package family name; expected \
+                 <name>_<13-character publisher hash>"
+            )));
         }
+
+        let flag = if exempt { "-a" } else { "-d" };
+        let output = Command::new("CheckNetIsolation.exe")
+            .args(["LoopbackExempt", flag, &format!("-n={family}")])
+            .output()
+            .map_err(|e| CorduitError::Io(format!("failed to run CheckNetIsolation: {e}")))?;
+        if output.status.success() {
+            tracing::info!(family, exempt, "UWP loopback exemption updated");
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
+        Err(CorduitError::Io(format!(
+            "CheckNetIsolation LoopbackExempt {flag} -n={family} failed: {}",
+            detail.trim()
+        )))
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(false)
+        let _ = (family, exempt);
+        Err(CorduitError::Config(
+            "UWP loopback exemptions exist on Windows only".to_string(),
+        ))
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod uwp_loopback_tests {
+    use super::*;
+
+    #[test]
+    fn package_family_name_shape_is_enforced() {
+        assert!(is_package_family_name(
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe"
+        ));
+        assert!(is_package_family_name(
+            "Microsoft.MicrosoftEdge_8wekyb3d8bbwe"
+        ));
+        assert!(!is_package_family_name(""));
+        assert!(!is_package_family_name("no_underscore"));
+        assert!(!is_package_family_name("Name_short"));
+        assert!(!is_package_family_name("Name_8wekyb3d8bbwe extra"));
+        assert!(!is_package_family_name("Name_8wekyb3d8bbwe\n-d"));
+        assert!(!is_package_family_name("Na me_8wekyb3d8bbwe"));
+        assert!(!is_package_family_name("Name_8WEKYB3D8BBWE"));
+        assert!(!is_package_family_name("Name_8wekyb3d8bbweX"));
+        assert!(!is_package_family_name("Name_8wekyb3d8bbw="));
+    }
+
+    #[test]
+    fn exemption_list_parses_names_only() {
+        let output = "List Loopback Exempted AppContainers\n\n\
+            [1] -----------------------------------------------------------------\n\
+                Name: microsoft.microsoftedge_8wekyb3d8bbwe\n\
+                SID:  S-1-15-2-3624059985-2099910731-1520657006-2479315451\n\
+            [2] -----------------------------------------------------------------\n\
+                Name: microsoft.windowscommunicationsapps_8wekyb3d8bbwe\n\
+                SID:  S-1-15-2-1771268158-1831592203-2114631840-1274560784\n";
+        let exempt = parse_loopback_exemptions(output);
+        assert_eq!(exempt.len(), 2);
+        assert!(exempt.contains("microsoft.microsoftedge_8wekyb3d8bbwe"));
+        assert!(exempt.contains("microsoft.windowscommunicationsapps_8wekyb3d8bbwe"));
+        assert!(!exempt.contains("not-a-package"));
+    }
+
+    #[test]
+    fn installed_packages_parse_and_reject_broken_lines() {
+        let output = "Microsoft.WindowsCalculator|Microsoft.WindowsCalculator_8wekyb3d8bbwe\n\
+            Microsoft.Edge|Microsoft.MicrosoftEdge_8wekyb3d8bbwe\n\
+            broken line without separator\n\
+            Something|not-a-family\n";
+        let packages = parse_installed_packages(output);
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0].0, "Microsoft.WindowsCalculator");
+        assert_eq!(packages[0].1, "microsoft.windowscalculator_8wekyb3d8bbwe");
+        assert_eq!(packages[1].1, "microsoft.microsoftedge_8wekyb3d8bbwe");
     }
 }
 

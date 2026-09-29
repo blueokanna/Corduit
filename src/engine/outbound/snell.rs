@@ -48,11 +48,23 @@
 //!   wrong would look like an auth failure rather than an unsupported version.
 //!   Versions below 4 are refused for a different reason — their key derivation
 //!   is not Argon2id.
-//! * **`obfs: http` is implemented** from the reference's request shape.
-//!   **`obfs: tls` is refused**: it prepends a fabricated `ClientHello` whose
-//!   extension sequence is what makes it look like a browser, and that sequence
-//!   could not be verified byte-for-byte from source. A wrong guess there is a
-//!   silent failure against a real server, which is worse than a config error.
+//! * **`obfs: tls` is implemented** from `SagerNet/sing-snell`'s `obfs.go`,
+//!   which is a byte-exact reimplementation of Surge 6.4.4's
+//!   `-[SGObfsHelperTLS encodeObfsData:]`. The first write is one fabricated
+//!   `ClientHello` that carries up to `0x400` payload bytes inside its session
+//!   ticket extension, with the remaining payload (and every later write) sent
+//!   as `17 03 03` application-data records of at most `0x4000` bytes; the
+//!   first read skips the server's fabricated `ServerHello` by its known
+//!   0x69-byte prefix rather than parsing it, exactly as the client does. The
+//!   three length fields (record, handshake, extensions) are checked against
+//!   the reference's overhead constants by unit tests, because a wrong length
+//!   here is a silent failure against a real server.
+//! * **`obfs: http` matches the same reference**: one `GET` with a WebSocket
+//!   upgrade whose `Content-Length` is the first record's length and whose body
+//!   is that record, written as a single `write`; the server's fabricated
+//!   response is skipped up to and including its first `\r\n\r\n`, and the
+//!   user agent is a Firefox fingerprint drawn once per process, not a fixed
+//!   constant.
 //! * The adaptive padding-length algorithm of the reference is **not**
 //!   reproduced (only its initial range is): the length is self-describing, so
 //!   any policy that the writer applies consistently is protocol-correct. What
@@ -70,6 +82,7 @@ use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::engine::tls::yaml_value_to_string;
+use crate::protocol::obfs::{HttpObfsStream, TlsObfsStream};
 use courierust::courierust_tls::crypto::rng::fill_random;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
@@ -116,16 +129,9 @@ const LATER_PADDING_MAX: usize = 64;
 
 /// TCP connect budget.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound for the fake-HTTP obfs header we skip on the first read.
-const MAX_OBFS_HEADER: usize = 16 * 1024;
-/// User agents the http obfs draws from, matching the reference's list of
-/// period browsers rather than one fixed string: a constant UA across a whole
-/// deployment is itself a fingerprint.
-const OBFS_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:42.0) Gecko/20100101 Firefox/42.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 9_1 like Mac OS X) AppleWebKit/601.1.46 (KHTML, like Gecko) Version/9.0 Mobile/13B143 Safari/601.1",
-];
+/// Default `obfs-host` for TLS obfs when the profile names none, from the
+/// reference (`DefaultTLSObfsHost`).
+const DEFAULT_TLS_OBFS_HOST: &str = "cloudfront.net";
 
 /// How the first packets are dressed up.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -136,6 +142,10 @@ pub enum SnellObfs {
     /// A fabricated `GET` (WebSocket upgrade) precedes the first record, and the
     /// server's fabricated `101` response is skipped before the first read.
     Http { host: String, uri: String },
+    /// The first record travels inside a fabricated TLS `ClientHello`'s session
+    /// ticket and every later write is an application-data record; the server's
+    /// fabricated `ServerHello` is skipped by its known length.
+    Tls { host: String },
 }
 
 /// Snell outbound settings (kept for introspection and tests).
@@ -236,12 +246,15 @@ impl SnellOutbound {
                     .filter(|s| s.starts_with('/'))
                     .unwrap_or_else(|| "/".to_string()),
             },
-            Some(mode) if mode == "tls" => {
-                return Err(Error::config(
-                    "Snell `obfs: tls` fabricates a ClientHello whose extension sequence this \
-                     build does not reproduce; `obfs: http` or no obfs are available",
-                ))
-            }
+            Some(mode) if mode == "tls" => SnellObfs::Tls {
+                host: config
+                    .options
+                    .get("obfs-host")
+                    .map(yaml_value_to_string)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| DEFAULT_TLS_OBFS_HOST.to_string()),
+            },
             Some(other) => {
                 return Err(Error::config(format!(
                     "Unknown Snell obfs mode `{other}`; the reference defines `http` and `tls`"
@@ -309,11 +322,12 @@ impl SnellOutbound {
 
         let inner: BoxStream = match &self.settings.obfs {
             SnellObfs::None => Box::new(stream),
-            SnellObfs::Http { host, uri } => Box::new(ObfsHttpStream::new(
+            SnellObfs::Http { host, uri } => Box::new(HttpObfsStream::snell(
                 Box::new(stream),
                 host.clone(),
                 uri.clone(),
             )),
+            SnellObfs::Tls { host } => Box::new(TlsObfsStream::new(Box::new(stream), host.clone())),
         };
         Ok(inner)
     }
@@ -822,114 +836,6 @@ impl SyncStream for SnellStream {
     }
 }
 
-/// The `obfs: http` dressing: a WebSocket-upgrade `GET` before the first write,
-/// and a skipped `101` response before the first read.
-///
-/// The `Content-Length` is the length of the record that follows, so the two
-/// are one HTTP body as far as anything reading the connection is concerned.
-struct ObfsHttpStream {
-    inner: BoxStream,
-    host: String,
-    uri: String,
-    header_sent: bool,
-    response_skipped: bool,
-}
-
-impl ObfsHttpStream {
-    fn new(inner: BoxStream, host: String, uri: String) -> Self {
-        Self {
-            inner,
-            host,
-            uri,
-            header_sent: false,
-            response_skipped: false,
-        }
-    }
-
-    /// The fabricated request head, with a per-process user agent and key.
-    fn request_head(&self, body_len: usize) -> Vec<u8> {
-        use std::sync::OnceLock;
-        static FINGERPRINT: OnceLock<(String, String)> = OnceLock::new();
-        let (agent, key) = FINGERPRINT.get_or_init(|| {
-            let mut pick = [0u8; 1];
-            fill_random(&mut pick);
-            let agent = OBFS_USER_AGENTS[usize::from(pick[0]) % OBFS_USER_AGENTS.len()].to_string();
-            let mut key_bytes = [0u8; 16];
-            fill_random(&mut key_bytes);
-            let key = courierust::courierust_crypto::base64::encode(&key_bytes);
-            (agent, key)
-        });
-
-        format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nUpgrade: websocket\r\n\
-             Connection: Upgrade\r\nContent-Length: {}\r\nSec-WebSocket-Key: {}\r\n\r\n",
-            self.uri, self.host, agent, body_len, key
-        )
-        .into_bytes()
-    }
-}
-
-impl Read for ObfsHttpStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.response_skipped {
-            self.response_skipped = true;
-            let mut seen = Vec::new();
-            let mut byte = [0u8; 1];
-            while !seen.ends_with(b"\r\n\r\n") {
-                if seen.len() >= MAX_OBFS_HEADER {
-                    return Err(std::io::Error::other(
-                        "Snell http obfs: server response head exceeded the cap",
-                    ));
-                }
-                match self.inner.read(&mut byte)? {
-                    0 => break,
-                    _ => seen.push(byte[0]),
-                }
-            }
-        }
-        self.inner.read(buf)
-    }
-}
-
-impl Write for ObfsHttpStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if !self.header_sent {
-            self.header_sent = true;
-            let head = self.request_head(buf.len());
-            self.inner.write_all(&head)?;
-        }
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl SyncStream for ObfsHttpStream {
-    fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
-        self.inner.shutdown(how)
-    }
-
-    fn peer_addr(&self) -> Option<SocketAddr> {
-        self.inner.peer_addr()
-    }
-
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.inner.set_read_timeout(timeout)
-    }
-
-    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.inner.set_write_timeout(timeout)
-    }
-
-    /// `None` on purpose: the obfs header has to be written before anything
-    /// else, and a shared-handle relay would write around it.
-    fn shared_handle(&self) -> Option<crate::common::stream::SharedStream> {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,10 +1053,26 @@ mod tests {
             }
         );
 
-        let tls = build(&[("psk", string("x")), ("obfs", string("tls"))])
-            .unwrap_err()
-            .to_string();
-        assert!(tls.contains("ClientHello"), "{tls}");
+        let tls = build(&[("psk", string("x")), ("obfs", string("tls"))]).unwrap();
+        assert_eq!(
+            tls.obfs,
+            SnellObfs::Tls {
+                host: DEFAULT_TLS_OBFS_HOST.to_string()
+            }
+        );
+
+        let tls = build(&[
+            ("psk", string("x")),
+            ("obfs", string("tls")),
+            ("obfs-host", string("cdn.example")),
+        ])
+        .unwrap();
+        assert_eq!(
+            tls.obfs,
+            SnellObfs::Tls {
+                host: "cdn.example".to_string()
+            }
+        );
 
         let other = build(&[("psk", string("x")), ("obfs", string("plain"))])
             .unwrap_err()

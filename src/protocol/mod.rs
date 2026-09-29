@@ -81,6 +81,8 @@ macro_rules! impl_protocol_enum {
 
 pub mod address;
 pub mod error;
+#[cfg(feature = "std")]
+pub mod obfs;
 
 #[cfg(all(feature = "std", feature = "quic"))]
 pub mod quic;

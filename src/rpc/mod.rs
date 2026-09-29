@@ -343,8 +343,12 @@ pub fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
         }
         "get_windows_proxy_mode_str" => value(&api::get_windows_proxy_mode_str()),
         "get_windows_tun_stats" => call(api::get_windows_tun_stats()),
-        "enable_uwp_loopback" => call(api::enable_uwp_loopback()),
-        "open_uwp_loopback_utility" => call(api::open_uwp_loopback_utility()),
+        "list_uwp_loopback" => call(api::list_uwp_loopback()),
+        "set_uwp_loopback" => {
+            let family = args.string("family")?;
+            let exempt = args.bool("exempt")?;
+            call(api::set_uwp_loopback(&family, exempt))
+        }
 
         // ---- Android ----
         "set_android_vpn_fd" => {
@@ -496,8 +500,8 @@ pub const CORDUIT_METHODS: &[&str] = &[
     "set_windows_proxy_mode",
     "get_windows_proxy_mode_str",
     "get_windows_tun_stats",
-    "enable_uwp_loopback",
-    "open_uwp_loopback_utility",
+    "list_uwp_loopback",
+    "set_uwp_loopback",
     // android
     "set_android_vpn_fd",
     "get_android_vpn_fd",

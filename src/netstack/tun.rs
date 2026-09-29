@@ -493,7 +493,7 @@ impl TunDevice {
         );
 
         // Set IP address using netsh
-        let _ = Command::new("netsh")
+        match Command::new("netsh")
             .args([
                 "interface",
                 "ip",
@@ -503,8 +503,17 @@ impl TunDevice {
                 "source=static",
                 &format!("addr={}", ip_str),
                 &format!("mask={}", self.config.netmask),
+                "gateway=none",
             ])
-            .output();
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => warn!(
+                "netsh could not set the adapter address: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => warn!("netsh could not run: {error}"),
+        }
 
         // Set MTU
         let _ = Command::new("netsh")
@@ -519,18 +528,34 @@ impl TunDevice {
             ])
             .output();
 
-        // Configure DNS
+        // Configure DNS. The first entry goes in with `validate=no`:
+        // `netsh`'s probe cannot validate a virtual resolver, and without the
+        // flag the command turns interactive on a stdin that is not there,
+        // which is how the address silently fails to be written.
         for (i, dns) in self.config.dns.iter().enumerate() {
-            let _ = Command::new("netsh")
-                .args([
-                    "interface",
-                    "ip",
-                    if i == 0 { "set" } else { "add" },
-                    "dns",
-                    &format!("name=\"{}\"", name),
-                    &format!("addr={}", dns),
-                ])
-                .output();
+            let mut args = vec![
+                "interface".to_string(),
+                "ip".to_string(),
+                if i == 0 { "set" } else { "add" }.to_string(),
+                "dns".to_string(),
+                format!("name=\"{}\"", name),
+            ];
+            if i == 0 {
+                args.push("source=static".to_string());
+            }
+            args.push(format!("addr={}", dns));
+            if i == 0 {
+                args.push("register=primary".to_string());
+                args.push("validate=no".to_string());
+            }
+            match Command::new("netsh").args(&args).output() {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => warn!(
+                    "netsh could not set DNS {dns}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                Err(error) => warn!("netsh could not run for DNS {dns}: {error}"),
+            }
         }
 
         // Set interface metric to 1 (highest priority) to ensure DNS queries use this interface

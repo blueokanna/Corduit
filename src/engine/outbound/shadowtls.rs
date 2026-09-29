@@ -499,7 +499,7 @@ impl Read for HandshakeReader {
 // ---------------------------------------------------------------------------
 
 /// A ShadowTLS v3 connection after the handshake, as a duplex stream.
-struct ShadowTlsStream {
+pub(crate) struct ShadowTlsStream {
     reader: RecordReader,
     writer: TcpStream,
     state: HandshakeState,
@@ -831,47 +831,107 @@ impl ShadowTlsOutbound {
             .map_err(|e| Error::network(format!("set read timeout: {e}")))?;
         sock.set_write_timeout(Some(timeout))
             .map_err(|e| Error::network(format!("set write timeout: {e}")))?;
-        let writer = sock
-            .try_clone()
-            .map_err(|e| Error::network(format!("clone ShadowTLS socket: {e}")))?;
 
         let mut pick = [0u8; 1];
         fill_random(&mut pick);
         let sni = self.settings.sni[usize::from(pick[0]) % self.settings.sni.len()].clone();
 
-        let reader = HandshakeReader::new(sock, self.password.clone());
-        let tls_config = Tls13ClientConfig {
-            server_name: sni,
-            alpn: self.settings.alpn.clone(),
-            fingerprint: self.fingerprint.clone(),
-            now: unix_now(),
-            roots: Some(crate::common::roots::system_root_store().clone()),
-            verify: !self.settings.insecure,
-            auth: None,
-            hello_hook: Some(Box::new(SessionIdSigner {
-                password: self.password.clone(),
-            })),
-            compatibility_ccs: true,
-            shutdown_hook: None,
-        };
-
-        let tls = connect(reader, writer, tls_config).map_err(|e| {
-            Error::protocol(format!(
-                "ShadowTLS: the camouflage handshake with {} failed: {e}",
-                self.settings.sni.join(", ")
-            ))
-        })?;
-        let (reader, writer) = tls.into_parts();
-        let (sock, pending, state) = reader.into_parts();
-        let state = state.ok_or_else(|| {
-            Error::protocol(
-                "ShadowTLS: the peer completed a handshake without a ServerHello in it, so the \
-                 random every frame MAC depends on never arrived",
-            )
-        })?;
-        debug!("ShadowTLS: handshake done, switching to frames");
-        Ok(ShadowTlsStream::new(sock, writer, pending, state))
+        handshake(
+            sock,
+            self.password.clone(),
+            sni,
+            self.settings.alpn.clone(),
+            self.fingerprint.clone(),
+            self.settings.insecure,
+        )
     }
+}
+
+/// Run the v3 camouflage handshake over a fresh connection and leave the
+/// socket in the frame phase.
+///
+/// Shared by the standalone `shadowtls` outbound and the Shadowsocks
+/// `shadow-tls` plugin, which is the same client under another config
+/// spelling: the plugin's password and impersonated host go through the same
+/// fields the outbound fills from its own options.
+pub(crate) fn handshake(
+    sock: TcpStream,
+    password: Vec<u8>,
+    sni: String,
+    alpn: Vec<String>,
+    fingerprint: Fingerprint,
+    insecure: bool,
+) -> Result<ShadowTlsStream> {
+    let writer = sock
+        .try_clone()
+        .map_err(|e| Error::network(format!("clone ShadowTLS socket: {e}")))?;
+
+    let reader = HandshakeReader::new(sock, password.clone());
+    let tls_config = Tls13ClientConfig {
+        server_name: sni.clone(),
+        alpn,
+        fingerprint,
+        now: unix_now(),
+        roots: Some(crate::common::roots::system_root_store().clone()),
+        verify: !insecure,
+        auth: None,
+        hello_hook: Some(Box::new(SessionIdSigner {
+            password: password.clone(),
+        })),
+        compatibility_ccs: true,
+        shutdown_hook: None,
+    };
+
+    let tls = connect(reader, writer, tls_config).map_err(|e| {
+        Error::protocol(format!(
+            "ShadowTLS: the camouflage handshake with {sni} failed: {e}"
+        ))
+    })?;
+    let (reader, writer) = tls.into_parts();
+    let (sock, pending, state) = reader.into_parts();
+    let state = state.ok_or_else(|| {
+        Error::protocol(
+            "ShadowTLS: the peer completed a handshake without a ServerHello in it, so the \
+             random every frame MAC depends on never arrived",
+        )
+    })?;
+    debug!("ShadowTLS: handshake done, switching to frames");
+    Ok(ShadowTlsStream::new(sock, writer, pending, state))
+}
+
+/// Open a ShadowTLS v3 session as a boxed stream, for the Shadowsocks
+/// `shadow-tls` plugin.
+///
+/// The fingerprint is the browser default the plugin spelling has no field
+/// for; the plugin's `host` is the SNI, exactly as the outbound's `sni`.
+pub(crate) fn open_client_stream(
+    server: &str,
+    port: u16,
+    password: &str,
+    sni: &str,
+    timeout: Duration,
+) -> Result<BoxStream> {
+    let sock = connect_host(server, port, timeout).map_err(|e| {
+        Error::network(format!(
+            "Failed to connect to the ShadowTLS server {server}:{port}: {e}"
+        ))
+    })?;
+    sock.set_read_timeout(Some(timeout))
+        .map_err(|e| Error::network(format!("set read timeout: {e}")))?;
+    sock.set_write_timeout(Some(timeout))
+        .map_err(|e| Error::network(format!("set write timeout: {e}")))?;
+
+    let fingerprint = Fingerprint::parse("chrome")
+        .map_err(|e| Error::config(format!("ShadowTLS default fingerprint: {e}")))?;
+    let stream = handshake(
+        sock,
+        password.as_bytes().to_vec(),
+        sni.trim().to_string(),
+        Vec::new(),
+        fingerprint,
+        false,
+    )?;
+    Ok(Box::new(stream))
 }
 
 impl OutboundProxy for ShadowTlsOutbound {

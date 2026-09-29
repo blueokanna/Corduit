@@ -9,7 +9,7 @@ use crate::engine::outbound::{OutboundProxy, TargetAddr, UdpReplySink};
 use crate::engine::tls::yaml_value_to_string;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -35,6 +35,8 @@ pub struct ShadowsocksOutbound {
     password: String,
     cipher: String,
     udp_enabled: bool,
+    /// The SIP003 plugin shaping this node's stream, if the profile names one.
+    plugin: crate::engine::outbound::sip003::Plugin,
     /// One UDP session per (client association, destination), so replies
     /// reach exactly the association that sent the datagrams.
     udp_sessions: parking_lot::Mutex<HashMap<(usize, String), Arc<SsUdpSession>>>,
@@ -142,16 +144,13 @@ impl OutboundProxy for ShadowsocksOutbound {
         let server_addr = format!("{}:{}", self.server, self.port);
         tracing::debug!("SS latency test: resolving {}", server_addr);
 
-        let mut stream = crate::common::socket::connect_host(&self.server, self.port, timeout)
-            .map_err(|e| Error::network(format!("Failed to connect: {}", e)))?;
+        let mut stream: BoxStream = self.plugin.wrap(&self.server, self.port, timeout)?;
         stream
             .set_read_timeout(Some(timeout))
             .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
         stream
             .set_write_timeout(Some(timeout))
             .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
-
-        stream.set_nodelay(true).ok();
 
         tracing::debug!(
             "SS latency test: connected, setting up cipher {}",
@@ -253,22 +252,17 @@ impl OutboundProxy for ShadowsocksOutbound {
     ) -> Result<()> {
         let cipher_spec = CipherSpec::new(&self.cipher)?;
 
-        let mut outbound =
-            crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
-                .map_err(|e| {
-                Error::network(format!(
-                    "Failed to connect to SS server {}:{}: {}",
-                    self.server, self.port, e
-                ))
-            })?;
+        // The plugin dials: ShadowTLS owns the socket from its first byte, so
+        // the wrapper takes the whole dial rather than a connected stream.
+        let mut outbound: BoxStream =
+            self.plugin
+                .wrap(&self.server, self.port, Duration::from_secs(30))?;
         outbound
             .set_read_timeout(Some(Duration::from_secs(60)))
             .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
         outbound
             .set_write_timeout(Some(Duration::from_secs(60)))
             .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
-
-        outbound.set_nodelay(true).ok();
 
         tracing::debug!(
             "Shadowsocks: connected to {}:{} for target {}",
@@ -328,6 +322,19 @@ impl ShadowsocksOutbound {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        // The plugin shapes the TCP stream only, so it is resolved here and
+        // its verdict on UDP is applied before the proxy can ever hand a
+        // datagram to a socket the server will not answer on.
+        let plugin = crate::engine::outbound::sip003::Plugin::parse(&config.options, &server)?;
+        if !plugin.carries_udp() && udp_enabled {
+            tracing::warn!(
+                "Shadowsocks outbound '{}': the plugin only shapes TCP; UDP is disabled for \
+                 this node",
+                config.tag
+            );
+        }
+        let udp_enabled = udp_enabled && plugin.carries_udp();
+
         tracing::debug!(
             "Creating SS outbound: server={}, port={}, cipher={}, password_len={}, udp={}",
             server,
@@ -353,6 +360,7 @@ impl ShadowsocksOutbound {
             password,
             cipher,
             udp_enabled,
+            plugin,
             udp_sessions: parking_lot::Mutex::new(HashMap::new()),
             live_udp_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
@@ -695,7 +703,7 @@ fn decrypt_udp_datagram(
 /// server salt once and then decrypt chunk-by-chunk. Read/write timeouts
 /// surface as `WouldBlock`/`TimedOut` and are treated as idle by the relay.
 struct ShadowsocksStream {
-    inner: parking_lot::Mutex<TcpStream>,
+    inner: parking_lot::Mutex<BoxStream>,
     enc: AeadCipher,
     dec: Option<AeadCipher>,
     password: String,
@@ -706,7 +714,7 @@ struct ShadowsocksStream {
 }
 
 impl ShadowsocksStream {
-    fn new(inner: TcpStream, enc: AeadCipher, cipher_spec: CipherSpec, password: String) -> Self {
+    fn new(inner: BoxStream, enc: AeadCipher, cipher_spec: CipherSpec, password: String) -> Self {
         Self {
             inner: parking_lot::Mutex::new(inner),
             enc,
@@ -786,7 +794,7 @@ impl crate::common::stream::SyncStream for ShadowsocksStream {
     }
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        self.inner.lock().peer_addr().ok()
+        self.inner.lock().peer_addr()
     }
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {

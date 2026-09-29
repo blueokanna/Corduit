@@ -237,6 +237,17 @@ pub struct TunStatus {
     pub error: Option<String>,
 }
 
+/// One AppContainer package's loopback exemption state.
+#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
+pub struct UwpLoopbackEntry {
+    /// Package identity name, e.g. `Microsoft.WindowsCalculator`.
+    pub name: String,
+    /// Package family name, the identity the exemption is stored under.
+    pub family: String,
+    /// Whether the AppContainer may currently reach loopback.
+    pub exempt: bool,
+}
+
 // ============== QUIC Proxy Types ==============
 
 /// QUIC proxy configuration for FFI

@@ -115,9 +115,10 @@ fn outbound_interface_index() -> Option<u32> {
 /// against a socket this function owns, with the result checked.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn apply_outbound_interface(sock: &socket2::Socket, destination: std::net::IpAddr) {
-    use std::os::windows::io::AsRawSocket;
-
+fn apply_outbound_interface_raw(
+    raw: std::os::windows::io::RawSocket,
+    destination: std::net::IpAddr,
+) {
     /// `IP_UNICAST_IF` / `IPV6_UNICAST_IF` share this option number.
     const UNICAST_IF: libc::c_int = 31;
     const IPPROTO_IP: libc::c_int = 0;
@@ -135,7 +136,7 @@ fn apply_outbound_interface(sock: &socket2::Socket, destination: std::net::IpAdd
     let level = if ipv6 { IPPROTO_IPV6 } else { IPPROTO_IP };
     let result = unsafe {
         libc::setsockopt(
-            sock.as_raw_socket() as libc::SOCKET,
+            raw as libc::SOCKET,
             level,
             UNICAST_IF,
             &value as *const u32 as *const libc::c_char,
@@ -153,9 +154,32 @@ fn apply_outbound_interface(sock: &socket2::Socket, destination: std::net::IpAdd
     }
 }
 
-/// See [`apply_outbound_interface`]; no-op on non-Windows platforms.
+/// See [`apply_outbound_interface_raw`]; the `socket2` spelling.
+#[cfg(windows)]
+fn apply_outbound_interface(sock: &socket2::Socket, destination: std::net::IpAddr) {
+    use std::os::windows::io::AsRawSocket;
+    apply_outbound_interface_raw(sock.as_raw_socket(), destination);
+}
+
+/// See [`apply_outbound_interface_raw`]; no-op on non-Windows platforms.
 #[cfg(not(windows))]
 fn apply_outbound_interface(_sock: &socket2::Socket, _destination: std::net::IpAddr) {}
+
+/// Pin a `std` UDP socket to the engine's physical interface (Windows).
+///
+/// Sockets that the engine builds through [`udp_bind_for`] are pinned there;
+/// this is for the ones a transport builds itself — the QUIC client's socket
+/// is the caller — whose datagrams would otherwise follow the TUN capture
+/// route and re-enter the engine's own netstack.
+#[cfg(windows)]
+pub fn pin_outbound_udp_socket(udp: &std::net::UdpSocket, destination: std::net::IpAddr) {
+    use std::os::windows::io::AsRawSocket;
+    apply_outbound_interface_raw(udp.as_raw_socket(), destination);
+}
+
+/// See [`pin_outbound_udp_socket`]; a no-op off Windows.
+#[cfg(not(windows))]
+pub fn pin_outbound_udp_socket(_udp: &std::net::UdpSocket, _destination: std::net::IpAddr) {}
 
 /// Exempt a `socket2` socket from the engine's own tunnel.
 fn protect_socket2(sock: &socket2::Socket) {
@@ -320,10 +344,47 @@ where
 pub fn resolve_host(host: &str, port: u16, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
     let host_owned = host.to_owned();
     bounded_lookup(&format!("{host}:{port}"), timeout, move || {
-        (host_owned.as_str(), port)
-            .to_socket_addrs()
-            .map(|iter| iter.collect::<Vec<SocketAddr>>())
+        resolve_system(&host_owned, port)
     })
+}
+
+/// The last resort for a dial, with the TUN in mind.
+///
+/// While a TUN's DNS capture is installed, the OS resolver is pointed at the
+/// tunnel — which is this process — so asking it routes the query back into
+/// the engine and answers with a fake address the dial can only re-enter.
+/// The physical servers captured before the capture was installed answer
+/// instead, queried directly from a pinned socket so the exchange never
+/// touches the tunnel. With no tunnel up this is plain `to_socket_addrs`.
+fn resolve_system(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    if crate::dns::trusted::is_active() {
+        let addresses = crate::dns::trusted::resolve_any(host)?;
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no addresses for {host}"),
+            ));
+        }
+        return Ok(addresses
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect());
+    }
+    (host, port)
+        .to_socket_addrs()
+        .map(|iter| iter.collect::<Vec<SocketAddr>>())
+}
+
+/// As [`resolve_system`], without a port: the address list a rule matches on.
+fn resolve_system_ips(host: &str) -> io::Result<Vec<IpAddr>> {
+    if crate::dns::trusted::is_active() {
+        return crate::dns::trusted::resolve_any(host);
+    }
+    let mut addresses: Vec<IpAddr> = Vec::new();
+    for address in (host, 0u16).to_socket_addrs()? {
+        extend_unique(&mut addresses, [address.ip()]);
+    }
+    Ok(addresses)
 }
 
 /// Resolve a hostname to addresses of **both** families, with a bounded wait.
@@ -404,8 +465,8 @@ fn engine_then_system(host: &str, engine: EngineLookup) -> io::Result<Vec<IpAddr
     }
 
     let mut addresses: Vec<IpAddr> = Vec::new();
-    for address in (host, 0u16).to_socket_addrs()? {
-        extend_unique(&mut addresses, [address.ip()]);
+    for address in resolve_system_ips(host)? {
+        extend_unique(&mut addresses, [address]);
     }
     Ok(addresses)
 }

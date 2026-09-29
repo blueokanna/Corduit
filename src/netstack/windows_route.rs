@@ -343,20 +343,31 @@ pub fn set_tun_dns(interface_name: &str, dns_servers: &[Ipv4Addr]) -> Result<(),
     // Reject shell-unsafe adapter names before interpolation (CWE-78).
     let interface_name = sanitize_interface_name(interface_name)?;
 
-    // First, set DNS for the TUN interface
+    // First, set DNS for the TUN interface. The first entry is written with
+    // `validate=no`: `netsh`'s probe cannot validate the tunnel's virtual
+    // resolver, and without the flag the command prompts on a stdin that is
+    // not attached, leaving the address unwritten.
     for (i, dns) in dns_servers.iter().enumerate() {
         let action = if i == 0 { "set" } else { "add" };
+        let mut args = vec![
+            "interface".to_string(),
+            "ip".to_string(),
+            action.to_string(),
+            "dns".to_string(),
+            format!("name=\"{}\"", interface_name),
+        ];
+        if i == 0 {
+            args.push("source=static".to_string());
+        }
+        args.push(format!("addr={}", dns));
+        if i == 0 {
+            args.push("register=primary".to_string());
+            args.push("validate=no".to_string());
+        }
         let result = Command::new("netsh")
-            .args([
-                "interface",
-                "ip",
-                action,
-                "dns",
-                &format!("name=\"{}\"", interface_name),
-                &format!("addr={}", dns),
-            ])
+            .args(&args)
             .output()
-            .map_err(|e| format!("netsh command failed: {}", e))?;
+            .map_err(|e| format!("netsh command failed: {e}"))?;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);

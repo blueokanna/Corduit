@@ -29,6 +29,9 @@
 //!   gate above, and useful on its own to any caller inspecting a response.
 //! - [`pattern`] — the domain-rule spellings on the string side, for the
 //!   paths that hold a name as text rather than as a parsed [`Name`].
+//! - [`trusted`] — the physical network's own DNS servers, snapshotted before
+//!   a TUN installs its DNS capture, so the engine's own dials never ask the
+//!   resolver the engine itself is standing in for.
 //! - [`server`] — the client-facing listener `dns.enable` and `dns.listen`
 //!   start, which is RecurseX's server bound to a resolver built from the same
 //!   profile.
@@ -47,6 +50,7 @@ pub mod bogon;
 pub mod engine_resolver;
 pub mod pattern;
 pub mod server;
+pub mod trusted;
 pub mod upstream;
 
 // RecurseX *is* the DNS engine, so its vocabulary is re-exported rather than

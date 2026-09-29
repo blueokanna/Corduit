@@ -35,6 +35,7 @@ mod reject;
 mod shadowsocks;
 #[cfg(feature = "shadowtls")]
 mod shadowtls;
+mod sip003;
 mod snell;
 mod socks4;
 mod socks5;
