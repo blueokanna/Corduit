@@ -64,7 +64,7 @@ impl ProxyManager {
         self.inbound_manager.start()
     }
 
-    /// Start outbound connection pools
+    /// Start the outbound manager (dialing is lazy; this registers the set).
     pub fn start_outbounds(&self) -> Result<()> {
         self.outbound_manager.start()
     }

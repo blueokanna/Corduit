@@ -106,7 +106,7 @@ flowchart LR
     DNS["DNS — RecurseX<br/>resolver · cache · transports"] -.-> RT
     RT --> OM["OutboundManager<br/>groups · health check · tracker"]
     OM --> DIAL["dial outbound<br/>handshake + optional chain"]
-    DIAL --> RELAY["relay<br/>two threads, half-close, accounting"]
+    DIAL --> RELAY["relay<br/>one copy thread + the connection thread, half-close, accounting"]
     RELAY --> NET(["socket / QUIC connection"])
 ```
 
@@ -122,7 +122,7 @@ Corduit has no reactor. Concurrency is layered, and each layer does one job:
 flowchart TB
     L["accept loop<br/>one thread per listener"] -->|accepted socket| S["connection thread<br/>courierust's per-connection engine<br/>HTTP/1.1 · h2c · CONNECT tunnels"]
     S -->|dial + handshake| G{"connection budget<br/>admission control"}
-    G -->|admitted| R["relay threads<br/>2 per connection, one per direction"]
+    G -->|admitted| R["relay<br/>one copy thread + the connection thread"]
     R -->|EOF| HC["half-close the opposite transport"]
     R -->|cancel token| SD["shutdown both transports"]
     P["courierust work-stealing pool<br/>short tasks: DNS · control plane · timers"] -->|timers| T["timer wheel<br/>health checks · provider refresh"]
@@ -131,9 +131,10 @@ flowchart TB
 1. **Short tasks** (DNS lookups, control plane, periodic refresh, timer
    callbacks) run on **courierust's work-stealing thread pool**: per-worker
    LIFO caches, a global FIFO, cross-worker stealing, zero CPU when idle.
-2. **Long-lived relays** run on **dedicated threads**, two per connection, one
-   per direction, with half-close semantics. Their number is bounded by a
-   `SessionGate`, so relays cannot starve the pool of handshake capacity.
+2. **Long-lived relays** run on **dedicated threads**: one copy thread per
+   connection plus the connection's own thread for the other direction, with
+   half-close semantics. The listener's connection budget bounds how many can
+   be live, so relays cannot starve the pool of handshake capacity.
 3. **Accept loops** run one thread per listener. Each accepted socket is served
    on a thread of its own by **courierust's per-connection engine** (TLS/ALPN,
    HTTP/1.1, HTTP/2, keep-alive, `CONNECT` tunnels, WebSocket upgrades), and
@@ -147,10 +148,11 @@ share a stream behind a mutex, so a read that could block indefinitely would
 be a lock-ordering deadlock. The relay therefore sets a 25 ms read poll
 (`RELAY_READ_POLL`) before it starts, which bounds every lock hold.
 
-The cost is explicit: connections that stay open but mostly idle occupy one
-thread each. The session gate caps that cost, and the pool keeps short work
-fast. For a desktop or mobile proxy with tens to a few hundred concurrent
-connections, the trade is reasonable.
+The cost is explicit: a connection that stays open but mostly idle occupies
+its connection thread plus one relay thread. The listener's connection budget
+caps how many can be live, and the pool keeps short work fast. For a desktop
+or mobile proxy with tens to a few hundred concurrent connections, the trade
+is reasonable.
 
 ## Cargo features
 
@@ -417,6 +419,12 @@ cargo check --no-default-features --features std  # engine layer, no optional pr
 cargo test --no-default-features --features std   # …and its test code
 cargo run --example minimal                       # a real engine, loopback only
 ```
+
+A check that calls every method of the dispatch table runs where nothing else
+is connected: `stop_corduit` and `close_all_connections_dto` cancel every
+tracked connection in the process. Cargo gives each file under `tests/` a
+process of its own, so that check lives in `tests/rpc_dispatch.rs` instead of
+next to the table it verifies.
 
 CI runs the full check-and-test matrix on Linux, macOS and Windows, an
 `--all-features` job (which builds and tests the gated QUIC / TUIC / Hysteria

@@ -15,14 +15,16 @@
 //!
 //! # Layering
 //!
-//! * **Short tasks** (accept dispatch, handshake, DNS lookups, control
-//!   plane, periodic refresh) run on the work-stealing pool. A job may
-//!   spawn further jobs without deadlocking the pool.
-//! * **Long-lived relays** run on dedicated OS threads, bounded by a
-//!   [`SessionGate`] so an unbounded number of relays can never starve the
-//!   pool of handshake capacity.
-//! * **Accept loops** run one thread per listener, handing each accepted
-//!   socket to the pool.
+//! * **Short tasks** (DNS lookups, control plane, periodic refresh, timer
+//!   callbacks) run on the work-stealing pool. A job may spawn further jobs
+//!   without deadlocking the pool.
+//! * **Long-lived relays** run on dedicated OS threads: one spawned per
+//!   connection plus the connection's own thread for the other direction
+//!   (see [`crate::common::stream::relay_with`]); the listener's connection
+//!   budget bounds how many can be live.
+//! * **Accept loops** run one thread per listener, and each accepted socket
+//!   is served on a dedicated thread whose stack budget the listener sets
+//!   (see [`crate::common::listener`]).
 //!
 //! # Cancellation
 //!
@@ -31,8 +33,6 @@
 //! cancellation latency is bounded by the configured read timeout.
 
 use courierust::courierust_pool::ThreadPool;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 /// Default worker count if `available_parallelism` reports nothing useful.
@@ -105,71 +105,10 @@ impl<T> Task<T> {
     }
 }
 
-/// Bounded admission control for long-lived sessions.
-///
-/// Accept loops must not hand an unbounded number of relays to the engine —
-/// each relay owns at least one OS thread, so without a bound the process
-/// would exhaust its thread budget and stall the accept path entirely.
-/// [`SessionGate::acquire`] applies backpressure: it blocks the accept
-/// thread until a slot frees, which naturally throttles new connections
-/// without dropping them.
-pub struct SessionGate {
-    max: usize,
-    active: AtomicUsize,
-    wake: (Mutex<()>, Condvar),
-}
-
-impl SessionGate {
-    /// Create a gate admitting at most `max` concurrent sessions.
-    pub fn new(max: usize) -> Self {
-        Self {
-            max: max.max(1),
-            active: AtomicUsize::new(0),
-            wake: (Mutex::new(()), Condvar::new()),
-        }
-    }
-
-    /// The configured capacity.
-    pub fn capacity(&self) -> usize {
-        self.max
-    }
-
-    /// The number of currently admitted sessions.
-    pub fn active(&self) -> usize {
-        self.active.load(Ordering::Acquire)
-    }
-
-    /// Block until a session slot is free, then return a guard that
-    /// releases it on drop.
-    pub fn acquire(&self) -> SessionGuard<'_> {
-        let (lock, cond) = &self.wake;
-        let mut guard = lock.lock().unwrap();
-        while self.active.load(Ordering::Acquire) >= self.max {
-            guard = cond.wait(guard).unwrap();
-        }
-        self.active.fetch_add(1, Ordering::AcqRel);
-        SessionGuard { gate: self }
-    }
-}
-
-/// Releases a session slot when dropped.
-pub struct SessionGuard<'a> {
-    gate: &'a SessionGate,
-}
-
-impl Drop for SessionGuard<'_> {
-    fn drop(&mut self) {
-        self.gate.active.fetch_sub(1, Ordering::AcqRel);
-        let (lock, cond) = &self.gate.wake;
-        let _guard = lock.lock().unwrap();
-        cond.notify_one();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -188,40 +127,5 @@ mod tests {
     fn task_joins_with_value() {
         let t = Task::spawn(|| 6 * 7);
         assert_eq!(t.join(), 42);
-    }
-
-    #[test]
-    fn session_gate_bounds_concurrency() {
-        let gate = SessionGate::new(2);
-        let a = gate.acquire();
-        let b = gate.acquire();
-        assert_eq!(gate.active(), 2);
-        drop(b);
-        let c = gate.acquire();
-        assert_eq!(gate.active(), 2);
-        drop(a);
-        drop(c);
-        assert_eq!(gate.active(), 0);
-    }
-
-    #[test]
-    fn session_gate_applies_backpressure() {
-        let gate = Arc::new(SessionGate::new(1));
-        let _a = gate.acquire();
-        let g2 = gate.clone();
-        let entered = Arc::new(AtomicBool::new(false));
-        let e2 = entered.clone();
-        std::thread::spawn(move || {
-            let _g = g2.acquire();
-            e2.store(true, Ordering::SeqCst);
-        });
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!entered.load(Ordering::SeqCst), "second acquire must block");
-        drop(_a);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(entered.load(Ordering::SeqCst));
     }
 }

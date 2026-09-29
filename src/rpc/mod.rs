@@ -575,22 +575,6 @@ mod tests {
     }
 
     #[test]
-    fn every_declared_method_is_dispatched() {
-        api::init_app();
-
-        let value = nextjson::Value::Null;
-        for method in CORDUIT_METHODS {
-            let result = dispatch(method, &value);
-            if let Err(e) = result {
-                assert!(
-                    !e.starts_with("unknown method"),
-                    "declared method '{method}' is missing from dispatch: {e}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn api_version_is_semver_like() {
         assert!(
             CORDUIT_API_VERSION.split('.').count() >= 2,

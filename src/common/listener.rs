@@ -54,6 +54,16 @@ const WAKE_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 /// listener that somehow ends up non-blocking backs off instead of spinning.
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(5);
 
+/// Stack budget for a connection thread.
+///
+/// The thread carries courierust's per-connection engine and, for a relayed
+/// connection, one direction of the copy loop (the other runs on
+/// `corduit-relay-up`); the copy loop's own buffers are heap, so the stack
+/// only has to cover frame depth. One ceiling for both roles is deliberate:
+/// the connection thread *becomes* a relay direction, and a second number
+/// would just be a second thing to keep right.
+const CONNECTION_THREAD_STACK: usize = 512 * 1024;
+
 /// A shared admission counter for live connections.
 struct Slots {
     max: usize,
@@ -228,6 +238,7 @@ impl ConnectionListener {
                                 let handler = Arc::clone(&handler);
                                 let worker = std::thread::Builder::new()
                                     .name(thread_name.into())
+                                    .stack_size(CONNECTION_THREAD_STACK)
                                     .spawn(move || {
                                         let _slot = slot;
                                         handler(stream, peer);

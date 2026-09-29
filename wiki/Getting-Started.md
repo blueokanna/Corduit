@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2) 创建引擎
     let engine = Corduit::new(config)?;
 
-    // 3) 启动（打开入站监听、出站连接池、后台 provider 刷新）
+    // 3) 启动（打开入站监听、出站管理器、后台 provider 刷新）
     engine.start()?;
 
     // 4) 停引擎

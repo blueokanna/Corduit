@@ -72,8 +72,8 @@ Corduit 没有 async runtime。并发是分层的，每一层只做它擅长的�
 
 1. **短任务**（DNS 查询、控制面、周期刷新、定时器回调）跑在 courierust 的
    work-stealing 线程池上（每 worker 私有 LIFO、全局 FIFO、跨 worker 偷取、空闲零 CPU）。
-2. **长连接中继**跑在专用线程上（每连接两条、每方向一条、带半关闭），由会话门限
-   （`SessionGate`）限制并发数，避免中继饿死握手容量。
+2. **长连接中继**跑在专用线程上（每连接一条复制线程 + 连接线程自身各管一个方向、带半关闭），
+   由监听器的连接配额限制并发数，避免中继饿死握手容量。
 3. **accept 循环**每个监听器一条专用线程；接到的 socket 由 courierust 的
    per-connection 引擎（`serve_connection`）在专属线程上服务，活跃连接达到监听器配额时
    accept 线程自身阻塞，形成背压（空闲监听器在 `accept` 上阻塞，不轮询）。

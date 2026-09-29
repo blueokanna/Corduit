@@ -32,11 +32,14 @@
 //!
 //! Corduit has **no async runtime**. Concurrency is layered:
 //!
-//! 1. Short tasks (accept dispatch, handshakes, DNS, control plane,
-//!    timers) run on courierust's work-stealing thread pool ([`exec`]).
-//! 2. Long-lived relays run on dedicated threads, bounded by a
-//!    [`SessionGate`](exec::SessionGate).
-//! 3. One accept thread per listener hands connections to the pool.
+//! 1. Short tasks (DNS, control plane, periodic refresh, timer callbacks)
+//!    run on courierust's work-stealing thread pool ([`exec`]).
+//! 2. Long-lived relays run on dedicated threads: one spawned per connection
+//!    plus the connection's own thread for the other direction
+//!    ([`stream::relay_with`]); the listener's connection budget bounds how many
+//!    can be live.
+//! 3. One accept thread per listener serves each accepted socket on a
+//!    dedicated thread ([`listener`]).
 //!
 //! # Safety
 //!

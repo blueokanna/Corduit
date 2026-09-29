@@ -8,8 +8,7 @@
 //! - Full TCP state machine with proper connection handling
 //! - UDP session management with NAT support
 //! - DNS interception with Fake-IP support
-//! - Zero-copy packet processing where possible
-//! - Connection pooling and reuse
+//! - A bounded proxy-connection budget with backpressure
 //! - Traffic statistics and monitoring
 //!
 //! The stack is fully synchronous: packet processing runs inline on the

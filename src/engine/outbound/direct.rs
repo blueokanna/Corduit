@@ -359,11 +359,12 @@ fn pump_direct_udp_replies(session: Arc<DirectUdpSession>) {
 /// Bidirectional relay between two owned streams with traffic statistics and
 /// optional connection tracking.
 ///
-/// Two dedicated threads, one per direction; EOF half-closes the opposite
-/// peer. `a` is the client side (upload), `b` the upstream side (download).
-/// Threads need `'static` streams, so both transports are owned (boxed) and
-/// shared behind mutexes; each operation locks exactly one stream, which
-/// keeps the two-thread relay deadlock-free by construction.
+/// One spawned copy thread plus one direction on the caller's thread; EOF
+/// half-closes the opposite peer. `a` is the client side (upload), `b` the
+/// upstream side (download). Threads need `'static` streams, so both
+/// transports are owned (boxed) and shared behind mutexes; each operation
+/// locks exactly one stream, which keeps the cross-direction relay
+/// deadlock-free by construction.
 ///
 /// # Lock fairness
 ///

@@ -66,20 +66,20 @@ Corduit 没有 reactor。并发是分层的，每层只做一件事：
 ```mermaid
 flowchart TB
     L["accept 循环<br/>每监听器一条线程"] -->|接受到的 socket| S["连接线程<br/>courierust 单连接引擎<br/>HTTP/1.1 · h2c · CONNECT 隧道"]
-    S -->|拨号与握手| G{"SessionGate<br/>连接配额"}
-    G -->|准入| R["中继线程<br/>每连接两条、每方向一条"]
+    S -->|拨号与握手| G{"连接配额<br/>准入控制"}
+    G -->|准入| R["中继<br/>一条复制线程 + 连接线程自身"]
     R -->|EOF| HC["对另一侧做半关闭"]
     R -->|取消令牌| SD["关闭两端传输"]
     P["courierust work-stealing 池<br/>短任务：DNS · 控制面 · 定时器"] -->|定时器| T["时间轮<br/>健康检查 · 代理集刷新"]
 ```
 
 1. **短任务**（DNS 查询、控制面、周期刷新、定时器回调）运行在 **courierust 的 work-stealing 线程池**上：每 worker 私有 LIFO、全局 FIFO、跨 worker 窃取、空闲时零 CPU。
-2. **长连接中继**运行在**专用线程**上，每连接两条、每方向一条，带半关闭语义。数量由 `SessionGate` 封顶，因此中继不会挤占池中的握手容量。
+2. **长连接中继**运行在**专用线程**上：每连接一条复制线程，另一个方向跑在连接线程自身，带半关闭语义。数量由监听器的连接配额封顶，因此中继不会挤占池中的握手容量。
 3. **accept 循环**每个监听器一条线程。接入的 socket 由 **courierust 的单连接引擎**在专属线程上处理（TLS/ALPN、HTTP/1.1、HTTP/2、keep-alive、`CONNECT` 隧道、WebSocket 升级）；连接数达到监听器配额后 accept 循环被阻塞，空闲客户端无法无限扩张线程。
 
 阻塞由 socket 超时界定（`SO_RCVTIMEO` / `SO_SNDTIMEO`）：`WouldBlock` / `TimedOut` 表示*此刻无数据*，各循环在两次操作之间检查 `CancellationToken`。中继的两个线程通过互斥量共享同一条流，一次可能无限阻塞的读会构成锁序死锁，因此中继在启动前设置 25 ms 读轮询（`RELAY_READ_POLL`），让每次持锁时长有上界。
 
-代价是明确的：长期空闲的连接会各占一条线程。会话门限为此封顶，线程池保证短任务路径的吞吐。对几十到几百并发连接的桌面 / 移动代理来说，这个取舍是合理的。
+代价是明确的：长期空闲的连接会各占连接线程 + 一条复制线程。监听器的连接配额为此封顶，线程池保证短任务路径的吞吐。对几十到几百并发连接的桌面 / 移动代理来说，这个取舍是合理的。
 
 ## Cargo feature
 
@@ -292,6 +292,10 @@ cargo check --no-default-features --features std  # 引擎层，不含可选协�
 cargo test --no-default-features --features std   # …以及该配置下的测试代码
 cargo run --example minimal                       # 真跑一个引擎，只用环回端口
 ```
+
+逐个调用分发表每个方法的检查，必须放在「本进程没有其它活跃连接」的地方：`stop_corduit`
+与 `close_all_connections_dto` 会取消进程内所有已跟踪连接。Cargo 会给 `tests/` 下每个文件
+独立进程，因此该检查放在 `tests/rpc_dispatch.rs`，而不是挨着它所验证的分发表。
 
 CI 在 Linux、macOS、Windows 上运行完整的检查与测试矩阵，另有 all-features 作业（覆盖被门控的 QUIC / TUIC / Hysteria 代码的构建与测试）、`no_std` 核心检查、既有检查也有测试的 `std`-only 配置、Android（aarch64 与 x86_64）与 iOS 交叉检查，以及**构建并测试** 1.78 的 MSRV 作业。桌面平台的作业还会跑只用环回端口的示例，以应用的方式驱动整个 crate，并用 `--all-features` 构建文档。`RUSTFLAGS` 与 `RUSTDOCFLAGS` 都是 `-D warnings`：出现警告或文档内链接失效，都会让构建失败。
 

@@ -63,16 +63,16 @@ if data.is_empty() { return; }
 
 ## 缺陷类型三：中继线程的所有权不完整
 
-`common::stream::relay_with` 会为每个方向启动一个线程。它必须满足一条不变量：**返回之后，函数不再持有任何活动线程**。
+`common::stream::relay_with` 启动一条复制线程，并在调用线程上跑另一个方向。它必须满足一条不变量：**返回之后，函数不再持有任何活动线程**——复制线程已被 join，调用线程上的方向已经退出。
 
-两个曾经违反这条不变量、并因此在设备上表现为线程数单调增长的出口路径：
+两个曾经违反这条不变量、并因此在设备上表现为线程数单调增长的出口路径（当时两个方向各 spawn 一条线程）：
 
 1. 两个 `spawn` 之间、两次 `join` 之间的 `?` 提前返回——第一个线程已经启动，却没有任何人再拥有它；
 2. 某一个方向 panic 时直接向上返回——另一个方向仍 parked 在永远不会再有数据的读上。
 
-现在的形状是：spawn 失败时先 `release()` 两侧再 `join` 已启动的线程；两次 `join` 都执行完才做错误传播；`up.join()` 报错时先释放两侧再 join 下行，避免 `join` 永久阻塞。
+现在的形状是：spawn 失败时先 `release()` 两侧再返回；任一方向 panic 时，**panic 的一方先 `release()` 两侧再由内层守卫向上传播**，让另一个方向必然在它自己的唤醒路径上退出；`join` 在任何 `?` 之前完成，错误传播放在最后。
 
-回归测试 `a_panicking_direction_does_not_strand_its_partner` 用「一个方向 panic、另一个方向 parked」复现原缺陷，并以“两个传输最终都被 drop”作为线程已被 join 的判据——线程若仍在运行，其 `Arc<Side>` 依旧持有传输。
+回归测试 `a_panicking_direction_does_not_strand_its_partner` 对两个 panic 位置各跑一遍（spawned 方向与调用线程方向），并以「两个传输最终都被 drop」作为线程已被收尾的判据——线程若仍在运行，其 `Arc<Side>` 依旧持有传输。
 
 ## 缺陷类型四：可重试的错误码把失败变成死循环
 
@@ -181,6 +181,8 @@ rchar +31 KB      wchar +833 KB       => 约 57 KB/s
 wchan 分布: 117 线程 wchan=0, 49 wait_woken, 6 hrtimer_nanosleep, 4 futex_wait
 线程名: corduit-relay-u 136, corduit-relay-d 41
 ```
+
+> 样例采集自**每个方向各 spawn 一条线程的旧构建**，所以线程名里能同时看到 `-u` 与 `-d`；当前构建只 spawn 一条复制线程（`corduit-relay-up`），另一个方向跑在连接线程自身。空转的三个特征量不受这一改动影响。
 
 「7 个核的用户态时间 + 57 KB/s 的 I/O + 117 个线程停留在用户态」三者同时成立，就已经排除了“真流量”和“锁竞争”两种解释：前者会让 I/O 与 CPU 同比例增长，后者会让线程进入内核等待并抬高 `stime`。
 

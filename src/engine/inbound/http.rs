@@ -442,6 +442,7 @@ impl HttpProxyHandler {
         let (mut client_side, server_side) = forward::mem_duplex(64 * 1024);
         let relay_handle = std::thread::Builder::new()
             .name("corduit-http-relay".into())
+            .stack_size(crate::common::stream::RELAY_THREAD_STACK)
             .spawn(move || outbound.relay_tcp(Box::new(server_side) as BoxStream, target))
             .map_err(|e| Error::network(format!("Failed to spawn relay thread: {e}")))?;
         let body = req.body.as_bytes().map(|b| b.to_vec()).unwrap_or_default();

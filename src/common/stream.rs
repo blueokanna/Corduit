@@ -6,9 +6,9 @@
 //! implements it, so the relay and the outbound handlers stay agnostic to
 //! the transport underneath.
 //!
-//! [`relay`] is the heart of every proxy connection: two dedicated threads,
-//! one per direction, each doing a bounded blocking copy with proper
-//! half-close semantics.
+//! [`relay`] is the heart of every proxy connection: one spawned copy thread
+//! plus one direction on the caller's thread, each doing a blocking copy with
+//! proper half-close semantics.
 
 use crate::common::cancel::CancellationToken;
 use std::io::{self, Read, Write};
@@ -55,6 +55,16 @@ pub const RELAY_POLL_YIELD: Duration = Duration::from_millis(2);
 /// — but not forever: a peer that has stopped reading for this long has gone
 /// away without saying so, and the connection is better torn down than held.
 pub const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Stack budget for the one relay thread a connection spawns.
+///
+/// The copy loop's buffers are heap (`RELAY_BUF_SIZE` per direction), so the
+/// stack only has to cover the deepest read/write frame in a protocol codec —
+/// the largest in-tree read chunk is 16 KiB, on top of ordinary frame depth.
+/// The default two-megabyte stack would reserve four times this per live
+/// connection for headroom nothing uses; at a listener's budget of 2048 live
+/// connections that is the difference between 4 GiB and 1 GiB of address space.
+pub const RELAY_THREAD_STACK: usize = 512 * 1024;
 
 /// A boxed synchronous duplex byte stream — the engine's canonical relay
 /// type.
@@ -423,27 +433,6 @@ fn copy_one_way(
     }
 }
 
-/// Bidirectionally relay two duplex streams on dedicated threads.
-///
-/// Two copy threads — one per direction — each doing a blocking copy. When a
-/// direction reaches EOF it half-closes the opposite peer; on error or
-/// cancellation both transports are shut down so the peer thread wakes and
-/// exits promptly.
-///
-/// The copy threads are dedicated OS threads (not pool workers) so a relay
-/// can never starve the work-stealing pool of handshake capacity; the
-/// number of concurrent relays is bounded upstream by
-/// [`crate::common::exec::SessionGate`].
-///
-/// # Idle cost
-///
-/// A relay is idle for most of a connection's life — a browser holds hundreds
-/// of keep-alive sockets that are silent almost all the time — so what a
-/// silent connection costs dominates the device's power draw. The design goal
-/// is therefore that an idle direction is *parked*, not ticking: see
-/// [`relay`] for how a transport that supports concurrent use gets there, and
-/// [`RELAY_READ_POLL`] for the fallback.
-///
 /// One end of a relay.
 ///
 /// The distinction is the whole point of the relay's design: a side that can be
@@ -613,8 +602,6 @@ impl RelayAccounting {
 
 /// Copy `src` to `dst` until a side finishes, the relay is cancelled, or a
 /// transport fails.
-/// Copy `src` to `dst` until a side finishes, the relay is cancelled, or a
-/// transport fails.
 ///
 /// `finished` is the partner's guarantee that it will stop. It is set on every
 /// ending except a clean half-close, and it exists because releasing the other
@@ -698,7 +685,9 @@ fn copy_direction(
 }
 
 /// Copy bytes both ways between two transports until a side finishes or the
-/// token is cancelled.
+/// token is cancelled, recording per-chunk accounting as it goes.
+///
+/// [`relay`] is the same function with the default accounting.
 ///
 /// # Why this is not just a pair of bounded copies
 ///
@@ -722,7 +711,17 @@ fn copy_direction(
 ///
 /// The two are not exclusive: a relay between a plain socket and a wrapped
 /// transport gets the lock-free direction on the socket side as well.
-/// [`relay`] with per-chunk accounting.
+///
+/// # One thread, not two
+///
+/// Only one copy thread is spawned; the second direction runs on the caller's
+/// thread. `relay_with` blocks until both directions finish either way, so the
+/// caller was going to wait for the relay anyway, and running a direction on it
+/// saves a spawn, a join and a stack per connection — the difference between
+/// two and three threads for every proxied connection. The termination rules
+/// are identical: each direction reports through the same `finished` flag, and
+/// a direction that panics releases both sides before unwinding so its partner
+/// cannot stay parked in a read that will never return.
 pub fn relay_with(
     a: BoxStream,
     b: BoxStream,
@@ -774,6 +773,10 @@ pub fn relay_with(
     // holding the lock against.
     let finished = Arc::new(AtomicBool::new(false));
 
+    // The upstream direction runs on a thread of its own; if it panics it must
+    // release both sides before unwinding, because the partner may be parked in
+    // a read that only a release can wake. `resume_unwind` keeps the failure
+    // visible to `join` exactly as it was.
     let upstream = {
         let src = Arc::clone(&a);
         let dst = Arc::clone(&b);
@@ -781,18 +784,30 @@ pub fn relay_with(
         let stats = Arc::clone(&stats);
         let finished = Arc::clone(&finished);
         let accounting = accounting.clone();
+        let release_a = Arc::clone(&a);
+        let release_b = Arc::clone(&b);
+        let release_flag = Arc::clone(&finished);
         std::thread::Builder::new()
             .name("corduit-relay-up".into())
-            .spawn(move || copy_direction(src, dst, token, finished, stats, accounting, true))
+            .stack_size(RELAY_THREAD_STACK)
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    copy_direction(src, dst, token, finished, stats, accounting, true)
+                }));
+                match result {
+                    Ok(outcome) => outcome,
+                    Err(payload) => {
+                        release_flag.store(true, Ordering::Release);
+                        release_a.release();
+                        release_b.release();
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            })
     };
 
-    // Both spawns and both joins have to complete on every path out of this
-    // function. A `?` between the two spawns used to return while the first
-    // thread was already running: nothing owned it any more, so it kept its
-    // two streams, its buffers and its spot in the thread table for the life
-    // of the process. On a device that opens a connection per app flow the
-    // strays accumulate until thread creation itself starts failing, which is
-    // what turned a leak into a storm.
+    // A failed spawn must release the sides it was handed and return; nothing
+    // else owns them yet.
     let upstream = match upstream {
         Ok(handle) => handle,
         Err(error) => {
@@ -803,49 +818,32 @@ pub fn relay_with(
         }
     };
 
-    let downstream = {
-        let src = Arc::clone(&b);
-        let dst = Arc::clone(&a);
-        let token = token.clone();
-        let stats = Arc::clone(&stats);
-        let finished = Arc::clone(&finished);
-        let accounting = accounting.clone();
-        std::thread::Builder::new()
-            .name("corduit-relay-down".into())
-            .spawn(move || copy_direction(src, dst, token, finished, stats, accounting, false))
-    };
-
-    let downstream = match downstream {
-        Ok(handle) => handle,
-        Err(error) => {
-            // The upstream thread is already running and holds both sides.
-            // The flag is what tells it to stop; releasing the sides is what
-            // makes it stop promptly when their locks happen to be free.
-            finished.store(true, Ordering::Release);
-            a.release();
-            b.release();
-            let _ = upstream.join();
-            return Err(error);
-        }
-    };
-
-    // Both joins run before any `?`, so a panic in one direction can never
-    // return early and strand the other thread.
-    let up = upstream.join();
-
-    // A panicking direction unwinds without setting anything, so the other one
-    // can still be parked in a read that will never see data again. Tell it to
-    // stop before waiting for it, or this join never returns.
-    if up.is_err() {
+    // The downstream direction runs here, on the caller's thread. It is the
+    // same `copy_direction` with the same token, flag and stats; only the
+    // thread differs. A panic in it releases both sides for the same reason
+    // the spawned direction does, then propagates after the join below.
+    let downstream = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        copy_direction(
+            Arc::clone(&b),
+            Arc::clone(&a),
+            token.clone(),
+            Arc::clone(&finished),
+            Arc::clone(&stats),
+            accounting.clone(),
+            false,
+        )
+    }));
+    if downstream.is_err() {
         finished.store(true, Ordering::Release);
         a.release();
         b.release();
     }
 
-    let down = downstream.join();
-
-    let up = up.map_err(|_| io::Error::other("relay thread panicked"))?;
-    let down = down.map_err(|_| io::Error::other("relay thread panicked"))?;
+    // The join runs before any `?`, so a panic can never return early and
+    // strand the other direction.
+    let up = upstream.join();
+    let up = up.map_err(|_| io::Error::other("upstream relay direction panicked"))?;
+    let down = downstream.map_err(|_| io::Error::other("downstream relay direction panicked"))?;
 
     if token.is_cancelled() {
         return Err(io::Error::new(
@@ -872,6 +870,7 @@ pub fn relay(a: BoxStream, b: BoxStream, token: CancellationToken) -> io::Result
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn copy_one_way_half_closes_on_eof() {
@@ -1276,44 +1275,47 @@ mod tests {
     /// process, and a failing spawn did the same to a thread that had not even
     /// started working yet. Both transports being dropped is the proof that no
     /// thread is still holding them.
+    ///
+    /// Both shapes are run: a panic in the spawned direction and a panic in
+    /// the direction that runs on the caller's thread. Each has to release the
+    /// survivor before unwinding, or the survivor parks in a read that never
+    /// returns and this test hangs instead of failing.
     #[test]
     fn a_panicking_direction_does_not_strand_its_partner() {
-        let up_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let up_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let down_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let down_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for panic_on_upstream in [true, false] {
+            let up_dropped = Arc::new(AtomicBool::new(false));
+            let down_dropped = Arc::new(AtomicBool::new(false));
 
-        let upstream: BoxStream = Box::new(Parking {
-            released: std::sync::Arc::clone(&up_released),
-            dropped: std::sync::Arc::clone(&up_dropped),
-            panic_on_read: true,
-            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
-        let downstream: BoxStream = Box::new(Parking {
-            released: std::sync::Arc::clone(&down_released),
-            dropped: std::sync::Arc::clone(&down_dropped),
-            panic_on_read: false,
-            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
+            let upstream: BoxStream = Box::new(Parking {
+                released: Arc::new(AtomicBool::new(false)),
+                dropped: Arc::clone(&up_dropped),
+                panic_on_read: panic_on_upstream,
+                reads: Arc::new(AtomicUsize::new(0)),
+            });
+            let downstream: BoxStream = Box::new(Parking {
+                released: Arc::new(AtomicBool::new(false)),
+                dropped: Arc::clone(&down_dropped),
+                panic_on_read: !panic_on_upstream,
+                reads: Arc::new(AtomicUsize::new(0)),
+            });
 
-        let outcome = relay(upstream, downstream, CancellationToken::new());
+            let outcome = relay(upstream, downstream, CancellationToken::new());
 
-        assert!(
-            outcome.is_err(),
-            "a panicking direction has to fail the relay"
-        );
-        assert!(
-            down_released.load(std::sync::atomic::Ordering::SeqCst),
-            "the surviving direction was left parked instead of released"
-        );
-        assert!(
-            up_dropped.load(std::sync::atomic::Ordering::SeqCst),
-            "the upstream transport is still owned by a live thread"
-        );
-        assert!(
-            down_dropped.load(std::sync::atomic::Ordering::SeqCst),
-            "the downstream transport is still owned by a live thread"
-        );
+            assert!(
+                outcome.is_err(),
+                "a panicking direction has to fail the relay (panic_on_upstream={panic_on_upstream})"
+            );
+            assert!(
+                up_dropped.load(Ordering::SeqCst),
+                "the upstream transport is still owned by a live thread \
+                 (panic_on_upstream={panic_on_upstream})"
+            );
+            assert!(
+                down_dropped.load(Ordering::SeqCst),
+                "the downstream transport is still owned by a live thread \
+                 (panic_on_upstream={panic_on_upstream})"
+            );
+        }
     }
 
     /// A relay that never sees data must poll, not spin: the no-progress path

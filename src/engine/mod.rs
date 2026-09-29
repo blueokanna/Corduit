@@ -64,7 +64,6 @@
 pub mod macros;
 pub mod api;
 pub mod config;
-pub mod connection_pool;
 pub mod connection_tracker;
 pub mod dns;
 pub mod error;
@@ -88,7 +87,6 @@ pub mod traffic_stats;
 mod tests;
 
 pub use config::*;
-pub use connection_pool::*;
 pub use connection_tracker::global_tracker;
 pub use connection_tracker::ConnectionHandle;
 pub use connection_tracker::ConnectionTracker;
