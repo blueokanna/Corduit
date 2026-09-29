@@ -44,6 +44,7 @@ mod ssr;
 mod trojan;
 #[cfg(feature = "tuic")]
 mod tuic;
+mod v2ray_mux;
 mod vless;
 mod vmess;
 #[cfg(feature = "wireguard")]
@@ -400,7 +401,6 @@ impl OutboundManager {
         let mut proxy_group_configs: Vec<OutboundConfig> = Vec::new();
         let mut provider_tags: std::collections::HashSet<String> = Default::default();
 
-        // Pass 1: leaf proxies (everything except proxy groups).
         for outbound_config in &config.outbounds {
             let proxy: Option<Arc<dyn OutboundProxy>> = build_outbound_proxy(outbound_config)?;
 
@@ -409,16 +409,10 @@ impl OutboundManager {
                 proxy_list.push(p.clone());
                 registry.write().insert(tag, p);
             } else {
-                // Group types (Selector/Urltest/…) are resolved in a final
-                // pass once every leaf and provider proxy is in the registry.
                 proxy_group_configs.push(outbound_config.clone());
             }
         }
 
-        // Pass 2: proxy providers. Load each configured provider (parses its
-        // subscription) and register every resulting proxy by tag so proxy
-        // groups can reference them. Failures abort startup — a broken
-        // provider must never silently fall back to direct.
         let provider_configs = runtime_proxy_providers();
         for provider_config in provider_configs {
             provider_manager.add_provider(provider_config)?;
@@ -437,8 +431,6 @@ impl OutboundManager {
         for mut group_config in proxy_group_configs {
             Self::expand_provider_use(&mut group_config, provider_manager)?;
             let group = Arc::new(GroupOutbound::new(group_config, registry.clone())?);
-            // Start the probe loop for the strategies that need it, now that
-            // the group is about to become reachable.
             group.ensure_prober();
             let proxy: Arc<dyn OutboundProxy> = group;
             let tag = proxy.tag().to_string();
@@ -570,8 +562,6 @@ impl OutboundManager {
     pub fn reload(&self) -> Result<()> {
         let rebuilt = {
             let config = self.config.read();
-            // Reset the registry and providers first so outbounds removed
-            // from the config do not linger and stay reachable by tag.
             self.proxies.write().clear();
             self.proxy_providers.clear();
             Self::build_outbounds(&config, &self.proxies, &self.proxy_providers)?

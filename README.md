@@ -65,7 +65,8 @@ Capabilities:
   `shadowtls` (v3), `tuic` (v5), `hysteria` (v1) and `hysteria2`; plus the
   group selectors `selector`, `url-test`, `fallback`, `load-balance` and
   `relay`. A Shadowsocks node can carry a SIP003 plugin — `obfs`
-  (simple-obfs `http` / `tls`), `v2ray-plugin` (`websocket` mode) or
+  (simple-obfs `http` / `tls`), `v2ray-plugin` (`websocket` mode, carrying
+  the mux session framing its server expects by default) or
   `shadow-tls` (v3) — resolved as an in-tree stream, never as an external
   binary.
 - **Routing**: `domain`, `domain-suffix`, `domain-keyword`, `domain-regex`,

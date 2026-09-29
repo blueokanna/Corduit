@@ -17,9 +17,11 @@
 //!   different fabricated request.
 //! * **`v2ray-plugin`** in `websocket` mode is a WebSocket (optionally over
 //!   TLS) whose binary messages carry the SS records, with the `Host` header
-//!   from `plugin-opts.host`. `mux` is deliberately not implemented as a
-//!   setting: it is a client-side stream multiplexing *optimisation* of an
-//!   otherwise identical protocol, so connections work without it.
+//!   from `plugin-opts.host`. The messages are mux session frames (the
+//!   `v2ray_mux` module): the reference server routes every WebSocket stream
+//!   into v2ray's mux handler by default, so a client writing raw bytes there
+//!   connects and then fails every request. `mux: false` in `plugin-opts`
+//!   turns the framing off for servers explicitly built without it.
 //! * **`shadow-tls`** runs the ShadowTLS v3 handshake — the same client as
 //!   [`crate::engine::outbound::shadowtls`], which serves the standalone
 //!   `shadowtls` outbound — and then carries SS records inside its frames.
@@ -72,6 +74,16 @@ pub(crate) enum Plugin {
         path: String,
         /// The TLS server name the handshake presents.
         sni: String,
+        /// Whether the WebSocket carries mux session frames. On by default:
+        /// the reference server, the reference client and mihomo all run
+        /// their `mux` option on, and a mismatch is the silent
+        /// "connects, then every request fails" case.
+        mux: bool,
+        /// `skip-cert-verify` for the plugin's own TLS layer.
+        skip_cert_verify: bool,
+        /// Extra headers for the handshake request (`headers` in the option
+        /// map, as panels spell it).
+        headers: HashMap<String, String>,
     },
     /// ShadowTLS v3 under a Shadowsocks node.
     #[cfg(feature = "shadowtls")]
@@ -106,6 +118,13 @@ impl Plugin {
                 .map(yaml_value_to_string)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
+        };
+        let flag = |key: &str| -> Option<bool> {
+            opt(key).and_then(|value| match value.to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            })
         };
 
         match name.as_str() {
@@ -146,31 +165,40 @@ impl Plugin {
                 if mode != "websocket" {
                     return Err(Error::config(format!(
                         "v2ray-plugin mode `{mode}` is not implemented; only `websocket` is \
-                         (its `quic` mode is a different wire, and `mux` is a client-side \
-                         optimisation that is not required to talk to the server)"
+                         (its `quic` mode is a different wire)"
                     )));
                 }
-                let tls = opts
-                    .and_then(|value| value.get("tls"))
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
+
+                if flag("v2ray-http-upgrade").unwrap_or(false) {
+                    return Err(Error::config(
+                        "v2ray-plugin `v2ray-http-upgrade` is not implemented; this build \
+                         speaks the classic WebSocket handshake",
+                    ));
+                }
+                let tls = flag("tls").unwrap_or(false);
+                let skip_cert_verify = flag("skip-cert-verify").unwrap_or(false);
                 let host = opt("host")
                     .map(|host| host.split(':').next().unwrap_or(&host).to_string())
                     .unwrap_or_else(|| server.to_string());
                 let path = opt("path").unwrap_or_else(|| "/".to_string());
-                // The WebSocket handshake writes this value into its request
-                // line; the same rule as every other fabricated head applies.
                 if !path.starts_with('/') || crate::common::text::has_line_breaking_byte(&path) {
                     return Err(Error::config(format!(
                         "v2ray-plugin path must start with '/' and hold no control byte: {path:?}"
                     )));
                 }
-                let sni = opt("sni").unwrap_or_else(|| host.clone());
+                let headers = parse_headers(opts);
+                let sni = opt("sni")
+                    .or_else(|| header_value(&headers, "Host"))
+                    .unwrap_or_else(|| host.clone());
+                let mux = flag("mux").unwrap_or(true);
                 Ok(Plugin::V2rayWs {
                     tls,
                     host,
                     path,
                     sni,
+                    mux,
+                    skip_cert_verify,
+                    headers,
                 })
             }
             "shadow-tls" => {
@@ -245,6 +273,9 @@ impl Plugin {
                 host,
                 path,
                 sni,
+                mux,
+                skip_cert_verify,
+                headers,
             } => {
                 let tcp = dial(server, port, timeout)?;
                 let stream: BoxStream = if *tls {
@@ -252,7 +283,7 @@ impl Plugin {
                         crate::engine::tls::TlsConnector::new(crate::engine::tls::ClientConfig {
                             server_name: Some(sni.clone()),
                             alpn: vec!["http/1.1".to_string()],
-                            skip_cert_verify: false,
+                            skip_cert_verify: *skip_cert_verify,
                             enable_sni: true,
                         })
                         .map_err(|e| Error::Tls {
@@ -266,13 +297,16 @@ impl Plugin {
                 } else {
                     Box::new(tcp)
                 };
-                let ws =
-                    crate::protocol::ws::WebSocket::connect(stream, host, path, &HashMap::new())
-                        .map_err(|e| {
-                            Error::network(format!("v2ray-plugin WebSocket handshake failed: {e}"))
-                        })?;
-                debug!("v2ray-plugin: websocket transport up (tls={tls})");
-                Ok(Box::new(ws))
+                let ws = crate::protocol::ws::WebSocket::connect(stream, host, path, headers)
+                    .map_err(|e| {
+                        Error::network(format!("v2ray-plugin WebSocket handshake failed: {e}"))
+                    })?;
+                debug!("v2ray-plugin: websocket transport up (tls={tls}, mux={mux})");
+                if *mux {
+                    Ok(Box::new(super::v2ray_mux::MuxStream::new(ws)))
+                } else {
+                    Ok(Box::new(ws))
+                }
             }
             #[cfg(feature = "shadowtls")]
             Plugin::ShadowTls { host, password } => {
@@ -295,6 +329,35 @@ fn dial(server: &str, port: u16, timeout: Duration) -> Result<std::net::TcpStrea
         .map_err(|e| Error::network(format!("set write timeout: {e}")))?;
     tcp.set_nodelay(true).ok();
     Ok(tcp)
+}
+
+/// The `headers` map of a v2ray-plugin profile, both sides stringified.
+///
+/// A malformed map is warned about and ignored rather than refused: the node
+/// still works with the default headers, and the WebSocket layer validates
+/// every entry it is actually handed (token names, no CR/LF).
+fn parse_headers(opts: Option<&Value>) -> HashMap<String, String> {
+    match opts.and_then(|value| value.get("headers")) {
+        None => HashMap::new(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(name, value)| (name.to_string(), yaml_value_to_string(value)))
+            .filter(|(name, _)| !name.is_empty())
+            .collect(),
+        Some(_) => {
+            warn!("v2ray-plugin `headers` is not a map; it is ignored");
+            HashMap::new()
+        }
+    }
+}
+
+/// The value of `name` in a header map, case-insensitively.
+fn header_value(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -423,6 +486,10 @@ mod tests {
                 host: "node.example".to_string(),
                 path: "/".to_string(),
                 sni: "node.example".to_string(),
+                // mux is on by default, like every reference implementation.
+                mux: true,
+                skip_cert_verify: false,
+                headers: HashMap::new(),
             }
         );
 
@@ -445,6 +512,9 @@ mod tests {
                 host: "front.example".to_string(),
                 path: "/ray".to_string(),
                 sni: "front.example".to_string(),
+                mux: true,
+                skip_cert_verify: false,
+                headers: HashMap::new(),
             }
         );
 
@@ -472,6 +542,91 @@ mod tests {
             ),
         ]);
         assert!(Plugin::parse(&injected, "node.example").is_err());
+    }
+
+    /// The full option set: `mux` off is what a server built with `mux: 0`
+    /// needs, `skip-cert-verify` reaches the TLS layer, and `headers` entries
+    /// ride the handshake — with mihomo's rule that a `Host` entry names the
+    /// TLS server.
+    #[test]
+    fn v2ray_plugin_reads_its_full_option_set() {
+        let opts = options(&[
+            ("plugin", string("v2ray-plugin")),
+            (
+                "plugin-opts",
+                object(&[
+                    ("tls", Value::Bool(true)),
+                    ("host", string("front.example")),
+                    ("skip-cert-verify", string("true")),
+                    ("mux", string("false")),
+                    (
+                        "headers",
+                        object(&[("Host", string("edge.example")), ("X-Extra", string("1"))]),
+                    ),
+                ]),
+            ),
+        ]);
+        match Plugin::parse(&opts, "node.example").unwrap() {
+            Plugin::V2rayWs {
+                tls,
+                host,
+                mux,
+                skip_cert_verify,
+                sni,
+                headers,
+                ..
+            } => {
+                assert!(tls);
+                assert_eq!(host, "front.example");
+                assert!(!mux, "`mux: false` must turn the framing off");
+                assert!(skip_cert_verify);
+                assert_eq!(sni, "edge.example", "a Host header names the TLS server");
+                assert_eq!(headers.get("X-Extra").map(String::as_str), Some("1"));
+            }
+            other => panic!("expected a v2ray-plugin outbound, got {other:?}"),
+        }
+
+        // Numeric and SCREAMING spellings are the same flag.
+        let off = options(&[
+            ("plugin", string("v2ray-plugin")),
+            ("plugin-opts", object(&[("mux", string("0"))])),
+        ]);
+        assert!(matches!(
+            Plugin::parse(&off, "node.example").unwrap(),
+            Plugin::V2rayWs { mux: false, .. }
+        ));
+        let on = options(&[
+            ("plugin", string("v2ray-plugin")),
+            (
+                "plugin-opts",
+                object(&[("tls", string("TRUE")), ("mux", string("1"))]),
+            ),
+        ]);
+        assert!(matches!(
+            Plugin::parse(&on, "node.example").unwrap(),
+            Plugin::V2rayWs {
+                mux: true,
+                tls: true,
+                ..
+            }
+        ));
+    }
+
+    /// `v2ray-http-upgrade` is a different wire end to end; a node asking for
+    /// it is refused by name instead of being dialled as a WebSocket.
+    #[test]
+    fn v2ray_plugin_refuses_the_http_upgrade_flavour() {
+        let opts = options(&[
+            ("plugin", string("v2ray-plugin")),
+            (
+                "plugin-opts",
+                object(&[("v2ray-http-upgrade", Value::Bool(true))]),
+            ),
+        ]);
+        let err = Plugin::parse(&opts, "node.example")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("v2ray-http-upgrade"), "{err}");
     }
 
     #[cfg(feature = "shadowtls")]
