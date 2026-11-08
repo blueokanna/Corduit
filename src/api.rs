@@ -659,6 +659,18 @@ fn tun_proxy_credentials() -> Option<(String, String)> {
 }
 
 pub fn set_proxy_mode(mode: i32) -> std::result::Result<(), String> {
+    if !(0..=3).contains(&mode) {
+        return Err(format!("Unsupported routing mode: {mode}"));
+    }
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if mode != crate::engine::proxy_mode::GLOBAL
+        && crate::get_linux_vpn_processor().is_some_and(|processor| processor.is_running())
+    {
+        return Err(
+            "Linux TUN currently requires global mode; stop TUN before changing routing mode"
+                .into(),
+        );
+    }
     crate::engine::set_runtime_proxy_mode(mode);
 
     #[cfg(target_os = "android")]
@@ -870,6 +882,7 @@ pub fn stop_corduit() -> Result<()> {
 
     std::thread::sleep(std::time::Duration::from_millis(500));
     *CORDUIT_INSTANCE.write() = None;
+    crate::dns::engine_resolver::clear();
 
     tracing::info!("Corduit proxy server stopped successfully");
     Ok(())
@@ -910,11 +923,13 @@ fn running_status_of(corduit: &crate::engine::Corduit) -> Result<ProxyStatus> {
     let config = corduit.config();
 
     let memory_usage = {
-        let mut sys = System::new_with_specifics(
-            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-        );
+        let mut sys = System::new_with_specifics(RefreshKind::nothing());
         let pid = Pid::from_u32(std::process::id());
-        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
         sys.process(pid).map(|p| p.memory()).unwrap_or(0)
     };
 
@@ -1794,9 +1809,11 @@ fn decode_options(kind: &str, tag: &str, raw: &str) -> Result<HashMap<String, ne
         return Ok(HashMap::new());
     }
 
-    nextjson::from_str(raw).map_err(|error| {
-        CorduitError::Config(format!("Invalid {kind} options for '{tag}': {error}"))
-    })
+    nextjson::from_str::<std::collections::BTreeMap<String, nextjson::Value>>(raw)
+        .map(|options| options.into_iter().collect())
+        .map_err(|error| {
+            CorduitError::Config(format!("Invalid {kind} options for '{tag}': {error}"))
+        })
 }
 
 // ============== Latency Testing ==============
@@ -2774,14 +2791,10 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
             });
         }
 
-        // Both capture modes raise the same route table and differ only in
-        // how the engine routes what it captures (`rule` matches the profile,
-        // `global` ignores it). `direct` captures nothing at all.
-        let capture_traffic = mode_int == crate::engine::proxy_mode::GLOBAL
-            || mode_int == crate::engine::proxy_mode::RULE;
+        let capture_traffic = true;
         let mut excluded_addresses = std::collections::HashSet::new();
         if capture_traffic {
-            if proxy_servers.is_empty() {
+            if proxy_servers.is_empty() && mode_int == crate::engine::proxy_mode::GLOBAL {
                 return Ok(TunStatus {
                     enabled: false,
                     interface_name: None,
@@ -2808,7 +2821,7 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
                     _ => None,
                 }));
             }
-            if excluded_addresses.is_empty() {
+            if excluded_addresses.is_empty() && mode_int == crate::engine::proxy_mode::GLOBAL {
                 return Ok(TunStatus {
                     enabled: false,
                     interface_name: None,
@@ -3363,31 +3376,11 @@ pub fn get_tun_status() -> Result<TunStatus> {
     })
 }
 
+/// Routing mode does not own the adapter routes. Keep capture installed until
+/// the tunnel is stopped; otherwise switching to rules bypasses the router.
 pub fn set_windows_proxy_mode(mode: String) -> Result<bool> {
     let mode_int = parse_proxy_mode(&mode)?;
-    let _lifecycle_guard = crate::TUN_LIFECYCLE_LOCK.try_lock().ok_or_else(|| {
-        CorduitError::Internal("A TUN lifecycle operation is already in progress".to_string())
-    })?;
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(mut route_manager) = crate::get_windows_route_manager_mut() {
-            if mode_int == 1 && !route_manager.is_active() {
-                return Err(CorduitError::Internal(
-                    "Global mode must be initialized through enable_tun_mode_with_mode".to_string(),
-                ));
-            }
-            if mode_int != 1 {
-                route_manager.disable_global_mode().map_err(|error| {
-                    CorduitError::Internal(format!("Failed to disable global mode routes: {error}"))
-                })?;
-            }
-        }
-        crate::netstack::set_windows_proxy_mode(mode_int);
-    }
-
-    crate::engine::set_runtime_proxy_mode(mode_int);
-    tracing::info!("Runtime proxy mode set to {} ({})", mode, mode_int);
+    set_proxy_mode(mode_int).map_err(CorduitError::Internal)?;
     Ok(true)
 }
 

@@ -47,6 +47,7 @@ impl TlsConnector {
                 min_version: courierust::courierust_tls::TlsVersion::Tls12,
                 max_version: courierust::courierust_tls::TlsVersion::Tls13,
                 identity: None,
+                profile: None,
             },
         );
         Ok(Self { inner, config })

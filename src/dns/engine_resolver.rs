@@ -48,6 +48,7 @@ use recurse_x::cache::CacheConfig;
 use recurse_x::cidr::IpCidr;
 use recurse_x::forward::Forwarder;
 use recurse_x::hosts::HostsTable;
+use recurse_x::pattern::DomainPattern;
 use recurse_x::resolver::{DnsPolicy, EngineConfig, ResolverConfig, UpstreamGroups};
 use recurse_x::routing::{FallbackFilter, GroupId, NameserverPolicy};
 use recurse_x::{ErrorKind, Name, Resolver, RrType};
@@ -107,7 +108,7 @@ struct SuspectPolicy {
     networks: Vec<IpCidr>,
     /// Suffixes that always go to the fallback set, normalized.
     domains: Vec<String>,
-    /// Country codes that make an answer suspect.
+    /// Countries whose addresses may be accepted from the primary servers.
     countries: Vec<String>,
 }
 
@@ -139,10 +140,10 @@ impl SuspectPolicy {
             return true;
         }
         if let Some(matches) = country {
-            if self
-                .countries
-                .iter()
-                .any(|code| ips.iter().any(|ip| matches(code, *ip)))
+            if !self.countries.is_empty()
+                && ips
+                    .iter()
+                    .any(|ip| !self.countries.iter().any(|code| matches(code, *ip)))
             {
                 return true;
             }
@@ -205,6 +206,7 @@ struct Plan {
     fallback: Vec<Upstream>,
     /// `nameserver-policy`, each entry with the servers it selects.
     policy: Vec<(String, Vec<Upstream>)>,
+    policy_patterns: Vec<DomainPattern>,
     /// `default-nameserver`, restricted to IP literals.
     bootstrap: Vec<Upstream>,
     /// Static answers, in RecurseX's own table so the resolver serves them
@@ -348,10 +350,14 @@ impl EngineResolver {
             plan: Arc::new(Plan {
                 default,
                 fallback,
+                policy_patterns: policy
+                    .iter()
+                    .filter_map(|(pattern, _)| DomainPattern::parse(pattern).ok())
+                    .collect(),
                 policy,
                 bootstrap,
                 hosts: hosts_table(&settings.hosts),
-                cache_size: settings.cache_size.max(1),
+                cache_size: settings.cache_size.clamp(1, 65_536),
                 suspect,
                 country,
             }),
@@ -408,10 +414,12 @@ impl EngineResolver {
     /// for such a name: the system answer is exactly what the policy exists
     /// to bypass (a decoy for a subscription node, typically).
     pub fn uses_policy(&self, host: &str) -> bool {
-        self.plan
-            .policy
-            .iter()
-            .any(|(suffix, _)| suffix_matches(host, suffix))
+        parse_name(host).is_ok_and(|name| {
+            self.plan
+                .policy_patterns
+                .iter()
+                .any(|pattern| pattern.matches(&name))
+        })
     }
 
     /// Resolve `host` into addresses of a single family.
@@ -432,33 +440,47 @@ impl EngineResolver {
             };
         }
 
-        let (primary, fallback) = self.live().ok_or_else(|| self.no_resolver(host))?;
         let name = parse_name(host)?;
         let rr_type = if want_v6 { RrType::AAAA } else { RrType::A };
-        let mut ips = query(&primary, &name, rr_type, host)?;
-        let answer_looks_suspect = !ips.is_empty()
-            && self
+        // Explicit hosts and nameserver policies may intentionally resolve to
+        // private addresses. Generic fallback filters must not override them.
+        let mut ips = if let Some(addresses) = self.plan.hosts.lookup(&name) {
+            addresses
+                .iter()
+                .copied()
+                .filter(|ip| matches!(ip, IpAddr::V6(_)) == want_v6)
+                .collect()
+        } else {
+            let (primary, fallback) = self.live().ok_or_else(|| self.no_resolver(host))?;
+            if self.uses_policy(host) {
+                query(&primary, &name, rr_type, host)?
+            } else if self
                 .plan
                 .suspect
-                .suspect(host, &ips, self.plan.country.as_ref());
-        if answer_looks_suspect {
-            if let Some(fallback) = fallback {
-                match query(&fallback, &name, rr_type, host) {
-                    Ok(from_fallback) if !from_fallback.is_empty() => {
-                        debug!("engine DNS: answer for '{host}' looked suspect; using the fallback set");
-                        ips = from_fallback;
+                .domains
+                .iter()
+                .any(|suffix| suffix_matches(host, suffix))
+            {
+                // A forced fallback domain must not first leak to the default resolver.
+                self.query_fallback(fallback.as_deref(), &name, rr_type, host)?
+            } else {
+                match query(&primary, &name, rr_type, host) {
+                    Ok(ips)
+                        if self
+                            .plan
+                            .suspect
+                            .suspect(host, &ips, self.plan.country.as_ref()) =>
+                    {
+                        self.query_fallback(fallback.as_deref(), &name, rr_type, host)?
                     }
-                    Ok(_) => warn!(
-                        "engine DNS: answer for '{host}' looked suspect but the fallback set \
-                         returned nothing; using the suspect answer"
-                    ),
-                    Err(error) => warn!(
-                        "engine DNS: answer for '{host}' looked suspect and the fallback set \
-                         failed ({error}); using the suspect answer"
-                    ),
+                    Ok(ips) => ips,
+                    Err(_) if fallback.is_some() => {
+                        self.query_fallback(fallback.as_deref(), &name, rr_type, host)?
+                    }
+                    Err(error) => return Err(error),
                 }
             }
-        }
+        };
 
         if ips.is_empty() {
             return Err(io::Error::new(
@@ -468,6 +490,38 @@ impl EngineResolver {
         }
         // Dialing order matters for flaky IPv6 paths.
         ips.sort_by_key(|ip| matches!(ip, IpAddr::V6(_)) as u8);
+        Ok(ips)
+    }
+
+    fn query_fallback(
+        &self,
+        resolver: Option<&Resolver>,
+        name: &Name,
+        rr_type: RrType,
+        host: &str,
+    ) -> io::Result<Vec<IpAddr>> {
+        let rejected = |reason: &str| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("fallback returned no acceptable DNS answer for '{host}': {reason}"),
+            )
+        };
+        let resolver = resolver.ok_or_else(|| rejected("resolver unavailable"))?;
+        let ips =
+            query(resolver, name, rr_type, host).map_err(|error| rejected(&error.to_string()))?;
+        // Country and domain conditions select the fallback; applying them
+        // again here would reject the very answer they were meant to obtain.
+        if ips.is_empty()
+            || bogon::contains_bogon(&ips)
+            || self
+                .plan
+                .suspect
+                .networks
+                .iter()
+                .any(|net| ips.iter().any(|ip| net.contains(*ip)))
+        {
+            return Err(rejected("empty or rejected address set"));
+        }
         Ok(ips)
     }
 
@@ -485,12 +539,11 @@ impl EngineResolver {
 
         let (v4, v6) = std::thread::scope(|scope| {
             let v4 = scope.spawn(|| self.resolve_ips(host, false));
-            let v6 = scope.spawn(|| self.resolve_ips(host, true));
+            let v6 = self.resolve_ips(host, true);
             (
                 v4.join()
                     .unwrap_or_else(|_| Err(io::Error::other("A lookup thread panicked"))),
-                v6.join()
-                    .unwrap_or_else(|_| Err(io::Error::other("AAAA lookup thread panicked"))),
+                v6,
             )
         });
 
@@ -646,6 +699,9 @@ impl Plan {
                 query_budget_ms: QUERY_BUDGET_MS,
                 ..EngineConfig::default()
             },
+            max_inflight: 256,
+            max_prefetch_per_tick: 4,
+            max_concurrent_refreshes: 2,
             ..ResolverConfig::default()
         })
     }
@@ -703,6 +759,9 @@ impl Plan {
                 query_budget_ms: QUERY_BUDGET_MS,
                 ..EngineConfig::default()
             },
+            max_inflight: 256,
+            max_prefetch_per_tick: 4,
+            max_concurrent_refreshes: 2,
             ..ResolverConfig::default()
         };
         Some(Arc::new(Resolver::new(config)))
@@ -716,7 +775,10 @@ impl Plan {
     /// growing with the operator's number.
     fn cache_config(&self) -> CacheConfig {
         CacheConfig {
+            hot_capacity: self.cache_size.min(512),
             warm_capacity: self.cache_size,
+            cold_capacity: (self.cache_size / 4).max(1),
+            nx_capacity: (self.cache_size / 4).max(1),
             ..CacheConfig::default()
         }
     }
@@ -782,6 +844,9 @@ impl Bootstrap {
                 query_budget_ms: BOOTSTRAP_BUDGET_MS,
                 ..EngineConfig::default()
             },
+            max_inflight: 256,
+            max_prefetch_per_tick: 4,
+            max_concurrent_refreshes: 2,
             ..ResolverConfig::default()
         };
         Bootstrap::Resolver(Arc::new(Resolver::new(config)))
@@ -1036,6 +1101,12 @@ pub fn configure(settings: EngineDnsSettings) {
 /// with a valid configuration: that means "not yet online", not "not
 /// configured". [`resolve`] and [`resolve_ips`] tell the two apart by returning
 /// `None` only in the second case.
+/// Release the process-owned cache and maintenance workers when the proxy stops.
+pub fn clear() {
+    let previous = ENGINE_RESOLVER.write().take();
+    drop(previous);
+}
+
 pub fn resolver() -> Option<Arc<EngineResolver>> {
     ENGINE_RESOLVER.read().clone()
 }
@@ -1073,7 +1144,9 @@ pub fn resolve_ips(host: &str, want_v6: bool) -> Option<io::Result<Vec<IpAddr>>>
 /// policy-covered name as authoritative: the policy names where the name is
 /// resolved, and a second opinion is how a node domain ends up at a decoy.
 pub fn domain_uses_policy(host: &str) -> bool {
-    resolver().map(|r| r.uses_policy(host)).unwrap_or(false)
+    resolver()
+        .map(|r| r.uses_policy(host) || r.has_fallback_policy())
+        .unwrap_or(false)
 }
 
 /// Resolve `host` through the engine's configured DNS.
@@ -1205,8 +1278,6 @@ mod tests {
 
         assert!(policy.suspect("blocked.example", &[public], None));
         assert!(policy.suspect("a.blocked.example", &[public], None));
-        // Label boundary: a longer name that merely ends in the same letters is
-        // a different name.
         assert!(!policy.suspect("notblocked.example", &[public], None));
 
         assert!(policy.suspect("x.example", &[v4("203.0.113.7")], None));
@@ -1227,7 +1298,10 @@ mod tests {
         assert!(!policy.suspect("x.example", &address, None));
 
         let matcher: CountryLookup = Arc::new(|_code: &str, _ip: IpAddr| true);
-        assert!(policy.suspect("x.example", &address, Some(&matcher)));
+        assert!(!policy.suspect("x.example", &address, Some(&matcher)));
+        let outside: CountryLookup = Arc::new(|_code: &str, _ip: IpAddr| false);
+        assert!(policy.suspect("x.example", &address, Some(&outside)));
+        assert!(!SuspectPolicy::default().suspect("x.example", &address, Some(&outside)));
     }
 
     /// A `fallback` list is what arms the bogus-address signal: without servers
@@ -1481,5 +1555,95 @@ mod tests {
         assert!(resolver.resolve("entry.example", 443).is_err());
         assert!(started.elapsed() < Duration::from_millis(50));
         assert!(resolver.live.read().next_attempt > Instant::now());
+    }
+    #[test]
+    fn suspect_answer_is_not_used_when_fallback_has_no_answer() {
+        let (primary_port, _primary) = spawn_udp_server(|_| Some(Ipv4Addr::LOCALHOST));
+        let (fallback_port, _fallback) = spawn_udp_server(|_| None);
+        let resolver = EngineResolver::from_settings(EngineDnsSettings {
+            nameservers: vec![format!("udp://127.0.0.1:{primary_port}")],
+            fallback: vec![format!("udp://127.0.0.1:{fallback_port}")],
+            ..EngineDnsSettings::default()
+        })
+        .unwrap();
+        assert!(resolver.resolve_ips("poison.test", false).is_err());
+    }
+
+    #[test]
+    fn suspect_answer_is_replaced_by_usable_fallback() {
+        let (primary_port, _primary) = spawn_udp_server(|_| Some(Ipv4Addr::LOCALHOST));
+        let (fallback_port, _fallback) = spawn_udp_server(|_| Some(Ipv4Addr::new(1, 1, 1, 1)));
+        let resolver = EngineResolver::from_settings(EngineDnsSettings {
+            nameservers: vec![format!("udp://127.0.0.1:{primary_port}")],
+            fallback: vec![format!("udp://127.0.0.1:{fallback_port}")],
+            ..EngineDnsSettings::default()
+        })
+        .unwrap();
+        assert_eq!(
+            resolver.resolve_ips("poison.test", false).unwrap(),
+            vec![v4("1.1.1.1")]
+        );
+    }
+
+    #[test]
+    fn forced_fallback_never_queries_primary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let queries = Arc::new(AtomicUsize::new(0));
+        let observed = queries.clone();
+        let (primary_port, _primary) = spawn_udp_server(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Some(Ipv4Addr::new(8, 8, 8, 8))
+        });
+        let (fallback_port, _fallback) = spawn_udp_server(|_| Some(Ipv4Addr::new(1, 1, 1, 1)));
+        let resolver = EngineResolver::from_settings(EngineDnsSettings {
+            nameservers: vec![format!("udp://127.0.0.1:{primary_port}")],
+            fallback: vec![format!("udp://127.0.0.1:{fallback_port}")],
+            fallback_domain: vec!["+.blocked.test".into()],
+            ..EngineDnsSettings::default()
+        })
+        .unwrap();
+        assert_eq!(
+            resolver.resolve_ips("a.blocked.test", false).unwrap(),
+            vec![v4("1.1.1.1")]
+        );
+        assert_eq!(queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn explicit_hosts_and_policy_preserve_private_addresses() {
+        let (port, _server) = spawn_udp_server(|_| Some(Ipv4Addr::new(10, 1, 2, 3)));
+        let resolver = EngineResolver::from_settings(EngineDnsSettings {
+            nameservers: vec![format!("udp://127.0.0.1:{port}")],
+            fallback: vec!["udp://127.0.0.1:9".into()],
+            policy: HashMap::from([(
+                "+.private.test".into(),
+                vec![format!("udp://127.0.0.1:{port}")],
+            )]),
+            hosts: HashMap::from([("local.test".into(), v4("192.168.1.2"))]),
+            fallback_domain: vec!["+.private.test".into(), "local.test".into()],
+            ..EngineDnsSettings::default()
+        })
+        .unwrap();
+        assert_eq!(
+            resolver.resolve_ips("a.private.test", false).unwrap(),
+            vec![v4("10.1.2.3")]
+        );
+        assert_eq!(
+            resolver.resolve_ips("local.test", false).unwrap(),
+            vec![v4("192.168.1.2")]
+        );
+    }
+
+    #[test]
+    fn all_cache_tiers_follow_the_configured_budget() {
+        let resolver = EngineResolver::from_settings(EngineDnsSettings {
+            nameservers: vec!["127.0.0.1:53".into()],
+            cache_size: 1024,
+            ..EngineDnsSettings::default()
+        })
+        .unwrap();
+        let cache = resolver.plan.cache_config();
+        assert_eq!(cache.warm_capacity, 1024);
+        assert!(cache.hot_capacity + cache.cold_capacity + cache.nx_capacity <= 1024);
     }
 }

@@ -2,9 +2,8 @@ use crate::common::stream::BoxStream;
 use crate::engine::config::OutboundConfig;
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::net::TcpStream;
 use std::time::Duration;
 
 /// SOCKS5 outbound proxy
@@ -18,7 +17,6 @@ pub struct Socks5Outbound {
 
 impl OutboundProxy for Socks5Outbound {
     fn connect(&self) -> Result<()> {
-        // Test connection to SOCKS5 server (DNS resolution happens here)
         let _stream =
             crate::common::socket::connect_host(&self.server, self.port, Duration::from_secs(30))
                 .map_err(|e| {
@@ -43,73 +41,18 @@ impl OutboundProxy for Socks5Outbound {
         Some((self.server.clone(), self.port))
     }
 
-    fn test_http_latency(
-        &self,
-        test_url: &str,
-        timeout: std::time::Duration,
-    ) -> Result<std::time::Duration> {
-        use std::time::Instant;
-
-        // Parse the test URL to get host and port
-        let url = crate::common::url::Url::parse(test_url)
-            .map_err(|e| Error::config(format!("Invalid test URL: {}", e)))?;
-
-        let host = url
-            .host_str()
-            .ok_or_else(|| Error::config("Test URL has no host"))?
-            .to_string();
-        let url_port = url
-            .port()
-            .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
-        let path = if url.path().is_empty() {
-            "/"
-        } else {
-            url.path()
-        };
-
-        let start = Instant::now();
-
-        // Connect to SOCKS5 server
-        let mut stream = crate::common::socket::connect_host(&self.server, self.port, timeout)
-            .map_err(|e| Error::network(format!("Failed to connect: {}", e)))?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
-
-        // Perform SOCKS5 handshake
-        self.perform_handshake(&mut stream)?;
-
-        // Send CONNECT request
-        let target = TargetAddr::Domain(host.clone(), url_port);
-        self.send_connect_request_target(&mut stream, &target)?;
-
-        // Read response
-        self.read_connect_response(&mut stream)?;
-
-        // Send HTTP request
-        let http_request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n",
-            path, host
-        );
-        stream
-            .write_all(http_request.as_bytes())
-            .map_err(|e| Error::network(format!("Failed to send HTTP request: {}", e)))?;
-
-        // Read HTTP response (bounded by the socket read timeout)
-        let mut reader = std::io::BufReader::new(stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
-
-        if response_line.starts_with("HTTP/") {
-            Ok(start.elapsed())
-        } else {
-            Err(Error::network("Invalid HTTP response"))
-        }
+    fn test_http_latency(&self, test_url: &str, timeout: Duration) -> Result<Duration> {
+        let probe = crate::common::http_probe::HttpProbe::new(test_url, timeout)?;
+        let tcp = crate::common::socket::connect_host(&self.server, self.port, probe.remaining()?)
+            .map_err(|e| Error::network(format!("Probe connect failed: {e}")))?;
+        let mut transport = probe.transport(&tcp);
+        self.perform_handshake(&mut transport)?;
+        self.send_connect_request_target(
+            &mut transport,
+            &TargetAddr::Domain(probe.url.host.clone(), probe.url.port),
+        )?;
+        self.read_connect_response(&mut transport)?;
+        probe.finish(&tcp)
     }
 
     fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
@@ -183,6 +126,17 @@ impl Socks5Outbound {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        match (&username, &password) {
+            (None, None) => {}
+            (Some(user), Some(pass))
+                if (1..=255).contains(&user.len()) && (1..=255).contains(&pass.len()) => {}
+            _ => {
+                return Err(Error::config(
+                    "SOCKS5 credentials must be supplied together, each 1..=255 bytes",
+                ))
+            }
+        }
+
         Ok(Self {
             config,
             server,
@@ -192,11 +146,11 @@ impl Socks5Outbound {
         })
     }
 
-    fn perform_handshake(&self, stream: &mut TcpStream) -> Result<()> {
+    fn perform_handshake<S: Read + Write>(&self, stream: &mut S) -> Result<()> {
         // SOCKS5 initial handshake
         let handshake = if self.username.is_some() {
-            // Support username/password auth
-            vec![0x05, 0x02, 0x00, 0x02] // No auth and username/password
+            // Explicit credentials must not silently downgrade to no authentication.
+            vec![0x05, 0x01, 0x02]
         } else {
             vec![0x05, 0x01, 0x00] // No auth only
         };
@@ -216,7 +170,10 @@ impl Socks5Outbound {
         }
 
         match response[1] {
-            0x00 => Ok(()), // No auth required
+            0x00 if self.username.is_none() => Ok(()),
+            0x00 => Err(Error::protocol(
+                "SOCKS5 server selected unoffered no-auth method",
+            )),
             0x02 => {
                 // Username/password auth required
                 if let (Some(user), Some(pass)) = (&self.username, &self.password) {
@@ -235,13 +192,15 @@ impl Socks5Outbound {
         }
     }
 
-    fn perform_auth(&self, stream: &mut TcpStream, username: &str, password: &str) -> Result<()> {
-        // Username/password auth (RFC 1929). Each credential is a single byte
-        // length-prefixed field (max 255 bytes), so oversized credentials are
-        // rejected instead of silently truncated.
-        if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
+    fn perform_auth<S: Read + Write>(
+        &self,
+        stream: &mut S,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        if !(1..=255).contains(&username.len()) || !(1..=255).contains(&password.len()) {
             return Err(Error::config(
-                "SOCKS5 username/password must be at most 255 bytes (RFC 1929)",
+                "SOCKS5 username/password must be 1..=255 bytes (RFC 1929)",
             ));
         }
 
@@ -260,16 +219,16 @@ impl Socks5Outbound {
             .read_exact(&mut response)
             .map_err(|e| Error::network(format!("Failed to read auth response: {}", e)))?;
 
-        if response[1] != 0x00 {
+        if response[0] != 0x01 || response[1] != 0x00 {
             return Err(Error::protocol("SOCKS5 authentication failed"));
         }
 
         Ok(())
     }
 
-    fn send_connect_request_target(
+    fn send_connect_request_target<S: Read + Write>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         target: &TargetAddr,
     ) -> Result<()> {
         let mut request = vec![
@@ -280,6 +239,12 @@ impl Socks5Outbound {
 
         match target {
             TargetAddr::Domain(domain, port) => {
+                if domain.is_empty()
+                    || domain.len() > u8::MAX as usize
+                    || domain.bytes().any(|b| b <= b' ' || b == 0x7f)
+                {
+                    return Err(Error::config("Invalid SOCKS5 target domain"));
+                }
                 request.push(0x03); // Domain address type
                 request.push(domain.len() as u8);
                 request.extend_from_slice(domain.as_bytes());
@@ -307,7 +272,7 @@ impl Socks5Outbound {
         Ok(())
     }
 
-    fn read_connect_response(&self, stream: &mut TcpStream) -> Result<()> {
+    fn read_connect_response<S: Read>(&self, stream: &mut S) -> Result<()> {
         let mut header = [0u8; 4];
         stream
             .read_exact(&mut header)
@@ -317,6 +282,9 @@ impl Socks5Outbound {
             return Err(Error::protocol("Invalid SOCKS5 version in response"));
         }
 
+        if header[2] != 0 {
+            return Err(Error::protocol("Invalid SOCKS5 reserved byte"));
+        }
         let status = header[1];
         if status != 0x00 {
             let error_msg = match status {
@@ -353,6 +321,9 @@ impl Socks5Outbound {
                 let mut len_buf = [0u8; 1];
                 stream.read_exact(&mut len_buf)?;
                 let len = len_buf[0] as usize;
+                if len == 0 {
+                    return Err(Error::protocol("Empty SOCKS5 bound domain"));
+                }
                 let mut addr_port = vec![0u8; len + 2];
                 stream.read_exact(&mut addr_port)?;
             }
@@ -364,5 +335,116 @@ impl Socks5Outbound {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn config() -> OutboundConfig {
+        OutboundConfig {
+            tag: "socks-test".into(),
+            outbound_type: crate::engine::config::OutboundType::Socks5,
+            server: Some("127.0.0.1".into()),
+            port: Some(1080),
+            options: Default::default(),
+        }
+    }
+    struct Wire {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Wire {
+        fn new(input: &[u8]) -> Self {
+            Self {
+                input: Cursor::new(input.to_vec()),
+                output: Vec::new(),
+            }
+        }
+    }
+    impl Read for Wire {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(b)
+        }
+    }
+    impl Write for Wire {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn refuses_authentication_downgrade_and_wrong_auth_version() {
+        let mut cfg = config();
+        cfg.options
+            .insert("username".into(), nextjson::Value::String("u".into()));
+        cfg.options
+            .insert("password".into(), nextjson::Value::String("p".into()));
+        let proxy = Socks5Outbound::new(cfg).unwrap();
+        let mut downgrade = Wire::new(&[5, 0]);
+        assert!(proxy.perform_handshake(&mut downgrade).is_err());
+        assert_eq!(downgrade.output, [5, 1, 2]);
+        let mut wrong_version = Wire::new(&[5, 2, 5, 0]);
+        assert!(proxy.perform_handshake(&mut wrong_version).is_err());
+        let mut valid = Wire::new(&[5, 2, 1, 0]);
+        assert!(proxy.perform_handshake(&mut valid).is_ok());
+    }
+
+    #[test]
+    fn rejects_incomplete_and_oversized_credentials_before_connect() {
+        for (user, pass) in [
+            (Some("u".to_string()), None),
+            (None, Some("p".to_string())),
+            (Some("".to_string()), Some("p".to_string())),
+            (Some("u".repeat(256)), Some("p".to_string())),
+        ] {
+            let mut cfg = config();
+            if let Some(user) = user {
+                cfg.options
+                    .insert("username".into(), nextjson::Value::String(user));
+            }
+            if let Some(pass) = pass {
+                cfg.options
+                    .insert("password".into(), nextjson::Value::String(pass));
+            }
+            assert!(Socks5Outbound::new(cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_target_without_writing_a_truncated_length() {
+        let proxy = Socks5Outbound::new(config()).unwrap();
+        for domain in ["".to_string(), "a".repeat(256), "bad\nhost".to_string()] {
+            let mut wire = Wire::new(&[]);
+            assert!(proxy
+                .send_connect_request_target(&mut wire, &TargetAddr::Domain(domain, 443))
+                .is_err());
+            assert!(wire.output.is_empty());
+        }
+        let mut wire = Wire::new(&[]);
+        assert!(proxy
+            .send_connect_request_target(&mut wire, &TargetAddr::Domain("a".repeat(255), 443))
+            .is_ok());
+        assert_eq!(wire.output[4], 255);
+        assert_eq!(wire.output.len(), 262);
+    }
+
+    #[test]
+    fn rejects_reserved_byte_and_empty_bound_domain() {
+        let proxy = Socks5Outbound::new(config()).unwrap();
+        for response in [&[5, 0, 1, 1][..], &[5, 0, 0, 3, 0][..], &[4, 0, 0, 1][..]] {
+            assert!(proxy
+                .read_connect_response(&mut Cursor::new(response))
+                .is_err());
+        }
+        assert!(proxy
+            .read_connect_response(&mut Cursor::new([5, 0, 0, 1, 127, 0, 0, 1, 0, 80]))
+            .is_ok());
     }
 }

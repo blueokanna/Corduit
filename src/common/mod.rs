@@ -66,6 +66,10 @@ pub mod exec;
 #[cfg(feature = "std")]
 pub mod http;
 #[cfg(feature = "std")]
+pub(crate) mod http_probe;
+#[cfg(feature = "std")]
+pub(crate) mod json_map;
+#[cfg(feature = "std")]
 pub mod listener;
 #[cfg(feature = "std")]
 pub mod lru;

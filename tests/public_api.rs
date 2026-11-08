@@ -138,8 +138,6 @@ fn socks5_round_trip(proxy_port: u16, target: SocketAddr, payload: &[u8]) -> Vec
 
 #[test]
 fn the_public_facade_drives_a_full_lifecycle() {
-    // The facade must answer before anything is running, too: a UI asks this on
-    // startup and an error there is a worse answer than `false`.
     assert!(
         !is_proxy_running().expect("status"),
         "nothing is running yet"
@@ -213,6 +211,17 @@ fn the_public_facade_drives_a_full_lifecycle() {
     );
     set_log_level("debug".to_string()).expect("`debug` is");
 
+    for mode in ["global", "rule", "direct", "rule", "global"] {
+        corduit::api::set_windows_proxy_mode(mode.to_string()).expect("switch routing mode");
+        assert_eq!(
+            socks5_round_trip(port, echo, payload),
+            payload,
+            "routing changes must keep the mixed listener alive ({mode})"
+        );
+    }
+    let before = corduit::api::get_proxy_mode().unwrap();
+    assert!(set_proxy_mode(99).is_err());
+    assert_eq!(corduit::api::get_proxy_mode().unwrap(), before);
     set_proxy_mode(2).expect("direct");
     set_proxy_mode(0).expect("back to the profile's mode");
 
@@ -224,6 +233,10 @@ fn the_public_facade_drives_a_full_lifecycle() {
     );
 
     stop_proxy().expect("stop");
+    assert!(
+        corduit::dns::engine_resolver::resolver().is_none(),
+        "stopping releases the process-owned DNS cache"
+    );
     assert!(!is_proxy_running().expect("status"), "stopped");
 
     stop_proxy().expect("stopping again is a no-op");

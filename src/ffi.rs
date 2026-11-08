@@ -1,8 +1,8 @@
 //! Hand-written, dependency-free C ABI for the Corduit engine.
 //!
-//! No code generation, no third-party FFI framework — every symbol below is
-//! authored in plain Rust against the C ABI. The Flutter/mobile/Dart side no
-//! longer needs `flutter_rust_bridge`; it binds these functions directly.
+//! This optional C ABI shares the engine dispatcher with the RPC layer.
+//! ArcadiaPlus also exposes its application API through flutter_rust_bridge;
+//! these entry points do not replace that generated bridge.
 //!
 //! Two wire formats are exposed at the boundary, sharing one typed dispatch
 //! table ([`crate::rpc::dispatch`]):
@@ -40,7 +40,8 @@ pub struct FfiResponse {
 pub struct FfiBinaryResponse {
     /// `0` on success, non-zero on error.
     pub code: i32,
-    /// rustbinary payload. Free with [`corduit_binary_free`].
+    /// RustBinary on success; UTF-8 error text otherwise.
+    /// Free with [`corduit_binary_free`].
     pub data: *mut u8,
     /// Number of valid bytes in `data`.
     pub len: usize,
@@ -95,18 +96,34 @@ fn into_cstring(s: String) -> *mut c_char {
     }
 }
 
-/// SAFETY: `ptr` must be a valid NUL-terminated string (or null).
-unsafe fn read_cstr<'a>(ptr: *const c_char) -> &'a str {
-    if ptr.is_null() {
-        return "";
+// Match the bounded RustBinary profile for both transports. Check the binary
+// length before forming a Rust slice; catch_unwind cannot recover from UB.
+const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_METHOD_BYTES: usize = 128;
+
+fn check_request_size(len: usize) -> Result<(), String> {
+    if len > MAX_REQUEST_BYTES {
+        return Err("request exceeds the 64 MiB input limit".into());
     }
-    CStr::from_ptr(ptr).to_str().unwrap_or("")
+    Ok(())
+}
+
+/// SAFETY: `ptr` must be a valid NUL-terminated string (or null).
+unsafe fn read_cstr<'a>(ptr: *const c_char, limit: usize) -> Result<&'a str, String> {
+    if ptr.is_null() {
+        return Ok("");
+    }
+    let bytes = CStr::from_ptr(ptr).to_bytes();
+    if bytes.len() > limit {
+        return Err("C string exceeds the input limit".into());
+    }
+    std::str::from_utf8(bytes).map_err(|_| "C string is not valid UTF-8".into())
 }
 
 /// Free a string returned by [`corduit_call`].
 ///
 /// # Safety
-/// `ptr` must come from a previous successful [`corduit_call`] (or be null).
+/// `ptr` must be an unfreed string returned by this module (or be null).
 #[no_mangle]
 pub unsafe extern "C" fn corduit_string_free(ptr: *mut c_char) {
     if !ptr.is_null() {
@@ -180,15 +197,15 @@ pub unsafe extern "C" fn corduit_call(
     // A panic must never unwind across the `extern "C"` boundary (UB). The
     // whole body is fenced so any internal panic becomes a structured error.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let method = unsafe { read_cstr(method) }.to_string();
-        let raw = unsafe { read_cstr(args_json) };
+        let method = unsafe { read_cstr(method, MAX_METHOD_BYTES) }?;
+        let raw = unsafe { read_cstr(args_json, MAX_REQUEST_BYTES) }?;
         let value: nextjson::Value = if raw.is_empty() {
             nextjson::Value::Null
         } else {
-            nextjson::from_str(raw).unwrap_or(nextjson::Value::Null)
+            nextjson::from_str(raw).map_err(|e| format!("invalid JSON request: {e}"))?
         };
 
-        dispatch(&method, &value)
+        dispatch(method, &value)
     }));
 
     match result {
@@ -214,9 +231,10 @@ pub unsafe extern "C" fn corduit_call(
 ///
 /// # Safety
 ///
-/// `method` must be a valid NUL-terminated C string (or null); `payload` must
-/// point to `len` readable bytes (or be null when `len == 0`) and stay valid
-/// for the duration of the call.
+/// `method` must be a valid NUL-terminated C string (or null). A non-null
+/// `payload` must point to `len` readable bytes and stay valid for the call.
+/// Null payloads with a nonzero length are rejected without dereferencing.
+/// Invalid non-null pointers cannot be checked by this ABI.
 #[no_mangle]
 pub unsafe extern "C" fn corduit_call_binary(
     method: *const c_char,
@@ -225,15 +243,21 @@ pub unsafe extern "C" fn corduit_call_binary(
 ) -> FfiBinaryResponse {
     // A panic must never unwind across the `extern "C"` boundary (UB).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let method = unsafe { read_cstr(method) }.to_string();
-        let value: nextjson::Value = if payload.is_null() || len == 0 {
+        let method = unsafe { read_cstr(method, MAX_METHOD_BYTES) }?;
+        check_request_size(len)?;
+        let value: nextjson::Value = if len == 0 {
             nextjson::Value::Null
         } else {
+            if payload.is_null() {
+                return Err("non-empty request has a null payload".into());
+            }
             let bytes = unsafe { std::slice::from_raw_parts(payload, len) };
-            rustbinary::deserialize(bytes).unwrap_or(nextjson::Value::Null)
+            rustbinary::options()
+                .deserialize(bytes)
+                .map_err(|e| format!("invalid binary request: {e}"))?
         };
 
-        dispatch(&method, &value)
+        dispatch(method, &value)
     }));
 
     match result {
@@ -293,23 +317,84 @@ mod tests {
         }
     }
 
+    fn binary_request(bytes: &[u8]) -> (i32, Vec<u8>) {
+        let method = CString::new("get_version").unwrap();
+        let response = unsafe { corduit_call_binary(method.as_ptr(), bytes.as_ptr(), bytes.len()) };
+        let code = response.code;
+        let body = if response.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(response.data, response.len).to_vec() }
+        };
+        unsafe { corduit_binary_free(response) };
+        (code, body)
+    }
+
     #[test]
     fn binary_call_roundtrip() {
         let params: nextjson::Value = nextjson::from_str(r#"{"mode":1}"#).unwrap();
         let encoded = rustbinary::serialize(&params).unwrap();
-        let resp = unsafe {
-            let method = CString::new("get_proxy_mode").unwrap();
-            corduit_call_binary(method.as_ptr(), encoded.as_ptr(), encoded.len())
-        };
-        unsafe {
-            if resp.code == 0 && !resp.data.is_null() {
-                let bytes = std::slice::from_raw_parts(resp.data, resp.len).to_vec();
-                corduit_binary_free(resp);
-                let v: nextjson::Value =
-                    rustbinary::deserialize(&bytes).unwrap_or(nextjson::Value::Null);
-                let _ = v;
-            }
+        for input in [&encoded[..], &[]] {
+            let (code, body) = binary_request(input);
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&body));
+            let value: nextjson::Value = rustbinary::deserialize(&body).unwrap();
+            assert_eq!(value.as_str(), Some(api::get_version().as_str()));
         }
+    }
+
+    #[test]
+    fn malformed_json_cannot_reach_even_a_parameterless_handler() {
+        let method = CString::new("get_version").unwrap();
+        for input in [&b"{"[..], b"null true", &[0xff]] {
+            let args = CString::new(input).unwrap();
+            let response = unsafe { corduit_call(method.as_ptr(), args.as_ptr()) };
+            let code = response.code;
+            unsafe { corduit_string_free(response.data) };
+            assert_ne!(code, 0, "accepted malformed input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_binary_cannot_reach_even_a_parameterless_handler() {
+        let mut trailing = rustbinary::serialize(&nextjson::Value::Null).unwrap();
+        trailing.push(0);
+        let mut truncated = rustbinary::serialize(&"payload").unwrap();
+        truncated.pop();
+        // A depth beyond the profile ceiling must fail without recursive
+        // allocation or dispatch. Build bytes rather than a deep Rust value.
+        let array = rustbinary::serialize(&vec![nextjson::Value::Null]).unwrap();
+        let mut deep = vec![array[0]; 129];
+        deep.extend(rustbinary::serialize(&nextjson::Value::Null).unwrap());
+        deep.extend(std::iter::repeat(*array.last().unwrap()).take(129));
+        for bytes in [vec![0xfe], trailing, truncated, deep] {
+            let (code, error) = binary_request(&bytes);
+            assert_ne!(code, 0, "accepted malformed binary input");
+            assert!(String::from_utf8(error)
+                .unwrap()
+                .starts_with("invalid binary request:"));
+        }
+    }
+
+    #[test]
+    fn ffi_rejects_invalid_methods_null_payload_and_oversized_lengths() {
+        let method = CString::new(vec![0xff]).unwrap();
+        let json = unsafe { corduit_call(method.as_ptr(), ptr::null()) };
+        let code = json.code;
+        unsafe { corduit_string_free(json.data) };
+        assert_ne!(code, 0);
+        let binary = unsafe { corduit_call_binary(method.as_ptr(), ptr::null(), 0) };
+        let code = binary.code;
+        unsafe { corduit_binary_free(binary) };
+        assert_ne!(code, 0);
+
+        let method = CString::new("get_version").unwrap();
+        let response = unsafe { corduit_call_binary(method.as_ptr(), ptr::null(), 1) };
+        let code = response.code;
+        unsafe { corduit_binary_free(response) };
+        assert_ne!(code, 0);
+        assert!(check_request_size(MAX_REQUEST_BYTES).is_ok());
+        assert!(check_request_size(MAX_REQUEST_BYTES + 1).is_err());
+        assert!(check_request_size(usize::MAX).is_err());
     }
 
     /// The binary channel must transfer an allocation whose size is exactly

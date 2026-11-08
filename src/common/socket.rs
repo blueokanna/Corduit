@@ -461,6 +461,12 @@ fn engine_then_system(host: &str, engine: EngineLookup) -> io::Result<Vec<IpAddr
         return Ok(found);
     }
     if configured {
+        if crate::dns::engine_resolver::domain_uses_policy(host) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("configured DNS policy refused '{host}'; system fallback is disabled"),
+            ));
+        }
         tracing::debug!("engine DNS found no address for {host}; trying the system resolver");
     }
 

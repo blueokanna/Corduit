@@ -235,6 +235,7 @@ fn build_client(timeout: Duration) -> Client {
         min_version: TlsVersion::Tls12,
         max_version: TlsVersion::Tls13,
         identity: None,
+        profile: None,
     };
     Client::with_config(ClientConfig {
         http2: true,
@@ -251,7 +252,7 @@ fn build_client(timeout: Duration) -> Client {
 
 /// Shared TLS connector for the proxy path (its resumption-session store
 /// survives across requests, so repeat visits to the same host resume).
-fn shared_tls_connector() -> &'static TlsConnector {
+pub(crate) fn shared_tls_connector() -> &'static TlsConnector {
     static CONNECTOR: OnceLock<TlsConnector> = OnceLock::new();
     CONNECTOR.get_or_init(|| {
         TlsConnector::new(courierust::courierust_tls::ClientConfig {
@@ -262,6 +263,7 @@ fn shared_tls_connector() -> &'static TlsConnector {
             min_version: TlsVersion::Tls12,
             max_version: TlsVersion::Tls13,
             identity: None,
+            profile: None,
         })
     })
 }
@@ -455,7 +457,7 @@ fn read_to_eof_capped<R: CRead>(
     let mut out = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        match reader.read_more(&mut chunk) {
+        match reader.read_direct(&mut chunk) {
             Ok(0) => return Ok(out),
             Ok(n) => {
                 if out.len() + n > max {
@@ -464,7 +466,7 @@ fn read_to_eof_capped<R: CRead>(
                 out.extend_from_slice(&chunk[..n]);
             }
             Err(e) if matches!(e.kind, CourierErrorKind::Timeout) => {
-                return Ok(out);
+                return Err(HttpError::Timeout);
             }
             Err(e) if matches!(e.kind, CourierErrorKind::WouldBlock) => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -555,6 +557,46 @@ fn establish_connect_tunnel(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn close_delimited_body_keeps_the_final_short_read() {
+        let mut reader = BufReader::new(
+            courierust::courierust_io::SliceReader::new(b"complete body"),
+            8,
+        );
+        assert_eq!(
+            read_to_eof_capped(&mut reader, 128).unwrap(),
+            b"complete body"
+        );
+        let mut reader =
+            BufReader::new(courierust::courierust_io::SliceReader::new(b"too large"), 8);
+        assert!(matches!(
+            read_to_eof_capped(&mut reader, 3),
+            Err(HttpError::BodyTooLarge)
+        ));
+    }
+
+    #[test]
+    fn close_delimited_body_timeout_never_returns_partial_success() {
+        struct Partial {
+            sent: bool,
+        }
+        impl CRead for Partial {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize, CourierError> {
+                if self.sent {
+                    return Err(CourierError::new(CourierErrorKind::Timeout));
+                }
+                self.sent = true;
+                buf[0] = b'{';
+                Ok(1)
+            }
+        }
+        let mut reader = BufReader::new(Partial { sent: false }, 8);
+        assert!(matches!(
+            read_to_eof_capped(&mut reader, 128),
+            Err(HttpError::Timeout)
+        ));
+    }
+
     use super::*;
 
     #[test]
@@ -583,7 +625,6 @@ mod tests {
 
     #[test]
     fn http_response_helpers() {
-        // 204 is a 2xx status (success) with no body.
         let resp = HttpResponse {
             status: 204,
             headers: HeaderMap::new(),

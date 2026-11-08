@@ -12,7 +12,7 @@ use crate::engine::connection_tracker::ConnectionTracker;
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr, UdpReplySink};
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -102,62 +102,15 @@ impl OutboundProxy for DirectOutbound {
         session.send(data)
     }
 
-    fn test_http_latency(
-        &self,
-        test_url: &str,
-        timeout: std::time::Duration,
-    ) -> Result<std::time::Duration> {
-        // Parse the test URL
-        let url = crate::common::url::Url::parse(test_url)
-            .map_err(|e| Error::config(format!("Invalid test URL: {}", e)))?;
-
-        let host = url
-            .host_str()
-            .ok_or_else(|| Error::config("Test URL has no host"))?
-            .to_string();
-        let url_port = url
-            .port()
-            .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
-        let path = if url.path().is_empty() {
-            "/"
-        } else {
-            url.path()
-        };
-
-        let start = Instant::now();
-
-        // Direct connection to target
-        let addr = format!("{}:{}", host, url_port);
-        let mut stream = crate::common::socket::connect_host(&host, url_port, timeout)
-            .map_err(|e| Error::network(format!("Failed to connect to {}: {}", addr, e)))?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
-
-        // Send HTTP request
-        let http_request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n",
-            path, host
-        );
-        stream
-            .write_all(http_request.as_bytes())
-            .map_err(|e| Error::network(format!("Failed to send HTTP request: {}", e)))?;
-
-        // Read the response status line
-        let mut reader = std::io::BufReader::new(stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .map_err(|e| Error::network(format!("Failed to read response: {}", e)))?;
-
-        if response_line.starts_with("HTTP/") {
-            Ok(start.elapsed())
-        } else {
-            Err(Error::network("Invalid HTTP response"))
-        }
+    fn test_http_latency(&self, test_url: &str, timeout: Duration) -> Result<Duration> {
+        let probe = crate::common::http_probe::HttpProbe::new(test_url, timeout)?;
+        let tcp = crate::common::socket::connect_host(
+            &probe.url.host,
+            probe.url.port,
+            probe.remaining()?,
+        )
+        .map_err(|e| Error::network(format!("Probe connect failed: {e}")))?;
+        probe.finish(&tcp)
     }
 
     fn relay_tcp(

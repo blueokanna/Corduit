@@ -1,4 +1,5 @@
 pub mod validator;
+mod wire;
 
 use nextjson::{NsonDeserialize, NsonSerialize};
 use std::collections::HashMap;
@@ -243,6 +244,7 @@ pub struct DnsConfig {
     /// `+.example.com`, values are upstream server strings. Applies to the
     /// engine's own outbound server names (node domains).
     #[serde(default, alias = "nameserver_policy")]
+    #[serde(with = "crate::common::json_map")]
     pub nameserver_policy: std::collections::HashMap<String, Vec<String>>,
 
     /// When to re-resolve through `fallback`.
@@ -269,6 +271,7 @@ pub struct DnsConfig {
 
     /// Static host entries, answered without asking anyone.
     #[serde(default)]
+    #[serde(with = "crate::common::json_map")]
     pub hosts: std::collections::HashMap<String, String>,
 
     /// Whether `hosts` is consulted at all.
@@ -360,7 +363,8 @@ impl Default for DnsConfig {
 }
 
 /// Inbound configuration
-#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
+#[derive(Debug, Clone, NsonDeserialize)]
+#[serde(from = "wire::Inbound")]
 pub struct InboundConfig {
     /// Inbound type
     #[serde(rename = "type")]
@@ -382,7 +386,8 @@ pub struct InboundConfig {
 }
 
 /// Outbound configuration
-#[derive(Debug, Clone, NsonSerialize, NsonDeserialize)]
+#[derive(Debug, Clone, NsonDeserialize)]
+#[serde(from = "wire::Outbound")]
 pub struct OutboundConfig {
     /// Outbound type
     #[serde(rename = "type")]

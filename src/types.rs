@@ -44,6 +44,7 @@ pub struct DnsConfig {
     pub fallback: Vec<String>,
     pub enhanced_mode: String,
     #[serde(default)]
+    #[serde(with = "crate::common::json_map")]
     pub nameserver_policy: std::collections::HashMap<String, Vec<String>>,
     /// Resolvers used only to resolve a resolver's own hostname.
     #[serde(default)]
@@ -64,6 +65,7 @@ pub struct DnsConfig {
     pub fake_ip_ttl: Option<u32>,
     /// Static host entries.
     #[serde(default)]
+    #[serde(with = "crate::common::json_map")]
     pub hosts: std::collections::HashMap<String, String>,
     /// Whether `hosts` is consulted. `None` keeps the engine default.
     #[serde(default)]
@@ -362,6 +364,7 @@ pub struct DnsConfigDto {
     pub nameservers: Vec<String>,
     pub fallback: Vec<String>,
     #[serde(default)]
+    #[serde(with = "crate::common::json_map")]
     pub nameserver_policy: std::collections::HashMap<String, Vec<String>>,
     #[serde(default)]
     pub default_nameserver: Vec<String>,

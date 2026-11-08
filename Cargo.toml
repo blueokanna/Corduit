@@ -1,6 +1,6 @@
 [package]
 name = "corduit"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 rust-version = "1.78"
 license-file = "LICENSE"
@@ -31,7 +31,6 @@ std = [
     "dep:tracing-subscriber",
     "bytes/std",
     "courierust/std",
-    "nextjson/std",
     "thiserror/std",
 ]
 tls = []
@@ -56,12 +55,11 @@ once_cell = { version = "1", optional = true }
 thiserror = { version = "2.0.21", default-features = false }
 
 # --- codec / time  -------------------------------
-nextjson = { version = "0.1.4", default-features = false, features = [
+nextjson = { version = "0.1.5", default-features = false, features = [
     "derive",
 ] }
-rustbinary = { version = "0.1.8", default-features = false, features = [
+rustbinary = { version = "0.1.10", default-features = false, features = [
     "derive",
-    "std",
 ], optional = true }
 
 # --- tracing / telemetry (std only) -----------------------------------------
@@ -71,10 +69,10 @@ tracing-subscriber = { version = "0.3", features = [
 ], optional = true }
 
 # --- HTTP / TLS / QUIC / multithreading --
-courierust = { version = "1.0.7", default-features = false }
+courierust = { version = "1.1.1", default-features = false }
 
 # --- DNS ---------------------------------------------------------------------
-recurse-x = { version = "0.2.2", default-features = false, features = [
+recurse-x = { version = "0.2.3", default-features = false, features = [
     "std",
     "dot",
     "doh",

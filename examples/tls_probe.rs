@@ -33,6 +33,7 @@ fn main() {
         min_version: TlsVersion::Tls12,
         max_version: TlsVersion::Tls13,
         identity: None,
+        profile: None,
     });
 
     let mut tls = match connector.connect(&name, arc.clone(), arc.clone()) {

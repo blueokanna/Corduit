@@ -52,6 +52,8 @@ use courierust::courierust_fingerprint::{chrome_tls_profile, TlsProfile};
 /// Extensions a Chromium-shaped profile lists but this client never emits,
 /// with the reason. See the module docs.
 pub const KNOWN_OMISSIONS: &[(u16, &str)] = &[
+    (0x44cd, "application_settings (ALPS) is not advertised: no protocol settings payload"),
+    (0xfe0d, "encrypted_client_hello is not advertised: ECH configuration and HPKE are not implemented"),
     (
         super::codec::EXT_COMPRESS_CERTIFICATE,
         "compress_certificate (RFC 8879) is not advertised: certificate decompression is not implemented",
@@ -202,7 +204,7 @@ pub fn build_client_hello(spec: &ClientHelloSpec<'_>) -> Result<ClientHello> {
         if !spec.server_name.is_empty() {
             let host = spec.server_name.as_bytes();
             let mut sni = Vec::with_capacity(3 + host.len());
-            sni.push(0x00); // host_name
+            sni.push(0x00);
             sni.extend_from_slice(&(host.len() as u16).to_be_bytes());
             sni.extend_from_slice(host);
             exts.push((super::codec::EXT_SERVER_NAME, sni));
@@ -329,7 +331,9 @@ pub fn build_client_hello(spec: &ClientHelloSpec<'_>) -> Result<ClientHello> {
         stream.shuffle(&mut exts);
     }
 
-    let want_padding = !matches!(spec.fingerprint, Fingerprint::Off);
+    let want_padding = profile
+        .as_ref()
+        .is_some_and(|p| p.extensions.contains(&super::codec::EXT_PADDING));
     let mut ext_bytes = Vec::new();
     for (t, d) in &exts {
         ext_bytes.extend_from_slice(&super::codec::encode_extension(*t, d));
@@ -681,18 +685,18 @@ mod tests {
         );
         assert_eq!(emitted.alpn, expected.alpn, "ALPN");
         assert_eq!(emitted.point_formats, expected.point_formats);
-
-        // GREASE (RFC 8701) is on the wire in the cipher list, the extension
-        // list and the group list, and the reported omissions are exactly the
-        // documented ones.
         assert!(emitted.ciphers.iter().any(|c| is_grease_val(*c)));
         assert!(emitted.extensions.iter().any(|e| is_grease_val(*e)));
         assert!(emitted.groups.iter().any(|g| is_grease_val(*g)));
-        assert_eq!(hello.omitted_extensions.len(), KNOWN_OMISSIONS.len());
+        assert_eq!(
+            hello.omitted_extensions.len(),
+            expected_profile
+                .extensions
+                .iter()
+                .filter(|id| KNOWN_OMISSIONS.iter().any(|(omitted, _)| omitted == *id))
+                .count()
+        );
 
-        // Fingerprints: JA4 ignores GREASE, JA3 keeps it, so the emitted
-        // hello is compared after filtering GREASE out (which is what a
-        // capture-based JA3 would report for a browser that sends GREASE).
         let mut emitted_no_grease = emitted.clone();
         emitted_no_grease.ciphers = without_grease(&emitted_no_grease.ciphers);
         emitted_no_grease.groups = without_grease(&emitted_no_grease.groups);
@@ -719,8 +723,6 @@ mod tests {
         v & 0x000f == 0x000a && (v >> 8) == (v & 0x00ff)
     }
 
-    /// GREASE (RFC 8701) values are per-connection and are filtered out of
-    /// JA3/JA4; comparisons of the *shape* must do the same.
     fn without_grease(values: &[u16]) -> Vec<u16> {
         values
             .iter()
@@ -753,14 +755,16 @@ mod tests {
     /// Padding brings Chrome-shaped messages to a 512-byte boundary; the
     /// message stays within the record limit and parses end to end.
     #[test]
-    fn chrome_padding_is_bounded_and_parsable() {
+    fn declared_padding_is_bounded_and_parsable() {
         for seed in 0u8..16 {
             let alpn = alloc::vec!["h2".to_string(), "http/1.1".to_string()];
             let random = [seed; 32];
-            let hello =
-                build_client_hello(&spec(Fingerprint::Chrome, &random, &alpn)).expect("built");
+            let mut profile = chrome_tls_profile();
+            profile.extensions.push(super::super::codec::EXT_PADDING);
+            let hello = build_client_hello(&spec(Fingerprint::Custom(profile), &random, &alpn))
+                .expect("built");
             assert!(hello.raw.len() <= 2 * 16384, "fits in two records");
-            // A full parse walks every extension and rejects malformed ones.
+
             let emitted = profile_from_bytes(&hello.raw, 't');
             assert!(
                 emitted

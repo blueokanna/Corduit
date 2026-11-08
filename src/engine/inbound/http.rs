@@ -141,6 +141,9 @@ fn peek_connect_head(stream: &TcpStream) -> std::result::Result<Option<usize>, S
         } else if available >= CONNECT_PREFIX.len() {
             return Ok(None);
         }
+        if available == probe.len() {
+            return Err("CONNECT request head exceeds the configured limit".to_string());
+        }
         if Instant::now() > deadline {
             return Err("timed out waiting for the request head".to_string());
         }
@@ -693,6 +696,26 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oversized_connect_head_is_rejected_without_waiting_for_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let worker = std::thread::spawn(move || {
+            client
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut head = vec![b'x'; PROXY_MAX_HEAD];
+            head[..CONNECT_PREFIX.len()].copy_from_slice(CONNECT_PREFIX);
+            client.write_all(&head).unwrap();
+            client
+        });
+        let started = Instant::now();
+        assert!(peek_connect_head(&server).unwrap_err().contains("limit"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(worker.join().unwrap());
+    }
+
     use super::*;
 
     #[test]
