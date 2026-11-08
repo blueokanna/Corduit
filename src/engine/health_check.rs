@@ -222,31 +222,33 @@ impl HealthChecker {
 
     /// Start the health checker
     pub fn start(self) -> Result<()> {
-        crate::common::exec::spawn(move || loop {
-            let targets = self.monitor.targets_needing_check();
+        crate::common::exec::spawn(move || {
+            loop {
+                let targets = self.monitor.targets_needing_check();
 
-            for target_tag in targets {
-                if let Some(checkable) = self
-                    .checkables
-                    .iter()
-                    .find(|c| c.health_target().tag == target_tag)
-                {
-                    match checkable.health_check() {
-                        Ok(status) => {
-                            self.monitor.update_health(&target_tag, status);
-                        }
-                        Err(e) => {
-                            let status = HealthStatus::Unhealthy {
-                                reason: "Health check failed".to_string(),
-                                last_error: Some(e.to_string()),
-                            };
-                            self.monitor.update_health(&target_tag, status);
+                for target_tag in targets {
+                    if let Some(checkable) = self
+                        .checkables
+                        .iter()
+                        .find(|c| c.health_target().tag == target_tag)
+                    {
+                        match checkable.health_check() {
+                            Ok(status) => {
+                                self.monitor.update_health(&target_tag, status);
+                            }
+                            Err(e) => {
+                                let status = HealthStatus::Unhealthy {
+                                    reason: "Health check failed".to_string(),
+                                    last_error: Some(e.to_string()),
+                                };
+                                self.monitor.update_health(&target_tag, status);
+                            }
                         }
                     }
                 }
-            }
 
-            std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_secs(1));
+            }
         });
 
         Ok(())

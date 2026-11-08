@@ -42,8 +42,8 @@
 //! attacker-influenced — cannot engineer hash collisions.
 
 use std::borrow::Borrow;
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroUsize;
@@ -743,9 +743,9 @@ mod tests {
         c.put(PanicKey(7), 3); // evicts 5 (harmless drop)
         c.put(PanicKey(42), 4); // evicts 6 (harmless); 42 now MRU
         assert_eq!(c.get(&PanicKey(7)), Some(&3)); // 7 -> MRU, 42 -> LRU
-                                                   // The next put evicts PanicKey(42); dropping its canonical key panics
-                                                   // mid-eviction. This is exactly the failure mode behind
-                                                   // RUSTSEC-2026-0253: the cache must stay structurally consistent.
+        // The next put evicts PanicKey(42); dropping its canonical key panics
+        // mid-eviction. This is exactly the failure mode behind
+        // RUSTSEC-2026-0253: the cache must stay structurally consistent.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             c.put(PanicKey(8), 5);
         }));
@@ -786,8 +786,8 @@ mod tests {
         c.put("c", PanicValue(3)); // evicts "a"
         c.put("z", PanicValue(42)); // evicts "b"; "z" now MRU
         assert_eq!(c.get("c"), Some(&PanicValue(3))); // "c" -> MRU, "z" -> LRU
-                                                      // Evicting "z" returns its value to `put`'s caller, whose drop panics
-                                                      // after the cache is already consistent.
+        // Evicting "z" returns its value to `put`'s caller, whose drop panics
+        // after the cache is already consistent.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             c.put("w", PanicValue(5));
         }));

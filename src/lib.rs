@@ -379,8 +379,8 @@ pub fn set_windows_route_manager(manager: crate::netstack::WindowsRouteManager) 
 
 /// Get the global Windows route manager
 #[cfg(all(feature = "std", windows))]
-pub fn get_windows_route_manager(
-) -> Option<parking_lot::MappedRwLockReadGuard<'static, crate::netstack::WindowsRouteManager>> {
+pub fn get_windows_route_manager()
+-> Option<parking_lot::MappedRwLockReadGuard<'static, crate::netstack::WindowsRouteManager>> {
     let guard = WINDOWS_ROUTE_MANAGER.read();
     if guard.is_some() {
         Some(parking_lot::RwLockReadGuard::map(guard, |opt| {
@@ -393,8 +393,8 @@ pub fn get_windows_route_manager(
 
 /// Get mutable access to the global Windows route manager
 #[cfg(all(feature = "std", windows))]
-pub fn get_windows_route_manager_mut(
-) -> Option<parking_lot::MappedRwLockWriteGuard<'static, crate::netstack::WindowsRouteManager>> {
+pub fn get_windows_route_manager_mut()
+-> Option<parking_lot::MappedRwLockWriteGuard<'static, crate::netstack::WindowsRouteManager>> {
     let guard = WINDOWS_ROUTE_MANAGER.write();
     if guard.is_some() {
         Some(parking_lot::RwLockWriteGuard::map(guard, |opt| {

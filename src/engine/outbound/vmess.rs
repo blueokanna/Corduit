@@ -10,8 +10,8 @@ use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use dashmap::DashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VMESS_VERSION: u8 = 1;
@@ -362,12 +362,12 @@ impl VmessOutbound {
                 .map(String::from);
 
             let mut headers = std::collections::HashMap::new();
-            if let Some(headers_value) = ws_opts_value.and_then(|v| v.get("headers")) {
-                if let Some(map) = headers_value.as_object() {
-                    for (k, v) in map.iter() {
-                        if let Some(value) = v.as_str() {
-                            headers.insert(k.to_string(), value.to_string());
-                        }
+            if let Some(headers_value) = ws_opts_value.and_then(|v| v.get("headers"))
+                && let Some(map) = headers_value.as_object()
+            {
+                for (k, v) in map.iter() {
+                    if let Some(value) = v.as_str() {
+                        headers.insert(k.to_string(), value.to_string());
                     }
                 }
             }
@@ -904,20 +904,20 @@ impl VmessOutbound {
         session.touch();
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        if !session.header_consumed.swap(true, Ordering::SeqCst) {
-            if let Err(e) = self.read_response_header(
+        if !session.header_consumed.swap(true, Ordering::SeqCst)
+            && let Err(e) = self.read_response_header(
                 &mut **stream_guard,
                 &response_key,
                 &response_iv,
                 session.expected_response_header,
                 Some(deadline),
-            ) {
-                drop(stream_guard);
-                self.udp_sessions.remove(&target_str);
-                return Err(Error::network(format!(
-                    "Failed to read the UDP response header: {e}"
-                )));
-            }
+            )
+        {
+            drop(stream_guard);
+            self.udp_sessions.remove(&target_str);
+            return Err(Error::network(format!(
+                "Failed to read the UDP response header: {e}"
+            )));
         }
 
         let Some(response_count) = session.next_response_chunk_count() else {
@@ -1198,7 +1198,7 @@ fn read_exact_deadline<R: Read + ?Sized>(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "unexpected EOF",
-                ))
+                ));
             }
             Ok(n) => pos += n,
             Err(e)
@@ -1568,13 +1568,13 @@ impl VmessStream {
                         "vmess: response header payload is too short",
                     ));
                 }
-                if let Some(expected) = self.expected_response_header.take() {
-                    if plain[0] != expected {
-                        return Err(std::io::Error::other(format!(
-                            "vmess: response header byte mismatch (expected {expected}, got {})",
-                            plain[0]
-                        )));
-                    }
+                if let Some(expected) = self.expected_response_header.take()
+                    && plain[0] != expected
+                {
+                    return Err(std::io::Error::other(format!(
+                        "vmess: response header byte mismatch (expected {expected}, got {})",
+                        plain[0]
+                    )));
                 }
                 self.begin_chunk_length();
             }
@@ -2749,16 +2749,20 @@ mod property_tests {
             .expect("the legacy header opens and validates");
 
         let mut reader = std::io::Cursor::new(block.to_vec());
-        assert!(outbound
-            .read_response_header(&mut reader, &response_key, &response_iv, 0x99, None)
-            .is_err());
+        assert!(
+            outbound
+                .read_response_header(&mut reader, &response_key, &response_iv, 0x99, None)
+                .is_err()
+        );
 
         let mut dynamic_port = [0x5au8, 0x01, 0x01, 0x00];
         aes128_cfb_encrypt(&response_key, &response_iv, &mut dynamic_port).unwrap();
         let mut reader = std::io::Cursor::new(dynamic_port.to_vec());
-        assert!(outbound
-            .read_response_header(&mut reader, &response_key, &response_iv, 0x5a, None)
-            .is_err());
+        assert!(
+            outbound
+                .read_response_header(&mut reader, &response_key, &response_iv, 0x5a, None)
+                .is_err()
+        );
     }
 
     /// The legacy downlink consumes the CFB header lazily on its first read,
@@ -3118,9 +3122,11 @@ mod property_tests {
         assert_eq!(length, sealed.len() - 42 - 16);
 
         // The same ciphertext without the AuthID as additional data must fail.
-        assert!(length_cipher
-            .decrypt(&length_nonce, &sealed[16..34], &[])
-            .is_err());
+        assert!(
+            length_cipher
+                .decrypt(&length_nonce, &sealed[16..34], &[])
+                .is_err()
+        );
 
         let header_key = kdf16(
             &outbound.cmd_key,
@@ -3186,15 +3192,17 @@ mod property_tests {
         assert_eq!(reader.position() as usize, 18 + payload.len() + 16);
 
         let mut mismatched = std::io::Cursor::new(wire);
-        assert!(outbound
-            .read_response_header(
-                &mut mismatched,
-                &response_key,
-                &response_iv,
-                echoed ^ 0xff,
-                None
-            )
-            .is_err());
+        assert!(
+            outbound
+                .read_response_header(
+                    &mut mismatched,
+                    &response_key,
+                    &response_iv,
+                    echoed ^ 0xff,
+                    None
+                )
+                .is_err()
+        );
     }
 
     /// The full server-side open of a sealed request: decode the AuthID (AES

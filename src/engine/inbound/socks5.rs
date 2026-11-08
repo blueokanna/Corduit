@@ -23,19 +23,19 @@
 use crate::common::listener::ConnectionListener;
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{
-    fill_destination_ip_in_background, global_tracker, TrackedConnection,
+    TrackedConnection, fill_destination_ip_in_background, global_tracker,
 };
 use crate::engine::error::{Error, Result};
-use crate::engine::inbound::auth::{socks5_userpass, InboundAuth, SOCKS5_AUTH_USERPASS};
-use crate::engine::inbound::{bind_tcp_listener, InboundListener};
+use crate::engine::inbound::auth::{InboundAuth, SOCKS5_AUTH_USERPASS, socks5_userpass};
+use crate::engine::inbound::{InboundListener, bind_tcp_listener};
 use crate::engine::outbound::{OutboundManager, TargetAddr, UdpReplySink};
 use crate::engine::routing::{InboundContext, Network, RouteRequest, Router};
 use parking_lot::Mutex;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// UDP ASSOCIATE lifetime: the relay socket gives up after this much
@@ -348,8 +348,14 @@ fn handle_connect(
         target.port(),
         "SOCKS5".to_string(),
         "tcp".to_string(),
-        "SOCKS5".to_string(),
-        target.to_string(),
+        decision
+            .rule_type
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|| "Mode/default".into()),
+        decision
+            .rule_index
+            .map(|index| format!("#{}", index + 1))
+            .unwrap_or_default(),
     ));
     if let TargetAddr::Domain(domain, _) = &target {
         fill_destination_ip_in_background(Arc::clone(&tracked), domain.clone(), target.port());
@@ -454,7 +460,7 @@ fn handle_udp_associate(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                continue
+                continue;
             }
             Err(e) => {
                 tracing::debug!("UDP ASSOCIATE control connection from {peer_addr} failed: {e}");

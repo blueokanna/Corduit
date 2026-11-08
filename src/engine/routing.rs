@@ -1,7 +1,7 @@
 use crate::common::lru::LruCache;
 use crate::engine::config::{Config, Mode, RuleConfig, RuleType};
 use crate::engine::error::{Error, Result};
-use crate::engine::geoip::{is_non_routable, CountryMatcher, GeoIpManager};
+use crate::engine::geoip::{CountryMatcher, GeoIpManager, is_non_routable};
 use crate::engine::rule_provider::RuleProviderConfig;
 use crate::engine::rule_provider::RuleProviderManager;
 use ipnet::IpNet;
@@ -10,9 +10,9 @@ use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 static RUNTIME_PROXY_MODE: AtomicI32 = AtomicI32::new(0);
@@ -608,10 +608,10 @@ impl Router {
         let now = Instant::now();
         {
             let mut cache = DNS_CACHE.lock();
-            if let Some(cached) = cache.get(&normalized) {
-                if cached.expires_at > now {
-                    return cached.addresses.clone();
-                }
+            if let Some(cached) = cache.get(&normalized)
+                && cached.expires_at > now
+            {
+                return cached.addresses.clone();
             }
             cache.pop(&normalized);
         }
@@ -1060,17 +1060,16 @@ impl Router {
         if basename.eq_ignore_ascii_case(pattern) {
             return true;
         }
-        if let Some(without_ext) = strip_suffix_ignore_case(pattern, ".exe") {
-            if process_name.eq_ignore_ascii_case(without_ext)
-                || basename.eq_ignore_ascii_case(without_ext)
-            {
-                return true;
-            }
+        if let Some(without_ext) = strip_suffix_ignore_case(pattern, ".exe")
+            && (process_name.eq_ignore_ascii_case(without_ext)
+                || basename.eq_ignore_ascii_case(without_ext))
+        {
+            return true;
         }
-        if let Some(without_ext) = strip_suffix_ignore_case(process_name, ".exe") {
-            if without_ext.eq_ignore_ascii_case(pattern) {
-                return true;
-            }
+        if let Some(without_ext) = strip_suffix_ignore_case(process_name, ".exe")
+            && without_ext.eq_ignore_ascii_case(pattern)
+        {
+            return true;
         }
 
         false
@@ -1099,19 +1098,18 @@ impl Router {
         for part in pattern.split(',') {
             let part = part.trim();
             if part.contains('-') {
-                if let Some((start, end)) = part.split_once('-') {
-                    if let (Ok(start), Ok(end)) =
+                if let Some((start, end)) = part.split_once('-')
+                    && let (Ok(start), Ok(end)) =
                         (start.trim().parse::<u16>(), end.trim().parse::<u16>())
-                    {
-                        if port >= start && port <= end {
-                            return true;
-                        }
-                    }
-                }
-            } else if let Ok(single_port) = part.parse::<u16>() {
-                if port == single_port {
+                    && port >= start
+                    && port <= end
+                {
                     return true;
                 }
+            } else if let Ok(single_port) = part.parse::<u16>()
+                && port == single_port
+            {
+                return true;
             }
         }
         false
@@ -1562,25 +1560,25 @@ mod tests {
             if process_lower == pattern {
                 return true;
             }
-            if let Some(base) = name.rsplit(['/', '\\']).next() {
-                if base.eq_ignore_ascii_case(pattern) {
-                    return true;
-                }
+            if let Some(base) = name.rsplit(['/', '\\']).next()
+                && base.eq_ignore_ascii_case(pattern)
+            {
+                return true;
             }
             if let Some(without_ext) = pattern.strip_suffix(".exe") {
                 if process_lower == without_ext {
                     return true;
                 }
-                if let Some(base) = name.rsplit(['/', '\\']).next() {
-                    if base.eq_ignore_ascii_case(without_ext) {
-                        return true;
-                    }
-                }
-            }
-            if let Some(without_ext) = process_lower.strip_suffix(".exe") {
-                if without_ext == pattern {
+                if let Some(base) = name.rsplit(['/', '\\']).next()
+                    && base.eq_ignore_ascii_case(without_ext)
+                {
                     return true;
                 }
+            }
+            if let Some(without_ext) = process_lower.strip_suffix(".exe")
+                && without_ext == pattern
+            {
+                return true;
             }
             false
         }

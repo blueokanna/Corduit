@@ -44,10 +44,10 @@ impl QuicClient {
     pub fn connect(&self) -> Result<Arc<ClientConnection>> {
         {
             let guard = self.conn.lock();
-            if let Some(c) = guard.as_ref() {
-                if !c.is_closed() {
-                    return Ok(c.clone());
-                }
+            if let Some(c) = guard.as_ref()
+                && !c.is_closed()
+            {
+                return Ok(c.clone());
             }
         }
 
@@ -182,12 +182,12 @@ impl ClientConnection {
 
     fn accept_uni_inner(&self, deadline: Option<std::time::Instant>) -> Result<QuicRecvStream> {
         loop {
-            if let Some(deadline) = deadline {
-                if std::time::Instant::now() >= deadline {
-                    return Err(QuicError::Io(
-                        "timed out waiting for a server stream".to_string(),
-                    ));
-                }
+            if let Some(deadline) = deadline
+                && std::time::Instant::now() >= deadline
+            {
+                return Err(QuicError::Io(
+                    "timed out waiting for a server stream".to_string(),
+                ));
             }
             {
                 let mut st = self.conn.lock();
@@ -224,12 +224,12 @@ impl ClientConnection {
 
     fn read_datagram_inner(&self, deadline: Option<std::time::Instant>) -> Result<Vec<u8>> {
         loop {
-            if let Some(deadline) = deadline {
-                if std::time::Instant::now() >= deadline {
-                    return Err(QuicError::Io(
-                        "timed out waiting for a UDP datagram".to_string(),
-                    ));
-                }
+            if let Some(deadline) = deadline
+                && std::time::Instant::now() >= deadline
+            {
+                return Err(QuicError::Io(
+                    "timed out waiting for a UDP datagram".to_string(),
+                ));
             }
             {
                 let mut st = self.conn.lock();

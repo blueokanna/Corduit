@@ -399,7 +399,7 @@ fn read_varint<R: Read>(r: &mut R, deadline: Instant) -> std::io::Result<u64> {
 /// is static-indexed or literal.
 fn encode_auth_field_section(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
     use courierust::courierust_h3::qpack::{
-        encode_field_line, encode_field_section_prefix, DynamicTable,
+        DynamicTable, encode_field_line, encode_field_section_prefix,
     };
 
     let table = DynamicTable::new(0);
@@ -416,7 +416,7 @@ fn encode_auth_field_section(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
 /// peer that emits one is violating the setting it accepted.
 fn decode_auth_field_section(block: &[u8]) -> courierust::Result<Vec<(String, Vec<u8>)>> {
     use courierust::courierust_h3::qpack::{
-        decode_field_line, decode_field_section_prefix, DynamicTable,
+        DynamicTable, decode_field_line, decode_field_section_prefix,
     };
     use courierust::courierust_hpack::huffman::HuffmanDecoder;
 
@@ -499,7 +499,7 @@ fn read_exact_deadline(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "unexpected EOF",
-                ))
+                ));
             }
             Ok(n) => pos += n,
             Err(e)
@@ -890,10 +890,10 @@ impl Hysteria2Outbound {
     fn get_or_create_connection(&self) -> Result<Arc<Hysteria2Connection>> {
         let mut conn_guard = self.connection.lock();
 
-        if let Some(ref conn) = *conn_guard {
-            if !conn.is_closed() {
-                return Ok(conn.clone());
-            }
+        if let Some(ref conn) = *conn_guard
+            && !conn.is_closed()
+        {
+            return Ok(conn.clone());
         }
 
         let socket_addr: SocketAddr = crate::common::socket::resolve_host(

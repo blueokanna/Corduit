@@ -166,7 +166,7 @@ impl Cbc {
     /// Decrypt `buf` in place with the given `iv`. `buf` must be a whole
     /// number of 16-byte blocks.
     pub fn decrypt(&self, iv: &[u8; 16], buf: &mut [u8]) -> Result<(), InvalidLength> {
-        if buf.len() % 16 != 0 {
+        if !buf.len().is_multiple_of(16) {
             return Err(InvalidLength);
         }
         let mut previous = *iv;
@@ -189,7 +189,7 @@ impl Cbc {
     /// Encrypt `buf` in place with the given `iv`. `buf` must be a whole
     /// number of 16-byte blocks.
     pub fn encrypt(&self, iv: &[u8; 16], buf: &mut [u8]) -> Result<(), InvalidLength> {
-        if buf.len() % 16 != 0 {
+        if !buf.len().is_multiple_of(16) {
             return Err(InvalidLength);
         }
         let mut previous = *iv;

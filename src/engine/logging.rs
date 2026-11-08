@@ -2,7 +2,7 @@ use crate::engine::config::LogLevel;
 use crate::engine::error::{Error, Result};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Once, OnceLock};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Format the current UTC time as `YYYY-MM-DD HH:MM:SS`.
 fn now_timestamp() -> String {
@@ -50,14 +50,15 @@ fn console_filter(level: LogLevel) -> Result<EnvFilter> {
 }
 
 /// Global log buffer for storing recent logs
-/// Increased buffer size to 5000 to store more logs
+/// Bounded by entry count and UTF-8 byte size.
 static LOG_BUFFER: once_cell::sync::Lazy<Arc<Mutex<LogBuffer>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(LogBuffer::new(5000))));
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(LogBuffer::new(2000))));
 
 /// Buffer for storing recent log messages
 pub struct LogBuffer {
     logs: VecDeque<String>,
     max_size: usize,
+    bytes: usize,
 }
 
 impl LogBuffer {
@@ -65,13 +66,32 @@ impl LogBuffer {
         Self {
             logs: VecDeque::with_capacity(max_size),
             max_size,
+            bytes: 0,
         }
     }
 
-    pub fn push(&mut self, log: String) {
-        if self.logs.len() >= self.max_size {
-            self.logs.pop_front();
+    pub fn push(&mut self, mut log: String) {
+        const MAX_LINE: usize = 8 * 1024;
+        const MAX_BYTES: usize = 2 * 1024 * 1024;
+        if self.max_size == 0 {
+            return;
         }
+        if log.len() > MAX_LINE {
+            let mut end = MAX_LINE - 3;
+            while !log.is_char_boundary(end) {
+                end -= 1;
+            }
+            log.truncate(end);
+            log.push_str("...");
+            log.shrink_to_fit();
+        }
+        while self.logs.len() >= self.max_size || self.bytes + log.len() > MAX_BYTES {
+            let Some(old) = self.logs.pop_front() else {
+                break;
+            };
+            self.bytes -= old.len();
+        }
+        self.bytes += log.len();
         self.logs.push_back(log);
     }
 
@@ -86,6 +106,7 @@ impl LogBuffer {
 
     pub fn clear(&mut self) {
         self.logs.clear();
+        self.bytes = 0;
     }
 }
 
@@ -189,6 +210,26 @@ pub fn set_log_level(level: LogLevel) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_storage_bounds_utf8_bytes_and_clear_releases_entries() {
+        let mut logs = LogBuffer::new(5000);
+        for _ in 0..1000 {
+            logs.push("\u{4e2d}".repeat(10_000));
+        }
+        assert!(logs.bytes <= 2 * 1024 * 1024);
+        assert!(
+            logs.get_logs(0)
+                .iter()
+                .all(|line| line.len() <= 8192 && line.ends_with("..."))
+        );
+        logs.clear();
+        assert!(logs.get_logs(0).is_empty());
+        assert_eq!(logs.bytes, 0);
+        let mut disabled = LogBuffer::new(0);
+        disabled.push("ignored".into());
+        assert!(disabled.get_logs(0).is_empty());
+    }
 
     /// The directive each level maps to.
     ///

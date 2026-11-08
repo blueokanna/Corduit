@@ -162,13 +162,13 @@ impl HysteriaOutbound {
         // A non-default encapsulation is a different wire shape, not a tuning
         // knob: a server expecting FakeTCP drops plain QUIC in silence, so a
         // config naming one fails here rather than timing out later.
-        if let Some(mode) = obfs.as_deref() {
-            if mode.eq_ignore_ascii_case("faketcp") || mode.eq_ignore_ascii_case("wechat") {
-                return Err(Error::config(format!(
-                    "Hysteria 1 obfs `{mode}` is a UDP packet encapsulation this build does not \
+        if let Some(mode) = obfs.as_deref()
+            && (mode.eq_ignore_ascii_case("faketcp") || mode.eq_ignore_ascii_case("wechat"))
+        {
+            return Err(Error::config(format!(
+                "Hysteria 1 obfs `{mode}` is a UDP packet encapsulation this build does not \
                      implement; only the default (XPlus) is available"
-                )));
-            }
+            )));
         }
 
         if config
@@ -271,10 +271,10 @@ impl HysteriaOutbound {
 
     fn get_or_create_connection(&self) -> Result<Arc<HysteriaConnection>> {
         let mut guard = self.connection.lock();
-        if let Some(conn) = guard.as_ref() {
-            if !conn.conn.is_closed() {
-                return Ok(conn.clone());
-            }
+        if let Some(conn) = guard.as_ref()
+            && !conn.conn.is_closed()
+        {
+            return Ok(conn.clone());
         }
 
         let socket_addr = crate::common::socket::resolve_host(
@@ -419,13 +419,13 @@ impl OutboundProxy for HysteriaOutbound {
                 Ok(0) => {
                     return Err(Error::network(
                         "Hysteria latency probe: the stream closed before a status line",
-                    ))
+                    ));
                 }
                 Ok(n) => n,
                 Err(e) => {
                     return Err(Error::network(format!(
                         "Failed to read probe response: {e}"
-                    )))
+                    )));
                 }
             };
             filled += n;

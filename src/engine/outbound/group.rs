@@ -51,12 +51,12 @@ use crate::common::stream::BoxStream;
 use crate::engine::config::{OutboundConfig, OutboundType};
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{
-    get_global_selector_selections, OutboundProxy, ProxyRegistry, TargetAddr, UdpReplySink,
+    OutboundProxy, ProxyRegistry, TargetAddr, UdpReplySink, get_global_selector_selections,
 };
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Health-check URL: a `204`-answering endpoint, so the measurement is one
@@ -415,19 +415,21 @@ impl GroupOutbound {
 
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(tag) = members.get(index) else {
-                        break;
-                    };
-                    let Some(proxy) = self.find(tag) else {
-                        results
-                            .lock()
-                            .push((tag.clone(), Err(Error::config("not in registry"))));
-                        continue;
-                    };
-                    let measured = proxy.test_http_latency(&self.test_url, self.test_timeout);
-                    results.lock().push((tag.clone(), measured));
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(tag) = members.get(index) else {
+                            break;
+                        };
+                        let Some(proxy) = self.find(tag) else {
+                            results
+                                .lock()
+                                .push((tag.clone(), Err(Error::config("not in registry"))));
+                            continue;
+                        };
+                        let measured = proxy.test_http_latency(&self.test_url, self.test_timeout);
+                        results.lock().push((tag.clone(), measured));
+                    }
                 });
             }
         });

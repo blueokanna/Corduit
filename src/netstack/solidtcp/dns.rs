@@ -8,10 +8,10 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// TTL of a fake-IP answer, in seconds.
 ///
@@ -121,11 +121,11 @@ impl FakeIpPool {
 
     pub fn allocate(&self, domain: &str) -> Result<Ipv4Addr> {
         let domain = domain.to_lowercase();
-        if let Some(e) = self.domain_to_ip.get(&domain) {
-            if Instant::now() < e.expires {
-                self.lru.lock().put(domain.clone(), e.ip);
-                return Ok(e.ip);
-            }
+        if let Some(e) = self.domain_to_ip.get(&domain)
+            && Instant::now() < e.expires
+        {
+            self.lru.lock().put(domain.clone(), e.ip);
+            return Ok(e.ip);
         }
 
         if self.domain_to_ip.len() >= self.config.pool_size as usize - 3 {
@@ -432,10 +432,18 @@ pub enum DnsVerdict {
     Forward,
 }
 
+/// Only client DNS answers create an observation. Shared CDN addresses are
+/// deliberately ambiguous; guessing a hostname would select the wrong rule.
+struct ObservedDomain {
+    name: Option<String>,
+    expires: Instant,
+}
+
 /// DNS handler
 pub struct DnsHandler {
     fake_ip_pool: Arc<FakeIpPool>,
     policy: AnswerPolicy,
+    observed: Mutex<LruCache<IpAddr, ObservedDomain>>,
 }
 
 impl DnsHandler {
@@ -443,7 +451,39 @@ impl DnsHandler {
         Self {
             fake_ip_pool: pool,
             policy: AnswerPolicy::from_settings(settings),
+            observed: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
         }
+    }
+
+    fn observe(&self, domain: &str, addresses: &[IpAddr], ttl: u32) {
+        let now = Instant::now();
+        let expires = now + Duration::from_secs(u64::from(ttl));
+        let name = domain.trim_end_matches('.').to_ascii_lowercase();
+        let mut observed = self.observed.lock();
+        for ip in addresses {
+            let ambiguous = observed.peek(ip).is_some_and(|previous| {
+                previous.expires > now && previous.name.as_deref() != Some(name.as_str())
+            });
+            observed.put(
+                *ip,
+                ObservedDomain {
+                    name: if ambiguous { None } else { Some(name.clone()) },
+                    expires,
+                },
+            );
+        }
+    }
+
+    /// A recent, unambiguous name actually answered to the client. This is not
+    /// PTR resolution and makes no claim about names hidden inside encrypted DNS.
+    pub fn observed_domain(&self, ip: IpAddr) -> Option<String> {
+        let mut observed = self.observed.lock();
+        let entry = observed.get(&ip)?;
+        if entry.expires <= Instant::now() {
+            observed.pop(&ip);
+            return None;
+        }
+        entry.name.clone()
     }
 
     /// The mode in effect, for diagnostics.
@@ -584,6 +624,7 @@ impl DnsHandler {
         if let Some(addresses) = self.policy.host_answer(&query.domain) {
             let wanted = select_family(addresses, query.qtype);
             if !wanted.is_empty() {
+                self.observe(&query.domain, &wanted, HOSTS_TTL_SECS);
                 info!(
                     "DNS {} query: {} -> {} host entries",
                     query.qtype.to_u16(),
@@ -664,6 +705,7 @@ impl DnsHandler {
                     query.domain,
                     addresses.len()
                 );
+                self.observe(&query.domain, &addresses, REAL_ANSWER_TTL_SECS);
                 self.build_address_response(query, addresses.as_slice(), REAL_ANSWER_TTL_SECS)
             }
 
@@ -678,17 +720,8 @@ impl DnsHandler {
         }
     }
 
-    /// Resolve through the profile's DNS, then the system resolver.
-    ///
-    /// The system resolver gets the last word whenever the engine lookup
-    /// produced nothing — it failed, it answered NODATA or NXDOMAIN, or no
-    /// engine resolver is configured at all. That mirrors the outbound path
-    /// (`common::socket`), which has always retried the engine's "found no
-    /// address" through the system resolver: the engine resolver is a
-    /// convenience over the profile's servers, not a name filter, so a client
-    /// query must not fail where a dial would have succeeded. When both fail,
-    /// the error names the engine's reason first, so the log answers "why"
-    /// instead of "could not resolve".
+    /// A configured resolver owns both positive and negative outcomes. Only
+    /// an absent resolver permits the system path; errors cannot bypass policy.
     fn resolve_real(
         &self,
         domain: &str,
@@ -800,32 +833,18 @@ fn select_family(addresses: &[IpAddr], qtype: DnsQueryType) -> Vec<IpAddr> {
         .collect()
 }
 
-/// The engine lookup's outcome, with the system resolver as the last word.
-///
-/// Split out as a pure decision so the policy — *when* the system resolver is
-/// asked — is testable without touching a socket. `engine` is exactly what
-/// [`resolve_ips`] hands back: `None` when no engine resolver is configured,
-/// otherwise its result; an engine answer with no address of the wanted
-/// family is already an error by the time it gets here, and is treated like
-/// any other engine failure.
+/// A configured DNS failure must not escape to an unconfigured resolver.
 fn with_system_fallback(
     domain: &str,
     engine: Option<std::io::Result<Vec<IpAddr>>>,
     system: impl FnOnce() -> std::result::Result<Vec<IpAddr>, String>,
 ) -> std::result::Result<Vec<IpAddr>, String> {
-    let reason = match engine {
-        Some(Ok(addresses)) if !addresses.is_empty() => return Ok(addresses),
-        Some(Ok(_)) => "the engine DNS returned no addresses".to_string(),
-        Some(Err(error)) => error.to_string(),
-        None => "no engine DNS resolver is configured".to_string(),
-    };
-    debug!(
-        "DNS: the engine lookup for {domain} produced nothing ({reason}); \
-         the system resolver gets the last word"
-    );
-    system().map_err(|system_error| {
-        format!("engine DNS: {reason}; the system resolver failed too: {system_error}")
-    })
+    match engine {
+        Some(Ok(addresses)) if !addresses.is_empty() => Ok(addresses),
+        Some(Ok(_)) => Err(format!("configured DNS returned no address for {domain}")),
+        Some(Err(error)) => Err(format!("configured DNS failed for {domain}: {error}")),
+        None => system(),
+    }
 }
 
 /// One system-resolver lookup, restricted to the requested family.
@@ -1076,9 +1095,11 @@ mod tests {
         assert!(faked_domain.is_none());
         assert_eq!(pool.size(), 0);
         assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 1);
-        assert!(bytes
-            .windows(4)
-            .any(|window| window == [203, 0, 113, 9].as_slice()));
+        assert!(
+            bytes
+                .windows(4)
+                .any(|window| window == [203, 0, 113, 9].as_slice())
+        );
     }
 
     /// An `AAAA` answer must never carry an IPv4 address, and a `hosts` entry
@@ -1369,57 +1390,38 @@ mod tests {
         assert_eq!(asked, 0, "the system resolver must stay out of the way");
     }
 
-    /// The bug this fixes: "engine DNS found no address" used to be the end of
-    /// the story for a client query, even though the outbound path retries the
-    /// system resolver for exactly the same error.
     #[test]
-    fn an_engine_miss_falls_back_to_the_system_resolver() {
-        let engine_error = std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "engine DNS found no address for 'node.example.com'",
-        );
+    fn configured_failures_never_query_the_system_resolver() {
         for engine in [
-            Some(Err(engine_error)),
-            None, // no engine resolver configured at all
+            Some(Ok(Vec::new())),
+            Some(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "rejected answer",
+            ))),
         ] {
-            let answer =
-                with_system_fallback("node.example.com", engine, || Ok(vec![v4("198.51.100.1")]))
-                    .expect("the system resolver answers");
-            assert_eq!(answer, vec![v4("198.51.100.1")]);
+            assert!(
+                with_system_fallback("api.bilibili.com", engine, || panic!("DNS policy bypass"))
+                    .is_err()
+            );
         }
+        assert_eq!(
+            with_system_fallback("no-config.test", None, || Ok(vec![v4("192.0.2.1")])).unwrap(),
+            vec![v4("192.0.2.1")]
+        );
     }
 
-    /// An empty engine answer should not happen — `resolve_ips` reports it as
-    /// an error — but if it ever does, it is a miss, not an answer.
     #[test]
-    fn an_empty_engine_answer_is_treated_like_a_miss() {
-        let answer = with_system_fallback("node.example.com", Some(Ok(Vec::new())), || {
-            Ok(vec![v4("198.51.100.2")])
-        })
-        .expect("fallback answer");
-        assert_eq!(answer, vec![v4("198.51.100.2")]);
-    }
-
-    /// When both resolvers fail, the error names both reasons: the engine's
-    /// first — it is the run's configured resolver — and the system's after it,
-    /// so the log answers "why" instead of "could not resolve".
-    #[test]
-    fn both_resolvers_failing_names_both_reasons() {
-        let engine = Some(Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "engine DNS found no address for 'node.example.com'",
-        )));
-        let error = with_system_fallback("node.example.com", engine, || {
-            Err("no address of the requested family".to_string())
-        })
-        .expect_err("nothing resolved");
-        assert!(
-            error.contains("engine DNS found no address"),
-            "the engine reason must survive: {error}"
+    fn observed_names_expire_and_shared_addresses_are_not_guessed() {
+        let handler = DnsHandler::new(Arc::new(FakeIpPool::new()), &ClientDnsSettings::default());
+        let ip = v4("192.0.2.42");
+        handler.observe("API.BILIBILI.COM.", &[ip], 60);
+        assert_eq!(
+            handler.observed_domain(ip).as_deref(),
+            Some("api.bilibili.com")
         );
-        assert!(
-            error.contains("system resolver failed too"),
-            "the system side must be named: {error}"
-        );
+        handler.observe("another.example", &[ip], 60);
+        assert_eq!(handler.observed_domain(ip), None);
+        handler.observe("api.bilibili.com", &[ip], 0);
+        assert_eq!(handler.observed_domain(ip), None);
     }
 }

@@ -20,8 +20,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 type Job = Box<dyn FnMut() + Send + 'static>;

@@ -285,16 +285,16 @@ pub fn serve(
         };
         // An oversized declared body is answered before a byte of it is
         // read: the client is told, not drained.
-        if let h1::BodyLen::Length(len) = framed {
-            if len > limits.max_body {
-                write_refusal(
-                    &stream,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body too large",
-                )?;
-                linger(&stream);
-                return Ok(());
-            }
+        if let h1::BodyLen::Length(len) = framed
+            && len > limits.max_body
+        {
+            write_refusal(
+                &stream,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large",
+            )?;
+            linger(&stream);
+            return Ok(());
         }
 
         state.enter_body(limits);
@@ -424,21 +424,21 @@ fn serve_websocket(
             Ok(Message::Text(text)) => {
                 last_rx = Instant::now();
                 ping_sent = false;
-                if let Some(reply) = endpoint.on_message(Payload::Text(text)) {
-                    if send(&mut ws, reply).is_err() {
-                        let _ = ws.close_with(1011, "send failed");
-                        return Ok(());
-                    }
+                if let Some(reply) = endpoint.on_message(Payload::Text(text))
+                    && send(&mut ws, reply).is_err()
+                {
+                    let _ = ws.close_with(1011, "send failed");
+                    return Ok(());
                 }
             }
             Ok(Message::Binary(data)) => {
                 last_rx = Instant::now();
                 ping_sent = false;
-                if let Some(reply) = endpoint.on_message(Payload::Binary(data)) {
-                    if send(&mut ws, reply).is_err() {
-                        let _ = ws.close_with(1011, "send failed");
-                        return Ok(());
-                    }
+                if let Some(reply) = endpoint.on_message(Payload::Binary(data))
+                    && send(&mut ws, reply).is_err()
+                {
+                    let _ = ws.close_with(1011, "send failed");
+                    return Ok(());
                 }
             }
             // The peer started the closing handshake; the session has
@@ -576,7 +576,7 @@ impl CourierRead for BoundedIo<'_> {
         // time the phase has left: whichever comes first, the loop regains
         // control in time to answer.
         let wait = phase.max_gap.min(phase.deadline - now).max(MIN_WAIT);
-        if self.state.armed.get().map_or(true, |armed| wait < armed) {
+        if self.state.armed.get().is_none_or(|armed| wait < armed) {
             self.stream
                 .set_read_timeout(Some(wait))
                 .map_err(socket_error)?;
@@ -694,10 +694,8 @@ fn write_response(
     h1::write_response_head(&mut head, resp.status, Version::HTTP_11, &out)
         .map_err(courier_to_io)?;
     write_all(stream, &head)?;
-    if !is_head {
-        if let Some(body) = resp.body.as_bytes() {
-            write_all(stream, body)?;
-        }
+    if !is_head && let Some(body) = resp.body.as_bytes() {
+        write_all(stream, body)?;
     }
     Ok(())
 }

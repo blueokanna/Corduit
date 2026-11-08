@@ -133,7 +133,7 @@ impl Socks5Outbound {
             _ => {
                 return Err(Error::config(
                     "SOCKS5 credentials must be supplied together, each 1..=255 bytes",
-                ))
+                ));
             }
         }
 
@@ -330,7 +330,7 @@ impl Socks5Outbound {
             _ => {
                 return Err(Error::protocol(
                     "Unsupported address type in SOCKS5 response",
-                ))
+                ));
             }
         }
 
@@ -422,15 +422,19 @@ mod tests {
         let proxy = Socks5Outbound::new(config()).unwrap();
         for domain in ["".to_string(), "a".repeat(256), "bad\nhost".to_string()] {
             let mut wire = Wire::new(&[]);
-            assert!(proxy
-                .send_connect_request_target(&mut wire, &TargetAddr::Domain(domain, 443))
-                .is_err());
+            assert!(
+                proxy
+                    .send_connect_request_target(&mut wire, &TargetAddr::Domain(domain, 443))
+                    .is_err()
+            );
             assert!(wire.output.is_empty());
         }
         let mut wire = Wire::new(&[]);
-        assert!(proxy
-            .send_connect_request_target(&mut wire, &TargetAddr::Domain("a".repeat(255), 443))
-            .is_ok());
+        assert!(
+            proxy
+                .send_connect_request_target(&mut wire, &TargetAddr::Domain("a".repeat(255), 443))
+                .is_ok()
+        );
         assert_eq!(wire.output[4], 255);
         assert_eq!(wire.output.len(), 262);
     }
@@ -439,12 +443,16 @@ mod tests {
     fn rejects_reserved_byte_and_empty_bound_domain() {
         let proxy = Socks5Outbound::new(config()).unwrap();
         for response in [&[5, 0, 1, 1][..], &[5, 0, 0, 3, 0][..], &[4, 0, 0, 1][..]] {
-            assert!(proxy
-                .read_connect_response(&mut Cursor::new(response))
-                .is_err());
+            assert!(
+                proxy
+                    .read_connect_response(&mut Cursor::new(response))
+                    .is_err()
+            );
         }
-        assert!(proxy
-            .read_connect_response(&mut Cursor::new([5, 0, 0, 1, 127, 0, 0, 1, 0, 80]))
-            .is_ok());
+        assert!(
+            proxy
+                .read_connect_response(&mut Cursor::new([5, 0, 0, 1, 127, 0, 0, 1, 0, 80]))
+                .is_ok()
+        );
     }
 }

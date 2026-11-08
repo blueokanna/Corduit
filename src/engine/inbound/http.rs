@@ -36,14 +36,14 @@ use crate::common::listener::ConnectionListener;
 use crate::common::stream::{BoxStream, SyncStream};
 use crate::engine::config::InboundConfig;
 use crate::engine::connection_tracker::{
-    fill_destination_ip_in_background, global_tracker, TrackedConnection,
+    TrackedConnection, fill_destination_ip_in_background, global_tracker,
 };
 use crate::engine::error::{Error, Result};
 use crate::engine::inbound::auth::{
-    check_proxy_authorization, proxy_authorization_user, InboundAuth,
+    InboundAuth, check_proxy_authorization, proxy_authorization_user,
 };
 use crate::engine::inbound::forward;
-use crate::engine::inbound::{bind_tcp_listener, InboundListener};
+use crate::engine::inbound::{InboundListener, bind_tcp_listener};
 use crate::engine::outbound::{OutboundManager, OutboundProxy, TargetAddr};
 use crate::engine::routing::{InboundContext, RouteRequest, Router};
 use courierust::courierust_body::Body;
@@ -52,12 +52,12 @@ use courierust::courierust_http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version,
 };
 use courierust::courierust_io::{BufReader, SliceReader};
-use courierust::courierust_server::{serve_connection, Handler, ServerConfig};
+use courierust::courierust_server::{Handler, ServerConfig, serve_connection};
 use parking_lot::Mutex;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Cap for a single request head (status line + header list).
@@ -609,21 +609,22 @@ pub(crate) fn error_response(status: StatusCode, message: &str) -> Response<Body
 /// Parse a CONNECT authority (`host:port` or `[v6]:port`).
 pub(crate) fn parse_authority(authority: &str) -> Option<(String, u16)> {
     let authority = authority.trim_start_matches('/');
-    if let Some(rest) = authority.strip_prefix('[') {
-        if let Some((host, suffix)) = rest.split_once(']') {
-            let port = if let Some(p) = suffix.strip_prefix(':') {
-                p.parse::<u16>().ok()?
-            } else {
-                443
-            };
-            return Some((host.to_string(), port));
-        }
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some((host, suffix)) = rest.split_once(']')
+    {
+        let port = if let Some(p) = suffix.strip_prefix(':') {
+            p.parse::<u16>().ok()?
+        } else {
+            443
+        };
+        return Some((host.to_string(), port));
     }
     if let Some((host, port_str)) = authority.rsplit_once(':') {
-        if !host.is_empty() && !host.contains(':') {
-            if let Ok(port) = port_str.parse::<u16>() {
-                return Some((host.to_string(), port));
-            }
+        if !host.is_empty()
+            && !host.contains(':')
+            && let Ok(port) = port_str.parse::<u16>()
+        {
+            return Some((host.to_string(), port));
         }
         // A bare IPv6 address without brackets is invalid.
         return None;
@@ -671,10 +672,10 @@ fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> 
         return Some((host.to_string(), port));
     }
     if let Some((host, port_str)) = authority.rsplit_once(':') {
-        if !host.contains(':') {
-            if let Ok(port) = port_str.parse::<u16>() {
-                return Some((host.to_string(), port));
-            }
+        if !host.contains(':')
+            && let Ok(port) = port_str.parse::<u16>()
+        {
+            return Some((host.to_string(), port));
         }
         return None;
     }

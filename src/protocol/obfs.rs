@@ -772,14 +772,16 @@ mod tests {
             HttpObfsStream::snell(inner(), "ok.example".to_string(), "no-slash".to_string())
                 .is_err()
         );
-        assert!(HttpObfsStream::simple_obfs(
-            inner(),
-            "ok.example".to_string(),
-            "/".to_string(),
-            443,
-            "GET\r\nHost: evil".to_string(),
-        )
-        .is_err());
+        assert!(
+            HttpObfsStream::simple_obfs(
+                inner(),
+                "ok.example".to_string(),
+                "/".to_string(),
+                443,
+                "GET\r\nHost: evil".to_string(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

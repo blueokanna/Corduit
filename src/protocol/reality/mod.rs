@@ -40,7 +40,7 @@ pub mod wire;
 mod client;
 
 #[cfg(feature = "std")]
-pub use client::{connect, RealityClientOptions};
+pub use client::{RealityClientOptions, connect};
 
 use alloc::string::String;
 use core::fmt;

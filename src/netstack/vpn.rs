@@ -4,7 +4,7 @@ use crate::netstack::error::{NetStackError, Result};
 use crate::netstack::solidtcp::{ClientDnsSettings, SolidStack, StackBuilder, StackStats};
 use bytes::BytesMut;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::{net::Ipv4Addr, net::SocketAddr};
 use tracing::{debug, info};
 
@@ -108,7 +108,7 @@ impl TunPacketProcessor {
         }
 
         let packet_number = self.packet_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if packet_number <= 10 || packet_number % 500 == 0 {
+        if packet_number <= 10 || packet_number.is_multiple_of(500) {
             debug!(packet_number, bytes = packet.len(), "processing TUN packet");
         }
 

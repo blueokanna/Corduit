@@ -42,10 +42,10 @@ fn load() -> RootStore {
 // slices are copied out before the store is closed.
 #[allow(unsafe_code)]
 fn collect_root_der() -> Vec<Vec<u8>> {
-    use windows::core::PCWSTR;
     use windows::Win32::Security::Cryptography::{
-        CertCloseStore, CertEnumCertificatesInStore, CertOpenSystemStoreW, CERT_CONTEXT,
+        CERT_CONTEXT, CertCloseStore, CertEnumCertificatesInStore, CertOpenSystemStoreW,
     };
+    use windows::core::PCWSTR;
 
     let mut certs = Vec::new();
     let store = unsafe { CertOpenSystemStoreW(None, PCWSTR(windows::core::w!("ROOT").as_ptr())) };
@@ -75,11 +75,11 @@ fn collect_root_der() -> Vec<Vec<u8>> {
         "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL / Fedora
         "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
     ] {
-        if let Ok(pem) = std::fs::read_to_string(path) {
-            if let Ok(der) = parse_pem_bundle(&pem) {
-                out.extend(der);
-                return out;
-            }
+        if let Ok(pem) = std::fs::read_to_string(path)
+            && let Ok(der) = parse_pem_bundle(&pem)
+        {
+            out.extend(der);
+            return out;
         }
     }
 
@@ -91,10 +91,10 @@ fn collect_root_der() -> Vec<Vec<u8>> {
             let Ok(path) = entry.path().into_os_string().into_string() else {
                 continue;
             };
-            if let Ok(pem) = std::fs::read_to_string(&path) {
-                if let Ok(der) = parse_pem_bundle(&pem) {
-                    out.extend(der);
-                }
+            if let Ok(pem) = std::fs::read_to_string(&path)
+                && let Ok(der) = parse_pem_bundle(&pem)
+            {
+                out.extend(der);
             }
         }
         if !out.is_empty() {

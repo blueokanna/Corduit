@@ -16,11 +16,11 @@
 //! engine synchronously on the calling thread, and no panic ever unwinds
 //! across the `extern "C"` boundary.
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
 use crate::api;
-use crate::rpc::{dispatch, CORDUIT_API_VERSION, CORDUIT_METHODS};
+use crate::rpc::{CORDUIT_API_VERSION, CORDUIT_METHODS, dispatch};
 
 // ---------------------------------------------------------------------------
 // C-compatible response types
@@ -110,24 +110,28 @@ fn check_request_size(len: usize) -> Result<(), String> {
 
 /// SAFETY: `ptr` must be a valid NUL-terminated string (or null).
 unsafe fn read_cstr<'a>(ptr: *const c_char, limit: usize) -> Result<&'a str, String> {
-    if ptr.is_null() {
-        return Ok("");
+    unsafe {
+        if ptr.is_null() {
+            return Ok("");
+        }
+        let bytes = CStr::from_ptr(ptr).to_bytes();
+        if bytes.len() > limit {
+            return Err("C string exceeds the input limit".into());
+        }
+        std::str::from_utf8(bytes).map_err(|_| "C string is not valid UTF-8".into())
     }
-    let bytes = CStr::from_ptr(ptr).to_bytes();
-    if bytes.len() > limit {
-        return Err("C string exceeds the input limit".into());
-    }
-    std::str::from_utf8(bytes).map_err(|_| "C string is not valid UTF-8".into())
 }
 
 /// Free a string returned by [`corduit_call`].
 ///
 /// # Safety
 /// `ptr` must be an unfreed string returned by this module (or be null).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn corduit_string_free(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        drop(CString::from_raw(ptr));
+    unsafe {
+        if !ptr.is_null() {
+            drop(CString::from_raw(ptr));
+        }
     }
 }
 
@@ -135,12 +139,14 @@ pub unsafe extern "C" fn corduit_string_free(ptr: *mut c_char) {
 ///
 /// # Safety
 /// `resp` must come from a previous [`corduit_call_binary`] call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn corduit_binary_free(resp: FfiBinaryResponse) {
-    if !resp.data.is_null() && resp.len > 0 {
-        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
-            resp.data, resp.len,
-        )));
+    unsafe {
+        if !resp.data.is_null() && resp.len > 0 {
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+                resp.data, resp.len,
+            )));
+        }
     }
 }
 
@@ -149,7 +155,7 @@ pub unsafe extern "C" fn corduit_binary_free(resp: FfiBinaryResponse) {
 // ---------------------------------------------------------------------------
 
 /// Initialize the bridge (logging, tracing, platform hooks).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn corduit_init() {
     // Nothing here is expected to panic, but an unwind across `extern "C"`
     // would be UB; initialisation failure must not abort the host process.
@@ -158,14 +164,14 @@ pub extern "C" fn corduit_init() {
 
 /// Return the bridge ABI version as a C string (caller frees with
 /// [`corduit_string_free`]).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn corduit_api_version() -> *mut c_char {
     into_cstring(CORDUIT_API_VERSION.to_string())
 }
 
 /// Return the list of supported `corduit_call` methods as a JSON array string
 /// (caller frees with [`corduit_string_free`]).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn corduit_methods() -> *mut c_char {
     let json = nextjson::to_string(&nextjson::Value::Array(
         CORDUIT_METHODS
@@ -189,7 +195,7 @@ pub extern "C" fn corduit_methods() -> *mut c_char {
 ///
 /// Both pointers must be valid NUL-terminated C strings (or null) and stay
 /// valid for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn corduit_call(
     method: *const c_char,
     args_json: *const c_char,
@@ -235,7 +241,7 @@ pub unsafe extern "C" fn corduit_call(
 /// `payload` must point to `len` readable bytes and stay valid for the call.
 /// Null payloads with a nonzero length are rejected without dereferencing.
 /// Invalid non-null pointers cannot be checked by this ABI.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn corduit_call_binary(
     method: *const c_char,
     payload: *const u8,
@@ -365,13 +371,15 @@ mod tests {
         let array = rustbinary::serialize(&vec![nextjson::Value::Null]).unwrap();
         let mut deep = vec![array[0]; 129];
         deep.extend(rustbinary::serialize(&nextjson::Value::Null).unwrap());
-        deep.extend(std::iter::repeat(*array.last().unwrap()).take(129));
+        deep.extend(std::iter::repeat_n(*array.last().unwrap(), 129));
         for bytes in [vec![0xfe], trailing, truncated, deep] {
             let (code, error) = binary_request(&bytes);
             assert_ne!(code, 0, "accepted malformed binary input");
-            assert!(String::from_utf8(error)
-                .unwrap()
-                .starts_with("invalid binary request:"));
+            assert!(
+                String::from_utf8(error)
+                    .unwrap()
+                    .starts_with("invalid binary request:")
+            );
         }
     }
 

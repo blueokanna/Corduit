@@ -1,6 +1,6 @@
 use crate::common::stream::BoxStream;
 use crate::engine::config::OutboundConfig;
-use crate::engine::connection_tracker::{global_tracker, TrackedConnection};
+use crate::engine::connection_tracker::{TrackedConnection, global_tracker};
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::protocol::wireguard::WireGuardTunnel;
@@ -110,10 +110,11 @@ impl WireguardOutbound {
     fn ensure_tunnel(&self) -> Result<()> {
         let mut tunnel_guard = self.tunnel.lock();
 
-        if let Some(tunnel) = tunnel_guard.as_ref() {
-            if tunnel.has_session() && !tunnel.is_session_expired() {
-                return Ok(());
-            }
+        if let Some(tunnel) = tunnel_guard.as_ref()
+            && tunnel.has_session()
+            && !tunnel.is_session_expired()
+        {
+            return Ok(());
         }
 
         let endpoint: SocketAddr = format!("{}:{}", self.server, self.port)
@@ -165,7 +166,7 @@ impl WireguardOutbound {
                     return Err(Error::network(format!(
                         "Failed to receive handshake response: {}",
                         e
-                    )))
+                    )));
                 }
             }
         };
@@ -237,7 +238,7 @@ impl WireguardOutbound {
             TargetAddr::Ip(addr) => match addr.ip() {
                 IpAddr::V4(ip) => ip,
                 IpAddr::V6(_) => {
-                    return Err(Error::protocol("IPv6 not supported for WireGuard UDP"))
+                    return Err(Error::protocol("IPv6 not supported for WireGuard UDP"));
                 }
             },
             TargetAddr::Domain(_, _) => {
@@ -301,7 +302,7 @@ impl WireguardOutbound {
                     return Err(Error::network(format!(
                         "Failed to receive UDP response: {}",
                         e
-                    )))
+                    )));
                 }
             };
 

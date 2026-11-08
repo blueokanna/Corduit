@@ -87,10 +87,10 @@ pub mod traffic_stats;
 mod tests;
 
 pub use config::*;
-pub use connection_tracker::global_tracker;
 pub use connection_tracker::ConnectionHandle;
 pub use connection_tracker::ConnectionTracker;
 pub use connection_tracker::TrackedConnection;
+pub use connection_tracker::global_tracker;
 pub use error::*;
 pub use health_check::*;
 pub use proxy::*;
@@ -253,10 +253,10 @@ impl Corduit {
 
     /// Get uptime in seconds
     pub fn uptime_secs(&self) -> u64 {
-        if let Ok(start_time) = self.start_time.read() {
-            if let Some(start) = *start_time {
-                return start.elapsed().as_secs();
-            }
+        if let Ok(start_time) = self.start_time.read()
+            && let Some(start) = *start_time
+        {
+            return start.elapsed().as_secs();
         }
         0
     }

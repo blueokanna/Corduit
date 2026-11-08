@@ -5,7 +5,7 @@
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use bytes::BytesMut;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
 /// Device configuration
 #[derive(Debug, Clone)]
@@ -180,21 +180,27 @@ impl VirtualDevice {
 #[cfg(target_os = "android")]
 pub mod android {
     use super::*;
-    use std::os::unix::io::RawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
     /// Android TUN device
     pub struct AndroidTunDevice {
-        fd: RawFd,
+        fd: OwnedFd,
         config: DeviceConfig,
         stats: Arc<DeviceStats>,
         running: Arc<AtomicBool>,
     }
 
     impl AndroidTunDevice {
-        /// Create from raw file descriptor
+        /// Take ownership of an Android TUN descriptor.
+        ///
+        /// # Safety
+        /// `fd` must be open, valid for TUN packet I/O and exclusively owned by
+        /// the caller. Ownership transfers here: the caller must not close it
+        /// or wrap it in another owner. Drop closes it exactly once.
         pub unsafe fn from_raw_fd(fd: RawFd, config: DeviceConfig) -> Self {
             Self {
-                fd,
+                // SAFETY: the caller transfers a valid, exclusively owned fd.
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
                 config,
                 stats: Arc::new(DeviceStats::default()),
                 running: Arc::new(AtomicBool::new(true)),
@@ -203,7 +209,7 @@ pub mod android {
 
         /// Get raw file descriptor
         pub fn fd(&self) -> RawFd {
-            self.fd
+            self.fd.as_raw_fd()
         }
 
         /// Get statistics
@@ -227,7 +233,7 @@ pub mod android {
             // The TUN fd is owned once by this device; read through it
             // directly instead of wrapping it in a fresh `File` per call
             // (which would be both wasteful and an unsafe ownership dance).
-            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n < 0 {
                 self.stats.record_read_error();
                 return Err(SolidTcpError::Io(std::io::Error::last_os_error()));
@@ -238,7 +244,7 @@ pub mod android {
         }
 
         fn write_packet(&self, data: &[u8]) -> Result<usize> {
-            let n = unsafe { libc::write(self.fd, data.as_ptr().cast(), data.len()) };
+            let n = unsafe { libc::write(self.fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
             if n < 0 {
                 self.stats.record_write_error();
                 return Err(SolidTcpError::Io(std::io::Error::last_os_error()));

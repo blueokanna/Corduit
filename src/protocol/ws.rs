@@ -40,7 +40,7 @@ use courierust::courierust_ws::{
     Event, FrameWriter, MaskSource, Role, Session, SessionConfig, StreamSink,
 };
 
-use crate::common::stream::{shutdown_lenient, SyncStream};
+use crate::common::stream::{SyncStream, shutdown_lenient};
 
 /// Largest single frame / message accepted from the peer (16 MiB). The
 /// wire length field is 64-bit, so an unbounded value would let a peer
@@ -273,7 +273,7 @@ impl<S: SyncStream> WebSocket<S> {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         "websocket: no complete message yet",
-                    ))
+                    ));
                 }
             }
         }
@@ -378,11 +378,10 @@ impl<S: SyncStream> SyncStream for WebSocket<S> {
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         if matches!(how, Shutdown::Write | Shutdown::Both)
             && !self.close_sent.swap(true, Ordering::AcqRel)
+            && let Ok(mut session) = self.session.lock()
         {
-            if let Ok(mut session) = self.session.lock() {
-                let _ = session.close(1000, "");
-                let _ = session.flush();
-            }
+            let _ = session.close(1000, "");
+            let _ = session.flush();
         }
         if matches!(how, Shutdown::Read) {
             return self.with_stream(|stream| shutdown_lenient(stream, Shutdown::Read));
@@ -559,7 +558,7 @@ fn read_handshake_response<S: SyncStream>(stream: &mut S) -> io::Result<Vec<u8>>
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "websocket: the peer closed during the handshake",
-                ))
+                ));
             }
             Ok(_) => {
                 head.push(byte[0]);
@@ -645,10 +644,10 @@ mod tests {
             if line == "\r\n" {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("sec-websocket-key") {
-                    key = value.trim().to_string();
-                }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("sec-websocket-key")
+            {
+                key = value.trim().to_string();
             }
         }
         let accept = accept_key(&key).unwrap();
@@ -681,7 +680,7 @@ mod tests {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    continue
+                    continue;
                 }
                 Err(_) => return,
             }
@@ -719,7 +718,7 @@ mod tests {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    continue
+                    continue;
                 }
                 Err(e) => panic!("read failed: {e}"),
             }

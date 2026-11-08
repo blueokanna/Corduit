@@ -1,6 +1,6 @@
 use crate::engine::config::{OutboundConfig, OutboundType};
 use crate::engine::error::{Error, Result};
-use crate::engine::outbound::{build_outbound_proxy, OutboundProxy};
+use crate::engine::outbound::{OutboundProxy, build_outbound_proxy};
 use nextjson::{NsonDeserialize, NsonSerialize};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -194,12 +194,11 @@ impl ProxyProvider {
             .as_ref()
             .ok_or_else(|| Error::config("HTTP proxy provider requires 'url' field"))?;
 
-        if let Some(path) = &self.config.path {
-            if Path::new(path).exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    return Ok(content);
-                }
-            }
+        if let Some(path) = &self.config.path
+            && Path::new(path).exists()
+            && let Ok(content) = std::fs::read_to_string(path)
+        {
+            return Ok(content);
         }
 
         let client = crate::common::HttpClient::new().with_timeout(Duration::from_secs(30));
@@ -235,10 +234,10 @@ impl ProxyProvider {
             proxies: Option<Vec<OutboundConfig>>,
         }
 
-        if let Ok(yaml_content) = nextjson::from_str::<ProxyFile>(content) {
-            if let Some(proxies) = yaml_content.proxies {
-                return Ok(proxies);
-            }
+        if let Ok(yaml_content) = nextjson::from_str::<ProxyFile>(content)
+            && let Some(proxies) = yaml_content.proxies
+        {
+            return Ok(proxies);
         }
 
         if let Ok(proxies) = nextjson::from_str::<Vec<OutboundConfig>>(content) {

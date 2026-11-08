@@ -110,18 +110,20 @@ mod x86 {
     /// [`available`] must have returned `true` on this CPU.
     #[target_feature(enable = "pclmulqdq")]
     pub unsafe fn clmul64(a: u64, b: u64) -> u128 {
-        // `_mm_set_epi64x` rather than the x86_64-only `_mm_cvtsi64_si128`:
-        // one source compiles (and emits the same `movq`) on both x86 widths.
-        let product = _mm_clmulepi64_si128(
-            _mm_set_epi64x(0, a as i64),
-            _mm_set_epi64x(0, b as i64),
-            0x00,
-        );
-        // The lane pair is the full product: low half in lane 0, high half in
-        // lane 1. Reading it back as little-endian `u128` gives exactly that.
-        let mut out = [0u8; 16];
-        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, product);
-        u128::from_le_bytes(out)
+        unsafe {
+            // `_mm_set_epi64x` rather than the x86_64-only `_mm_cvtsi64_si128`:
+            // one source compiles (and emits the same `movq`) on both x86 widths.
+            let product = _mm_clmulepi64_si128(
+                _mm_set_epi64x(0, a as i64),
+                _mm_set_epi64x(0, b as i64),
+                0x00,
+            );
+            // The lane pair is the full product: low half in lane 0, high half in
+            // lane 1. Reading it back as little-endian `u128` gives exactly that.
+            let mut out = [0u8; 16];
+            _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, product);
+            u128::from_le_bytes(out)
+        }
     }
 }
 
@@ -175,7 +177,8 @@ mod arm {
     /// # Safety
     /// [`available`] must have returned `true` on this CPU.
     pub unsafe fn clmul64(a: u64, b: u64) -> u128 {
-        vmull_p64(a, b)
+        // SAFETY: the caller checked PMULL support; NEON is baseline on AArch64.
+        unsafe { vmull_p64(a, b) }
     }
 }
 
@@ -211,7 +214,7 @@ pub fn available() -> bool {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 unsafe fn clmul64(a: u64, b: u64) -> u128 {
-    back_end::clmul64(a, b)
+    unsafe { back_end::clmul64(a, b) }
 }
 
 /// Unreachable stand-in for architectures without a back end: [`prepare`]
@@ -295,28 +298,30 @@ fn lane_sl(v: u128, n: u32) -> u128 {
 /// The CPU must implement the carry-less multiply instructions.
 #[inline]
 unsafe fn dot(x: u128, h: u128) -> u128 {
-    let (x0, x1) = (x as u64, (x >> 64) as u64);
-    let (h0, h1) = (h as u64, (h >> 64) as u64);
+    unsafe {
+        let (x0, x1) = (x as u64, (x >> 64) as u64);
+        let (h0, h1) = (h as u64, (h >> 64) as u64);
 
-    // Karatsuba: three 64×64 products cover the 128×128 one.
-    let t0 = clmul64(x0, h0);
-    let t1 = clmul64(x1, h1);
-    let t2 = clmul64(x0 ^ x1, h0 ^ h1) ^ t0 ^ t1;
+        // Karatsuba: three 64×64 products cover the 128×128 one.
+        let t0 = clmul64(x0, h0);
+        let t1 = clmul64(x1, h1);
+        let t2 = clmul64(x0 ^ x1, h0 ^ h1) ^ t0 ^ t1;
 
-    let v0 = t0;
-    let v1 = (t0 >> 64) ^ t2;
-    let v2 = t1 ^ (t2 >> 64);
-    let v3 = t1 >> 64;
+        let v0 = t0;
+        let v1 = (t0 >> 64) ^ t2;
+        let v2 = t1 ^ (t2 >> 64);
+        let v3 = t1 >> 64;
 
-    // Reduction: fold the high half back in with the shifts POLYVAL's
-    // polynomial was chosen for (57..63 bits, twice).
-    let v2 = v2 ^ v0 ^ lane_sr(v0, 1) ^ lane_sr(v0, 2) ^ lane_sr(v0, 7);
-    let v1 = v1 ^ lane_sl(v0, 63) ^ lane_sl(v0, 62) ^ lane_sl(v0, 57);
-    let v3 = v3 ^ v1 ^ lane_sr(v1, 1) ^ lane_sr(v1, 2) ^ lane_sr(v1, 7);
-    let v2 = v2 ^ lane_sl(v1, 63) ^ lane_sl(v1, 62) ^ lane_sl(v1, 57);
+        // Reduction: fold the high half back in with the shifts POLYVAL's
+        // polynomial was chosen for (57..63 bits, twice).
+        let v2 = v2 ^ v0 ^ lane_sr(v0, 1) ^ lane_sr(v0, 2) ^ lane_sr(v0, 7);
+        let v1 = v1 ^ lane_sl(v0, 63) ^ lane_sl(v0, 62) ^ lane_sl(v0, 57);
+        let v3 = v3 ^ v1 ^ lane_sr(v1, 1) ^ lane_sr(v1, 2) ^ lane_sr(v1, 7);
+        let v2 = v2 ^ lane_sl(v1, 63) ^ lane_sl(v1, 62) ^ lane_sl(v1, 57);
 
-    let low_lane = 0xffff_ffff_ffff_ffffu128;
-    (v2 & low_lane) | ((v3 & low_lane) << 64)
+        let low_lane = 0xffff_ffff_ffff_ffffu128;
+        (v2 & low_lane) | ((v3 & low_lane) << 64)
+    }
 }
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets --all-features
 
       - name: Test
         run: cargo test --workspace
@@ -48,22 +48,34 @@ jobs:
 
   # ---- MSRV job: the declared rust-version must really compile --------------
   msrv:
-    name: MSRV 1.78 (ubuntu)
-    runs-on: ubuntu-latest
+    name: MSRV 1.88 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.78
-        uses: dtolnay/rust-toolchain@1.78.0
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-linux-android
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Check (MSRV)
-        run: cargo check --workspace --all-targets
+        run: cargo +1.88.0 check --locked --workspace --all-targets --all-features
 
       - name: Test (MSRV)
-        run: cargo test --workspace
+        run: cargo +1.88.0 test --locked --workspace --all-features
+
+      - name: Check no_std (MSRV)
+        run: cargo +1.88.0 check --locked --no-default-features
+
+      - name: Check Android (MSRV)
+        run: cargo +1.88.0 check --locked --all-features --target aarch64-linux-android
 
   # ---- Android: cross-check via `cross` (handles the NDK in Docker) --------
   android:
@@ -122,6 +134,7 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.97.0'
           components: clippy, rustfmt
 
       - name: Cache cargo

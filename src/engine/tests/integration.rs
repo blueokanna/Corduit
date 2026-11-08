@@ -5,10 +5,10 @@
 //! handshake, routing, DIRECT outbound and the relay (one copy thread plus the
 //! connection's own thread) — over real sockets, no mocks.
 
+use crate::engine::Corduit;
 use crate::engine::config::{
     Config, GeneralConfig, InboundConfig, InboundType, LogLevel, OutboundConfig, OutboundType,
 };
-use crate::engine::Corduit;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;

@@ -260,6 +260,7 @@ pub fn dispatch(method: &str, args: &nextjson::Value) -> HandlerResult {
             let id = args.string("connection_id")?;
             call(api::close_connection(id))
         }
+        "clear_logs" => call(api::clear_logs()),
         "get_logs" => {
             let lines = args.opt_u32("lines")?;
             call(api::get_logs(lines))
@@ -471,6 +472,7 @@ pub const CORDUIT_METHODS: &[&str] = &[
     "get_connections",
     "close_connection",
     "get_logs",
+    "clear_logs",
     "set_log_level",
     "get_system_info",
     "get_version",

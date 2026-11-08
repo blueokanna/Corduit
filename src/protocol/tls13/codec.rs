@@ -111,20 +111,12 @@ pub(crate) fn is_supported_suite(suite: u16) -> bool {
 
 /// Hash length of a TLS 1.3 cipher suite (32 for SHA-256, 48 for SHA-384).
 pub(crate) fn suite_hash_len(suite: u16) -> usize {
-    if suite == SUITE_AES_256 {
-        48
-    } else {
-        32
-    }
+    if suite == SUITE_AES_256 { 48 } else { 32 }
 }
 
 /// Traffic key length of a TLS 1.3 cipher suite.
 pub(crate) fn suite_key_len(suite: u16) -> usize {
-    if suite == SUITE_AES_128 {
-        16
-    } else {
-        32
-    }
+    if suite == SUITE_AES_128 { 16 } else { 32 }
 }
 
 // ---------------------------------------------------------------------------

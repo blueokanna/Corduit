@@ -41,7 +41,7 @@ pub enum HexDecodeError {
 
 /// Decode a hex string (odd length or invalid digits rejected).
 pub fn hex_decode(input: &[u8]) -> Result<alloc::vec::Vec<u8>, HexDecodeError> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err(HexDecodeError::OddLength);
     }
     let mut out = alloc::vec::Vec::with_capacity(input.len() / 2);
@@ -80,7 +80,7 @@ fn decode_normalised(input: &str, url: bool) -> Option<alloc::vec::Vec<u8>> {
     if padding > 0 {
         // Padding, when present, must be the tail of a 4-character quantum:
         // "Zg==" is canonical, "Zg=" and "Zm9vYmFy=" are not.
-        if input.len() % 4 != 0 || padding != 4 - body.len() % 4 {
+        if !input.len().is_multiple_of(4) || padding != 4 - body.len() % 4 {
             return None;
         }
     }
@@ -101,7 +101,7 @@ fn decode_normalised(input: &str, url: bool) -> Option<alloc::vec::Vec<u8>> {
         };
         text.push(mapped);
     }
-    while text.len() % 4 != 0 {
+    while !text.len().is_multiple_of(4) {
         text.push('=');
     }
     courierust::courierust_crypto::base64::decode(text.as_bytes()).ok()

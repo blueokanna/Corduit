@@ -130,13 +130,13 @@ impl QuicRecvStream {
         deadline: Option<std::time::Instant>,
     ) -> io::Result<usize> {
         loop {
-            if let Some(deadline) = deadline {
-                if std::time::Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "QUIC stream read timed out",
-                    ));
-                }
+            if let Some(deadline) = deadline
+                && std::time::Instant::now() >= deadline
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "QUIC stream read timed out",
+                ));
             }
             let mut st = self.conn.lock();
             if let Some(e) = &st.closed {
@@ -149,7 +149,7 @@ impl QuicRecvStream {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
                         format!("QUIC stream reset by peer (code {code})"),
-                    ))
+                    ));
                 }
                 RecvOutcome::WouldBlock => {
                     let notify = self.conn.stream_recv_notify(&st, self.stream_id);

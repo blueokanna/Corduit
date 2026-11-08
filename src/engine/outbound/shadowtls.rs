@@ -78,7 +78,7 @@ use courierust::courierust_tls::crypto::rng::fill_random;
 use tracing::debug;
 
 use crate::common::socket::connect_host;
-use crate::common::stream::{is_benign_shutdown_error, BoxStream, SyncStream};
+use crate::common::stream::{BoxStream, SyncStream, is_benign_shutdown_error};
 use crate::crypto::hash::{Sha1, Sha256};
 use crate::crypto::mac::Hmac;
 use crate::crypto::util::ct_eq;
@@ -87,7 +87,7 @@ use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
 use crate::protocol::tls13::{
-    connect, fingerprint::Fingerprint, ClientHelloDraft, ClientHelloHook, Tls13ClientConfig,
+    ClientHelloDraft, ClientHelloHook, Tls13ClientConfig, connect, fingerprint::Fingerprint,
 };
 
 /// TCP connect budget.
@@ -329,7 +329,7 @@ impl RecordReader {
                 // A read timeout is how the relay stays cancellable; the bytes
                 // of an unfinished record stay here for the next call.
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    return Err(e)
+                    return Err(e);
                 }
                 Err(e) => return Err(e),
             }
@@ -541,7 +541,7 @@ impl ShadowTlsStream {
                     format!(
                         "ShadowTLS: unexpected TLS record type 0x{other:02x} in the data phase"
                     ),
-                ))
+                ));
             }
         }
         if record.len() < FRAME_HEADER {
@@ -994,7 +994,7 @@ impl OutboundProxy for ShadowTlsOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::tls13::fingerprint::{build_client_hello, ClientHelloSpec};
+    use crate::protocol::tls13::fingerprint::{ClientHelloSpec, build_client_hello};
     use std::net::TcpListener;
 
     const PASSWORD: &[u8] = b"a-shadowtls-password";
@@ -1132,11 +1132,13 @@ mod tests {
             key_share_public: &[0x7f; 32],
             raw: &mut raw,
         };
-        assert!(SessionIdSigner {
-            password: PASSWORD.to_vec()
-        }
-        .on_client_hello(&mut draft)
-        .is_err());
+        assert!(
+            SessionIdSigner {
+                password: PASSWORD.to_vec()
+            }
+            .on_client_hello(&mut draft)
+            .is_err()
+        );
     }
 
     /// During the handshake the server's records are wrapped: the tag covers the
@@ -1385,30 +1387,38 @@ mod tests {
         };
         let string = |s: &str| nextjson::Value::String(s.to_string());
 
-        assert!(build(&[("password", string("x"))])
+        assert!(
+            build(&[("password", string("x"))])
+                .unwrap_err()
+                .to_string()
+                .contains("sni")
+        );
+        assert!(
+            build(&[("sni", string("www.bing.com"))])
+                .unwrap_err()
+                .to_string()
+                .contains("password")
+        );
+        assert!(
+            build(&[
+                ("password", string("x")),
+                ("sni", string("www.bing.com")),
+                ("version", string("2"))
+            ])
             .unwrap_err()
             .to_string()
-            .contains("sni"));
-        assert!(build(&[("sni", string("www.bing.com"))])
+            .contains("Version 3 only")
+        );
+        assert!(
+            build(&[
+                ("password", string("x")),
+                ("sni", string("www.bing.com")),
+                ("insecure", string("maybe"))
+            ])
             .unwrap_err()
             .to_string()
-            .contains("password"));
-        assert!(build(&[
-            ("password", string("x")),
-            ("sni", string("www.bing.com")),
-            ("version", string("2"))
-        ])
-        .unwrap_err()
-        .to_string()
-        .contains("Version 3 only"));
-        assert!(build(&[
-            ("password", string("x")),
-            ("sni", string("www.bing.com")),
-            ("insecure", string("maybe"))
-        ])
-        .unwrap_err()
-        .to_string()
-        .contains("boolean"));
+            .contains("boolean")
+        );
 
         let outbound = build(&[
             ("password", string("x")),

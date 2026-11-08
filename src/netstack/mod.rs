@@ -72,25 +72,25 @@ pub use vpn::{TunPacketProcessor, TunTrafficStats};
 // engine itself, so its vocabulary is re-exported rather than mirrored; the
 // `dns` modules below it are the adapter from a profile to a resolver.
 pub use crate::dns::{
-    bogon, engine_resolver, upstream, HeaderFlags, Message, Name, Question, RData, Rcode, Record,
-    RrClass, RrType, Upstream, UpstreamProtocol,
+    HeaderFlags, Message, Name, Question, RData, Rcode, Record, RrClass, RrType, Upstream,
+    UpstreamProtocol, bogon, engine_resolver, upstream,
 };
 
 // Android-specific exports
 #[cfg(target_os = "android")]
 pub use tun::{
-    clear_android_vpn_fd, get_android_proxy_mode, get_android_vpn_fd, set_android_proxy_mode,
-    set_android_vpn_fd, ANDROID_PROXY_MODE, ANDROID_VPN_FD,
+    ANDROID_PROXY_MODE, ANDROID_VPN_FD, clear_android_vpn_fd, get_android_proxy_mode,
+    get_android_vpn_fd, set_android_proxy_mode, set_android_vpn_fd,
 };
 
 #[cfg(target_env = "ohos")]
 pub use tun::{
-    clear_ohos_vpn_fd, get_ohos_vpn_fd, is_ohos_process_protected, set_ohos_process_protected,
-    set_ohos_vpn_fd, OHOS_PROCESS_PROTECTED, OHOS_VPN_FD,
+    OHOS_PROCESS_PROTECTED, OHOS_VPN_FD, clear_ohos_vpn_fd, get_ohos_vpn_fd,
+    is_ohos_process_protected, set_ohos_process_protected, set_ohos_vpn_fd,
 };
 
 #[cfg(target_os = "ios")]
-pub use tun::{clear_ios_vpn_fd, get_ios_vpn_fd, set_ios_vpn_fd, IOS_VPN_FD};
+pub use tun::{IOS_VPN_FD, clear_ios_vpn_fd, get_ios_vpn_fd, set_ios_vpn_fd};
 
 #[cfg(target_os = "android")]
 pub use android_vpn::{AndroidVpnProcessor, VpnTrafficStats};
@@ -103,11 +103,11 @@ pub use solidtcp::{
 // Windows-specific exports
 #[cfg(windows)]
 pub use windows_vpn::{
-    get_windows_proxy_mode, set_windows_proxy_mode, WindowsVpnProcessor, WindowsVpnTrafficStats,
+    WindowsVpnProcessor, WindowsVpnTrafficStats, get_windows_proxy_mode, set_windows_proxy_mode,
 };
 
 #[cfg(windows)]
-pub use windows_route::{flush_dns_cache, set_tun_dns, WindowsRouteManager};
+pub use windows_route::{WindowsRouteManager, flush_dns_cache, set_tun_dns};
 
 #[cfg(windows)]
 pub fn check_wintun_available() -> bool {

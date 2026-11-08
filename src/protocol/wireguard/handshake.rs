@@ -1,8 +1,8 @@
-use super::crypto::{
-    aead_decrypt, aead_encrypt, dh, hash, kdf1, kdf2, kdf3, mac, timestamp, CONSTRUCTION,
-    IDENTIFIER, LABEL_MAC1,
-};
 use super::WireGuardError;
+use super::crypto::{
+    CONSTRUCTION, IDENTIFIER, LABEL_MAC1, aead_decrypt, aead_encrypt, dh, hash, kdf1, kdf2, kdf3,
+    mac, timestamp,
+};
 
 pub const MSG_TYPE_HANDSHAKE_INIT: u8 = 1;
 pub const MSG_TYPE_HANDSHAKE_RESP: u8 = 2;

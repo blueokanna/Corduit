@@ -2,11 +2,11 @@ use crate::common::cancel::CancellationToken;
 use crate::netstack::error::{NetStackError, Result};
 use bytes::BytesMut;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 

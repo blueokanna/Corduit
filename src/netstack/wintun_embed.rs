@@ -31,11 +31,11 @@ const WINTUN_DOWNLOAD_URL: &str = "https://www.wintun.net/builds/wintun-0.14.1.z
 #[cfg(windows)]
 fn wintun_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("wintun.dll"));
-            candidates.push(exe_dir.join("wintun").join("wintun.dll"));
-        }
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        candidates.push(exe_dir.join("wintun.dll"));
+        candidates.push(exe_dir.join("wintun").join("wintun.dll"));
     }
     candidates
 }
@@ -112,8 +112,6 @@ pub fn ensure_wintun_available() -> Result<PathBuf> {
 /// writable directory), not a reason to fall back to a user-writable one.
 #[cfg(windows)]
 pub fn download_wintun_dll() -> Result<PathBuf> {
-    use std::io::Write;
-
     let dll_path = get_wintun_dll_path()?;
 
     if dll_path.exists() {
@@ -135,14 +133,6 @@ pub fn download_wintun_dll() -> Result<PathBuf> {
         )));
     }
 
-    let bytes = response.bytes().to_vec();
-
-    info!("Downloaded {} bytes, extracting...", bytes.len());
-
-    let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| NetStackError::TunError(format!("Failed to open zip: {}", e)))?;
-
     #[cfg(target_arch = "x86_64")]
     let dll_name = "wintun/bin/amd64/wintun.dll";
     #[cfg(target_arch = "aarch64")]
@@ -150,19 +140,8 @@ pub fn download_wintun_dll() -> Result<PathBuf> {
     #[cfg(target_arch = "x86")]
     let dll_name = "wintun/bin/x86/wintun.dll";
 
-    let mut dll_file = archive
-        .by_name(dll_name)
-        .map_err(|e| NetStackError::TunError(format!("Failed to find {}: {}", dll_name, e)))?;
-
-    let mut dll_bytes = Vec::new();
-    std::io::Read::read_to_end(&mut dll_file, &mut dll_bytes)
-        .map_err(|e| NetStackError::TunError(format!("Failed to read DLL: {}", e)))?;
-
-    let mut output_file = std::fs::File::create(&dll_path)
-        .map_err(|e| NetStackError::TunError(format!("Failed to create file: {}", e)))?;
-    output_file
-        .write_all(&dll_bytes)
-        .map_err(|e| NetStackError::TunError(format!("Failed to write file: {}", e)))?;
+    let dll_bytes = read_archived_dll(response.bytes(), dll_name)?;
+    publish_dll(&dll_path, &dll_bytes)?;
 
     info!(
         "wintun.dll extracted to {:?} ({} bytes)",
@@ -170,6 +149,60 @@ pub fn download_wintun_dll() -> Result<PathBuf> {
         dll_bytes.len()
     );
     Ok(dll_path)
+}
+
+#[cfg(windows)]
+const MAX_DLL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read one fixed archive member; never create paths or links from ZIP metadata.
+#[cfg(windows)]
+fn read_archived_dll(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(NetStackError::TunError(
+            "Wintun archive exceeds 8 MiB".into(),
+        ));
+    }
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| NetStackError::TunError(format!("Invalid Wintun archive: {e}")))?;
+    let file = archive
+        .by_name(name)
+        .map_err(|e| NetStackError::TunError(format!("Missing Wintun DLL {name}: {e}")))?;
+    let expected = file.size();
+    if file.is_dir() || file.is_symlink() || expected == 0 || expected > MAX_DLL_BYTES {
+        return Err(NetStackError::TunError(
+            "Invalid Wintun DLL entry type or size".into(),
+        ));
+    }
+    let mut dll = Vec::with_capacity(expected as usize);
+    file.take(MAX_DLL_BYTES + 1)
+        .read_to_end(&mut dll)
+        .map_err(|e| NetStackError::TunError(format!("Failed to decode Wintun DLL: {e}")))?;
+    if dll.len() as u64 != expected || dll.len() as u64 > MAX_DLL_BYTES {
+        return Err(NetStackError::TunError(
+            "Wintun DLL size does not match its archive entry".into(),
+        ));
+    }
+    Ok(dll)
+}
+
+/// Publish only a fully written file. Never truncate an existing installation.
+#[cfg(windows)]
+fn publish_dll(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| NetStackError::TunError("DLL path has no parent".into()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| NetStackError::TunError(format!("Cannot stage Wintun DLL: {e}")))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|e| NetStackError::TunError(format!("Cannot write Wintun DLL: {e}")))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|e| NetStackError::TunError(format!("Cannot publish Wintun DLL: {}", e.error)))?;
+    Ok(())
 }
 
 /// Load the wintun library, downloading if necessary
@@ -248,5 +281,50 @@ mod tests {
         let path = get_wintun_dll_path();
         assert!(path.is_ok());
         assert!(path.unwrap().ends_with("wintun.dll"));
+    }
+    #[cfg(windows)]
+    fn dll_archive(symlink: bool) -> Vec<u8> {
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        if symlink {
+            archive
+                .add_symlink("wintun/bin/amd64/wintun.dll", "outside.dll", options)
+                .unwrap();
+        } else {
+            archive
+                .start_file("wintun/bin/amd64/wintun.dll", options)
+                .unwrap();
+            archive.write_all(b"bounded archive fixture").unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn dll_archive_rejects_links_missing_members_and_hostile_sizes() {
+        let name = "wintun/bin/amd64/wintun.dll";
+        assert_eq!(
+            read_archived_dll(&dll_archive(false), name).unwrap(),
+            b"bounded archive fixture"
+        );
+        assert!(read_archived_dll(&dll_archive(true), name).is_err());
+        assert!(read_archived_dll(&dll_archive(false), "wrong-architecture.dll").is_err());
+        let mut hostile = dll_archive(false);
+        let central = hostile.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+        hostile[central + 24..central + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(read_archived_dll(&hostile, name).is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn dll_publication_preserves_existing_files_and_cleans_staging_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("wintun.dll");
+        publish_dll(&target, b"first").unwrap();
+        assert!(publish_dll(&target, b"replacement").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

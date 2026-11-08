@@ -6,12 +6,12 @@ use crate::netstack::solidtcp::dns::{ClientDnsSettings, DnsHandler, DnsVerdict, 
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use crate::netstack::solidtcp::nat::{NatConfig, NatTable};
 use crate::netstack::solidtcp::packet::{
-    build_tcp, build_udp, parse_packet, ParsedPacket, TcpFlags, TcpInfo, TransportInfo,
-    DEFAULT_MSS_V4, DEFAULT_MSS_V6,
+    DEFAULT_MSS_V4, DEFAULT_MSS_V6, ParsedPacket, TcpFlags, TcpInfo, TransportInfo, build_tcp,
+    build_udp, parse_packet,
 };
 use crate::netstack::solidtcp::stats::StackStats;
 use crate::netstack::solidtcp::tcp::{
-    TcpAction, TcpConfig, TcpConnection, TcpManager, MAX_RECV_WINDOW,
+    MAX_RECV_WINDOW, TcpAction, TcpConfig, TcpConnection, TcpManager,
 };
 use crate::netstack::solidtcp::udp::{UdpConfig, UdpManager};
 use bytes::BytesMut;
@@ -23,7 +23,7 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, UdpSocket as StdUdpSocket,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -264,7 +264,10 @@ fn is_peer_gone(error: &io::Error) -> bool {
 use std::os::unix::io::AsRawFd;
 
 #[cfg(any(target_os = "android", target_env = "ohos"))]
-static PROTECT_CALLBACK: parking_lot::RwLock<Option<Box<dyn Fn(i32) -> bool + Send + Sync>>> =
+type ProtectCallback = Box<dyn Fn(i32) -> bool + Send + Sync>;
+
+#[cfg(any(target_os = "android", target_env = "ohos"))]
+static PROTECT_CALLBACK: parking_lot::RwLock<Option<ProtectCallback>> =
     parking_lot::RwLock::new(None);
 
 #[cfg(any(target_os = "android", target_env = "ohos"))]
@@ -647,11 +650,6 @@ impl SolidStack {
         tcp_info: &TcpInfo,
         _parsed: &ParsedPacket,
     ) -> Result<()> {
-        // A retransmitted SYN for a flow that already exists must not acquire
-        // a second budget slot or dial a second upstream connection: a client
-        // on a lossy path retransmits routinely, and duplicate SYNs would
-        // otherwise multiply dials until the whole tunnel budget is spent and
-        // every other flow is reset. Re-answer from the tracked state instead.
         if let Some(conn) = self.tcp_manager.get_connection(src_addr, dst_addr) {
             let (our_seq, their_seq, mss, window) = {
                 let conn = conn.read();
@@ -679,7 +677,15 @@ impl SolidStack {
             IpAddr::V4(ip) if self.fake_ip_pool.is_fake_ip(ip) => Some(ip),
             _ => None,
         };
-        let domain = fake_ip.and_then(|ip| self.fake_ip_pool.lookup(ip));
+        let domain = fake_ip
+            .and_then(|ip| self.fake_ip_pool.lookup(ip))
+            .or_else(|| {
+                if fake_ip.is_none() {
+                    self.dns_handler.observed_domain(dst_addr.ip())
+                } else {
+                    None
+                }
+            });
 
         debug!(
             "TCP SYN: {} -> {} (domain: {:?}, is_fake_ip: {})",
@@ -711,9 +717,6 @@ impl SolidStack {
             return Ok(());
         }
 
-        // The budget is taken before any state is created: a tunnel that
-        // cannot be served is reset right here, so the client fails fast and
-        // no half-open connection is left behind to time out.
         let Some(slot) = ProxySlot::acquire() else {
             warn!(
                 "TUN connection budget exhausted ({MAX_TUN_PROXY_CONNECTIONS} live); \
@@ -771,8 +774,6 @@ impl SolidStack {
         if let Err(e) = std::thread::Builder::new()
             .name("tun-proxy-tcp".into())
             .spawn(move || {
-                // The slot travels with the connection: it is released when
-                // the reader thread that owns the flow ends.
                 if let Err(e) =
                     stack.establish_proxy_connection(src_addr, dst_addr, domain, conn_clone, slot)
                 {
@@ -814,10 +815,10 @@ impl SolidStack {
 
         {
             let table = self.udp_associations.lock();
-            if let Some(existing) = table.get(&key) {
-                if existing.is_alive() {
-                    return Ok(Arc::clone(existing));
-                }
+            if let Some(existing) = table.get(&key)
+                && existing.is_alive()
+            {
+                return Ok(Arc::clone(existing));
             }
         }
 
@@ -829,12 +830,10 @@ impl SolidStack {
         let mut table = self.udp_associations.lock();
         let replaced = table.insert(key, Arc::clone(&association));
         let opened = self.udp_associations_opened.fetch_add(1, Ordering::Relaxed);
-        if opened % UDP_ASSOCIATION_SWEEP_EVERY == 0 {
+        if opened.is_multiple_of(UDP_ASSOCIATION_SWEEP_EVERY) {
             table.retain(|_, entry| entry.is_alive());
         }
         drop(table);
-        // Dropping the association the sweep just replaced closes its control
-        // connection, which is what tells the server to release the relay.
         drop(replaced);
 
         Ok(association)
@@ -1070,7 +1069,7 @@ impl SolidStack {
                     }
                 }
             }
-            _ => None,
+            _ => self.dns_handler.observed_domain(dst_addr.ip()),
         };
 
         debug!(
@@ -1477,6 +1476,15 @@ impl StackProxy {
 
         debug!("SOCKS5 handshake complete: {} -> {}", src_addr, dst_addr);
 
+        if !conn.write().set_proxy_socket(
+            stream
+                .try_clone()
+                .map_err(|e| SolidTcpError::ProxyError(format!("Clone shutdown handle: {e}")))?,
+        ) {
+            return Err(SolidTcpError::ProxyError(
+                "Flow closed during proxy handshake".into(),
+            ));
+        }
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         // The writer owns this handle: it releases each chunk back to the
         // connection's receive window as it drains, and clears the liveness
@@ -1501,9 +1509,10 @@ impl StackProxy {
         let rx = rx;
         std::thread::Builder::new()
             .name("tun-proxy-write".into())
+            .stack_size(256 * 1024)
             .spawn(move || {
                 let mut first_data = true;
-                let mut write_buffer = Vec::with_capacity(65536);
+                let mut write_buffer = Vec::new();
                 // Releases bytes back to the receive window as they reach the
                 // proxy, and gives back anything still held if this thread
                 // leaves early.
@@ -1528,8 +1537,6 @@ impl StackProxy {
                                             "WebSocket upgrade detected for {} -> {}",
                                             src_clone, dst_clone
                                         );
-                                        // The flow may already be gone; the
-                                        // flag matters only while it is not.
                                         if let Some(conn) = conn_for_ws.upgrade() {
                                             conn.write().set_websocket(true);
                                         }
@@ -1541,7 +1548,8 @@ impl StackProxy {
                             write_buffer.extend_from_slice(&data);
 
                             let mut has_pending = false;
-                            while let Ok(more) = rx.try_recv() {
+                            while write_buffer.len() < 16 * 1024 {
+                                let Ok(more) = rx.try_recv() else { break };
                                 flow.take(more.len());
                                 write_buffer.extend_from_slice(&more);
                                 has_pending = true;
@@ -1561,8 +1569,6 @@ impl StackProxy {
                                     }
                                     break;
                                 }
-                                // On the wire now, so no longer occupying the
-                                // receive window.
                                 flow.written();
                                 write_buffer.clear();
                             }
@@ -1606,11 +1612,12 @@ impl StackProxy {
         let read_stream = stream.clone();
         std::thread::Builder::new()
             .name("tun-proxy-read".into())
+            .stack_size(256 * 1024)
             .spawn(move || {
                 // Owns the connection's slot in the tunnel budget: released
                 // when this flow's reader ends, however it ends.
                 let _slot = slot;
-                let mut buf = vec![0u8; 65536];
+                let mut buf = vec![0u8; 16 * 1024];
 
                 loop {
                     if !running.load(Ordering::Relaxed) {
@@ -1625,18 +1632,16 @@ impl StackProxy {
                         Ok(n) => {
                             let send_info = {
                                 let mut conn_guard = conn_clone.write();
+                                if conn_guard.is_closed() {
+                                    break;
+                                }
                                 let base_seq = conn_guard.snd_nxt();
                                 let ack = conn_guard.rcv_nxt();
                                 let mss = conn_guard.mss() as usize;
-                                // The stack answers the client as the remote
-                                // server, so the roles swap here.
                                 let src_ip = dst_addr.ip();
                                 let dst_ip = src_addr.ip();
 
                                 conn_guard.advance_snd_nxt(n as u32);
-                                // The window rides on every segment we emit,
-                                // so a sender that is being throttled on the
-                                // uplink learns about it here too.
                                 let window = conn_guard.recv_window() as u16;
                                 (base_seq, ack, mss, window, src_ip, dst_ip)
                             };
@@ -1721,18 +1726,20 @@ impl StackProxy {
 
                 let fin_info = {
                     let conn_guard = conn_clone.read();
-                    (
-                        conn_guard.snd_nxt(),
-                        conn_guard.rcv_nxt(),
-                        conn_guard.recv_window() as u16,
-                        dst_addr.ip(),
-                        src_addr.ip(),
-                    )
+                    // shutdown() also ends a blocked read. A reset/expired
+                    // flow must not emit a fresh FIN for a possibly reused tuple.
+                    (!conn_guard.is_closed()).then(|| {
+                        (
+                            conn_guard.snd_nxt(),
+                            conn_guard.rcv_nxt(),
+                            conn_guard.recv_window() as u16,
+                            dst_addr.ip(),
+                            src_addr.ip(),
+                        )
+                    })
                 };
 
-                let (seq, ack, window, src_ip, dst_ip) = fin_info;
-
-                if let Some(ref tx) = tun_tx {
+                if let (Some((seq, ack, window, src_ip, dst_ip)), Some(tx)) = (fin_info, &tun_tx) {
                     match build_tcp(
                         src_ip,
                         dst_ip,
@@ -1754,7 +1761,8 @@ impl StackProxy {
                     }
                 }
 
-                tcp_manager.remove_connection(src_addr, dst_addr);
+                let key = conn_clone.read().key;
+                tcp_manager.remove_if_current(key, &conn_clone);
             })
             .map_err(|e| SolidTcpError::ProxyError(format!("Failed to spawn reader: {}", e)))?;
 
@@ -1884,7 +1892,6 @@ mod tests {
             .set_write_timeout(Some(Duration::from_millis(50)))
             .expect("write timeout");
 
-        // Far beyond any default send buffer, so the write has to stall.
         let payload = vec![0x5au8; 16 * 1024 * 1024];
         let expected = payload.len();
         let writer_thread =

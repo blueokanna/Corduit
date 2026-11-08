@@ -1087,10 +1087,10 @@ fn rule_type_name(spelling: &str) -> String {
 /// Split `"host:port"` into its parts, tolerating IPv6 in brackets and a
 /// missing port.
 fn split_host_port(addr: &str) -> (String, String) {
-    if let Some(rest) = addr.strip_prefix('[') {
-        if let Some((host, port)) = rest.split_once("]:") {
-            return (host.to_string(), port.to_string());
-        }
+    if let Some(rest) = addr.strip_prefix('[')
+        && let Some((host, port)) = rest.split_once("]:")
+    {
+        return (host.to_string(), port.to_string());
     }
     match addr.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => (host.to_string(), port.to_string()),

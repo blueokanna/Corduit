@@ -76,7 +76,7 @@
 
 use crate::common::stream::{BoxStream, SyncStream};
 use crate::crypto::aead::{Aead, Aes128Gcm};
-use crate::crypto::kdf::{argon2id, Argon2idParams};
+use crate::crypto::kdf::{Argon2idParams, argon2id};
 use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
@@ -211,13 +211,13 @@ impl SnellOutbound {
                 return Err(Error::config(
                     "Snell version 6 adds shaped records whose parameters this build does not \
                      reproduce; use version 5 against a v5/v6 server, or add the shaped mode",
-                ))
+                ));
             }
             other => {
                 return Err(Error::config(format!(
                     "Snell version {other} is not supported: versions before 4 derive their key \
                      differently (no Argon2id), and this build implements 4 and 5"
-                )))
+                )));
             }
         }
         let version = version as u8;
@@ -265,7 +265,7 @@ impl SnellOutbound {
             Some(other) => {
                 return Err(Error::config(format!(
                     "Unknown Snell obfs mode `{other}`; the reference defines `http` and `tls`"
-                )))
+                )));
             }
         };
 
@@ -666,7 +666,7 @@ fn read_or_eof(inner: &mut BoxStream, buf: &mut [u8]) -> std::io::Result<bool> {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "stream ended inside a Snell record",
-                ))
+                ));
             }
             n => filled += n,
         }

@@ -16,8 +16,8 @@
 
 use corduit::engine::routing::Router;
 use corduit::engine::{
-    get_runtime_proxy_mode, proxy_mode, set_runtime_proxy_mode, Config, GeneralConfig,
-    InboundConfig, InboundType, Mode, OutboundConfig, OutboundType, RuleConfig, RuleType,
+    Config, GeneralConfig, InboundConfig, InboundType, Mode, OutboundConfig, OutboundType,
+    RuleConfig, RuleType, get_runtime_proxy_mode, proxy_mode, set_runtime_proxy_mode,
 };
 use parking_lot::RwLock;
 use std::net::IpAddr;

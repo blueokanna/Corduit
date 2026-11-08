@@ -544,7 +544,7 @@ impl Side {
                             return Err(io::Error::new(
                                 io::ErrorKind::WriteZero,
                                 "relay write made no progress",
-                            ))
+                            ));
                         }
                         Ok(n) => written += n,
                         Err(e) => return Err(e),

@@ -7,7 +7,7 @@ wire protocol live in one crate, built without a third-party proxy core;
 
 [![Crates.io](https://img.shields.io/crates/v/corduit)](https://crates.io/crates/corduit)
 [![docs.rs](https://img.shields.io/docsrs/corduit)](https://docs.rs/corduit)
-[![MSRV](https://img.shields.io/badge/MSRV-1.78-blue)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
 
 - **中文说明** → [README.zh-CN.md](README.zh-CN.md)
 - **完整文档** → [Wiki](https://github.com/blueokanna/Corduit/wiki)（FFI / RPC / 方法参考）
@@ -373,7 +373,7 @@ curl -X POST http://127.0.0.1:8765/rpc \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.2.6"}
+# {"code":0,"data":"Corduit v0.3.0"}
 ```
 
 ## Configuration
@@ -431,12 +431,12 @@ CI runs the full check-and-test matrix on Linux, macOS and Windows, an
 `--all-features` job (which builds and tests the gated QUIC / TUIC / Hysteria
 code), a `no_std` core check, a `std`-only configuration that is both checked
 and tested, Android (aarch64 and x86_64) and iOS cross-checks, and an MSRV job
-that builds and tests on 1.78. The desktop jobs also run the loopback-only
+that builds and tests on 1.88. The desktop jobs also run the loopback-only
 examples, which drive the crate as an application, and build the docs with
 `--all-features`. `RUSTFLAGS` and `RUSTDOCFLAGS` are both `-D warnings`, so a
 warning and a broken intra-doc link both fail the build.
 
-MSRV: **Rust 1.78**. No HTTP/TLS/QUIC third-party library and no async runtime:
+MSRV: **Rust 1.88**, edition **2024**. No HTTP/TLS/QUIC third-party library and no async runtime:
 the network layer is courierust plus the in-tree codecs above, and concurrency
 is courierust's work-stealing pool plus `std::thread`.
 

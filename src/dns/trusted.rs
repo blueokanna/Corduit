@@ -161,10 +161,10 @@ fn resolve_cached(
     {
         let mut guard = ANSWER_CACHE.lock();
         if let Some(cache) = guard.as_mut() {
-            if let Some(entry) = cache.get(key) {
-                if Instant::now() < entry.expires {
-                    return Ok(entry.addresses.clone());
-                }
+            if let Some(entry) = cache.get(key)
+                && Instant::now() < entry.expires
+            {
+                return Ok(entry.addresses.clone());
             }
             cache.retain(|_, entry| Instant::now() < entry.expires);
         }
@@ -248,7 +248,7 @@ fn exchange(server: SocketAddr, name: &Name, rr_type: RrType) -> io::Result<Vec<
         _ => {
             return Err(io::Error::other(
                 "reply does not echo the question that was asked",
-            ))
+            ));
         }
     }
     if response.flags.tc {
@@ -362,10 +362,10 @@ mod tests {
                 let Ok(query) = Message::parse(&buf[..len]) else {
                     continue;
                 };
-                if let Some(response) = respond(&query) {
-                    if let Ok(bytes) = response.to_bytes() {
-                        let _ = server.send_to(&bytes, peer);
-                    }
+                if let Some(response) = respond(&query)
+                    && let Ok(bytes) = response.to_bytes()
+                {
+                    let _ = server.send_to(&bytes, peer);
                 }
             }
         });

@@ -455,12 +455,12 @@ mod tests {
 
     #[test]
     fn nist_gcm_case3_with_aad() {
-        // McGrew & Viega AES-128 GCM, test case 3 (exercises AAD + 3 blocks).
-        // Expected values cross-checked against the reference `aes-gcm` crate.
         let key = unhex("feffe9928665731c6d6a8f9467308308");
         let nonce = unhex("cafebabefacedbaddecaf888");
         let aad = unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
-        let pt = unhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39");
+        let pt = unhex(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+        );
         let cipher = AesGcm::new(&key).unwrap();
         let (ct, tag) = encrypt_vec(&cipher, &nonce, &aad, &pt);
         assert_eq!(

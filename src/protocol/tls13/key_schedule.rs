@@ -19,12 +19,12 @@
 //! followed by Expand. [`hkdf_expand`] therefore implements RFC 5869 §2.3
 //! directly.
 
-use super::codec::{suite_hash_len, suite_key_len, SUITE_AES_256};
+use super::codec::{SUITE_AES_256, suite_hash_len, suite_key_len};
 use super::{Result, Tls13Error};
+use crate::crypto::Digest;
 use crate::crypto::aead::{Aead, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305};
 use crate::crypto::hash::{Sha256, Sha384};
 use crate::crypto::mac::Hmac;
-use crate::crypto::Digest;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -202,7 +202,7 @@ impl TrafficKey {
             other => {
                 return Err(Tls13Error::Unsupported(alloc::format!(
                     "no traffic keys for cipher suite 0x{other:04x}"
-                )))
+                )));
             }
         };
         Ok((aead, iv))
@@ -384,7 +384,10 @@ mod tests {
     fn key_schedule_matches_rfc8448_simple_handshake() {
         fn hex(s: &str) -> Vec<u8> {
             let compact: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-            assert!(compact.len() % 2 == 0, "hex literals are byte-aligned");
+            assert!(
+                compact.len().is_multiple_of(2),
+                "hex literals are byte-aligned"
+            );
             compact
                 .chunks(2)
                 .map(|pair| {

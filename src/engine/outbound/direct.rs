@@ -183,10 +183,10 @@ impl DirectOutbound {
         target: &TargetAddr,
     ) -> Result<Arc<DirectUdpSession>> {
         let key = (Arc::as_ptr(sink) as usize, target.to_string());
-        if let Some(existing) = self.udp_sessions.lock().get(&key) {
-            if existing.alive.load(Ordering::Acquire) {
-                return Ok(Arc::clone(existing));
-            }
+        if let Some(existing) = self.udp_sessions.lock().get(&key)
+            && existing.alive.load(Ordering::Acquire)
+        {
+            return Ok(Arc::clone(existing));
         }
 
         if self.live_udp_sessions.load(Ordering::Acquire) >= MAX_UDP_SESSIONS {

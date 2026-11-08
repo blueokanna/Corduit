@@ -62,10 +62,12 @@ mod tests {
             r#"{"values":{"a":["resolver"],"z":["quote\"","\n"]}}"#
         );
         assert_eq!(nextjson::from_str::<Fixture>(&encoded).unwrap(), fixture);
-        assert!(nextjson::from_str::<Fixture>("{}")
-            .unwrap()
-            .values
-            .is_empty());
+        assert!(
+            nextjson::from_str::<Fixture>("{}")
+                .unwrap()
+                .values
+                .is_empty()
+        );
         assert!(nextjson::from_str::<Fixture>(r#"{"values":{"a":12}}"#).is_err());
     }
 }

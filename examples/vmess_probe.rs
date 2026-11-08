@@ -234,7 +234,7 @@ fn probe_udp_via_socks() -> bool {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                continue
+                continue;
             }
             Err(e) => {
                 eprintln!("udp receive failed: {e}");

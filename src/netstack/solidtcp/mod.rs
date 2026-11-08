@@ -64,8 +64,8 @@ pub use dns::{
 pub use error::{Result, SolidTcpError};
 pub use nat::{NatConfig, NatEntry, NatKey, NatState, NatTable};
 pub use packet::{
-    build_ipv4_tcp, build_ipv4_udp, build_ipv6_tcp, build_ipv6_udp, build_tcp, build_udp,
-    parse_packet, PacketBuilder, PacketParser, ParsedPacket, TcpFlags,
+    PacketBuilder, PacketParser, ParsedPacket, TcpFlags, build_ipv4_tcp, build_ipv4_udp,
+    build_ipv6_tcp, build_ipv6_udp, build_tcp, build_udp, parse_packet,
 };
 pub use stack::{SolidStack, StackBuilder, StackConfig};
 pub use stats::{ConnectionStats, StackStats, StatsSnapshot};

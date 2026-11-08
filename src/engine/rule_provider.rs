@@ -317,14 +317,13 @@ impl RuleIndex {
             }
         }
 
-        if let Some(address) = input.dst_ip {
-            if self
+        if let Some(address) = input.dst_ip
+            && self
                 .dst_nets
                 .iter()
                 .any(|network| network.contains(&address))
-            {
-                return true;
-            }
+        {
+            return true;
         }
 
         // Addresses the router resolved for the domain count too, unless the
@@ -341,14 +340,13 @@ impl RuleIndex {
             }
         }
 
-        if let Some(address) = input.src_ip {
-            if self
+        if let Some(address) = input.src_ip
+            && self
                 .src_nets
                 .iter()
                 .any(|network| network.contains(&address))
-            {
-                return true;
-            }
+        {
+            return true;
         }
 
         if let Some(process) = input.process_name {
@@ -530,49 +528,39 @@ impl RuleProvider {
         cache_path: &Option<PathBuf>,
         message: String,
     ) -> Result<String> {
-        if let Some(path) = cache_path {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                tracing::warn!(
-                    "Using cached rule provider '{}' after refresh failed: {}",
-                    self.config.name,
-                    message
-                );
-                return Ok(content);
-            }
+        if let Some(path) = cache_path
+            && let Ok(content) = std::fs::read_to_string(path)
+        {
+            tracing::warn!(
+                "Using cached rule provider '{}' after refresh failed: {}",
+                self.config.name,
+                message
+            );
+            return Ok(content);
         }
         Err(Error::network(message))
     }
 
     pub fn parse_rules(&self, content: &str) -> Result<Vec<CompiledRuleEntry>> {
-        match self.config.behavior {
-            RuleProviderBehavior::Domain => self.parse_domain_rules(content),
-            RuleProviderBehavior::IpCidr => self.parse_ipcidr_rules(content),
-            RuleProviderBehavior::Classical => self.parse_classical_rules(content),
-        }
-    }
-
-    fn parse_domain_rules(&self, content: &str) -> Result<Vec<CompiledRuleEntry>> {
-        let mut rules = Vec::new();
-
-        if let Ok(yaml_content) = nextjson::from_str::<nextjson::Value>(content) {
-            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_array()) {
-                for item in payload {
-                    if let Some(domain) = item.as_str() {
-                        rules.push(self.parse_domain_entry(domain));
-                    }
+        let lines = rule_payload(content)?;
+        let mut rules = Vec::with_capacity(lines.len());
+        for line in lines {
+            match self.config.behavior {
+                RuleProviderBehavior::Domain => rules.push(self.parse_domain_entry(&line)),
+                RuleProviderBehavior::IpCidr => {
+                    let network = line
+                        .parse::<IpNet>()
+                        .map_err(|_| Error::config(format!("Invalid rule CIDR: {line}")))?;
+                    rules.push(CompiledRuleEntry::IpCidr(network));
                 }
-                return Ok(rules);
+                RuleProviderBehavior::Classical => {
+                    let entry = self.parse_classical_entry(&line).ok_or_else(|| {
+                        Error::config(format!("Unsupported classical rule: {line}"))
+                    })?;
+                    rules.push(entry);
+                }
             }
         }
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-                continue;
-            }
-            rules.push(self.parse_domain_entry(line));
-        }
-
         Ok(rules)
     }
 
@@ -598,64 +586,6 @@ impl RuleProvider {
         } else {
             CompiledRuleEntry::DomainSuffix(entry.to_string())
         }
-    }
-
-    fn parse_ipcidr_rules(&self, content: &str) -> Result<Vec<CompiledRuleEntry>> {
-        let mut rules = Vec::new();
-
-        if let Ok(yaml_content) = nextjson::from_str::<nextjson::Value>(content) {
-            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_array()) {
-                for item in payload {
-                    if let Some(cidr) = item.as_str() {
-                        if let Ok(network) = cidr.parse::<IpNet>() {
-                            rules.push(CompiledRuleEntry::IpCidr(network));
-                        }
-                    }
-                }
-                return Ok(rules);
-            }
-        }
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-                continue;
-            }
-            if let Ok(network) = line.parse::<IpNet>() {
-                rules.push(CompiledRuleEntry::IpCidr(network));
-            }
-        }
-
-        Ok(rules)
-    }
-
-    fn parse_classical_rules(&self, content: &str) -> Result<Vec<CompiledRuleEntry>> {
-        let mut rules = Vec::new();
-
-        if let Ok(yaml_content) = nextjson::from_str::<nextjson::Value>(content) {
-            if let Some(payload) = yaml_content.get("payload").and_then(|v| v.as_array()) {
-                for item in payload {
-                    if let Some(rule_str) = item.as_str() {
-                        if let Some(entry) = self.parse_classical_entry(rule_str) {
-                            rules.push(entry);
-                        }
-                    }
-                }
-                return Ok(rules);
-            }
-        }
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-                continue;
-            }
-            if let Some(entry) = self.parse_classical_entry(line) {
-                rules.push(entry);
-            }
-        }
-
-        Ok(rules)
     }
 
     fn parse_classical_entry(&self, entry: &str) -> Option<CompiledRuleEntry> {
@@ -951,6 +881,55 @@ impl Clone for RuleProviderManager {
     }
 }
 
+/// Decode the shared JSON/YAML payload envelope once for every rule behavior.
+/// Malformed structured input is an error, never a list of accidental domains.
+fn rule_payload(content: &str) -> Result<Vec<Cow<'_, str>>> {
+    const MAX_BYTES: usize = 32 * 1024 * 1024;
+    if content.len() > MAX_BYTES {
+        return Err(Error::config("Rule provider exceeds the 32 MiB limit"));
+    }
+    let content = content.trim_start_matches('\u{feff}').trim();
+    let first = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("");
+    let structured = first.starts_with('{')
+        || first.starts_with('[')
+        || first == "---"
+        || content
+            .lines()
+            .any(|line| line.trim_start().starts_with("payload:"));
+    if !structured {
+        return Ok(content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("//"))
+            .map(Cow::Borrowed)
+            .collect());
+    }
+    let document: nextjson::Value = nextjson::from_str(content)
+        .or_else(|_| nextjson::formats::decode_with(content.as_bytes(), nextjson::formats::Yaml))
+        .map_err(|error| Error::config(format!("Invalid rule payload: {error}")))?;
+    let nextjson::Value::Object(mut object) = document else {
+        return Err(Error::config("Rule document must contain a payload array"));
+    };
+    let Some(nextjson::Value::Array(payload)) = object.remove("payload") else {
+        return Err(Error::config("Rule document must contain a payload array"));
+    };
+    payload
+        .into_iter()
+        .map(|entry| match entry {
+            nextjson::Value::String(value) if !value.trim().is_empty() => {
+                Ok(Cow::Owned(value.trim().to_string()))
+            }
+            _ => Err(Error::config(
+                "Every rule payload entry must be a non-empty string",
+            )),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,6 +981,59 @@ mod tests {
         RuleMatchInput {
             process_name: Some(process),
             ..RuleMatchInput::default()
+        }
+    }
+
+    #[test]
+    fn structured_rule_payloads_are_typed_and_never_fall_back_to_lines() {
+        let cidr = test_provider(RuleProviderBehavior::IpCidr);
+        assert_eq!(
+            cidr.parse_rules("payload:\n  - '10.0.0.0/8'\n  - '2001:db8::/32'\n")
+                .unwrap()
+                .len(),
+            2
+        );
+        let classical = test_provider(RuleProviderBehavior::Classical);
+        assert_eq!(
+            classical
+                .parse_rules(
+                    r#"{"payload":["DOMAIN-SUFFIX,bilibili.com","IP-CIDR,10.0.0.0/8,no-resolve"]}"#
+                )
+                .unwrap()
+                .len(),
+            2
+        );
+        let domain = test_provider(RuleProviderBehavior::Domain);
+        for invalid in [
+            "payload: [",
+            "payload: 42",
+            "payload: [123]",
+            "{broken",
+            "payload: ['']",
+        ] {
+            assert!(domain.parse_rules(invalid).is_err(), "{invalid}");
+        }
+        assert!(cidr.parse_rules("payload: ['not-an-ip']").is_err());
+    }
+
+    /// The domain payload contract used by Loyalsoldier/clash-rules.
+    #[test]
+    fn clash_yaml_payload_covers_video_subdomains_without_suffix_confusion() {
+        let provider = test_provider(RuleProviderBehavior::Domain);
+        let entries = provider
+            .parse_rules("payload:\n  - '+.bilibili.com'\n  - '+.bilivideo.com'\n")
+            .unwrap();
+        let index = RuleIndex::compile(&entries);
+        for domain in [
+            "bilibili.com",
+            "api.bilibili.com",
+            "search.bilibili.com",
+            "cdn.bilivideo.com",
+        ] {
+            assert!(index.matches(&domain_input(domain)), "{domain}");
+        }
+        for domain in ["notbilibili.com", "bilibili.com.attacker.example"] {
+            assert!(!index.matches(&domain_input(domain)), "{domain}");
         }
     }
 

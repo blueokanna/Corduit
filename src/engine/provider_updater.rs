@@ -143,32 +143,32 @@ impl ProviderUpdater {
                 break;
             }
 
-            if config.enable_proxy_provider_update {
-                if let Some(ref manager) = proxy_manager {
-                    Self::update_proxy_providers(manager);
-                    // Refreshed nodes are new proxy objects; re-sync the
-                    // shared registry so groups pick them up immediately.
-                    if let Some(ref sync) = proxy_registry_sync {
-                        if let Err(error) = sync.sync_providers() {
-                            tracing::warn!(
-                                "Failed to re-sync proxy registry after provider update: {}",
-                                error
-                            );
-                        }
-                    }
+            if config.enable_proxy_provider_update
+                && let Some(ref manager) = proxy_manager
+            {
+                Self::update_proxy_providers(manager);
+                // Refreshed nodes are new proxy objects; re-sync the
+                // shared registry so groups pick them up immediately.
+                if let Some(ref sync) = proxy_registry_sync
+                    && let Err(error) = sync.sync_providers()
+                {
+                    tracing::warn!(
+                        "Failed to re-sync proxy registry after provider update: {}",
+                        error
+                    );
                 }
             }
 
-            if config.enable_rule_provider_update {
-                if let Some(ref manager) = rule_manager {
-                    Self::update_rule_providers(manager);
-                }
+            if config.enable_rule_provider_update
+                && let Some(ref manager) = rule_manager
+            {
+                Self::update_rule_providers(manager);
             }
 
-            if config.enable_health_check {
-                if let Some(ref manager) = proxy_manager {
-                    Self::health_check_proxies(manager);
-                }
+            if config.enable_health_check
+                && let Some(ref manager) = proxy_manager
+            {
+                Self::health_check_proxies(manager);
             }
         }
 

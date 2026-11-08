@@ -13,8 +13,8 @@ use courierust::courierust_error::ErrorKind as CourierKind;
 use courierust::courierust_io::{Read as CRead, Write as CWrite};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A synchronous TLS 1.2 / 1.3 stream over a shared TCP socket.
 pub struct TlsStream {
@@ -59,11 +59,11 @@ impl TlsStream {
 
     /// Send a TLS `close_notify` alert (graceful write shutdown). Idempotent.
     pub fn close_notify(&self) {
-        if !self.write_closed.swap(true, Ordering::AcqRel) {
-            if let Ok(mut guard) = self.inner.try_lock() {
-                let _ = guard.close_notify();
-                let _ = CWrite::flush(&mut *guard);
-            }
+        if !self.write_closed.swap(true, Ordering::AcqRel)
+            && let Ok(mut guard) = self.inner.try_lock()
+        {
+            let _ = guard.close_notify();
+            let _ = CWrite::flush(&mut *guard);
         }
     }
 }

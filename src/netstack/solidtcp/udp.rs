@@ -3,7 +3,7 @@ use crate::netstack::solidtcp::nat::NatKey;
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 

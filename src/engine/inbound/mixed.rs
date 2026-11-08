@@ -15,16 +15,16 @@ use crate::engine::config::InboundConfig;
 use crate::engine::error::{Error, Result};
 use crate::engine::inbound::auth::InboundAuth;
 use crate::engine::inbound::http::{
-    proxy_server_config, serve_proxy_connection, HttpProxyHandler, PROXY_MAX_CONNECTIONS,
+    HttpProxyHandler, PROXY_MAX_CONNECTIONS, proxy_server_config, serve_proxy_connection,
 };
-use crate::engine::inbound::{bind_tcp_listener, InboundListener};
+use crate::engine::inbound::{InboundListener, bind_tcp_listener};
 use crate::engine::outbound::OutboundManager;
 use crate::engine::routing::Router;
 use courierust::courierust_server::ServerConfig;
 use parking_lot::Mutex;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// SOCKS5 version byte — the marker that selects the SOCKS5 branch.
@@ -159,7 +159,7 @@ fn dispatch(
         .peek(&mut first)
         .map_err(|e| Error::network(format!("Failed to read from {peer}: {e}")))?;
     if read == 0 {
-        return Ok(()); // the peer closed before saying anything
+        return Ok(());
     }
 
     if first[0] == SOCKS5_VERSION {

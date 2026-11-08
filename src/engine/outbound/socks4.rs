@@ -458,7 +458,9 @@ mod tests {
         let bytes = encode_ipv4(Ipv4Addr::new(93, 184, 216, 34), 80, b"alice");
         assert_eq!(
             bytes,
-            vec![0x04, 0x01, 0x00, 0x50, 93, 184, 216, 34, b'a', b'l', b'i', b'c', b'e', 0x00]
+            vec![
+                0x04, 0x01, 0x00, 0x50, 93, 184, 216, 34, b'a', b'l', b'i', b'c', b'e', 0x00
+            ]
         );
     }
 

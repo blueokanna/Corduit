@@ -2,13 +2,13 @@
 
 use crate::netstack::solidtcp::error::Result;
 use crate::netstack::solidtcp::nat::NatKey;
-use crate::netstack::solidtcp::packet::{TcpInfo, DEFAULT_MSS_V4, DEFAULT_MSS_V6};
+use crate::netstack::solidtcp::packet::{DEFAULT_MSS_V4, DEFAULT_MSS_V6, TcpInfo};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
@@ -159,6 +159,7 @@ pub struct TcpConnection {
     bytes_rx: u64,
     pub domain: Option<String>,
     proxy_tx: Option<mpsc::Sender<Vec<u8>>>,
+    proxy_socket: Option<std::net::TcpStream>,
     fin_recv: bool,
     pending_data: VecDeque<u8>,
     ooo_segments: BTreeMap<u32, Vec<u8>>,
@@ -211,7 +212,7 @@ impl TcpConnection {
             IpAddr::V6(_) => DEFAULT_MSS_V6,
         };
         let mss = their_mss.unwrap_or(fallback_mss).min(config.mss);
-        let is_websocket = matches!(key.dst.port(), 80 | 443 | 8080 | 8443 | 9000);
+        let is_websocket = false;
 
         Self {
             key,
@@ -228,6 +229,7 @@ impl TcpConnection {
             bytes_rx: 0,
             domain,
             proxy_tx: None,
+            proxy_socket: None,
             fin_recv: false,
             pending_data: VecDeque::new(),
             ooo_segments: BTreeMap::new(),
@@ -241,6 +243,31 @@ impl TcpConnection {
             proxy_dead: false,
             dup_ack_count: 0,
         }
+    }
+
+    /// Own a shutdown handle independently of relay threads. Removing a flow
+    /// must interrupt blocked socket reads, not just remove the table entry.
+    pub fn set_proxy_socket(&mut self, socket: std::net::TcpStream) -> bool {
+        if self.is_closed() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+            return false;
+        }
+        self.proxy_socket = Some(socket);
+        true
+    }
+
+    pub fn abort(&mut self) {
+        self.state = TcpState::Closed;
+        if let Some(socket) = self.proxy_socket.take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        self.proxy_tx.take();
+        self.proxy_alive.store(false, Ordering::Release);
+        self.recv_buf = VecDeque::new();
+        self.send_buf = VecDeque::new();
+        self.pending_data = VecDeque::new();
+        self.ooo_segments.clear();
+        self.ooo_size = 0;
     }
 
     pub fn set_websocket(&mut self, is_ws: bool) {
@@ -502,9 +529,7 @@ impl TcpConnection {
         if self.seq_before_or_eq(seq_end, self.rcv_nxt) {
             trace!(
                 "Complete retransmission detected: seq={}, seq_end={}, rcv_nxt={}",
-                seq,
-                seq_end,
-                self.rcv_nxt
+                seq, seq_end, self.rcv_nxt
             );
             return Ok(TcpAction::SendAck);
         }
@@ -615,21 +640,21 @@ impl TcpConnection {
                     }
                 }
 
-                if let Some((seg_seq, skip)) = found {
-                    if let Some(data) = self.ooo_segments.remove(&seg_seq) {
-                        let new_data = &data[skip..];
-                        debug!(
-                            "Delivering partial OOO segment: seq={}, skip={}, len={}",
-                            seg_seq,
-                            skip,
-                            new_data.len()
-                        );
-                        self.ooo_size -= data.len();
-                        self.recv_buf.extend(new_data);
-                        self.rcv_nxt = self.rcv_nxt.wrapping_add(new_data.len() as u32);
-                        self.bytes_rx += new_data.len() as u64;
-                        continue;
-                    }
+                if let Some((seg_seq, skip)) = found
+                    && let Some(data) = self.ooo_segments.remove(&seg_seq)
+                {
+                    let new_data = &data[skip..];
+                    debug!(
+                        "Delivering partial OOO segment: seq={}, skip={}, len={}",
+                        seg_seq,
+                        skip,
+                        new_data.len()
+                    );
+                    self.ooo_size -= data.len();
+                    self.recv_buf.extend(new_data);
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(new_data.len() as u32);
+                    self.bytes_rx += new_data.len() as u64;
+                    continue;
                 }
                 break;
             }
@@ -786,8 +811,19 @@ impl TcpManager {
 
     pub fn remove_connection(&self, src: SocketAddr, dst: SocketAddr) {
         let key = NatKey::new(src, dst);
-        self.connections.remove(&key);
+        if let Some((_, connection)) = self.connections.remove(&key) {
+            connection.write().abort();
+        }
         trace!("TCP connection removed: {} -> {}", src, dst);
+    }
+
+    pub fn remove_if_current(&self, key: NatKey, expected: &Arc<RwLock<TcpConnection>>) {
+        if let Some((_, connection)) = self
+            .connections
+            .remove_if(&key, |_, current| Arc::ptr_eq(current, expected))
+        {
+            connection.write().abort();
+        }
     }
 
     pub fn connection_count(&self) -> usize {
@@ -806,7 +842,12 @@ impl TcpManager {
             .collect();
 
         for key in to_remove {
-            self.connections.remove(&key);
+            if let Some((_, connection)) = self.connections.remove_if(&key, |_, connection| {
+                let connection = connection.read();
+                connection.is_closed() || connection.is_timed_out()
+            }) {
+                connection.write().abort();
+            }
             trace!("TCP connection cleaned up: {:?}", key);
         }
     }
@@ -826,6 +867,76 @@ impl Default for TcpManager {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn removing_a_flow_interrupts_reader_and_writer_even_with_external_owners() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let manager = TcpManager::new();
+        let connection = Arc::new(RwLock::new(TcpConnection::new_passive(
+            key(),
+            1,
+            None,
+            None,
+            TcpConfig::default(),
+        )));
+        assert!(
+            !connection.read().is_websocket(),
+            "HTTPS alone is not WebSocket"
+        );
+        assert!(
+            connection
+                .write()
+                .set_proxy_socket(socket.try_clone().unwrap())
+        );
+        let (tx, rx) = mpsc::channel();
+        let _writer = connection.write().set_proxy_tx(tx);
+        manager.connections.insert(key(), Arc::clone(&connection));
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = socket.read(&mut [0u8; 1]);
+            done_tx.send(result).unwrap();
+        });
+        manager.remove_connection(key().src, key().dst);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader still retained after removal");
+        assert!(matches!(result, Ok(0)) || result.is_err());
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(connection.read().is_closed());
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn an_old_reader_cannot_remove_a_reused_tuple() {
+        let manager = TcpManager::new();
+        let old = Arc::new(RwLock::new(TcpConnection::new_passive(
+            key(),
+            1,
+            None,
+            None,
+            TcpConfig::default(),
+        )));
+        let new = Arc::new(RwLock::new(TcpConnection::new_passive(
+            key(),
+            2,
+            None,
+            None,
+            TcpConfig::default(),
+        )));
+        manager.connections.insert(key(), Arc::clone(&new));
+        manager.remove_if_current(key(), &old);
+        assert_eq!(manager.connection_count(), 1);
+        assert!(!new.read().is_closed());
+        manager.remove_if_current(key(), &new);
+        assert_eq!(manager.connection_count(), 0);
+    }
 
     const SEGMENT: usize = 1024;
     const BUDGET: usize = 4096;

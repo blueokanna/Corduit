@@ -438,7 +438,7 @@ impl Attribute {
                 })
             }
             ATTRIBUTE_UNKNOWN_ATTRIBUTES => {
-                if value.len() % 2 != 0 {
+                if !value.len().is_multiple_of(2) {
                     return Err(StunError::Truncated);
                 }
                 Ok(Self::UnknownAttributes(
@@ -821,15 +821,15 @@ impl Message {
             }
         }
 
-        if message.class == MessageClass::ErrorResponse {
-            if let Some((code, reason)) = message.error_code() {
-                // 420 asks for the unrecognised attributes to be removed; there
-                // is nothing to retry, so it is reported like any other failure.
-                return Err(StunError::ServerError {
-                    code,
-                    reason: reason.to_string(),
-                });
-            }
+        if message.class == MessageClass::ErrorResponse
+            && let Some((code, reason)) = message.error_code()
+        {
+            // 420 asks for the unrecognised attributes to be removed; there
+            // is nothing to retry, so it is reported like any other failure.
+            return Err(StunError::ServerError {
+                code,
+                reason: reason.to_string(),
+            });
         }
 
         Ok(message)

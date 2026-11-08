@@ -53,8 +53,8 @@ use core::fmt;
 
 #[cfg(feature = "std")]
 pub use client::{
-    connect, ClientHelloDraft, ClientHelloHook, ServerAuth, Tls13ClientConfig, Tls13Stream,
-    X509ServerAuth,
+    ClientHelloDraft, ClientHelloHook, ServerAuth, Tls13ClientConfig, Tls13Stream, X509ServerAuth,
+    connect,
 };
 
 /// Errors produced by the TLS 1.3 client.

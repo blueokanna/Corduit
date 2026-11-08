@@ -219,7 +219,7 @@ pub fn verify_ephemeral_certificate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::tls13::fingerprint::{build_client_hello, ClientHelloSpec, Fingerprint};
+    use crate::protocol::tls13::fingerprint::{ClientHelloSpec, Fingerprint, build_client_hello};
     use alloc::string::String;
 
     fn sample_hello() -> (Vec<u8>, [u8; 32]) {

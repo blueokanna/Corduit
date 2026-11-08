@@ -1,11 +1,11 @@
 [package]
 name = "corduit"
-version = "0.2.8"
-edition = "2021"
-rust-version = "1.78"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.88"
 license-file = "LICENSE"
 authors = ["blueokanna"]
-description = "A synchronous, no_std-ready unified network proxy engine core"
+description = "A synchronous, no_std-ready unified network proxy engine core by rust"
 homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
 readme = "README.md"
@@ -27,6 +27,7 @@ std = [
     "dep:smoltcp",
     "dep:socket2",
     "dep:sysinfo",
+    "dep:mach2",
     "dep:tracing",
     "dep:tracing-subscriber",
     "bytes/std",
@@ -47,7 +48,7 @@ shadowtls = ["tls13"]
 [dependencies]
 
 # --- concurrency / sync primitives (std only) -------------------------------
-parking_lot = { version = "0.12", optional = true }
+parking_lot = { version = "0.12.5", optional = true }
 dashmap = { version = "6", optional = true }
 once_cell = { version = "1", optional = true }
 
@@ -99,7 +100,11 @@ smoltcp = { version = "0.11.0", default-features = false, features = [
     "socket-udp",
 ], optional = true }
 socket2 = { version = "0.6", features = ["all"], optional = true }
-sysinfo = { version = "=0.36.1", optional = true }
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+sysinfo = { version = "0.38", default-features = false, features = ["system"], optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+mach2 = { version = "0.7", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -109,9 +114,10 @@ tun-rs = { version = "=2.5.7" }
 
 [target.'cfg(windows)'.dependencies]
 wintun-bindings = { version = "0.7" }
-zip = { version = "4.2.0", default-features = false, features = ["deflate"] }
+tempfile = "3.27"
+zip = { version = "9.4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 libc = "0.2"
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Cryptography",

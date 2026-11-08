@@ -1,5 +1,5 @@
 //! Codec views keep the public hash tables and flattened JSON layout stable.
-use super::{default_bind_address, InboundConfig, InboundType, OutboundConfig, OutboundType};
+use super::{InboundConfig, InboundType, OutboundConfig, OutboundType, default_bind_address};
 use crate::common::json_map::MapRef;
 use nextjson::{FormatEncoder, NsonDeserialize, NsonSchema, NsonSerialize, TypeSchema, Value};
 use std::collections::BTreeMap;
@@ -179,10 +179,10 @@ mod tests {
         let encoded = nextjson::to_string(&decoded).unwrap();
         let again: InboundConfig = nextjson::from_str(&encoded).unwrap();
         assert_eq!(decoded.options, again.options);
-        assert!(nextjson::from_str::<InboundConfig>(
-            r#"{"type":"mixed","tag":"local","port":70000}"#
-        )
-        .is_err());
+        assert!(
+            nextjson::from_str::<InboundConfig>(r#"{"type":"mixed","tag":"local","port":70000}"#)
+                .is_err()
+        );
         assert!(nextjson::from_str::<InboundConfig>(r#"{"type":"mixed","tag":"local"}"#).is_err());
     }
     #[test]

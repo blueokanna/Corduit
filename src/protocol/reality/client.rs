@@ -2,13 +2,13 @@
 //! the session id, and the server authentication that replaces the CA chain.
 
 use super::wire::{
-    client_shared_secret, derive_auth_key, seal_session_id, verify_ephemeral_certificate,
-    SessionMeta, MAX_SHORT_ID_LEN,
+    MAX_SHORT_ID_LEN, SessionMeta, client_shared_secret, derive_auth_key, seal_session_id,
+    verify_ephemeral_certificate,
 };
-use super::{client_version, RealityError, Result as RealityResult};
+use super::{RealityError, Result as RealityResult, client_version};
 use crate::common::stream::BoxStream;
 use crate::protocol::tls13::client::{
-    connect as tls13_connect, ClientHelloDraft, ClientHelloHook, ServerAuth, Tls13ClientConfig,
+    ClientHelloDraft, ClientHelloHook, ServerAuth, Tls13ClientConfig, connect as tls13_connect,
 };
 use crate::protocol::tls13::fingerprint::Fingerprint;
 use crate::protocol::tls13::{Result as Tls13Result, Tls13Error};

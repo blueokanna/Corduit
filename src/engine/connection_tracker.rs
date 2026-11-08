@@ -3,8 +3,8 @@
 
 use crate::common::cancel::CancellationToken;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Unique connection ID generator
@@ -398,21 +398,9 @@ pub fn fill_destination_ip_in_background(
         });
 }
 
-/// The address that stands for `host:port` in the connection list.
-///
-/// The engine's resolver answers first for the same reason the dial path
-/// prefers it — a profile may make a name resolvable only through its own
-/// `nameserver-policy` — with the system resolver as the documented
-/// fallback, exactly as on the dial path.
+/// A locally resolved display address. A remote proxy may resolve differently.
+/// Use the same DNS policy as the dial path; cosmetic lookups may not bypass it.
 fn resolve_for_display(host: &str, port: u16) -> Option<String> {
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Some(ip.to_string());
-    }
-    if let Some(Ok(addresses)) = crate::dns::engine_resolver::resolve(host, port) {
-        if let Some(address) = addresses.first() {
-            return Some(address.ip().to_string());
-        }
-    }
     crate::common::socket::resolve_host(host, port, std::time::Duration::from_secs(3))
         .ok()
         .and_then(|addresses| addresses.into_iter().next())

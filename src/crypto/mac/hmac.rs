@@ -1,7 +1,7 @@
 //! HMAC (RFC 2104), generic over any [`crate::crypto::digest::Digest`].
 
-use crate::crypto::digest::Digest;
 use crate::crypto::MAX_BLOCK_LEN;
+use crate::crypto::digest::Digest;
 
 /// HMAC construction parameterized by a hash function.
 #[derive(Clone)]

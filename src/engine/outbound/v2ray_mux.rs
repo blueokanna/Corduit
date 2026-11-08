@@ -170,7 +170,7 @@ impl<S: SyncStream> Read for MuxStream<S> {
                             return Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "mux: the peer closed mid-frame",
-                            ))
+                            ));
                         }
                         Ok(n) => self.size_filled += n,
                         Err(e) => return Err(e),

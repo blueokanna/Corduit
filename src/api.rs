@@ -2,7 +2,7 @@ use crate::engine::Config;
 use crate::error::{CorduitError, Result};
 use crate::logging::BridgeLogLayer;
 use crate::types::*;
-use crate::{get_corduit_instance, CORDUIT_INSTANCE};
+use crate::{CORDUIT_INSTANCE, get_corduit_instance};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,7 +30,7 @@ pub fn init_app() {
 }
 
 fn init_tracing_safe() -> std::result::Result<(), ()> {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug,corduit=debug"));
@@ -917,18 +917,22 @@ fn stopped_status() -> ProxyStatus {
 
 /// The status of a running engine.
 fn running_status_of(corduit: &crate::engine::Corduit) -> Result<ProxyStatus> {
+    #[cfg(not(target_os = "ios"))]
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
     let tracker = crate::engine::connection_tracker::global_tracker();
     let config = corduit.config();
 
+    #[cfg(target_os = "ios")]
+    let memory_usage = crate::common::apple_metrics::resident_memory()?;
+    #[cfg(not(target_os = "ios"))]
     let memory_usage = {
         let mut sys = System::new_with_specifics(RefreshKind::nothing());
         let pid = Pid::from_u32(std::process::id());
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
             true,
-            ProcessRefreshKind::nothing().with_memory(),
+            ProcessRefreshKind::nothing().with_memory().without_tasks(),
         );
         sys.process(pid).map(|p| p.memory()).unwrap_or(0)
     };
@@ -1049,6 +1053,12 @@ pub fn get_logs(lines: Option<u32>) -> Result<Vec<String>> {
     }
 }
 
+/// Clear the process-owned log ring. New events can arrive after this call.
+pub fn clear_logs() -> Result<()> {
+    crate::engine::logging::clear_logs();
+    Ok(())
+}
+
 /// Change the console log level of the running engine.
 ///
 /// The string is parsed with the same vocabulary the configuration uses, and
@@ -1066,11 +1076,28 @@ pub fn set_log_level(level: String) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "ios"))]
 pub fn get_system_info() -> Result<SystemInfo> {
-    use sysinfo::System;
+    use sysinfo::{
+        CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind,
+        System,
+    };
+
+    // Keep CPU samples between calls; never scan other processes or enumerate
+    // per-thread /proc entries merely to display this application's RSS.
+    static MONITOR: once_cell::sync::Lazy<parking_lot::Mutex<System>> =
+        once_cell::sync::Lazy::new(|| {
+            parking_lot::Mutex::new(System::new_with_specifics(
+                RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing().with_cpu_usage()),
+            ))
+        });
+    static PHYSICAL_CORES: once_cell::sync::Lazy<Option<usize>> =
+        once_cell::sync::Lazy::new(System::physical_core_count);
 
     let platform = if cfg!(target_os = "windows") {
         "Windows".to_string()
+    } else if cfg!(target_env = "ohos") {
+        "HarmonyOS".to_string()
     } else if cfg!(target_os = "linux") {
         "Linux".to_string()
     } else if cfg!(target_os = "macos") {
@@ -1085,8 +1112,16 @@ pub fn get_system_info() -> Result<SystemInfo> {
 
     let version = env!("CARGO_PKG_VERSION").to_string();
 
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let mut sys = MONITOR.lock();
+    sys.refresh_cpu_usage();
+    sys.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    if let Ok(pid) = sysinfo::get_current_pid() {
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory().without_tasks(),
+        );
+    }
 
     let memory_total = sys.total_memory();
     let memory_used = sysinfo::get_current_pid()
@@ -1095,9 +1130,7 @@ pub fn get_system_info() -> Result<SystemInfo> {
         .map(|process| process.memory())
         .unwrap_or_default();
     let cpu_threads = sys.cpus().len() as u32;
-    let cpu_cores = sysinfo::System::physical_core_count()
-        .map(|c| c as u32)
-        .unwrap_or(cpu_threads);
+    let cpu_cores = (*PHYSICAL_CORES).map(|c| c as u32).unwrap_or(cpu_threads);
 
     let cpu_name = get_cpu_name(&sys);
     let cpu_usage = if sys.cpus().is_empty() {
@@ -1122,6 +1155,7 @@ pub fn get_system_info() -> Result<SystemInfo> {
     })
 }
 
+#[cfg(not(target_os = "ios"))]
 fn get_cpu_name(sys: &sysinfo::System) -> String {
     let sysinfo_name = sys
         .cpus()
@@ -1137,32 +1171,33 @@ fn get_cpu_name(sys: &sysinfo::System) -> String {
     {
         if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
             for line in cpuinfo.lines() {
-                if line.starts_with("Hardware") {
-                    if let Some(value) = line.split(':').nth(1) {
-                        let name = value.trim();
-                        if !name.is_empty() {
-                            return name.to_string();
-                        }
+                if line.starts_with("Hardware")
+                    && let Some(value) = line.split(':').nth(1)
+                {
+                    let name = value.trim();
+                    if !name.is_empty() {
+                        return name.to_string();
                     }
                 }
             }
             for line in cpuinfo.lines() {
-                if line.starts_with("model name") {
-                    if let Some(value) = line.split(':').nth(1) {
-                        let name = value.trim();
-                        if !name.is_empty() {
-                            return name.to_string();
-                        }
+                if line.starts_with("model name")
+                    && let Some(value) = line.split(':').nth(1)
+                {
+                    let name = value.trim();
+                    if !name.is_empty() {
+                        return name.to_string();
                     }
                 }
             }
             for line in cpuinfo.lines() {
-                if line.starts_with("Processor") && !line.starts_with("Processors") {
-                    if let Some(value) = line.split(':').nth(1) {
-                        let name = value.trim();
-                        if !name.is_empty() {
-                            return name.to_string();
-                        }
+                if line.starts_with("Processor")
+                    && !line.starts_with("Processors")
+                    && let Some(value) = line.split(':').nth(1)
+                {
+                    let name = value.trim();
+                    if !name.is_empty() {
+                        return name.to_string();
                     }
                 }
             }
@@ -1173,12 +1208,12 @@ fn get_cpu_name(sys: &sysinfo::System) -> String {
     {
         if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
             for line in cpuinfo.lines() {
-                if line.starts_with("model name") {
-                    if let Some(value) = line.split(':').nth(1) {
-                        let name = value.trim();
-                        if !name.is_empty() {
-                            return name.to_string();
-                        }
+                if line.starts_with("model name")
+                    && let Some(value) = line.split(':').nth(1)
+                {
+                    let name = value.trim();
+                    if !name.is_empty() {
+                        return name.to_string();
                     }
                 }
             }
@@ -1189,6 +1224,11 @@ fn get_cpu_name(sys: &sysinfo::System) -> String {
     } else {
         "Unknown CPU".to_string()
     }
+}
+
+#[cfg(target_os = "ios")]
+pub fn get_system_info() -> Result<SystemInfo> {
+    Ok(crate::common::apple_metrics::system_info()?)
 }
 
 pub fn get_version() -> String {
@@ -1214,10 +1254,10 @@ fn generate_rpc_token() -> String {
 /// generated; the caller is responsible for delivering it to the frontend.
 pub fn start_rpc_server(port: u16, token: Option<String>) -> std::result::Result<(), String> {
     let mut guard = RPC_SERVER.lock();
-    if let Some(handle) = guard.as_ref() {
-        if handle.is_running() {
-            return Err("RPC server is already running".to_string());
-        }
+    if let Some(handle) = guard.as_ref()
+        && handle.is_running()
+    {
+        return Err("RPC server is already running".to_string());
     }
 
     let token = token
@@ -1282,10 +1322,10 @@ pub fn start_external_controller(
     secret: Option<String>,
 ) -> std::result::Result<(), String> {
     let mut guard = EXTERNAL_CONTROLLER.lock();
-    if let Some(handle) = guard.as_ref() {
-        if handle.is_running() {
-            return Err("external controller is already running".to_string());
-        }
+    if let Some(handle) = guard.as_ref()
+        && handle.is_running()
+    {
+        return Err("external controller is already running".to_string());
     }
 
     let config = crate::rpc::controller::ExternalControllerConfig::parse(
@@ -1352,8 +1392,8 @@ pub fn stop_external_controller() -> std::result::Result<(), String> {
 }
 
 /// Report whether the external controller is running and where.
-pub fn get_external_controller_status(
-) -> std::result::Result<crate::types::ExternalControllerStatus, String> {
+pub fn get_external_controller_status()
+-> std::result::Result<crate::types::ExternalControllerStatus, String> {
     let guard = EXTERNAL_CONTROLLER.lock();
     Ok(match guard.as_ref() {
         Some(handle) if handle.is_running() => crate::types::ExternalControllerStatus {
@@ -2534,7 +2574,7 @@ pub fn is_process_elevated() -> bool {
     {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Security::{
-            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+            GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
         };
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -2592,15 +2632,15 @@ fn stop_linux_tun_runtime() -> Vec<String> {
         processor.stop();
         processor.reset();
     }
-    if let Some(mut routes) = crate::take_linux_route_manager() {
-        if let Err(error) = routes.restore_routes() {
-            errors.push(format!("failed to restore routes: {error}"));
-        }
+    if let Some(mut routes) = crate::take_linux_route_manager()
+        && let Err(error) = routes.restore_routes()
+    {
+        errors.push(format!("failed to restore routes: {error}"));
     }
-    if let Some(mut device) = crate::take_linux_tun_device() {
-        if let Err(error) = device.stop() {
-            errors.push(format!("failed to stop TUN device: {error}"));
-        }
+    if let Some(mut device) = crate::take_linux_tun_device()
+        && let Err(error) = device.stop()
+    {
+        errors.push(format!("failed to stop TUN device: {error}"));
     }
 
     crate::engine::set_runtime_proxy_mode(0);
@@ -2613,18 +2653,18 @@ fn stop_windows_tun_runtime() -> Vec<String> {
     // capture below is gone the system resolver is honest again.
     crate::dns::trusted::clear();
 
-    if let Some(mut routes) = crate::take_windows_route_manager() {
-        if let Err(error) = routes.disable_global_mode() {
-            crate::set_windows_route_manager(routes);
-            return vec![format!("failed to restore routes: {error}")];
-        }
+    if let Some(mut routes) = crate::take_windows_route_manager()
+        && let Err(error) = routes.disable_global_mode()
+    {
+        crate::set_windows_route_manager(routes);
+        return vec![format!("failed to restore routes: {error}")];
     }
 
-    if let Some(mut device) = crate::take_windows_tun_device() {
-        if let Err(error) = device.stop() {
-            crate::set_windows_tun_device(device);
-            return vec![format!("failed to stop TUN device: {error}")];
-        }
+    if let Some(mut device) = crate::take_windows_tun_device()
+        && let Err(error) = device.stop()
+    {
+        crate::set_windows_tun_device(device);
+        return vec![format!("failed to stop TUN device: {error}")];
     }
     if let Some(processor) = crate::take_windows_vpn_processor() {
         processor.stop();
@@ -2736,7 +2776,10 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
                     enabled: false,
                     interface_name: None,
                     mtu: None,
-                    error: Some(format!("Failed to load wintun.dll: {}. Please ensure you have administrator privileges.", e)),
+                    error: Some(format!(
+                        "Failed to load wintun.dll: {}. Please ensure you have administrator privileges.",
+                        e
+                    )),
                 });
             }
         }
@@ -2935,7 +2978,7 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
 
                 while let Ok(packet) = tun_rx.recv() {
                     packet_count += 1;
-                    if packet_count <= 10 || packet_count % 100 == 0 {
+                    if packet_count <= 10 || packet_count.is_multiple_of(100) {
                         tracing::debug!(
                             "Processing packet #{}: {} bytes",
                             packet_count,
@@ -3307,47 +3350,45 @@ pub fn disable_tun_mode() -> Result<TunStatus> {
 pub fn get_tun_status() -> Result<TunStatus> {
     #[cfg(target_os = "windows")]
     {
-        if let Some(processor) = crate::get_windows_vpn_processor() {
-            if processor.is_running() {
-                return Ok(TunStatus {
-                    enabled: true,
-                    interface_name: Some("Corduit".to_string()),
-                    mtu: Some(1500),
-                    error: None,
-                });
-            }
+        if let Some(processor) = crate::get_windows_vpn_processor()
+            && processor.is_running()
+        {
+            return Ok(TunStatus {
+                enabled: true,
+                interface_name: Some("Corduit".to_string()),
+                mtu: Some(1500),
+                error: None,
+            });
         }
     }
 
     #[cfg(target_os = "android")]
     {
-        if crate::netstack::get_android_vpn_fd() >= 0 {
-            if let Some(processor) = crate::get_android_vpn_processor() {
-                if processor.is_running() {
-                    return Ok(TunStatus {
-                        enabled: true,
-                        interface_name: Some("tun0".to_string()),
-                        mtu: Some(1500),
-                        error: None,
-                    });
-                }
-            }
+        if crate::netstack::get_android_vpn_fd() >= 0
+            && let Some(processor) = crate::get_android_vpn_processor()
+            && processor.is_running()
+        {
+            return Ok(TunStatus {
+                enabled: true,
+                interface_name: Some("tun0".to_string()),
+                mtu: Some(1500),
+                error: None,
+            });
         }
     }
 
     #[cfg(target_env = "ohos")]
     {
-        if crate::netstack::get_ohos_vpn_fd() >= 0 {
-            if let Some(processor) = crate::get_ohos_vpn_processor() {
-                if processor.is_running() {
-                    return Ok(TunStatus {
-                        enabled: true,
-                        interface_name: Some("vpn-tun".to_string()),
-                        mtu: Some(1500),
-                        error: None,
-                    });
-                }
-            }
+        if crate::netstack::get_ohos_vpn_fd() >= 0
+            && let Some(processor) = crate::get_ohos_vpn_processor()
+            && processor.is_running()
+        {
+            return Ok(TunStatus {
+                enabled: true,
+                interface_name: Some("vpn-tun".to_string()),
+                mtu: Some(1500),
+                error: None,
+            });
         }
     }
 
@@ -3961,10 +4002,10 @@ fn stop_ohos_vpn_inner() -> Result<bool> {
     {
         tracing::info!("=== Stopping OHOS VPN packet processing ===");
 
-        if let Some(mut device) = crate::take_ohos_tun_device() {
-            if let Err(error) = device.stop() {
-                tracing::warn!("Failed to stop OHOS TUN device: {}", error);
-            }
+        if let Some(mut device) = crate::take_ohos_tun_device()
+            && let Err(error) = device.stop()
+        {
+            tracing::warn!("Failed to stop OHOS TUN device: {}", error);
         }
         if let Some(task) = crate::take_ohos_packet_task() {
             drop(task);
@@ -4165,10 +4206,10 @@ fn stop_android_vpn_inner() -> Result<bool> {
     {
         tracing::info!("=== Stopping Android VPN packet processing ===");
 
-        if let Some(mut device) = crate::take_android_tun_device() {
-            if let Err(error) = device.stop() {
-                tracing::warn!("Failed to stop Android TUN device: {}", error);
-            }
+        if let Some(mut device) = crate::take_android_tun_device()
+            && let Err(error) = device.stop()
+        {
+            tracing::warn!("Failed to stop Android TUN device: {}", error);
         }
 
         if let Some(task) = crate::take_android_packet_task() {

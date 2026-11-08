@@ -60,12 +60,12 @@ use courierust::courierust_http::header::{HeaderName, HeaderValue};
 use tracing::debug;
 
 use crate::common::socket::connect_host;
-use crate::common::stream::{is_benign_shutdown_error, BoxStream, SyncStream};
+use crate::common::stream::{BoxStream, SyncStream, is_benign_shutdown_error};
 use crate::engine::config::OutboundConfig;
 use crate::engine::connection_tracker::TrackedConnection;
 use crate::engine::error::{Error, Result};
 use crate::engine::outbound::{OutboundProxy, TargetAddr};
-use crate::engine::tls::{connect_advanced_tls, AdvancedTlsOptions, ClientConfig, TlsConnector};
+use crate::engine::tls::{AdvancedTlsOptions, ClientConfig, TlsConnector, connect_advanced_tls};
 
 /// TCP connect + handshake + `CONNECT` verdict budget.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -94,8 +94,7 @@ const MAX_WINDOW: i64 = 0x7fff_ffff;
 /// A browser-shaped `User-Agent`. The tunnel is the point, but a client that
 /// announces itself as a proxy is a client that a passive observer can pick
 /// out.
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
      Chrome/120.0.0.0 Safari/537.36";
 
 // ---------------------------------------------------------------------------
@@ -254,7 +253,7 @@ impl H2Tunnel {
                 Err(e) => {
                     return Err(Error::network(format!(
                         "NaiveProxy: reading the CONNECT verdict failed: {e}"
-                    )))
+                    )));
                 }
             }
             if tunnel.peer_closed && tunnel.status.is_none() {
@@ -280,14 +279,14 @@ impl H2Tunnel {
         // pads a tunnel this build would mis-frame; refusing is the only honest
         // answer, because a wrongly stripped frame corrupts the stream instead
         // of failing.
-        if let Some(reply) = tunnel.padding_reply.as_deref() {
-            if reply.trim() != "0" {
-                return Err(Error::protocol(format!(
-                    "NaiveProxy: the server negotiated padding type '{reply}', which this build \
+        if let Some(reply) = tunnel.padding_reply.as_deref()
+            && reply.trim() != "0"
+        {
+            return Err(Error::protocol(format!(
+                "NaiveProxy: the server negotiated padding type '{reply}', which this build \
                      does not implement: the `padding` header's direction mask is not stated in \
                      the protocol header, and a wrong guess would shift every byte of the tunnel"
-                )));
-            }
+            )));
         }
 
         debug!(
@@ -684,13 +683,13 @@ impl NaiveOutbound {
         // Both go into a header value: a CR or LF in either would inject
         // headers into the request this client signs with its credentials.
         for (field, value) in [("username", &username), ("password", &password)] {
-            if let Some(value) = value {
-                if value.contains(['\r', '\n']) {
-                    return Err(Error::config(format!(
-                        "NaiveProxy {field} must not contain CR or LF: it is encoded into a \
+            if let Some(value) = value
+                && value.contains(['\r', '\n'])
+            {
+                return Err(Error::config(format!(
+                    "NaiveProxy {field} must not contain CR or LF: it is encoded into a \
                          Proxy-Authorization header value"
-                    )));
-                }
+                )));
             }
         }
         if username.is_some() != password.is_some() {
@@ -1300,10 +1299,12 @@ mod tests {
             "the credentials travel as one Basic value"
         );
         assert_eq!(request.padding_request.as_deref(), Some("0"));
-        assert!(request
-            .user_agent
-            .as_deref()
-            .is_some_and(|ua| ua.contains("Mozilla/5.0")));
+        assert!(
+            request
+                .user_agent
+                .as_deref()
+                .is_some_and(|ua| ua.contains("Mozilla/5.0"))
+        );
 
         tunnel.write_all(b"ping through the tunnel").expect("write");
         // Read the way the relay does: a would-block is "nothing yet", not an
@@ -1370,25 +1371,31 @@ mod tests {
             build(&[]).is_ok(),
             "a naive hop with no credentials is legal"
         );
-        assert!(build(&[("username", string("u"))])
+        assert!(
+            build(&[("username", string("u"))])
+                .unwrap_err()
+                .to_string()
+                .contains("both")
+        );
+        assert!(
+            build(&[
+                ("username", string("u")),
+                ("password", string("p\r\nX-Injected: 1"))
+            ])
             .unwrap_err()
             .to_string()
-            .contains("both"));
-        assert!(build(&[
-            ("username", string("u")),
-            ("password", string("p\r\nX-Injected: 1"))
-        ])
-        .unwrap_err()
-        .to_string()
-        .contains("CR or LF"));
-        assert!(build(&[
-            ("username", string("u")),
-            ("password", string("p")),
-            ("alpn", array(&["http/1.1"]))
-        ])
-        .unwrap_err()
-        .to_string()
-        .contains("h2"));
+            .contains("CR or LF")
+        );
+        assert!(
+            build(&[
+                ("username", string("u")),
+                ("password", string("p")),
+                ("alpn", array(&["http/1.1"]))
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("h2")
+        );
 
         let outbound = build(&[
             ("username", string("u")),

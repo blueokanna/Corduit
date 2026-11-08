@@ -463,7 +463,7 @@ fn read_exact_deadline(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "unexpected EOF",
-                ))
+                ));
             }
             Ok(n) => pos += n,
             Err(e)

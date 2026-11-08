@@ -78,12 +78,11 @@ mod linux_impl {
                 continue;
             }
 
-            if let Ok(local_port) = u16::from_str_radix(local_addr_parts[1], 16) {
-                if local_port == port {
-                    if let Ok(inode) = parts[9].parse::<u64>() {
-                        return Some(inode);
-                    }
-                }
+            if let Ok(local_port) = u16::from_str_radix(local_addr_parts[1], 16)
+                && local_port == port
+                && let Ok(inode) = parts[9].parse::<u64>()
+            {
+                return Some(inode);
             }
         }
 
@@ -95,22 +94,22 @@ mod linux_impl {
 
         for entry in proc_dir.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if let Ok(pid) = name.parse::<u32>() {
-                    let fd_path = path.join("fd");
-                    if let Ok(fd_dir) = fs::read_dir(&fd_path) {
-                        for fd_entry in fd_dir.flatten() {
-                            if let Ok(link) = fs::read_link(fd_entry.path()) {
-                                let link_str = link.to_string_lossy();
-                                if link_str.starts_with("socket:[") {
-                                    let inode_str = link_str
-                                        .trim_start_matches("socket:[")
-                                        .trim_end_matches(']');
-                                    if let Ok(inode) = inode_str.parse::<u64>() {
-                                        if inode == target_inode {
-                                            return Some(pid);
-                                        }
-                                    }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && let Ok(pid) = name.parse::<u32>()
+            {
+                let fd_path = path.join("fd");
+                if let Ok(fd_dir) = fs::read_dir(&fd_path) {
+                    for fd_entry in fd_dir.flatten() {
+                        if let Ok(link) = fs::read_link(fd_entry.path()) {
+                            let link_str = link.to_string_lossy();
+                            if link_str.starts_with("socket:[") {
+                                let inode_str = link_str
+                                    .trim_start_matches("socket:[")
+                                    .trim_end_matches(']');
+                                if let Ok(inode) = inode_str.parse::<u64>()
+                                    && inode == target_inode
+                                {
+                                    return Some(pid);
                                 }
                             }
                         }
@@ -219,12 +218,11 @@ mod android_impl {
                 continue;
             }
 
-            if let Ok(local_port) = u16::from_str_radix(local_addr_parts[1], 16) {
-                if local_port == port {
-                    if let Ok(inode) = parts[9].parse::<u64>() {
-                        return Some(inode);
-                    }
-                }
+            if let Ok(local_port) = u16::from_str_radix(local_addr_parts[1], 16)
+                && local_port == port
+                && let Ok(inode) = parts[9].parse::<u64>()
+            {
+                return Some(inode);
             }
         }
 
@@ -236,22 +234,22 @@ mod android_impl {
 
         for entry in proc_dir.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if let Ok(pid) = name.parse::<u32>() {
-                    let fd_path = path.join("fd");
-                    if let Ok(fd_dir) = fs::read_dir(&fd_path) {
-                        for fd_entry in fd_dir.flatten() {
-                            if let Ok(link) = fs::read_link(fd_entry.path()) {
-                                let link_str = link.to_string_lossy();
-                                if link_str.starts_with("socket:[") {
-                                    let inode_str = link_str
-                                        .trim_start_matches("socket:[")
-                                        .trim_end_matches(']');
-                                    if let Ok(inode) = inode_str.parse::<u64>() {
-                                        if inode == target_inode {
-                                            return Some(pid);
-                                        }
-                                    }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && let Ok(pid) = name.parse::<u32>()
+            {
+                let fd_path = path.join("fd");
+                if let Ok(fd_dir) = fs::read_dir(&fd_path) {
+                    for fd_entry in fd_dir.flatten() {
+                        if let Ok(link) = fs::read_link(fd_entry.path()) {
+                            let link_str = link.to_string_lossy();
+                            if link_str.starts_with("socket:[") {
+                                let inode_str = link_str
+                                    .trim_start_matches("socket:[")
+                                    .trim_end_matches(']');
+                                if let Ok(inode) = inode_str.parse::<u64>()
+                                    && inode == target_inode
+                                {
+                                    return Some(pid);
                                 }
                             }
                         }
@@ -318,16 +316,16 @@ pub use android_impl::*;
 pub use fallback_impl::*;
 
 pub fn get_process_name(local_addr: Option<SocketAddr>, pid: Option<u32>) -> Option<String> {
-    if let Some(pid) = pid {
-        if let Some(name) = get_process_name_by_pid(pid) {
-            return Some(name);
-        }
+    if let Some(pid) = pid
+        && let Some(name) = get_process_name_by_pid(pid)
+    {
+        return Some(name);
     }
 
-    if let Some(addr) = local_addr {
-        if let Some(name) = get_process_name_by_socket(addr) {
-            return Some(name);
-        }
+    if let Some(addr) = local_addr
+        && let Some(name) = get_process_name_by_socket(addr)
+    {
+        return Some(name);
     }
 
     None
@@ -341,27 +339,27 @@ pub fn matches_process_name(pattern: &str, process_name: &str) -> bool {
         return true;
     }
 
-    if let Some(name) = process_name.rsplit(['/', '\\']).next() {
-        if name.to_lowercase() == pattern_lower {
-            return true;
-        }
+    if let Some(name) = process_name.rsplit(['/', '\\']).next()
+        && name.to_lowercase() == pattern_lower
+    {
+        return true;
     }
 
     if let Some(name_without_ext) = pattern_lower.strip_suffix(".exe") {
         if process_lower == name_without_ext {
             return true;
         }
-        if let Some(proc_name) = process_name.rsplit(['/', '\\']).next() {
-            if proc_name.to_lowercase() == name_without_ext {
-                return true;
-            }
+        if let Some(proc_name) = process_name.rsplit(['/', '\\']).next()
+            && proc_name.to_lowercase() == name_without_ext
+        {
+            return true;
         }
     }
 
-    if let Some(proc_without_ext) = process_lower.strip_suffix(".exe") {
-        if proc_without_ext == pattern_lower {
-            return true;
-        }
+    if let Some(proc_without_ext) = process_lower.strip_suffix(".exe")
+        && proc_without_ext == pattern_lower
+    {
+        return true;
     }
 
     false

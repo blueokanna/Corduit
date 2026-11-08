@@ -67,11 +67,7 @@ const DOWNGRADE_TLS12: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00
 /// The hash length of the negotiated cipher suite (32 for SHA-256, 48 for
 /// SHA-384).
 fn suite_hash_len(suite: u16) -> usize {
-    if suite == SUITE_AES_256 {
-        48
-    } else {
-        32
-    }
+    if suite == SUITE_AES_256 { 48 } else { 32 }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,12 +598,12 @@ impl Tls13Client {
                 HS_CLIENT_HELLO => {
                     return Err(QuicError::Protocol(
                         "unexpected ClientHello from server".into(),
-                    ))
+                    ));
                 }
                 other => {
                     return Err(QuicError::Protocol(format!(
                         "unexpected handshake message type {other}"
-                    )))
+                    )));
                 }
             }
         }

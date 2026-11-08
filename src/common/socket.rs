@@ -229,21 +229,7 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
 /// private `nameserver-policy` resolver, and the system resolver would
 /// answer NXDOMAIN — or worse, a decoy address — for them.
 pub fn connect_host(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
-    let addrs = match crate::dns::engine_resolver::resolve(host, port) {
-        Some(Ok(addrs)) => addrs,
-        Some(Err(e)) if crate::dns::engine_resolver::domain_uses_policy(host) => {
-            // A `nameserver-policy` entry names the only resolver allowed to
-            // answer this name; its verdict is final, and the system resolver
-            // is exactly the decoy the policy exists to bypass.
-            tracing::debug!("engine DNS policy for {host} produced no answer: {e}");
-            return Err(e);
-        }
-        Some(Err(e)) => {
-            tracing::debug!("engine DNS could not resolve {host}: {e}; trying the system resolver");
-            resolve_host(host, port, timeout)?
-        }
-        None => resolve_host(host, port, timeout)?,
-    };
+    let addrs = resolve_host(host, port, timeout)?;
     if addrs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -340,11 +326,36 @@ where
     }
 }
 
-/// Resolve a hostname to socket addresses with a bounded wait.
+/// Resolve within a bounded wait, honoring configured DNS for TCP, UDP and UI.
+/// System DNS is permitted only when there is no engine DNS configuration.
 pub fn resolve_host(host: &str, port: u16, timeout: Duration) -> io::Result<Vec<SocketAddr>> {
+    resolve_host_with(host, port, timeout, crate::dns::engine_resolver::resolve)
+}
+
+type AddressLookup = fn(&str, u16) -> Option<io::Result<Vec<SocketAddr>>>;
+
+fn resolve_host_with(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    engine: AddressLookup,
+) -> io::Result<Vec<SocketAddr>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
     let host_owned = host.to_owned();
     bounded_lookup(&format!("{host}:{port}"), timeout, move || {
-        resolve_system(&host_owned, port)
+        let addresses = match engine(&host_owned, port) {
+            Some(result) => result?,
+            None => resolve_system(&host_owned, port)?,
+        };
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "DNS returned no addresses",
+            ));
+        }
+        Ok(addresses)
     })
 }
 
@@ -398,7 +409,7 @@ fn resolve_system_ips(host: &str) -> io::Result<Vec<IpAddr>> {
 /// the profile's DNS was configured to make them.
 ///
 /// Both families are asked for because a rule matches against all of them. The
-/// system resolver is the fallback, exactly as in [`connect_host`].
+/// system resolver is used only when no engine resolver is configured.
 pub fn resolve_host_all(host: &str, timeout: Duration) -> io::Result<Vec<IpAddr>> {
     resolve_host_all_with(host, timeout, crate::dns::engine_resolver::resolve_ips)
 }
@@ -426,7 +437,7 @@ fn resolve_host_all_with(
     })
 }
 
-/// The engine resolver first, the system resolver as the documented fallback.
+/// Use engine DNS exclusively when configured; use OS DNS only without it.
 ///
 /// The two families are asked for at the same time. They are independent
 /// queries, each with its own budget inside the resolver, and probing them
@@ -436,7 +447,12 @@ fn engine_then_system(host: &str, engine: EngineLookup) -> io::Result<Vec<IpAddr
     let (v4, v6) = std::thread::scope(|scope| {
         let v4 = scope.spawn(|| engine(host, false));
         let v6 = scope.spawn(|| engine(host, true));
-        (v4.join().unwrap_or(None), v6.join().unwrap_or(None))
+        (
+            v4.join()
+                .unwrap_or_else(|_| Some(Err(io::Error::other("IPv4 DNS worker panicked")))),
+            v6.join()
+                .unwrap_or_else(|_| Some(Err(io::Error::other("IPv6 DNS worker panicked")))),
+        )
     });
 
     let mut found: Vec<IpAddr> = Vec::new();
@@ -461,13 +477,12 @@ fn engine_then_system(host: &str, engine: EngineLookup) -> io::Result<Vec<IpAddr
         return Ok(found);
     }
     if configured {
-        if crate::dns::engine_resolver::domain_uses_policy(host) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("configured DNS policy refused '{host}'; system fallback is disabled"),
-            ));
-        }
-        tracing::debug!("engine DNS found no address for {host}; trying the system resolver");
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "configured DNS returned no acceptable address for '{host}'; system fallback is disabled"
+            ),
+        ));
     }
 
     let mut addresses: Vec<IpAddr> = Vec::new();
@@ -789,6 +804,42 @@ mod tests {
     /// With no engine DNS configured, the system resolver is the path — which is
     /// what every caller had before the engine had a resolver at all.
     #[test]
+    fn dial_and_display_dns_never_replace_a_configured_failure() {
+        let empty: AddressLookup = |_, _| Some(Ok(Vec::new()));
+        let failed: AddressLookup = |_, _| {
+            Some(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "policy denied",
+            )))
+        };
+        for engine in [empty, failed] {
+            assert!(resolve_host_with("localhost", 443, Duration::from_secs(2), engine).is_err());
+        }
+        let answer: AddressLookup = |_, port| {
+            Some(Ok(vec![SocketAddr::new(
+                "203.0.113.7".parse().unwrap(),
+                port,
+            )]))
+        };
+        assert_eq!(
+            resolve_host_with("localhost", 443, Duration::from_secs(2), answer).unwrap(),
+            vec!["203.0.113.7:443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn configured_dns_failures_cannot_escape_via_localhost_os_resolution() {
+        let empty: EngineLookup = |_, _| Some(Ok(Vec::new()));
+        let failed: EngineLookup = |_, _| Some(Err(io::Error::other("policy denied")));
+        let panicked: EngineLookup = |_, _| panic!("resolver worker failed");
+        for engine in [empty, failed, panicked] {
+            let error = resolve_host_all_with("localhost", Duration::from_secs(2), engine)
+                .expect_err("configured DNS must not be bypassed by the OS resolver");
+            assert!(error.to_string().contains("system fallback is disabled"));
+        }
+    }
+
+    #[test]
     fn without_engine_dns_the_system_resolver_answers() {
         let addresses = resolve_host_all_with("localhost", Duration::from_secs(5), engine_absent)
             .expect("localhost resolves");
@@ -800,11 +851,13 @@ mod tests {
     /// distinguishes the two when it decides whether a rule saw an address.
     #[test]
     fn a_name_nothing_can_resolve_is_an_error() {
-        assert!(resolve_host_all_with(
-            "nothing-can-resolve-this.invalid",
-            Duration::from_secs(5),
-            engine_absent
-        )
-        .is_err());
+        assert!(
+            resolve_host_all_with(
+                "nothing-can-resolve-this.invalid",
+                Duration::from_secs(5),
+                engine_absent
+            )
+            .is_err()
+        );
     }
 }

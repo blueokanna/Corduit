@@ -21,11 +21,11 @@ use jni::sys::jint;
 use jni::{JNIEnv, JavaVM};
 use parking_lot::RwLock;
 use std::ffi::CString;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
-extern "C" {
+unsafe extern "C" {
     fn __android_log_write(
         prio: i32,
         tag: *const std::os::raw::c_char,
@@ -41,7 +41,7 @@ static JNI_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Store the VM and the service, replacing whatever a previous VPN session
 /// left behind.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeInitRustBridge<
     'local,
 >(
@@ -74,7 +74,7 @@ pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeInitR
 }
 
 /// Drop every stored reference so the next session starts clean.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeClearRustBridge<
     'local,
 >(
@@ -204,7 +204,7 @@ fn setup_protect_callback() {
         "INFO",
         "Setting up socket protect callback for corduit-netstack",
     );
-    crate::netstack::set_protect_callback(|fd| protect_socket_via_jni(fd));
+    crate::netstack::set_protect_callback(protect_socket_via_jni);
     android_log(
         "INFO",
         "Socket protect callback configured for corduit-netstack",

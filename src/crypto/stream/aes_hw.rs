@@ -120,13 +120,15 @@ mod x86 {
     /// `rounds + 1` blocks.
     #[target_feature(enable = "aes")]
     pub unsafe fn encrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) {
-        let mut state = round_key(keys, 0);
-        state = _mm_xor_si128(state, _mm_loadu_si128(block.as_ptr() as *const __m128i));
-        for round in 1..rounds {
-            state = _mm_aesenc_si128(state, round_key(keys, round));
+        unsafe {
+            let mut state = round_key(keys, 0);
+            state = _mm_xor_si128(state, _mm_loadu_si128(block.as_ptr() as *const __m128i));
+            for round in 1..rounds {
+                state = _mm_aesenc_si128(state, round_key(keys, round));
+            }
+            state = _mm_aesenclast_si128(state, round_key(keys, rounds));
+            _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, state);
         }
-        state = _mm_aesenclast_si128(state, round_key(keys, rounds));
-        _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, state);
     }
 
     /// Decrypt one block. The equivalent-inverse trick: `AESDEC` with
@@ -137,15 +139,17 @@ mod x86 {
     /// Same contract as [`encrypt_block`].
     #[target_feature(enable = "aes")]
     pub unsafe fn decrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) {
-        let mut state = _mm_xor_si128(
-            _mm_loadu_si128(block.as_ptr() as *const __m128i),
-            round_key(keys, rounds),
-        );
-        for round in (1..rounds).rev() {
-            state = _mm_aesdec_si128(state, _mm_aesimc_si128(round_key(keys, round)));
+        unsafe {
+            let mut state = _mm_xor_si128(
+                _mm_loadu_si128(block.as_ptr() as *const __m128i),
+                round_key(keys, rounds),
+            );
+            for round in (1..rounds).rev() {
+                state = _mm_aesdec_si128(state, _mm_aesimc_si128(round_key(keys, round)));
+            }
+            state = _mm_aesdeclast_si128(state, round_key(keys, 0));
+            _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, state);
         }
-        state = _mm_aesdeclast_si128(state, round_key(keys, 0));
-        _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, state);
     }
 }
 
@@ -195,7 +199,8 @@ mod arm {
     /// Round key `round` as a vector. `vld1q` is an unaligned load.
     #[inline]
     fn round_key(keys: &[[u8; 16]], round: usize) -> uint8x16_t {
-        unsafe { vld1q_u8(keys.as_ptr().add(round) as *const u8) }
+        // SAFETY: indexing checks the key bounds; each key holds exactly 16 bytes.
+        unsafe { vld1q_u8(keys[round].as_ptr()) }
     }
 
     /// Encrypt one block.
@@ -213,13 +218,15 @@ mod arm {
     /// `rounds + 1` blocks.
     #[target_feature(enable = "aes")]
     pub unsafe fn encrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) {
-        let mut state = vld1q_u8(block.as_ptr());
+        // SAFETY: the borrowed array contains 16 readable bytes.
+        let mut state = unsafe { vld1q_u8(block.as_ptr()) };
         for round in 0..rounds - 1 {
             state = vaesmcq_u8(vaeseq_u8(state, round_key(keys, round)));
         }
         state = vaeseq_u8(state, round_key(keys, rounds - 1));
         state = veorq_u8(state, round_key(keys, rounds));
-        vst1q_u8(block.as_mut_ptr(), state);
+        // SAFETY: the exclusive array borrow contains 16 writable bytes.
+        unsafe { vst1q_u8(block.as_mut_ptr(), state) };
     }
 
     /// Decrypt one block.
@@ -237,14 +244,16 @@ mod arm {
     /// Same contract as [`encrypt_block`].
     #[target_feature(enable = "aes")]
     pub unsafe fn decrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) {
-        let mut state = vld1q_u8(block.as_ptr());
+        // SAFETY: the borrowed array contains 16 readable bytes.
+        let mut state = unsafe { vld1q_u8(block.as_ptr()) };
         state = vaesimcq_u8(vaesdq_u8(state, round_key(keys, rounds)));
         for round in (2..rounds).rev() {
             state = vaesimcq_u8(vaesdq_u8(state, vaesimcq_u8(round_key(keys, round))));
         }
         state = vaesdq_u8(state, vaesimcq_u8(round_key(keys, 1)));
         state = veorq_u8(state, round_key(keys, 0));
-        vst1q_u8(block.as_mut_ptr(), state);
+        // SAFETY: the exclusive array borrow contains 16 writable bytes.
+        unsafe { vst1q_u8(block.as_mut_ptr(), state) };
     }
 }
 
@@ -278,7 +287,7 @@ pub fn available() -> bool {
 /// call out of their code.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn encrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) -> bool {
-    if !available() {
+    if !matches!(rounds, 10 | 12 | 14) || keys.len() <= rounds || !available() {
         return false;
     }
     unsafe { back_end::encrypt_block(rounds, keys, block) };
@@ -289,10 +298,35 @@ pub fn encrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) -> 
 /// [`encrypt_block`].
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn decrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) -> bool {
-    if !available() {
+    if !matches!(rounds, 10 | 12 | 14) || keys.len() <= rounds || !available() {
         return false;
     }
     // Safety: as in `encrypt_block`.
     unsafe { back_end::decrypt_block(rounds, keys, block) };
     true
+}
+
+#[cfg(all(
+    test,
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod tests {
+    #[test]
+    fn malformed_key_schedules_never_reach_hardware_loads() {
+        for (rounds, key_count) in [
+            (0, 0),
+            (usize::MAX, 0),
+            (10, 10),
+            (12, 12),
+            (14, 14),
+            (11, 15),
+        ] {
+            let keys = alloc::vec![[0u8; 16]; key_count];
+            let mut block = [0xabu8; 16];
+            assert!(!super::encrypt_block(rounds, &keys, &mut block));
+            assert_eq!(block, [0xab; 16]);
+            assert!(!super::decrypt_block(rounds, &keys, &mut block));
+            assert_eq!(block, [0xab; 16]);
+        }
+    }
 }

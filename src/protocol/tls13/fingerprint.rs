@@ -42,18 +42,24 @@
 //! JA3/JA4 by construction.
 
 use super::{Result, Tls13Error};
-use crate::crypto::hash::Sha256;
 use crate::crypto::Digest;
+use crate::crypto::hash::Sha256;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use courierust::courierust_fingerprint::{chrome_tls_profile, TlsProfile};
+use courierust::courierust_fingerprint::{TlsProfile, chrome_tls_profile};
 
 /// Extensions a Chromium-shaped profile lists but this client never emits,
 /// with the reason. See the module docs.
 pub const KNOWN_OMISSIONS: &[(u16, &str)] = &[
-    (0x44cd, "application_settings (ALPS) is not advertised: no protocol settings payload"),
-    (0xfe0d, "encrypted_client_hello is not advertised: ECH configuration and HPKE are not implemented"),
+    (
+        0x44cd,
+        "application_settings (ALPS) is not advertised: no protocol settings payload",
+    ),
+    (
+        0xfe0d,
+        "encrypted_client_hello is not advertised: ECH configuration and HPKE are not implemented",
+    ),
     (
         super::codec::EXT_COMPRESS_CERTIFICATE,
         "compress_certificate (RFC 8879) is not advertised: certificate decompression is not implemented",
@@ -481,11 +487,7 @@ fn key_share_body(public: &[u8; 32], grease: bool, stream: &mut Stream) -> Vec<u
 fn pad_len(unpadded: usize) -> usize {
     let target = ((unpadded / 512) + 1) * 512;
     let pad = target.saturating_sub(unpadded + 4); // 4 = padding extension header
-    if pad > 512 {
-        0
-    } else {
-        pad
-    }
+    if pad > 512 { 0 } else { pad }
 }
 
 /// Deterministic byte stream derived from the ClientHello random. Used for

@@ -63,7 +63,7 @@ use std::time::Duration;
 
 use courierust::courierust_body::Body;
 use courierust::courierust_http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
-use courierust::courierust_server::ws::{plan, WsConfig};
+use courierust::courierust_server::ws::{WsConfig, plan};
 use courierust::courierust_ws::{OriginPolicy, PmDeflatePolicy};
 
 use crate::common::listener::ConnectionListener;
@@ -383,7 +383,7 @@ fn handle_http_request(req: Request<Body>, token: &str) -> Response<Body> {
             return json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 r#"{"code":1,"error":"request too large"}"#,
-            )
+            );
         }
         None => Vec::new(),
     };

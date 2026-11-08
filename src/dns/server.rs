@@ -137,7 +137,7 @@ impl std::fmt::Debug for DnsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::engine_resolver::{client_resolver, EngineDnsSettings};
+    use crate::dns::engine_resolver::{EngineDnsSettings, client_resolver};
     use recurse_x::{Message, Name, RData, RrType};
     use std::collections::HashMap;
     use std::io::{Read, Write};

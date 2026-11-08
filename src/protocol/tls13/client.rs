@@ -28,15 +28,15 @@
 //!   buffered across calls.
 
 use super::codec::{
-    self, read_hs_message, take_hs_message, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY, HS_KEY_UPDATE,
-    HS_NEW_SESSION_TICKET, HS_SERVER_HELLO,
+    self, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY, HS_KEY_UPDATE, HS_NEW_SESSION_TICKET,
+    HS_SERVER_HELLO, read_hs_message, take_hs_message,
 };
 use super::fingerprint::{self, ClientHelloSpec, Fingerprint};
 use super::key_schedule::{HandshakeSecrets, SuiteHash, TrafficKey};
 use super::record::{
-    parse_record_header, plaintext_record, RecordProtector, ALERT_FATAL, ALERT_WARNING,
-    CONTENT_ALERT, CONTENT_APPLICATION_DATA, CONTENT_CHANGE_CIPHER_SPEC, CONTENT_HANDSHAKE,
-    MAX_PLAINTEXT,
+    ALERT_FATAL, ALERT_WARNING, CONTENT_ALERT, CONTENT_APPLICATION_DATA,
+    CONTENT_CHANGE_CIPHER_SPEC, CONTENT_HANDSHAKE, MAX_PLAINTEXT, RecordProtector,
+    parse_record_header, plaintext_record,
 };
 use super::{Result, Tls13Error};
 use crate::crypto::dh::{public_key as x25519_public_key, x25519};
@@ -303,7 +303,7 @@ pub fn connect<R: Read, W: Write>(
             other => {
                 return Err(Tls13Error::Protocol(format!(
                     "unexpected record type {other} before ServerHello"
-                )))
+                )));
             }
         }
     };
@@ -353,7 +353,7 @@ pub fn connect<R: Read, W: Write>(
             CONTENT_HANDSHAKE => {
                 return Err(Tls13Error::Protocol(
                     "unprotected handshake record after ServerHello".into(),
-                ))
+                ));
             }
             CONTENT_APPLICATION_DATA => {
                 let (inner, data) = read_protector.open(&payload)?;
@@ -363,14 +363,14 @@ pub fn connect<R: Read, W: Write>(
                     other => {
                         return Err(Tls13Error::Protocol(format!(
                             "unexpected inner content type {other} during handshake"
-                        )))
+                        )));
                     }
                 }
             }
             other => {
                 return Err(Tls13Error::Protocol(format!(
                     "unexpected record type {other} during handshake"
-                )))
+                )));
             }
         };
         pending.extend_from_slice(&plaintext);
@@ -385,13 +385,13 @@ pub fn connect<R: Read, W: Write>(
                     }
                     saw_ee = true;
                     let selected = parse_alpn_extension(body)?;
-                    if let Some(proto) = &selected {
-                        if !offered_alpn.iter().any(|p| p == proto) {
-                            return Err(Tls13Error::Protocol(format!(
-                                "server selected ALPN '{}' which was not offered",
-                                String::from_utf8_lossy(proto)
-                            )));
-                        }
+                    if let Some(proto) = &selected
+                        && !offered_alpn.iter().any(|p| p == proto)
+                    {
+                        return Err(Tls13Error::Protocol(format!(
+                            "server selected ALPN '{}' which was not offered",
+                            String::from_utf8_lossy(proto)
+                        )));
                     }
                     negotiated_alpn = selected;
                     transcript.extend_from_slice(&msg);
@@ -466,12 +466,12 @@ pub fn connect<R: Read, W: Write>(
                 HS_KEY_UPDATE => {
                     return Err(Tls13Error::Protocol(
                         "KeyUpdate before the handshake completed".into(),
-                    ))
+                    ));
                 }
                 other => {
                     return Err(Tls13Error::Protocol(format!(
                         "unexpected handshake message type {other} during handshake"
-                    )))
+                    )));
                 }
             }
             pending.drain(..used);
@@ -639,7 +639,7 @@ impl<R: Read, W: Write> Tls13Stream<R, W> {
                         CONTENT_HANDSHAKE => {
                             return Err(Tls13Error::Protocol(
                                 "unprotected handshake record after the handshake".into(),
-                            ))
+                            ));
                         }
                         CONTENT_ALERT => {
                             let (level, desc) = alert_parts(&body);
@@ -691,14 +691,14 @@ impl<R: Read, W: Write> Tls13Stream<R, W> {
                                 other => {
                                     return Err(Tls13Error::Protocol(format!(
                                         "invalid inner content type {other}"
-                                    )))
+                                    )));
                                 }
                             }
                         }
                         other => {
                             return Err(Tls13Error::Protocol(format!(
                                 "unexpected record type {other}"
-                            )))
+                            )));
                         }
                     }
                 }
@@ -811,7 +811,7 @@ fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
             Ok(0) => {
                 return Err(Tls13Error::Io(
                     "connection closed during a record read".into(),
-                ))
+                ));
             }
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

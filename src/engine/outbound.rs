@@ -18,7 +18,7 @@
 use crate::common::stream::BoxStream;
 use crate::engine::config::{Config, OutboundConfig, OutboundType};
 use crate::engine::error::{Error, Result};
-use crate::engine::proxy_provider::{runtime_proxy_providers, ProxyProviderManager};
+use crate::engine::proxy_provider::{ProxyProviderManager, runtime_proxy_providers};
 use parking_lot::RwLock as ParkingRwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,8 +50,8 @@ mod vmess;
 #[cfg(feature = "wireguard")]
 mod wireguard;
 
-pub use direct::relay_bidirectional_with_connection;
 pub use direct::DirectOutbound;
+pub use direct::relay_bidirectional_with_connection;
 pub use group::{GroupOutbound, GroupStrategy};
 pub use http::HttpOutbound;
 #[cfg(feature = "hysteria")]
@@ -315,7 +315,7 @@ pub(crate) fn build_outbound_proxy(
             return Err(crate::engine::config::disabled_protocol_error(
                 &config.tag,
                 "wireguard",
-            ))
+            ));
         }
         #[cfg(feature = "tuic")]
         OutboundType::Tuic => Some(Arc::new(TuicOutbound::new(config.clone())?)),
@@ -324,7 +324,7 @@ pub(crate) fn build_outbound_proxy(
             return Err(crate::engine::config::disabled_protocol_error(
                 &config.tag,
                 "tuic",
-            ))
+            ));
         }
         #[cfg(feature = "hysteria")]
         OutboundType::Hysteria => Some(Arc::new(HysteriaOutbound::new(config.clone())?)),
@@ -333,7 +333,7 @@ pub(crate) fn build_outbound_proxy(
             return Err(crate::engine::config::disabled_protocol_error(
                 &config.tag,
                 "hysteria",
-            ))
+            ));
         }
         #[cfg(feature = "hysteria2")]
         OutboundType::Hysteria2 => Some(Arc::new(Hysteria2Outbound::new(config.clone())?)),
@@ -342,7 +342,7 @@ pub(crate) fn build_outbound_proxy(
             return Err(crate::engine::config::disabled_protocol_error(
                 &config.tag,
                 "hysteria2",
-            ))
+            ));
         }
         #[cfg(feature = "shadowtls")]
         OutboundType::ShadowTls => Some(Arc::new(ShadowTlsOutbound::new(config.clone())?)),
@@ -351,7 +351,7 @@ pub(crate) fn build_outbound_proxy(
             return Err(crate::engine::config::disabled_protocol_error(
                 &config.tag,
                 "shadowtls",
-            ))
+            ));
         }
         OutboundType::Naive => Some(Arc::new(NaiveOutbound::new(config.clone())?)),
         OutboundType::Selector

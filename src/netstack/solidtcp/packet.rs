@@ -332,12 +332,12 @@ pub fn build_ipv4_tcp(
     pkt[tcp_start + 13] = flags.to_byte();
     pkt[tcp_start + 14..tcp_start + 16].copy_from_slice(&window.to_be_bytes());
 
-    if flags.syn {
-        if let Some(mss_val) = mss {
-            pkt[tcp_start + 20] = 2;
-            pkt[tcp_start + 21] = 4;
-            pkt[tcp_start + 22..tcp_start + 24].copy_from_slice(&mss_val.to_be_bytes());
-        }
+    if flags.syn
+        && let Some(mss_val) = mss
+    {
+        pkt[tcp_start + 20] = 2;
+        pkt[tcp_start + 21] = 4;
+        pkt[tcp_start + 22..tcp_start + 24].copy_from_slice(&mss_val.to_be_bytes());
     }
 
     let payload_start = tcp_start + tcp_hdr_len;
@@ -393,12 +393,12 @@ pub fn build_ipv6_tcp(
     pkt[tcp_start + 13] = flags.to_byte();
     pkt[tcp_start + 14..tcp_start + 16].copy_from_slice(&window.to_be_bytes());
 
-    if flags.syn {
-        if let Some(mss_val) = mss {
-            pkt[tcp_start + 20] = 2;
-            pkt[tcp_start + 21] = 4;
-            pkt[tcp_start + 22..tcp_start + 24].copy_from_slice(&mss_val.to_be_bytes());
-        }
+    if flags.syn
+        && let Some(mss_val) = mss
+    {
+        pkt[tcp_start + 20] = 2;
+        pkt[tcp_start + 21] = 4;
+        pkt[tcp_start + 22..tcp_start + 24].copy_from_slice(&mss_val.to_be_bytes());
     }
 
     let payload_start = tcp_start + tcp_hdr_len;
@@ -550,11 +550,7 @@ fn tcp_checksum(src: &[u8; 4], dst: &[u8; 4], tcp: &[u8]) -> u16 {
 
 fn udp_checksum(src: &[u8; 4], dst: &[u8; 4], udp: &[u8]) -> u16 {
     let cksum = transport_checksum(src, dst, 17, udp);
-    if cksum == 0 {
-        0xFFFF
-    } else {
-        cksum
-    }
+    if cksum == 0 { 0xFFFF } else { cksum }
 }
 
 /// Ones-complement sum over arbitrary bytes, odd trailing byte padded.
@@ -857,19 +853,21 @@ mod tests {
         .expect("v6 dispatch");
         assert_eq!(v6_packet[0] >> 4, 6);
 
-        assert!(build_tcp(
-            v4_src,
-            v6_dst,
-            1,
-            2,
-            0,
-            0,
-            TcpFlags::ack_only(),
-            100,
-            &[],
-            None
-        )
-        .is_err());
+        assert!(
+            build_tcp(
+                v4_src,
+                v6_dst,
+                1,
+                2,
+                0,
+                0,
+                TcpFlags::ack_only(),
+                100,
+                &[],
+                None
+            )
+            .is_err()
+        );
         assert!(build_udp(v6_src, v4_dst, 1, 2, &[]).is_err());
     }
 }

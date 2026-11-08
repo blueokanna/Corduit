@@ -12,8 +12,8 @@
 
 use parking_lot::Condvar;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 struct NotifyInner {

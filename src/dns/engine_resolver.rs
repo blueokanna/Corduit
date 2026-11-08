@@ -139,14 +139,13 @@ impl SuspectPolicy {
         {
             return true;
         }
-        if let Some(matches) = country {
-            if !self.countries.is_empty()
-                && ips
-                    .iter()
-                    .any(|ip| !self.countries.iter().any(|code| matches(code, *ip)))
-            {
-                return true;
-            }
+        if let Some(matches) = country
+            && !self.countries.is_empty()
+            && ips
+                .iter()
+                .any(|ip| !self.countries.iter().any(|code| matches(code, *ip)))
+        {
+            return true;
         }
         false
     }
@@ -877,7 +876,9 @@ fn parse_upstreams(servers: &[String], setting: &str) -> Vec<Upstream> {
     for server in servers {
         match Upstream::parse(server) {
             Ok(upstream) => parsed.push(upstream),
-            Err(error) => warn!("dns.{setting} entry '{server}' is not a usable DNS address: {error}; entry ignored"),
+            Err(error) => warn!(
+                "dns.{setting} entry '{server}' is not a usable DNS address: {error}; entry ignored"
+            ),
         }
     }
     parsed
@@ -1152,8 +1153,7 @@ pub fn domain_uses_policy(host: &str) -> bool {
 /// Resolve `host` through the engine's configured DNS.
 ///
 /// `None` means the engine has no DNS configuration — the caller falls back to
-/// the system resolver, which is also the fallback when the engine lookup
-/// fails.
+/// the system resolver. A configured lookup failure must remain an error.
 pub fn resolve(host: &str, port: u16) -> Option<io::Result<Vec<SocketAddr>>> {
     let resolver = resolver()?;
     Some(resolver.resolve(host, port))
@@ -1200,16 +1200,17 @@ pub(crate) mod testing {
                 response.flags.ra = true;
                 response.questions.clone_from(&query.questions);
 
-                if question.qclass == RrClass::IN && question.qtype == RrType::A {
-                    if let Some(address) = lookup(&question.qname) {
-                        response.answers.push(Record {
-                            name: question.qname.clone(),
-                            rr_type: RrType::A,
-                            class: RrClass::IN,
-                            ttl: 60,
-                            rdata: RData::A(address),
-                        });
-                    }
+                if question.qclass == RrClass::IN
+                    && question.qtype == RrType::A
+                    && let Some(address) = lookup(&question.qname)
+                {
+                    response.answers.push(Record {
+                        name: question.qname.clone(),
+                        rr_type: RrType::A,
+                        class: RrClass::IN,
+                        ttl: 60,
+                        rdata: RData::A(address),
+                    });
                 }
 
                 if let Ok(bytes) = response.to_bytes() {

@@ -134,9 +134,9 @@ impl CancellationToken {
             return true;
         }
         let (lock, cond) = (&self.inner.wake, &self.inner.cond);
-        let guard = lock.lock().unwrap();
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let (guard, _) = cond
-            .wait_timeout(guard, timeout)
+            .wait_timeout_while(guard, timeout, |_| !self.is_cancelled())
             .unwrap_or_else(|e| e.into_inner());
         drop(guard);
         self.is_cancelled()
@@ -154,10 +154,9 @@ impl CancellationToken {
         }
         let (lock, cond) = (&self.inner.wake, &self.inner.cond);
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if self.is_cancelled() {
-            return;
-        }
-        let _guard = cond.wait(guard).unwrap_or_else(|e| e.into_inner());
+        let _guard = cond
+            .wait_while(guard, |_| !self.is_cancelled())
+            .unwrap_or_else(|e| e.into_inner());
     }
 
     /// The number of hooks still registered, for tests.
@@ -213,6 +212,39 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         t.cancel();
         assert!(h.join().unwrap());
+    }
+
+    #[test]
+    fn unrelated_notifications_do_not_complete_either_wait() {
+        use std::sync::mpsc;
+        for timed in [true, false] {
+            let token = CancellationToken::new();
+            let worker = token.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let cancelled = if timed {
+                    worker.wait(Duration::from_secs(30))
+                } else {
+                    worker.wait_cancelled();
+                    worker.is_cancelled()
+                };
+                done_tx.send(cancelled).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Wake without changing the predicate, including during startup.
+            for _ in 0..20 {
+                token.inner.cond.notify_all();
+                assert!(matches!(
+                    done_rx.recv_timeout(Duration::from_millis(2)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+            }
+            token.cancel();
+            assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            handle.join().unwrap();
+        }
     }
 
     #[test]

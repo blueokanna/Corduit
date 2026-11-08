@@ -104,13 +104,13 @@ impl HttpOutbound {
         // would let a profile inject arbitrary headers into the request we
         // send to the proxy.
         for (field, value) in [("username", &username), ("password", &password)] {
-            if let Some(value) = value {
-                if value.contains(['\r', '\n']) {
-                    return Err(Error::config(format!(
-                        "HTTP proxy {field} must not contain CR or LF: it is encoded into a \
+            if let Some(value) = value
+                && value.contains(['\r', '\n'])
+            {
+                return Err(Error::config(format!(
+                    "HTTP proxy {field} must not contain CR or LF: it is encoded into a \
                          Proxy-Authorization header value"
-                    )));
-                }
+                )));
             }
         }
 
@@ -437,7 +437,7 @@ fn read_head(stream: &mut dyn Read, deadline: Instant) -> Result<(String, Vec<u8
             Ok(0) => {
                 return Err(Error::network(
                     "HTTP proxy closed the connection before finishing its response head",
-                ))
+                ));
             }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) if is_idle_poll(&e) => {
@@ -451,7 +451,7 @@ fn read_head(stream: &mut dyn Read, deadline: Instant) -> Result<(String, Vec<u8
             Err(e) => {
                 return Err(Error::network(format!(
                     "Failed to read HTTP proxy response: {e}"
-                )))
+                )));
             }
         }
     }
@@ -609,11 +609,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("CR or LF"), "{err}");
-        assert!(HttpOutbound::new(config(&[
-            ("username", string("a")),
-            ("password", string("b\nc")),
-        ]))
-        .is_err());
+        assert!(
+            HttpOutbound::new(config(&[
+                ("username", string("a")),
+                ("password", string("b\nc")),
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

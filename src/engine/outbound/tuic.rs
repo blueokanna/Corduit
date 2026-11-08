@@ -716,10 +716,10 @@ impl TuicOutbound {
     fn get_or_create_connection(&self) -> Result<Arc<TuicConnection>> {
         let mut conn_guard = self.connection.lock();
 
-        if let Some(ref conn) = *conn_guard {
-            if !conn.is_closed() {
-                return Ok(conn.clone());
-            }
+        if let Some(ref conn) = *conn_guard
+            && !conn.is_closed()
+        {
+            return Ok(conn.clone());
         }
 
         let socket_addr: SocketAddr = crate::common::socket::resolve_host(

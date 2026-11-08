@@ -2,13 +2,13 @@ mod crypto;
 mod handshake;
 
 pub use crypto::{
-    aead_decrypt, aead_encrypt, generate_keypair, public_key_from_private, KEEPALIVE_TIMEOUT,
-    REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME, REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME,
-    REKEY_TIMEOUT,
+    KEEPALIVE_TIMEOUT, REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME, REKEY_AFTER_MESSAGES,
+    REKEY_AFTER_TIME, REKEY_TIMEOUT, aead_decrypt, aead_encrypt, generate_keypair,
+    public_key_from_private,
 };
 pub use handshake::{
-    HandshakeInitiation, HandshakeResponse, HandshakeState, TransportKeys, MSG_TYPE_COOKIE_REPLY,
-    MSG_TYPE_HANDSHAKE_INIT, MSG_TYPE_HANDSHAKE_RESP, MSG_TYPE_TRANSPORT,
+    HandshakeInitiation, HandshakeResponse, HandshakeState, MSG_TYPE_COOKIE_REPLY,
+    MSG_TYPE_HANDSHAKE_INIT, MSG_TYPE_HANDSHAKE_RESP, MSG_TYPE_TRANSPORT, TransportKeys,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

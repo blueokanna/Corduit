@@ -224,9 +224,10 @@ mod tests {
         assert_eq!(obfs.deobfuscate_packet(&wrapped).unwrap(), packet);
 
         assert!(obfs.deobfuscate_packet(&[]).is_none());
-        assert!(obfs
-            .deobfuscate_packet(&[0u8; XPLUS_SALT_LEN - 1])
-            .is_none());
+        assert!(
+            obfs.deobfuscate_packet(&[0u8; XPLUS_SALT_LEN - 1])
+                .is_none()
+        );
         // Exactly the salt with no payload is decodable to nothing.
         assert_eq!(
             obfs.deobfuscate_packet(&[0u8; XPLUS_SALT_LEN]).unwrap(),

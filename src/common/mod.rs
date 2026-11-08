@@ -43,7 +43,7 @@
 //!
 //! # Safety
 //!
-//! The crate forbids `unsafe` everywhere except four audited sites:
+//! Platform calls and hardware intrinsics are isolated in small modules:
 //! [`roots`] (reading the Windows certificate store requires calling the
 //! Win32 API directly), the socket pin in [`socket`] (binding a socket to an
 //! interface needs `setsockopt`, which has no safe wrapper), and the two
@@ -51,9 +51,16 @@
 //! and the GHASH carry-less multiply — AES-NI / ARMv8 AES / PCLMULQDQ /
 //! PMULL have no safe form; each sits behind a safe wrapper that consults
 //! the runtime detection). Every unsafe call is spelled out and justified at
-//! its site; everything else stays under `deny(unsafe_code)`.
+//! its site. iOS metrics also use Mach calls for the current task and host;
+//! the rest of this module stays under `deny(unsafe_code)`.
 
 #![deny(unsafe_code)]
+
+#[cfg(all(
+    feature = "std",
+    any(target_os = "ios", all(test, target_os = "macos"))
+))]
+pub(crate) mod apple_metrics;
 
 pub mod url;
 
@@ -97,7 +104,7 @@ pub use http::{HttpClient, HttpError, HttpResponse};
 #[cfg(feature = "std")]
 pub use socket::{connect, connect_host, udp_exchange};
 #[cfg(feature = "std")]
-pub use stream::{relay, BoxStream, PrefixedStream, RelayStats, SyncStream};
+pub use stream::{BoxStream, PrefixedStream, RelayStats, SyncStream, relay};
 #[cfg(feature = "std")]
 pub use throttle::LogThrottle;
 pub use url::{Url, UrlError};

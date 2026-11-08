@@ -225,13 +225,13 @@ impl SsrMethod {
                 return Err(Error::config(
                     "SSR method `table` is an 8-bit substitution table with no key and no IV; \
                      it is not encryption and is not implemented",
-                ))
+                ));
             }
             other if other.ends_with("-gcm") || other.ends_with("-poly1305") => {
                 return Err(Error::config(format!(
                     "SSR method `{other}` is an AEAD method; use the `shadowsocks` outbound, \
                      which implements the AEAD framing, rather than the SSR plugin path"
-                )))
+                )));
             }
             other
                 if [
@@ -256,13 +256,13 @@ impl SsrMethod {
                     "SSR method `{other}` needs a block cipher this build does not carry \
                      (Blowfish / Camellia / CAST5 / DES / IDEA / RC2 / SEED); the aes-*, \
                      chacha20* and salsa20 families are available"
-                )))
+                )));
             }
             other => {
                 return Err(Error::config(format!(
                     "Unknown SSR method `{other}`; supported: none, rc4, rc4-md5, \
                      aes-{{128,192,256}}-{{cfb,ctr}}, chacha20, chacha20-ietf, salsa20"
-                )))
+                )));
             }
         };
         Ok(Self {
@@ -1911,26 +1911,36 @@ mod tests {
 
     #[test]
     fn refused_methods_name_their_reason() {
-        assert!(SsrMethod::parse("table")
-            .unwrap_err()
-            .to_string()
-            .contains("not encryption"));
-        assert!(SsrMethod::parse("aes-256-gcm")
-            .unwrap_err()
-            .to_string()
-            .contains("shadowsocks` outbound"));
-        assert!(SsrMethod::parse("chacha20-ietf-poly1305")
-            .unwrap_err()
-            .to_string()
-            .contains("AEAD"));
-        assert!(SsrMethod::parse("camellia-256-cfb")
-            .unwrap_err()
-            .to_string()
-            .contains("block cipher"));
-        assert!(SsrMethod::parse("nonsense")
-            .unwrap_err()
-            .to_string()
-            .contains("Unknown"));
+        assert!(
+            SsrMethod::parse("table")
+                .unwrap_err()
+                .to_string()
+                .contains("not encryption")
+        );
+        assert!(
+            SsrMethod::parse("aes-256-gcm")
+                .unwrap_err()
+                .to_string()
+                .contains("shadowsocks` outbound")
+        );
+        assert!(
+            SsrMethod::parse("chacha20-ietf-poly1305")
+                .unwrap_err()
+                .to_string()
+                .contains("AEAD")
+        );
+        assert!(
+            SsrMethod::parse("camellia-256-cfb")
+                .unwrap_err()
+                .to_string()
+                .contains("block cipher")
+        );
+        assert!(
+            SsrMethod::parse("nonsense")
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown")
+        );
     }
 
     #[test]
@@ -2519,9 +2529,10 @@ mod tests {
             443,
         );
         obfs.unwrapped = true;
-        assert!(obfs
-            .unwrap(&[0x99, 0x03, 0x03, 0x00, 0x00], b"key")
-            .is_err());
+        assert!(
+            obfs.unwrap(&[0x99, 0x03, 0x03, 0x00, 0x00], b"key")
+                .is_err()
+        );
     }
 
     /// The peer's half of `tls1.2_ticket_auth`, built from the reference's
@@ -2656,18 +2667,22 @@ mod tests {
         let string = |s: &str| nextjson::Value::String(s.to_string());
 
         assert!(build(&[]).unwrap_err().contains("cipher"));
-        assert!(build(&[("cipher", string("aes-256-cfb"))])
-            .unwrap_err()
-            .contains("password"));
+        assert!(
+            build(&[("cipher", string("aes-256-cfb"))])
+                .unwrap_err()
+                .contains("password")
+        );
         assert!(build(&[("cipher", string("aes-256-cfb")), ("password", string("x"))]).is_ok());
         // The refusals surface through the outbound constructor too.
-        assert!(build(&[
-            ("cipher", string("aes-256-cfb")),
-            ("password", string("x")),
-            ("protocol", string("auth_chain_a"))
-        ])
-        .unwrap_err()
-        .contains("xorshift"));
+        assert!(
+            build(&[
+                ("cipher", string("aes-256-cfb")),
+                ("password", string("x")),
+                ("protocol", string("auth_chain_a"))
+            ])
+            .unwrap_err()
+            .contains("xorshift")
+        );
     }
 
     #[test]
@@ -2690,8 +2705,9 @@ mod tests {
         })
         .unwrap();
         assert!(!out.supports_udp());
-        assert!(out
-            .relay_udp_packet(&TargetAddr::Domain("dns.test".to_string(), 53), b"\x00")
-            .is_err());
+        assert!(
+            out.relay_udp_packet(&TargetAddr::Domain("dns.test".to_string(), 53), b"\x00")
+                .is_err()
+        );
     }
 }

@@ -5,6 +5,25 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+static DEFAULT_DATABASE_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Register the database used by subsequently constructed routers.
+///
+/// Embedders must use this instead of mutating process environment variables
+/// after native or Flutter worker threads have started. Existing routers keep
+/// their current database until they are reconfigured.
+pub fn set_default_database_path(path: impl AsRef<Path>) -> Result<()> {
+    let path = path
+        .as_ref()
+        .canonicalize()
+        .map_err(|error| Error::config(format!("Cannot resolve GeoIP database: {error}")))?;
+    if !path.is_file() {
+        return Err(Error::config("GeoIP database path is not a file"));
+    }
+    *DEFAULT_DATABASE_PATH.write() = Some(path);
+    Ok(())
+}
+
 /// Longest [`CountryCode`] accepted, in bytes.
 ///
 /// A GeoLite2-family database ships two-letter ISO 3166-1 alpha-2 codes, but
@@ -164,13 +183,16 @@ impl GeoIpManager {
 
     /// Creates a manager backed by an optionally-supplied country database.
     /// A database is loaded from `Country.mmdb` next to the executable (or the
-    /// path given via `CORDUIT_GEOIP_DB`). If no database is available the
+    /// path registered through [`set_default_database_path`] or supplied via
+    /// `CORDUIT_GEOIP_DB`). If no database is available the
     /// manager starts empty: `GEOIP` rules will simply miss and fall through,
     /// while the rest of the router keeps working. Callers can later install a
     /// database at runtime via [`GeoIpManager::load_database`].
     pub fn from_embedded_country_database() -> Self {
-        let db_path = std::env::var_os("CORDUIT_GEOIP_DB")
-            .map(PathBuf::from)
+        let db_path = DEFAULT_DATABASE_PATH
+            .read()
+            .clone()
+            .or_else(|| std::env::var_os("CORDUIT_GEOIP_DB").map(PathBuf::from))
             .or_else(|| {
                 std::env::current_exe()
                     .ok()
@@ -330,12 +352,16 @@ mod tests {
     fn test_country_code_parse_and_match() {
         assert_eq!(CountryCode::parse("cn").unwrap().as_bytes(), b"CN");
         assert_eq!(CountryCode::parse("US").unwrap().as_bytes(), b"US");
-        assert!(CountryCode::parse("cn")
-            .unwrap()
-            .matches(&CountryCode::parse("CN").unwrap()));
-        assert!(!CountryCode::parse("CN")
-            .unwrap()
-            .matches(&CountryCode::parse("JP").unwrap()));
+        assert!(
+            CountryCode::parse("cn")
+                .unwrap()
+                .matches(&CountryCode::parse("CN").unwrap())
+        );
+        assert!(
+            !CountryCode::parse("CN")
+                .unwrap()
+                .matches(&CountryCode::parse("JP").unwrap())
+        );
         assert!(CountryCode::parse("C").is_none());
         assert!(CountryCode::parse("").is_none());
         assert!(CountryCode::parse("12").is_none());
@@ -351,9 +377,11 @@ mod tests {
         let google = CountryCode::parse("google").unwrap();
         assert_eq!(google.as_str(), "GOOGLE");
         assert_eq!(CountryCode::parse("GOOGLE").unwrap(), google);
-        assert!(CountryCode::parse("cloudfront")
-            .unwrap()
-            .matches(&CountryCode::parse("CLOUDFRONT").unwrap()));
+        assert!(
+            CountryCode::parse("cloudfront")
+                .unwrap()
+                .matches(&CountryCode::parse("CLOUDFRONT").unwrap())
+        );
         assert!(!google.matches(&CountryCode::parse("CLOUDFLARE").unwrap()));
         assert!(CountryCode::parse(&"A".repeat(MAX_COUNTRY_CODE_LEN)).is_some());
         assert!(CountryCode::parse(&"A".repeat(MAX_COUNTRY_CODE_LEN + 1)).is_none());
@@ -382,9 +410,11 @@ mod tests {
         assert!(!manager.is_loaded());
         // Empty database: every GEOIP lookup is a miss, falling through to
         // the next rule instead of aborting routing.
-        assert!(manager
-            .lookup_country(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))
-            .is_none());
+        assert!(
+            manager
+                .lookup_country(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))
+                .is_none()
+        );
         assert!(!manager.matches_country("CN", IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))));
     }
 }

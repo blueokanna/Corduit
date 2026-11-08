@@ -521,21 +521,20 @@ impl QuicConn {
             self.handshake.notify_waiters();
             return;
         }
-        if st.handshake_complete {
-            if let Some(_ka) = st.config.keep_alive_interval {
-                if Instant::now() >= st.keep_alive_next {
-                    // Send an ack-eliciting PING so the peer replies and the
-                    // connection stays alive. An ACK frame alone is not
-                    // ack-eliciting and would not solicit a response.
-                    st.ping_pending = true;
-                    st.keep_alive_next = Instant::now() + _ka;
-                }
-            }
+        if st.handshake_complete
+            && let Some(_ka) = st.config.keep_alive_interval
+            && Instant::now() >= st.keep_alive_next
+        {
+            // Send an ack-eliciting PING so the peer replies and the
+            // connection stays alive. An ACK frame alone is not
+            // ack-eliciting and would not solicit a response.
+            st.ping_pending = true;
+            st.keep_alive_next = Instant::now() + _ka;
         }
-        if let Some(due) = st.pto_due {
-            if Instant::now() >= due {
-                self.send_probe(st);
-            }
+        if let Some(due) = st.pto_due
+            && Instant::now() >= due
+        {
+            self.send_probe(st);
         }
     }
 
@@ -729,10 +728,10 @@ impl QuicConn {
 
         // The server's source connection ID becomes our destination ID for
         // all subsequent packets (RFC 9000 §7.2).
-        if let ParsedPacket::Long(h) = &parsed {
-            if !h.scid.is_empty() {
-                st.dcid.clone_from(&h.scid);
-            }
+        if let ParsedPacket::Long(h) = &parsed
+            && !h.scid.is_empty()
+        {
+            st.dcid.clone_from(&h.scid);
         }
 
         let plain = match key.open(pn, &packet[..header_end], &packet[header_end..]) {
@@ -795,11 +794,11 @@ impl QuicConn {
                 Ok(())
             }
             Frame::MaxStreamData { stream_id, max } => {
-                if let Some(s) = st.streams.get_mut(&stream_id) {
-                    if max > s.peer_limit {
-                        s.peer_limit = max;
-                        s.send_notify.notify_waiters();
-                    }
+                if let Some(s) = st.streams.get_mut(&stream_id)
+                    && max > s.peer_limit
+                {
+                    s.peer_limit = max;
+                    s.send_notify.notify_waiters();
                 }
                 Ok(())
             }
@@ -896,7 +895,7 @@ impl QuicConn {
                 }
             }
             std::cmp::Ordering::Greater => {
-                return Err(QuicError::Protocol("CRYPTO gap from peer".into()))
+                return Err(QuicError::Protocol("CRYPTO gap from peer".into()));
             }
         }
 
@@ -1052,11 +1051,7 @@ impl QuicConn {
                 st.rttvar = latest / 2;
             } else {
                 // abs_diff (stable 1.81) — hand-rolled for MSRV 1.78.
-                let diff = if st.smoothed_rtt >= adj {
-                    st.smoothed_rtt - adj
-                } else {
-                    adj - st.smoothed_rtt
-                };
+                let diff = st.smoothed_rtt.abs_diff(adj);
                 st.rttvar = (st.rttvar * 3 + diff) / 4;
                 st.smoothed_rtt = (st.smoothed_rtt * 7 + adj) / 8;
             }
@@ -1187,12 +1182,12 @@ impl QuicConn {
                 continue;
             }
 
-            if st.spaces[idx].ack_pending {
-                if let Some(ack) = build_ack(&st.spaces[idx]) {
-                    st.spaces[idx].ack_pending = false;
-                    let mut frames = vec![ack];
-                    let _ = self.send_one(st, space, &mut frames, false, max_datagram, &mut out);
-                }
+            if st.spaces[idx].ack_pending
+                && let Some(ack) = build_ack(&st.spaces[idx])
+            {
+                st.spaces[idx].ack_pending = false;
+                let mut frames = vec![ack];
+                let _ = self.send_one(st, space, &mut frames, false, max_datagram, &mut out);
             }
 
             loop {
@@ -1201,28 +1196,22 @@ impl QuicConn {
                     break;
                 }
 
-                if space == PnSpace::Application {
-                    if let Some(d) = st.datagram_tx.pop_front() {
-                        if d.len() as u64 > max_datagram.saturating_sub(DATAGRAM_OVERHEAD) {
-                            st.datagram_tx.push_front(d);
-                        } else {
-                            let mut frames = vec![Frame::Datagram {
-                                data: d,
-                                length: None,
-                            }];
-                            let _ = self.send_one(
-                                st,
-                                space,
-                                &mut frames,
-                                false,
-                                max_datagram,
-                                &mut out,
-                            );
-                            if out.len() >= 32 {
-                                break;
-                            }
-                            continue;
+                if space == PnSpace::Application
+                    && let Some(d) = st.datagram_tx.pop_front()
+                {
+                    if d.len() as u64 > max_datagram.saturating_sub(DATAGRAM_OVERHEAD) {
+                        st.datagram_tx.push_front(d);
+                    } else {
+                        let mut frames = vec![Frame::Datagram {
+                            data: d,
+                            length: None,
+                        }];
+                        let _ =
+                            self.send_one(st, space, &mut frames, false, max_datagram, &mut out);
+                        if out.len() >= 32 {
+                            break;
                         }
+                        continue;
                     }
                 }
 
@@ -1772,15 +1761,15 @@ fn wake_all(st: &mut ConnState) {
 /// Sync the TLS-layer keys into the packet-number spaces as the handshake
 /// progresses.
 fn install_keys(st: &mut ConnState) {
-    if let Some(k) = &st.tls.hs_write {
-        if st.spaces[PnSpace::Handshake.index()].write_key.is_none() {
-            st.spaces[PnSpace::Handshake.index()].write_key = Some(k.clone());
-        }
+    if let Some(k) = &st.tls.hs_write
+        && st.spaces[PnSpace::Handshake.index()].write_key.is_none()
+    {
+        st.spaces[PnSpace::Handshake.index()].write_key = Some(k.clone());
     }
-    if let Some(k) = &st.tls.hs_read {
-        if st.spaces[PnSpace::Handshake.index()].key.is_none() {
-            st.spaces[PnSpace::Handshake.index()].key = Some(k.clone());
-        }
+    if let Some(k) = &st.tls.hs_read
+        && st.spaces[PnSpace::Handshake.index()].key.is_none()
+    {
+        st.spaces[PnSpace::Handshake.index()].key = Some(k.clone());
     }
     if st.tls.is_complete() {
         if let Some(k) = &st.tls.app_write {
@@ -1822,7 +1811,7 @@ fn insert_gap(s: &mut StreamState, offset: u64, data: Vec<u8>) {
         let overlapping: Vec<(u64, Vec<u8>)> = s
             .recv_gaps
             .range(..=merged_end)
-            .filter(|(&k, v)| k + v.len() as u64 >= merged_offset)
+            .filter(|(k, v)| **k + v.len() as u64 >= merged_offset)
             .map(|(k, v)| (*k, v.clone()))
             .collect();
         if overlapping.is_empty() {
