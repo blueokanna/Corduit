@@ -68,12 +68,17 @@ struct OutboundRef<'a> {
     options: MapRef<'a, Value>,
 }
 impl NsonSchema for InboundConfig {
-    const SCHEMA: TypeSchema = match Inbound::SCHEMA {
-        TypeSchema::Struct(schema) => TypeSchema::Struct(&nextjson::StructSchema {
-            name: "InboundConfig",
-            ..*schema
-        }),
-        schema => schema,
+    const SCHEMA: TypeSchema = {
+        // A named constant gives the reference a static lifetime on Rust 1.78.
+        // Borrowing a struct built inside the match arm does not on that MSRV.
+        const SCHEMA: nextjson::StructSchema = match Inbound::SCHEMA {
+            TypeSchema::Struct(schema) => nextjson::StructSchema {
+                name: "InboundConfig",
+                ..*schema
+            },
+            _ => panic!("Inbound codec must have a struct schema"),
+        };
+        TypeSchema::Struct(&SCHEMA)
     };
 }
 impl NsonSerialize for InboundConfig {
@@ -95,12 +100,15 @@ impl NsonSerialize for InboundConfig {
     }
 }
 impl NsonSchema for OutboundConfig {
-    const SCHEMA: TypeSchema = match Outbound::SCHEMA {
-        TypeSchema::Struct(schema) => TypeSchema::Struct(&nextjson::StructSchema {
-            name: "OutboundConfig",
-            ..*schema
-        }),
-        schema => schema,
+    const SCHEMA: TypeSchema = {
+        const SCHEMA: nextjson::StructSchema = match Outbound::SCHEMA {
+            TypeSchema::Struct(schema) => nextjson::StructSchema {
+                name: "OutboundConfig",
+                ..*schema
+            },
+            _ => panic!("Outbound codec must have a struct schema"),
+        };
+        TypeSchema::Struct(&SCHEMA)
     };
 }
 impl NsonSerialize for OutboundConfig {
@@ -126,6 +134,27 @@ impl NsonSerialize for OutboundConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_schemas_preserve_codec_metadata() {
+        for (public, wire, name) in [
+            (InboundConfig::SCHEMA, Inbound::SCHEMA, "InboundConfig"),
+            (OutboundConfig::SCHEMA, Outbound::SCHEMA, "OutboundConfig"),
+        ] {
+            let (TypeSchema::Struct(public), TypeSchema::Struct(wire)) = (public, wire) else {
+                panic!("config and codec schemas must describe structs");
+            };
+            assert_eq!(public.name, name);
+            assert_eq!(public.fields, wire.fields);
+            assert_eq!(public.transparent, wire.transparent);
+            assert_eq!(public.max_depth, wire.max_depth);
+            assert_eq!(public.deny_unknown_fields, wire.deny_unknown_fields);
+            let options = public.fields.iter().find(|f| f.name == "options").unwrap();
+            assert!(options.flattened);
+            assert!(matches!(options.ty, TypeSchema::Map(_)));
+        }
+    }
+
     #[test]
     fn flattened_options_survive_roundtrip_without_changing_wire_keys() {
         let raw = r#"{"type":"socks5","tag":"node","server":"example.com","port":1080,"username":"u","password":"p","nested":{"list":[1,true,null]}}"#;
@@ -142,8 +171,6 @@ mod tests {
     }
     #[test]
     fn inbound_defaults_and_invalid_fields_match_existing_contract() {
-        assert_eq!(InboundConfig::SCHEMA.name(), "InboundConfig");
-        assert_eq!(OutboundConfig::SCHEMA.name(), "OutboundConfig");
         let decoded: InboundConfig =
             nextjson::from_str(r#"{"type":"mixed","tag":"local","port":7890,"sniff":true}"#)
                 .unwrap();
@@ -160,11 +187,19 @@ mod tests {
     }
     #[test]
     fn options_cannot_override_routing_identity_on_serialization() {
-        let mut decoded: OutboundConfig =
+        let outbound: OutboundConfig =
             nextjson::from_str(r#"{"type":"direct","tag":"safe"}"#).unwrap();
-        decoded
-            .options
-            .insert("tag".into(), Value::String("other".into()));
-        assert!(nextjson::to_string(&decoded).is_err());
+        for key in ["type", "tag", "server", "port"] {
+            let mut config = outbound.clone();
+            config.options.insert(key.into(), Value::Null);
+            assert!(nextjson::to_string(&config).is_err(), "reserved key: {key}");
+        }
+        let inbound: InboundConfig =
+            nextjson::from_str(r#"{"type":"mixed","tag":"safe","port":7890}"#).unwrap();
+        for key in ["type", "tag", "listen", "port"] {
+            let mut config = inbound.clone();
+            config.options.insert(key.into(), Value::Null);
+            assert!(nextjson::to_string(&config).is_err(), "reserved key: {key}");
+        }
     }
 }
