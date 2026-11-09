@@ -443,8 +443,10 @@ impl Attribute {
                 }
                 Ok(Self::UnknownAttributes(
                     value
-                        .chunks_exact(2)
-                        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|pair| u16::from_be_bytes(*pair))
                         .collect(),
                 ))
             }
@@ -809,10 +811,6 @@ impl Message {
         };
 
         if let Some((attribute_offset, claimed)) = fingerprint {
-            // Verify against a copy whose length field ends at the FINGERPRINT
-            // attribute, which is what the sender hashed — the finished message
-            // carries the same value there, but the header must not be taken on
-            // faith once anything after the attribute is considered.
             let mut candidate = bytes[..attribute_offset].to_vec();
             let length_to_fingerprint = attribute_offset - HEADER_LEN + FINGERPRINT_LEN;
             candidate[2..4].copy_from_slice(&(length_to_fingerprint as u16).to_be_bytes());
@@ -824,8 +822,6 @@ impl Message {
         if message.class == MessageClass::ErrorResponse
             && let Some((code, reason)) = message.error_code()
         {
-            // 420 asks for the unrecognised attributes to be removed; there
-            // is nothing to retry, so it is reported like any other failure.
             return Err(StunError::ServerError {
                 code,
                 reason: reason.to_string(),
@@ -896,9 +892,6 @@ pub mod client {
     }
 
     impl core::fmt::Debug for StunClient {
-        /// Reports the socket and target but never the RNG state: the state is
-        /// what makes future transaction ids unpredictable, and a stray
-        /// `{:?}` in a log line should not be able to leak it.
         fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             formatter
                 .debug_struct("StunClient")
@@ -1016,8 +1009,6 @@ pub mod client {
             loop {
                 let (length, source) = match self.socket.recv_from(&mut buffer) {
                     Ok(received) => received,
-                    // A timeout or an ICMP-derived error both mean "nothing
-                    // usable arrived in this window"; the caller retransmits.
                     Err(_) => return None,
                 };
 
@@ -1140,12 +1131,10 @@ mod tests {
         let encoded = message.encode(None);
         let decoded = decode(&encoded);
 
-        // Both forms survive, and the XOR form is what `mapped_address` returns.
         assert_eq!(decoded.mapped_address(), Some(address));
         assert_eq!(decoded.attributes[0], Attribute::MappedAddress(address));
         assert_eq!(decoded.attributes[1], Attribute::XorMappedAddress(address));
 
-        // The clear form must be byte-identical, the XOR form must not.
         let clear_start = HEADER_LEN + 4 + 4;
         assert_eq!(&encoded[clear_start..clear_start + 4], &[203, 0, 113, 7]);
         let xor_start = clear_start + 8 + 4;
@@ -1168,7 +1157,6 @@ mod tests {
 
     #[test]
     fn attributes_are_padded_to_four_byte_boundaries() {
-        // Three bytes of software name must occupy four on the wire.
         let message = Message {
             class: MessageClass::SuccessResponse,
             method: Method::Binding,

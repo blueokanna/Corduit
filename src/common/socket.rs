@@ -18,7 +18,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Whether a name's addresses are dialled at once instead of one after another.
 ///
@@ -252,38 +252,85 @@ pub fn connect_host(host: &str, port: u16, timeout: Duration) -> io::Result<TcpS
     Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses")))
 }
 
-/// Dial every candidate at once and keep the first one that answers.
+/// Race the first `MAX_CONCURRENT_DIALS` candidates and keep the first success.
 ///
 /// The losing sockets are abandoned rather than waited for: their threads end
 /// when their own connect completes or times out, which is bounded by `timeout`.
 /// Waiting for them would give back exactly the latency this exists to remove.
 fn connect_first(addrs: &[SocketAddr], timeout: Duration) -> io::Result<TcpStream> {
-    let candidates: Vec<SocketAddr> = addrs.iter().copied().take(MAX_CONCURRENT_DIALS).collect();
-    let (tx, rx) = mpsc::channel();
-    let attempts = candidates.len();
-
-    for addr in candidates {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            // A send error means the caller already took an answer.
-            let _ = tx.send(connect(&addr, timeout));
-        });
+    if addrs.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no addresses"));
     }
-    // The clone kept in `tx` would hold the channel open forever.
-    drop(tx);
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TCP connect timeout must be nonzero",
+        ));
+    }
 
+    let started = Instant::now();
+    let (tx, rx) = mpsc::channel();
+    let attempts = addrs.len().min(MAX_CONCURRENT_DIALS);
+
+    for addr in addrs.iter().copied().take(attempts) {
+        let result_tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("corduit-connect".into())
+            .spawn(move || {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                let result = if remaining.is_zero() {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "TCP dial timed out",
+                    ))
+                } else {
+                    connect(&addr, remaining)
+                };
+                // If another candidate won, sending drops this stream instead.
+                let _ = result_tx.send(result);
+            });
+        if let Err(error) = spawned {
+            // Thread exhaustion is a failed attempt, not a process panic.
+            let _ = tx.send(Err(error));
+        }
+    }
+    drop(tx);
+    collect_dials(rx, attempts, started, timeout)
+}
+
+/// Collect dial results against one shared budget. An earlier failure must not
+/// hide a later success, extend the deadline, or mask an unfinished attempt.
+fn collect_dials(
+    rx: mpsc::Receiver<io::Result<TcpStream>>,
+    attempts: usize,
+    started: Instant,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
     let mut last: Option<io::Error> = None;
     for _ in 0..attempts {
-        match rx.recv_timeout(timeout) {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TCP dial timed out",
+            ));
+        }
+        match rx.recv_timeout(remaining) {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(error)) => last = Some(error),
-            // Every attempt is accounted for by the loop bound, so a timeout here
-            // means the last one is still running; stop rather than wait again.
-            Err(_) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TCP dial timed out",
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("TCP dial worker exited without a result"));
+            }
         }
     }
 
-    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "no address answered")))
+    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses")))
 }
 
 /// Run a blocking lookup on a thread of its own and wait at most `timeout`.
@@ -422,8 +469,6 @@ fn resolve_host_all_with(
     timeout: Duration,
     engine: EngineLookup,
 ) -> io::Result<Vec<IpAddr>> {
-    // A literal needs no lookup and no thread, and asking the engine for the
-    // other family of a literal is an error by definition.
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![ip]);
     }
@@ -452,8 +497,6 @@ fn engine_then_system(host: &str, engine: EngineLookup) -> io::Result<Vec<IpAddr
     });
 
     let mut found: Vec<IpAddr> = Vec::new();
-    // `false` before `true` keeps the engine's own ordering: v4 addresses are
-    // dialled first, v6 rides along as the fallback.
     let mut configured = false;
     for outcome in [v4, v6] {
         match outcome {
@@ -465,7 +508,6 @@ fn engine_then_system(host: &str, engine: EngineLookup) -> io::Result<Vec<IpAddr
                 configured = true;
                 tracing::debug!("engine DNS could not resolve {host}: {error}");
             }
-            // No engine DNS at all: nothing to prefer.
             None => {}
         }
     }
@@ -615,8 +657,6 @@ mod tests {
 
     #[test]
     fn connect_timeout_fails_fast() {
-        // 192.0.2.0/24 is TEST-NET-1, guaranteed unroutable. A blocking
-        // connect would hang; connect_timeout must return within the budget.
         let addr: SocketAddr = "192.0.2.1:65000".parse().unwrap();
         let start = std::time::Instant::now();
         let res = connect(&addr, Duration::from_millis(300));
@@ -693,7 +733,6 @@ mod tests {
             connect(&first_addr, DIAL_TEST_TIMEOUT).expect("the first listener accepts");
         let mut peer = accept_dial(&first);
         assert_round_trip(&mut stream, &mut peer);
-        // The synchronous dial has finished; it cannot later dial the second.
         assert_no_dial(&second);
 
         let mut winner = connect_first(&[first_addr, second_addr], DIAL_TEST_TIMEOUT)
@@ -732,31 +771,92 @@ mod tests {
     }
 
     #[test]
-    fn racing_survives_a_refused_candidate() {
-        // Reserve a port without listening, so no other test can reuse it.
-        let refused = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )
-        .unwrap();
-        refused
-            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+    fn racing_survives_a_failed_candidate() {
+        for kind in [io::ErrorKind::ConnectionRefused, io::ErrorKind::TimedOut] {
+            for failure_first in [true, false] {
+                let listener = dial_listener();
+                let address = listener.local_addr().unwrap();
+                let stream = connect(&address, DIAL_TEST_TIMEOUT).unwrap();
+                let mut peer = accept_dial(&listener);
+                let (tx, rx) = mpsc::channel();
+                let failure = Err(io::Error::new(kind, "candidate failed"));
+                if failure_first {
+                    tx.send(failure).unwrap();
+                    tx.send(Ok(stream)).unwrap();
+                } else {
+                    tx.send(Ok(stream)).unwrap();
+                    tx.send(failure).unwrap();
+                }
+                drop(tx);
+                let mut winner = collect_dials(rx, 2, Instant::now(), DIAL_TEST_TIMEOUT)
+                    .expect("a failed candidate must not hide a successful one");
+                assert_eq!(winner.peer_addr().unwrap(), address);
+                assert_round_trip(&mut winner, &mut peer);
+            }
+        }
+    }
+
+    #[test]
+    fn racing_preserves_the_last_completed_error() {
+        for kind in [io::ErrorKind::ConnectionRefused, io::ErrorKind::TimedOut] {
+            let (tx, rx) = mpsc::channel();
+            tx.send(Err(io::Error::other("first failure"))).unwrap();
+            tx.send(Err(io::Error::new(kind, "last failure"))).unwrap();
+            drop(tx);
+            let error = collect_dials(rx, 2, Instant::now(), DIAL_TEST_TIMEOUT).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "last failure");
+        }
+    }
+
+    #[test]
+    fn racing_timeout_does_not_report_an_earlier_refusal() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(io::ErrorKind::ConnectionRefused.into()))
             .unwrap();
-        let refused_addr = refused.local_addr().unwrap().as_socket().unwrap();
-        let listener = dial_listener();
-        let address = listener.local_addr().unwrap();
-        let mut winner = connect_first(&[refused_addr, address], DIAL_TEST_TIMEOUT)
-            .expect("a refused candidate must not hide a successful one");
-        assert_eq!(winner.peer_addr().unwrap(), address);
-        let mut peer = accept_dial(&listener);
-        assert_round_trip(&mut winner, &mut peer);
+        // Keep the sender alive to represent a second, unfinished attempt.
+        let error = collect_dials(rx, 2, Instant::now(), Duration::from_millis(10)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(tx);
+    }
+
+    #[test]
+    fn racing_does_not_restart_an_expired_budget() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(io::ErrorKind::ConnectionRefused.into()))
+            .unwrap();
+        drop(tx);
+        let timeout = Duration::from_secs(1);
+        let started = Instant::now().checked_sub(timeout).unwrap();
+        let error = collect_dials(rx, 1, started, timeout).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn racing_reports_a_worker_that_exits_without_a_result() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(io::ErrorKind::ConnectionRefused.into()))
+            .unwrap();
+        drop(tx);
+        let error = collect_dials(rx, 2, Instant::now(), DIAL_TEST_TIMEOUT).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("worker exited without a result"));
+    }
+
+    #[test]
+    fn racing_rejects_empty_candidates_and_zero_timeout() {
         assert_eq!(
-            connect_first(&[refused_addr], DIAL_TEST_TIMEOUT)
-                .expect_err("all candidates refused")
-                .kind(),
-            io::ErrorKind::ConnectionRefused
+            connect_first(&[], DIAL_TEST_TIMEOUT).unwrap_err().kind(),
+            io::ErrorKind::NotFound
         );
+        let listener = dial_listener();
+        assert_eq!(
+            connect_first(&[listener.local_addr().unwrap()], Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_no_dial(&listener);
     }
 
     /// The switch the engine installs from `tcp-concurrent` reaches the dial path.
@@ -775,7 +875,6 @@ mod tests {
 
     #[test]
     fn connect_host_rejects_unresolvable() {
-        // A host that cannot resolve must surface as an error, not hang.
         let res = connect_host(
             "this-host-does-not-exist.invalid",
             80,
@@ -796,7 +895,6 @@ mod tests {
 
     #[test]
     fn udp_exchange_times_out() {
-        // 192.0.2.1 is unroutable; no reply will come within 200ms.
         let target: SocketAddr = "192.0.2.1:9".parse().unwrap();
         let start = std::time::Instant::now();
         let res = udp_exchange(&target, b"ping", Duration::from_millis(200), None);

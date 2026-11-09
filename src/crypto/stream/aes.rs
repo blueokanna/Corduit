@@ -119,8 +119,8 @@ impl Aes {
         }
 
         let mut round_keys = [[0u8; 16]; 15];
-        for (block, words) in round_keys.iter_mut().zip(w[..total].chunks_exact(4)) {
-            for (word, out) in words.iter().zip(block.chunks_exact_mut(4)) {
+        for (block, words) in round_keys.iter_mut().zip(w[..total].as_chunks::<4>().0) {
+            for (word, out) in words.iter().zip(block.as_chunks_mut::<4>().0) {
                 out.copy_from_slice(&word.to_be_bytes());
             }
         }

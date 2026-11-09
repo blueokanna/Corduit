@@ -62,7 +62,6 @@ impl Cfb128 {
             }
             let keystream = self.feedback[self.offset];
             let cipher = *byte ^ keystream;
-            // The feedback byte becomes the ciphertext byte it just produced.
             self.feedback[self.offset] = cipher;
             *byte = cipher;
             self.offset = (self.offset + 1) & 15;
@@ -76,8 +75,6 @@ impl Cfb128 {
                 self.aes.encrypt_block(&mut self.feedback);
             }
             let keystream = self.feedback[self.offset];
-            // The feedback byte becomes the *input* byte, which for decryption
-            // is the ciphertext.
             let cipher = *byte;
             self.feedback[self.offset] = cipher;
             *byte = cipher ^ keystream;
@@ -115,13 +112,8 @@ impl Ctr {
     }
 
     fn refill(&mut self) {
-        // The keystream block is the encryption of the *counter*, so the
-        // counter has to be loaded into the buffer before the block cipher
-        // runs. Encrypting the buffer's previous contents (or zeros) would
-        // still produce a stream, just not the one the peer computes.
         self.keystream.copy_from_slice(&self.counter);
         self.aes.encrypt_block(&mut self.keystream);
-        // Big-endian increment over all 16 bytes so the whole space is used.
         for byte in self.counter.iter_mut().rev() {
             let (next, carried) = byte.overflowing_add(1);
             *byte = next;
@@ -170,14 +162,9 @@ impl Cbc {
             return Err(InvalidLength);
         }
         let mut previous = *iv;
-        for block in buf.chunks_exact_mut(16) {
-            let cipher = {
-                let mut copy = [0u8; 16];
-                copy.copy_from_slice(block);
-                copy
-            };
-            self.aes
-                .decrypt_block(block.try_into().expect("16-byte chunk"));
+        for block in buf.as_chunks_mut::<16>().0 {
+            let cipher = *block;
+            self.aes.decrypt_block(block);
             for (byte, prev) in block.iter_mut().zip(previous.iter()) {
                 *byte ^= prev;
             }
@@ -193,12 +180,11 @@ impl Cbc {
             return Err(InvalidLength);
         }
         let mut previous = *iv;
-        for block in buf.chunks_exact_mut(16) {
+        for block in buf.as_chunks_mut::<16>().0 {
             for (byte, prev) in block.iter_mut().zip(previous.iter()) {
                 *byte ^= prev;
             }
-            self.aes
-                .encrypt_block(block.try_into().expect("16-byte chunk"));
+            self.aes.encrypt_block(block);
             previous.copy_from_slice(block);
         }
         Ok(())

@@ -31,9 +31,6 @@ fn gf_mul(x: u128, y: u128) -> u128 {
     let mut x = x;
     let mut y = y;
     for _ in 0..128 {
-        // Each bit becomes a 0/all-ones mask, so neither the secret `H`
-        // (riding in `x`) nor a secret intermediate (in `y`) is ever the
-        // subject of a branch the hardware can predict or time.
         let bit = ((y >> 127) & 1).wrapping_neg();
         z ^= x & bit;
         y <<= 1;
@@ -92,8 +89,6 @@ impl GHash {
     }
 
     fn absorb_block(&mut self, block: &[u8; 16]) {
-        // GCM treats 128-bit blocks as big-endian bit strings (the first
-        // byte is the coefficient of x^127).
         let x = u128::from_be_bytes(*block);
         self.state = self.mul(self.state ^ x);
     }
@@ -124,10 +119,6 @@ impl GHash {
             data = &data[16..];
         }
 
-        // `push` is a stream: a call may leave a partial block for the next
-        // one. Only copy what arrived and add to the fill count — assigning
-        // `data.len()` would silently discard a block filled by an earlier
-        // call when the new data does not complete it.
         if !data.is_empty() {
             self.buf[..data.len()].copy_from_slice(data);
         }
@@ -142,9 +133,6 @@ impl GHash {
     /// ciphertext bytes are absorbed.
     fn pad_to_block(&mut self) {
         if self.buf_len > 0 {
-            // Zero-pad the filled prefix explicitly; the tail of `self.buf`
-            // may hold stale bytes from an earlier partial block when callers
-            // push in pieces, and GHASH must only see the new bytes.
             let mut block = [0u8; 16];
             block[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
             self.absorb_block(&block);
@@ -230,12 +218,10 @@ impl AesGcm {
                 None => gf_mul(x, h),
             };
             let mut state = 0u128;
-            let mut blocks = nonce.chunks_exact(16);
-            for block in &mut blocks {
-                let arr: [u8; 16] = block.try_into().unwrap();
-                state = mul(state ^ u128::from_be_bytes(arr));
+            let (blocks, rem) = nonce.as_chunks::<16>();
+            for block in blocks {
+                state = mul(state ^ u128::from_be_bytes(*block));
             }
-            let rem = blocks.remainder();
             if !rem.is_empty() {
                 let mut block = [0u8; 16];
                 block[..rem.len()].copy_from_slice(rem);

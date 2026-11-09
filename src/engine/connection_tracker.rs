@@ -228,7 +228,6 @@ impl ConnectionTracker {
     fn maybe_update_speed(&self) {
         if let Ok(mut last_update) = self.last_speed_update.try_write() {
             let elapsed = last_update.elapsed();
-            // Update speed every 500ms for more responsive display
             if elapsed >= std::time::Duration::from_millis(500) {
                 let secs = elapsed.as_secs_f64();
                 if secs > 0.0 {
@@ -282,8 +281,6 @@ impl ConnectionTracker {
 
     /// Remove a connection from tracking
     pub fn untrack(&self, id: &str) {
-        // Just remove the connection from tracking
-        // Traffic is already counted in add_global_upload/download during relay
         self.connections.remove(id);
     }
 
@@ -355,7 +352,6 @@ impl ConnectionTracker {
 
     /// Reset all statistics (called when service restarts)
     pub fn reset(&self) {
-        // Clear all connections, tearing down whatever still runs
         self.close_all();
         self.connections.clear();
 
@@ -372,7 +368,6 @@ impl ConnectionTracker {
         self.upload_speed.store(0, Ordering::Relaxed);
         self.download_speed.store(0, Ordering::Relaxed);
 
-        // Reset speed update time
         if let Ok(mut last_update) = self.last_speed_update.write() {
             *last_update = Instant::now();
         }

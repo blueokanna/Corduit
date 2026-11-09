@@ -33,7 +33,10 @@ jobs:
         run: cargo check --locked --workspace --all-targets --all-features
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+
+      - name: Test all features
+        run: cargo test --locked --workspace --all-features
       - name: Examples (offline smoke tests)
         run: |
           cargo run --example minimal
@@ -134,7 +137,7 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.97.0'
+          toolchain: "1.97.0"
           components: clippy, rustfmt
 
       - name: Cache cargo

@@ -45,7 +45,7 @@ pub fn hex_decode(input: &[u8]) -> Result<alloc::vec::Vec<u8>, HexDecodeError> {
         return Err(HexDecodeError::OddLength);
     }
     let mut out = alloc::vec::Vec::with_capacity(input.len() / 2);
-    for pair in input.chunks_exact(2) {
+    for pair in input.as_chunks::<2>().0 {
         let hi = hex_val(pair[0]).ok_or(HexDecodeError::InvalidHexDigit)?;
         let lo = hex_val(pair[1]).ok_or(HexDecodeError::InvalidHexDigit)?;
         out.push((hi << 4) | lo);
@@ -77,12 +77,8 @@ pub fn base64url_decode(input: &str) -> Option<alloc::vec::Vec<u8>> {
 fn decode_normalised(input: &str, url: bool) -> Option<alloc::vec::Vec<u8>> {
     let body = input.trim_end_matches('=');
     let padding = input.len() - body.len();
-    if padding > 0 {
-        // Padding, when present, must be the tail of a 4-character quantum:
-        // "Zg==" is canonical, "Zg=" and "Zm9vYmFy=" are not.
-        if !input.len().is_multiple_of(4) || padding != 4 - body.len() % 4 {
-            return None;
-        }
+    if padding > 0 && (!input.len().is_multiple_of(4) || padding != 4 - body.len() % 4) {
+        return None;
     }
     if body.contains('=') {
         return None;
