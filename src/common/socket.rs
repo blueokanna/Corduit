@@ -208,14 +208,10 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
     // it, and the interface pin for the route table the tunnel installs.
     protect_socket2(&sock);
     apply_outbound_interface(&sock, addr.ip());
-    sock.set_nonblocking(true)?;
+    // `connect_timeout` switches to non-blocking mode internally and restores
+    // blocking mode on success, as required by the synchronous engine's I/O
+    // timeouts (SO_RCVTIMEO / SO_SNDTIMEO).
     sock.connect_timeout(&(*addr).into(), timeout)?;
-    // `connect_timeout` requires a non-blocking socket but leaves it that
-    // way; the synchronous engine needs a plain blocking stream (read/write
-    // timeouts via SO_RCVTIMEO/SO_SNDTIMEO only behave as intended on
-    // blocking sockets — on Linux a leftover O_NONBLOCK makes relay reads
-    // return WouldBlock instantly and stalls bidirectional copies).
-    sock.set_nonblocking(false)?;
     let stream: TcpStream = sock.into();
     stream.set_nodelay(true)?;
     Ok(stream)
@@ -612,6 +608,10 @@ pub fn recv_udp_timeout(sock: &UdpSocket, buf: &mut [u8], timeout: Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    const DIAL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn connect_timeout_fails_fast() {
@@ -624,77 +624,138 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
-    /// A listener that counts what it accepts, so a dial can be observed rather
-    /// than timed.
-    fn counting_listener() -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&hits);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if stream.is_err() {
-                    break;
-                }
-                counter.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-        (addr, hits)
+    fn dial_listener() -> TcpListener {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking listener");
+        listener
     }
 
-    /// Wait for `counter` to reach at least `expected`, then return what it reads.
-    ///
-    /// A connect is complete once the kernel finishes the handshake, which can be
-    /// before the accepting thread has returned from `accept`. The count is
-    /// therefore not readable the instant a dial returns, and asserting on it
-    /// immediately is a race rather than a check.
-    fn wait_for(
-        counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        expected: usize,
-    ) -> usize {
-        for _ in 0..300 {
-            let seen = counter.load(Ordering::SeqCst);
-            if seen >= expected {
-                return seen;
+    /// Keep listeners and accepted streams owned by the test. Closing an
+    /// accepted socket while the client is still polling connect can produce
+    /// POLLHUP on Windows. No detached accept thread or early close is needed:
+    /// the kernel completes the handshake before the test calls accept.
+    fn accept_dial(listener: &TcpListener) -> TcpStream {
+        let start = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // Accepted sockets may inherit the listener's mode.
+                    stream.set_nonblocking(false).expect("blocking peer");
+                    configure(&stream, Some(DIAL_TEST_TIMEOUT), Some(DIAL_TEST_TIMEOUT))
+                        .expect("peer timeouts");
+                    return stream;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(start.elapsed() < DIAL_TEST_TIMEOUT, "dial never arrived");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept failed: {error}"),
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
-        counter.load(Ordering::SeqCst)
+    }
+
+    fn assert_no_dial(listener: &TcpListener) {
+        assert_eq!(
+            listener.accept().expect_err("unexpected dial").kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    fn assert_round_trip(client: &mut TcpStream, peer: &mut TcpStream) {
+        assert!(client.nodelay().expect("TCP_NODELAY"));
+        configure(client, Some(DIAL_TEST_TIMEOUT), Some(DIAL_TEST_TIMEOUT))
+            .expect("client timeouts");
+        client.write_all(b"ping").expect("client write");
+        let mut message = [0; 4];
+        peer.read_exact(&mut message).expect("peer read");
+        assert_eq!(&message, b"ping");
+        peer.write_all(b"pong").expect("peer write");
+        client.read_exact(&mut message).expect("client read");
+        assert_eq!(&message, b"pong");
     }
 
     /// Racing dials every candidate; dialling in order stops at the first one
     /// that answers.
     ///
-    /// Counted on the listeners rather than timed: the difference is which
+    /// Observed on the listeners rather than timed: the difference is which
     /// sockets get opened, and a timing assertion would depend on how fast an
     /// unreachable address happens to fail on the machine running the test.
     #[test]
     fn racing_dials_every_candidate() {
-        let (first, first_hits) = counting_listener();
-        let (second, second_hits) = counting_listener();
+        let first = dial_listener();
+        let second = dial_listener();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
 
-        let stream = connect(&first, Duration::from_secs(2)).expect("the first listener accepts");
-        drop(stream);
-        assert_eq!(wait_for(&first_hits, 1), 1);
+        let mut stream =
+            connect(&first_addr, DIAL_TEST_TIMEOUT).expect("the first listener accepts");
+        let mut peer = accept_dial(&first);
+        assert_round_trip(&mut stream, &mut peer);
+        // The synchronous dial has finished; it cannot later dial the second.
+        assert_no_dial(&second);
 
-        // Give a stray dial the time it would need to show up, so "did not
-        // reach the second address" is an observation and not just a fast read.
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(
-            second_hits.load(Ordering::SeqCst),
-            0,
-            "one-at-a-time dialling must not reach the second address"
-        );
-
-        let stream = connect_first(&[first, second], Duration::from_secs(2))
+        let mut winner = connect_first(&[first_addr, second_addr], DIAL_TEST_TIMEOUT)
             .expect("at least one candidate answers");
-        drop(stream);
+        let mut first_peer = accept_dial(&first);
+        let mut second_peer = accept_dial(&second);
+        let (winner_peer, loser_peer) = if winner.peer_addr().unwrap() == first_addr {
+            (&mut first_peer, &mut second_peer)
+        } else {
+            (&mut second_peer, &mut first_peer)
+        };
+        assert_round_trip(&mut winner, winner_peer);
+        assert_eq!(loser_peer.read(&mut [0]).expect("loser closes"), 0);
+        drop(winner);
+        assert_eq!(winner_peer.read(&mut [0]).expect("winner closes"), 0);
+        assert_no_dial(&first);
+        assert_no_dial(&second);
+    }
 
-        assert_eq!(wait_for(&first_hits, 2), 2);
+    #[test]
+    fn racing_limits_concurrent_dials() {
+        let listeners: Vec<_> = (0..MAX_CONCURRENT_DIALS + 1)
+            .map(|_| dial_listener())
+            .collect();
+        let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let winner = connect_first(&addresses, DIAL_TEST_TIMEOUT).expect("a candidate answers");
+        let peers: Vec<_> = listeners[..MAX_CONCURRENT_DIALS]
+            .iter()
+            .map(accept_dial)
+            .collect();
+        drop(winner);
+        for mut peer in peers {
+            assert_eq!(peer.read(&mut [0]).expect("dial closes"), 0);
+        }
+        assert_no_dial(&listeners[MAX_CONCURRENT_DIALS]);
+    }
+
+    #[test]
+    fn racing_survives_a_refused_candidate() {
+        // Reserve a port without listening, so no other test can reuse it.
+        let refused = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        refused
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let refused_addr = refused.local_addr().unwrap().as_socket().unwrap();
+        let listener = dial_listener();
+        let address = listener.local_addr().unwrap();
+        let mut winner = connect_first(&[refused_addr, address], DIAL_TEST_TIMEOUT)
+            .expect("a refused candidate must not hide a successful one");
+        assert_eq!(winner.peer_addr().unwrap(), address);
+        let mut peer = accept_dial(&listener);
+        assert_round_trip(&mut winner, &mut peer);
         assert_eq!(
-            wait_for(&second_hits, 1),
-            1,
-            "racing must also dial the address that lost"
+            connect_first(&[refused_addr], DIAL_TEST_TIMEOUT)
+                .expect_err("all candidates refused")
+                .kind(),
+            io::ErrorKind::ConnectionRefused
         );
     }
 

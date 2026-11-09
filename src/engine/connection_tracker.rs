@@ -318,7 +318,6 @@ impl ConnectionTracker {
 
     /// Get total download bytes
     pub fn total_download(&self) -> u64 {
-        // Global traffic is already tracked via add_global_download
         self.total_download.load(Ordering::Relaxed)
     }
 
@@ -542,8 +541,6 @@ mod tests {
         let tracked = tracker.track(conn);
         fill_destination_ip_in_background(Arc::clone(&tracked), "203.0.113.7".to_string(), 443);
 
-        // A literal needs no lookup, so this settles almost immediately; the
-        // loop only bounds the thread hand-off.
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         while tracked.destination_ip().is_none() && Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -577,13 +574,11 @@ mod tests {
         assert_eq!(tracked.get_upload(), 1024);
         assert_eq!(tracked.get_download(), 2048);
 
-        // Simulate global traffic tracking (as done in relay functions)
         tracker.add_global_upload(1024);
         tracker.add_global_download(2048);
 
         tracker.untrack(&id);
         assert_eq!(tracker.active_count(), 0);
-        // Global traffic is tracked separately
         assert_eq!(tracker.total_upload(), 1024);
         assert_eq!(tracker.total_download(), 2048);
     }
