@@ -31,6 +31,7 @@ mod http;
 mod hysteria;
 #[cfg(feature = "hysteria2")]
 mod hysteria2;
+mod metered;
 mod naive;
 mod reject;
 mod shadowsocks;
@@ -191,6 +192,14 @@ impl UdpReplySink {
     }
 
     pub fn deliver(&self, target: &TargetAddr, payload: &[u8]) {
+        crate::engine::connection_tracker::global_tracker()
+            .add_global_download(payload.len() as u64);
+        (self.deliver)(target, payload);
+    }
+
+    pub fn deliver_direct(&self, target: &TargetAddr, payload: &[u8]) {
+        crate::engine::connection_tracker::global_tracker()
+            .add_direct_download(payload.len() as u64);
         (self.deliver)(target, payload);
     }
 }
@@ -360,7 +369,12 @@ pub(crate) fn build_outbound_proxy(
         | OutboundType::Loadbalance
         | OutboundType::Relay => None,
     };
-    Ok(proxy)
+    Ok(proxy.map(|inner| {
+        Arc::new(metered::MeteredOutbound::new(
+            inner,
+            config.outbound_type == OutboundType::Direct,
+        )) as Arc<dyn OutboundProxy>
+    }))
 }
 
 impl OutboundManager {

@@ -23,12 +23,6 @@ pub struct TrackedConnection {
     pub inbound_tag: String,
     pub outbound_tag: String,
     pub host: String,
-    /// The address behind [`host`](Self::host), as far as anyone has looked
-    /// it up.
-    ///
-    /// Written by whoever resolves the name, which is deliberately never the
-    /// code path of the connection itself: the value feeds the connection
-    /// list, and a list field is not worth a lookup in front of a relay.
     destination_ip: parking_lot::RwLock<Option<String>>,
     pub destination_port: u16,
     pub protocol: String,
@@ -165,6 +159,10 @@ pub struct ConnectionTracker {
     total_connections: AtomicU64,
     total_upload: AtomicU64,
     total_download: AtomicU64,
+    direct_upload: AtomicU64,
+    direct_download: AtomicU64,
+    proxy_upload: AtomicU64,
+    proxy_download: AtomicU64,
     // Real-time traffic counters (reset periodically for speed calculation)
     realtime_upload: AtomicU64,
     realtime_download: AtomicU64,
@@ -180,6 +178,10 @@ impl ConnectionTracker {
             total_connections: AtomicU64::new(0),
             total_upload: AtomicU64::new(0),
             total_download: AtomicU64::new(0),
+            direct_upload: AtomicU64::new(0),
+            direct_download: AtomicU64::new(0),
+            proxy_upload: AtomicU64::new(0),
+            proxy_download: AtomicU64::new(0),
             realtime_upload: AtomicU64::new(0),
             realtime_download: AtomicU64::new(0),
             last_speed_update: std::sync::RwLock::new(Instant::now()),
@@ -190,6 +192,16 @@ impl ConnectionTracker {
 
     /// Add global upload bytes (called from relay functions)
     pub fn add_global_upload(&self, bytes: u64) {
+        self.proxy_upload.fetch_add(bytes, Ordering::Relaxed);
+        self.add_upload_total(bytes);
+    }
+
+    pub fn add_direct_upload(&self, bytes: u64) {
+        self.direct_upload.fetch_add(bytes, Ordering::Relaxed);
+        self.add_upload_total(bytes);
+    }
+
+    fn add_upload_total(&self, bytes: u64) {
         self.total_upload.fetch_add(bytes, Ordering::Relaxed);
         self.realtime_upload.fetch_add(bytes, Ordering::Relaxed);
         self.maybe_update_speed();
@@ -197,6 +209,16 @@ impl ConnectionTracker {
 
     /// Add global download bytes (called from relay functions)
     pub fn add_global_download(&self, bytes: u64) {
+        self.proxy_download.fetch_add(bytes, Ordering::Relaxed);
+        self.add_download_total(bytes);
+    }
+
+    pub fn add_direct_download(&self, bytes: u64) {
+        self.direct_download.fetch_add(bytes, Ordering::Relaxed);
+        self.add_download_total(bytes);
+    }
+
+    fn add_download_total(&self, bytes: u64) {
         self.total_download.fetch_add(bytes, Ordering::Relaxed);
         self.realtime_download.fetch_add(bytes, Ordering::Relaxed);
         self.maybe_update_speed();
@@ -300,6 +322,17 @@ impl ConnectionTracker {
         self.total_download.load(Ordering::Relaxed)
     }
 
+    /// Payload bytes at the actual leaf outbound, including closed flows.
+    /// A direct exit is a transport classification, not a country assertion.
+    pub fn route_totals(&self) -> (u64, u64, u64, u64) {
+        (
+            self.direct_upload.load(Ordering::Relaxed),
+            self.direct_download.load(Ordering::Relaxed),
+            self.proxy_upload.load(Ordering::Relaxed),
+            self.proxy_download.load(Ordering::Relaxed),
+        )
+    }
+
     /// Close a connection by ID
     ///
     /// Cancels the connection's token first: removing the entry only hides it
@@ -331,6 +364,10 @@ impl ConnectionTracker {
         self.total_connections.store(0, Ordering::Relaxed);
         self.total_upload.store(0, Ordering::Relaxed);
         self.total_download.store(0, Ordering::Relaxed);
+        self.direct_upload.store(0, Ordering::Relaxed);
+        self.direct_download.store(0, Ordering::Relaxed);
+        self.proxy_upload.store(0, Ordering::Relaxed);
+        self.proxy_download.store(0, Ordering::Relaxed);
         self.realtime_upload.store(0, Ordering::Relaxed);
         self.realtime_download.store(0, Ordering::Relaxed);
         self.upload_speed.store(0, Ordering::Relaxed);

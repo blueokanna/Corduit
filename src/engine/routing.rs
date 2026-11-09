@@ -489,7 +489,9 @@ impl Router {
                 tracing::info!("Global mode: routing to proxy outbound '{}'", outbound);
                 return (outbound, None, None);
             }
-            return (direct_outbound, None, None);
+            // Global routing must never leak traffic through DIRECT when
+            // the profile has no proxy. A missing REJECT tag also fails closed.
+            return ("REJECT".to_string(), None, None);
         }
 
         if matches!(effective_mode, Mode::Direct) {
@@ -713,14 +715,17 @@ impl Router {
         let global = config
             .outbounds
             .iter()
-            .find(|outbound| {
-                matches!(
-                    outbound.outbound_type,
-                    crate::engine::config::OutboundType::Selector
-                        | crate::engine::config::OutboundType::Urltest
-                        | crate::engine::config::OutboundType::Fallback
-                        | crate::engine::config::OutboundType::Loadbalance
-                )
+            .find(|outbound| outbound.tag == "GLOBAL")
+            .or_else(|| {
+                config.outbounds.iter().find(|outbound| {
+                    matches!(
+                        outbound.outbound_type,
+                        crate::engine::config::OutboundType::Selector
+                            | crate::engine::config::OutboundType::Urltest
+                            | crate::engine::config::OutboundType::Fallback
+                            | crate::engine::config::OutboundType::Loadbalance
+                    )
+                })
             })
             .or_else(|| {
                 config.outbounds.iter().find(|outbound| {

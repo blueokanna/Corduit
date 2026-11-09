@@ -693,11 +693,7 @@ impl Plan {
                     extra: groups.extra,
                 },
             },
-            engine: EngineConfig {
-                timeout_ms: ATTEMPT_TIMEOUT_MS,
-                query_budget_ms: QUERY_BUDGET_MS,
-                ..EngineConfig::default()
-            },
+            engine: forwarding_engine_config(QUERY_BUDGET_MS),
             max_inflight: 256,
             max_prefetch_per_tick: 4,
             max_concurrent_refreshes: 2,
@@ -753,11 +749,7 @@ impl Plan {
                 },
                 ..DnsPolicy::default()
             },
-            engine: EngineConfig {
-                timeout_ms: ATTEMPT_TIMEOUT_MS,
-                query_budget_ms: QUERY_BUDGET_MS,
-                ..EngineConfig::default()
-            },
+            engine: forwarding_engine_config(QUERY_BUDGET_MS),
             max_inflight: 256,
             max_prefetch_per_tick: 4,
             max_concurrent_refreshes: 2,
@@ -780,6 +772,17 @@ impl Plan {
             nx_capacity: (self.cache_size / 4).max(1),
             ..CacheConfig::default()
         }
+    }
+}
+
+/// Every encrypted DNS role uses the same verified system trust anchors.
+/// RecurseX intentionally leaves its default store empty and fails closed.
+fn forwarding_engine_config(query_budget_ms: u64) -> EngineConfig {
+    EngineConfig {
+        timeout_ms: ATTEMPT_TIMEOUT_MS,
+        query_budget_ms,
+        forwarder_roots: crate::common::roots::system_root_store().clone(),
+        ..EngineConfig::default()
     }
 }
 
@@ -838,11 +841,7 @@ impl Bootstrap {
                 },
                 ..DnsPolicy::default()
             },
-            engine: EngineConfig {
-                timeout_ms: ATTEMPT_TIMEOUT_MS,
-                query_budget_ms: BOOTSTRAP_BUDGET_MS,
-                ..EngineConfig::default()
-            },
+            engine: forwarding_engine_config(BOOTSTRAP_BUDGET_MS),
             max_inflight: 256,
             max_prefetch_per_tick: 4,
             max_concurrent_refreshes: 2,

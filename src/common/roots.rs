@@ -79,12 +79,22 @@ fn collect_root_der() -> Vec<Vec<u8>> {
             && let Ok(der) = parse_pem_bundle(&pem)
         {
             out.extend(der);
-            return out;
+            if !out.is_empty() {
+                return out;
+            }
         }
     }
 
-    // Android: hashed PEM files in a directory.
-    if let Ok(entries) = std::fs::read_dir("/system/etc/security/cacerts") {
+    // Android 14+ updates its system roots through Conscrypt APEX.
+    // Prefer that complete store over the legacy system partition; merging
+    // them could reintroduce a root removed by a security update.
+    for directory in [
+        "/apex/com.android.conscrypt/cacerts",
+        "/system/etc/security/cacerts",
+    ] {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
         let mut files: Vec<_> = entries.filter_map(Result::ok).collect();
         files.sort_by_key(|e| e.file_name());
         for entry in files {

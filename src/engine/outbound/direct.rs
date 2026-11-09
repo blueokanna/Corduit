@@ -70,9 +70,6 @@ impl OutboundProxy for DirectOutbound {
     }
 
     fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        // One datagram's budget; every caller of this one-shot path shares a
-        // worker's time, and a UDP peer that has not answered in five seconds
-        // is not going to answer this datagram at all.
         let timeout = Duration::from_secs(5);
 
         let target_addr = match target {
@@ -129,7 +126,6 @@ impl OutboundProxy for DirectOutbound {
     ) -> Result<()> {
         use crate::engine::connection_tracker::global_tracker;
 
-        // Connect directly to target
         let target_str = target.to_string();
         let outbound = match target {
             TargetAddr::Ip(addr) => crate::common::socket::connect(&addr, Duration::from_secs(30)),
@@ -152,12 +148,13 @@ impl OutboundProxy for DirectOutbound {
 
         let tracker = global_tracker();
         let token = crate::engine::connection_tracker::cancellation_for(connection.as_ref());
-        relay_bidirectional_with_connection(
+        relay_classified(
             inbound,
             Box::new(outbound) as crate::common::stream::BoxStream,
             tracker,
             connection,
             token,
+            true,
         )
     }
 }
@@ -292,7 +289,7 @@ fn pump_direct_udp_replies(session: Arc<DirectUdpSession>) {
                     live
                 };
                 for sink in sinks {
-                    sink.deliver(&session.target, &buf[..len]);
+                    sink.deliver_direct(&session.target, &buf[..len]);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
@@ -335,6 +332,17 @@ pub fn relay_bidirectional_with_connection(
     connection: Option<Arc<crate::engine::connection_tracker::TrackedConnection>>,
     token: CancellationToken,
 ) -> Result<()> {
+    relay_classified(a, b, tracker, connection, token, false)
+}
+
+fn relay_classified(
+    a: crate::common::stream::BoxStream,
+    b: crate::common::stream::BoxStream,
+    tracker: Arc<ConnectionTracker>,
+    connection: Option<Arc<crate::engine::connection_tracker::TrackedConnection>>,
+    token: CancellationToken,
+    direct: bool,
+) -> Result<()> {
     let upload_tracker = Arc::clone(&tracker);
     let upload_connection = connection.clone();
     let download_tracker = Arc::clone(&tracker);
@@ -342,13 +350,21 @@ pub fn relay_bidirectional_with_connection(
 
     let accounting = crate::common::stream::RelayAccounting {
         upstream: Some(Arc::new(move |bytes| {
-            upload_tracker.add_global_upload(bytes);
+            if direct {
+                upload_tracker.add_direct_upload(bytes);
+            } else {
+                upload_tracker.add_global_upload(bytes);
+            }
             if let Some(ref tracked) = upload_connection {
                 tracked.add_upload(bytes);
             }
         })),
         downstream: Some(Arc::new(move |bytes| {
-            download_tracker.add_global_download(bytes);
+            if direct {
+                download_tracker.add_direct_download(bytes);
+            } else {
+                download_tracker.add_global_download(bytes);
+            }
             if let Some(ref tracked) = download_connection {
                 tracked.add_download(bytes);
             }
