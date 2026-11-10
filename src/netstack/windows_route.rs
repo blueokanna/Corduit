@@ -47,6 +47,7 @@ pub struct WindowsRouteManager {
     routes_active: bool,
     /// Routes owned by this manager, in creation order.
     added_routes: Vec<WindowsRouteEntry>,
+    ipv6_routes: Vec<(String, u32)>,
 }
 
 struct WindowsRouteEntry {
@@ -66,6 +67,7 @@ impl WindowsRouteManager {
             original_interface: None,
             routes_active: false,
             added_routes: Vec::new(),
+            ipv6_routes: Vec::new(),
         }
     }
 
@@ -92,7 +94,7 @@ impl WindowsRouteManager {
         let output = match Command::new("powershell")
             .args([
                 "-Command",
-                "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1 | ForEach-Object { \"$($_.NextHop)|$($_.InterfaceIndex)\" }",
+                "$ErrorActionPreference='Stop'; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore | Where-Object State -eq 'Alive' | Sort-Object @{Expression={$_.RouteMetric + $_.InterfaceMetric}} | Select-Object -First 1 | ForEach-Object { \"$($_.NextHop)|$($_.InterfaceIndex)\" }",
             ])
             .output()
         {
@@ -188,7 +190,57 @@ impl WindowsRouteManager {
                 });
             }
         }
-        info!("Global mode routes enabled successfully");
+        if let Err(error) = self.enable_ipv6_routes(if_index) {
+            let rollback = self.disable_global_mode().err();
+            return Err(match rollback {
+                Some(rollback) => format!("{error}; rollback failed: {rollback}"),
+                None => error,
+            });
+        }
+        info!("Global mode IPv4 and IPv6 routes enabled successfully");
+        Ok(())
+    }
+
+    fn enable_ipv6_routes(&mut self, interface: u32) -> Result<(), String> {
+        // Reusing an existing adapter is supported; only add the owned address
+        // when absent. Numeric interface indices avoid shell quoting ambiguity.
+        let script = format!(
+            "$ErrorActionPreference='Stop'; if (-not (Get-NetIPAddress -InterfaceIndex {interface} -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object IPAddress -eq 'fd7a:115c:a1e0::1')) {{ New-NetIPAddress -InterfaceIndex {interface} -IPAddress 'fd7a:115c:a1e0::1' -PrefixLength 126 -PolicyStore ActiveStore | Out-Null }}"
+        );
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map_err(|error| format!("Cannot configure TUN IPv6: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Cannot configure TUN IPv6: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        for prefix in ["::/1", "8000::/1"] {
+            let output = Command::new("netsh")
+                .args([
+                    "interface",
+                    "ipv6",
+                    "add",
+                    "route",
+                    &format!("prefix={prefix}"),
+                    &format!("interface={interface}"),
+                    "nexthop=::",
+                    "metric=1",
+                    "store=active",
+                ])
+                .output()
+                .map_err(|error| format!("Cannot add IPv6 capture route: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Cannot add IPv6 route {prefix}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            self.ipv6_routes.push((prefix.into(), interface));
+        }
         Ok(())
     }
 
@@ -201,6 +253,26 @@ impl WindowsRouteManager {
 
         info!("Disabling global mode routes");
 
+        let mut failed_v6 = Vec::new();
+        for (prefix, interface) in std::mem::take(&mut self.ipv6_routes).into_iter().rev() {
+            let output = Command::new("netsh")
+                .args([
+                    "interface",
+                    "ipv6",
+                    "delete",
+                    "route",
+                    &format!("prefix={prefix}"),
+                    &format!("interface={interface}"),
+                    "nexthop=::",
+                    "store=active",
+                ])
+                .output();
+            if !output.is_ok_and(|output| output.status.success()) {
+                failed_v6.push((prefix, interface));
+            }
+        }
+        failed_v6.reverse();
+        self.ipv6_routes = failed_v6;
         let mut failed = Vec::new();
         for route in std::mem::take(&mut self.added_routes).into_iter().rev() {
             let output = Command::new("route")
@@ -231,11 +303,11 @@ impl WindowsRouteManager {
         }
         failed.reverse();
         self.added_routes = failed;
-        self.routes_active = !self.added_routes.is_empty();
+        self.routes_active = !self.added_routes.is_empty() || !self.ipv6_routes.is_empty();
         if self.routes_active {
             return Err(format!(
                 "{} managed route(s) could not be removed",
-                self.added_routes.len()
+                self.added_routes.len() + self.ipv6_routes.len()
             ));
         }
 
@@ -370,20 +442,30 @@ pub fn set_tun_dns(interface_name: &str, dns_servers: &[Ipv4Addr]) -> Result<(),
             .map_err(|e| format!("netsh command failed: {e}"))?;
 
         if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            warn!("Failed to set DNS {}: {}", dns, stderr);
+            return Err(format!(
+                "Failed to set DNS {dns}: {} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            ));
         }
     }
 
-    let _ = Command::new("powershell")
+    let output = Command::new("powershell")
         .args([
             "-Command",
             &format!(
-                "Set-NetIPInterface -InterfaceAlias '{}' -InterfaceMetric 1",
+                "Set-NetIPInterface -InterfaceAlias '{}' -InterfaceMetric 1 -ErrorAction Stop",
                 interface_name
             ),
         ])
-        .output();
+        .output()
+        .map_err(|error| format!("Cannot set TUN interface metric: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Cannot set TUN interface metric: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
 
     info!("TUN DNS configured: {:?}", dns_servers);
     Ok(())

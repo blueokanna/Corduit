@@ -408,17 +408,41 @@ behind the `std` feature.
 
 ## Building and testing
 
+### Dependency versions
+
+Corduit uses the published `courierust 1.1.2` and `recurse-x 0.2.5` packages
+from crates.io. `Cargo.lock` records their versions and checksums; local builds
+and CI use `--locked`. No sibling checkouts or vendored sources are required.
+RecurseX and Corduit resolve to the same Courierust package, so HTTP and all
+DNS transports share the outbound socket factory. The `dns_socket_factory`
+integration test checks that these transports use the installed callbacks.
+The adapter belongs to Corduit; Courierust only exposes the socket callbacks and
+network-generation notification. Install callbacks before starting clients.
+Callbacks must apply protection before connecting and return an error if it fails.
+A network-generation change expires RecurseX's cached forwarding transports;
+already running exchanges are allowed to finish.
+
+`--no-default-features` builds the protocol core without DNS runtime or platform
+I/O dependencies. The existing default features retain the desktop engine.
+Corduit's `bytes` dependency requires pointer-width atomic operations, so
+Corduit does not yet support `thumbv6m-none-eabi`. Courierust and RecurseX can
+build their standalone cores on that target. Check Corduit on a freestanding target with:
+
+```sh
+cargo check --locked --no-default-features --target x86_64-unknown-none
+```
+
 ```bash
-cargo check --all-targets
-cargo test                            # unit + property tests, default features
-cargo test --features tuic,hysteria2  # include the optional QUIC-based outbounds
-cargo test --doc
-cargo clippy --all-targets --all-features -- -D warnings
+cargo check --locked --all-targets
+cargo test --locked                          # unit + property tests, default features
+cargo test --locked --features tuic,hysteria2  # include the optional QUIC-based outbounds
+cargo test --locked --doc
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-cargo check --no-default-features                 # the no_std protocol core
-cargo check --no-default-features --features std  # engine layer, no optional protocols
-cargo test --no-default-features --features std   # …and its test code
-cargo run --example minimal                       # a real engine, loopback only
+cargo check --locked --no-default-features                # the no_std protocol core
+cargo check --locked --no-default-features --features std  # engine layer, no optional protocols
+cargo test --locked --no-default-features --features std   # …and its test code
+cargo run --locked --example minimal                     # a real engine, loopback only
 ```
 
 A check that calls every method of the dispatch table runs where nothing else

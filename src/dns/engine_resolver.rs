@@ -238,6 +238,9 @@ impl Bootstrap {
                 for rr_type in [RrType::A, RrType::AAAA] {
                     if let Ok(resolution) = resolver.resolve(&name, rr_type) {
                         found.extend(addresses_of(&resolution));
+                        if !found.is_empty() {
+                            break;
+                        }
                     }
                 }
                 found
@@ -296,6 +299,7 @@ impl EngineResolver {
     /// leaves the system resolver in place. No I/O happens here; see the module
     /// documentation for why.
     pub fn from_settings(settings: EngineDnsSettings) -> Option<Self> {
+        super::transport::install();
         let default = parse_upstreams(&settings.nameservers, "nameservers");
         let fallback = parse_upstreams(&settings.fallback, "fallback");
 
@@ -683,6 +687,7 @@ impl Plan {
         Some(ResolverConfig {
             cache: self.cache_config(),
             dns: DnsPolicy {
+                privacy: Default::default(),
                 hosts: self.hosts.clone(),
                 fake_ip: None,
                 policy: NameserverPolicy::new(&groups.rules).ok()?,
@@ -1074,6 +1079,7 @@ static ENGINE_RESOLVER: RwLock<Option<Arc<EngineResolver>>> = RwLock::new(None);
 /// thread stops and its cache, estimators and alias graph are released, so a
 /// reload does not leak a resolver per reload.
 pub fn configure(settings: EngineDnsSettings) {
+    super::transport::install();
     let summary = format!(
         "{} default servers, {} policy entries, {} fallback servers, {} host entries",
         settings.nameservers.len(),

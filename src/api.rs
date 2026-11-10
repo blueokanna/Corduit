@@ -3019,7 +3019,24 @@ pub fn enable_tun_mode_with_mode(mode: String) -> Result<TunStatus> {
         }
 
         if let Err(e) = crate::netstack::set_tun_dns(&config.name, &config.dns) {
-            tracing::warn!("Failed to set TUN DNS: {}", e);
+            let rollback = route_manager.disable_global_mode().err();
+            processor.stop();
+            processor.reset();
+            let _ = tun.stop();
+            crate::dns::trusted::clear();
+            crate::engine::set_runtime_proxy_mode(0);
+            crate::netstack::set_windows_proxy_mode(0);
+            return Ok(TunStatus {
+                enabled: false,
+                interface_name: None,
+                mtu: None,
+                error: Some(match rollback {
+                    Some(rollback) => {
+                        format!("Failed to set TUN DNS: {e}; route rollback failed: {rollback}")
+                    }
+                    None => format!("Failed to set TUN DNS: {e}"),
+                }),
+            });
         } else {
             tracing::info!("TUN DNS set to {:?}", config.dns);
         }

@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/corduit)](https://crates.io/crates/corduit)
 [![docs.rs](https://img.shields.io/docsrs/corduit)](https://docs.rs/corduit)
-[![MSRV](https://img.shields.io/badge/MSRV-1.78-blue)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
 
 - **English** → [README.md](README.md)
 - **完整文档** → [Wiki](https://github.com/blueokanna/Corduit/wiki)（FFI / RPC / 方法参考）
@@ -280,26 +280,38 @@ src/
 
 ## 构建与测试
 
+### 依赖版本
+
+Corduit 使用 crates.io 发布的 `courierust 1.1.2` 和 `recurse-x 0.2.5`，由 `Cargo.lock` 记录版本与校验和，本地构建和 CI 均使用 `--locked`。构建不需要相邻源码仓库，也不保留 vendor 副本。Corduit 与 RecurseX 解析到同一个 Courierust 包，让 HTTP 和各 DNS 传输共享 socket 工厂；`dns_socket_factory` 集成测试会验证这些传输确实经过已安装的回调。
+
+平台适配留在 Corduit；Courierust 只提供 socket 回调和网络代次通知。回调应在客户端启动前安装，在连接前完成接口绑定或 VPN 保护，失败时返回错误。网络代次变化后，RecurseX 会淘汰缓存中的旧转发传输；正在执行的交换允许结束。
+
+`--no-default-features` 只构建协议核心，不启用 DNS 运行时和平台 I/O 依赖；默认特性继续保留现有桌面引擎行为。Corduit 的 `bytes` 依赖仍要求指针宽度原子操作，因此 Corduit 暂不支持 `thumbv6m-none-eabi`；Courierust 和 RecurseX 的独立协议核心可以在该目标编译。使用真正的裸机目标验证 Corduit：
+
+```sh
+cargo check --locked --no-default-features --target x86_64-unknown-none
+```
+
 ```bash
-cargo check --all-targets
-cargo test                            # 单元 + 属性测试（默认 feature）
-cargo test --features tuic,hysteria2  # 纳入可选的 QUIC 出站
-cargo test --doc
-cargo clippy --all-targets --all-features -- -D warnings
+cargo check --locked --all-targets
+cargo test --locked                          # 单元 + 属性测试（默认 feature）
+cargo test --locked --features tuic,hysteria2  # 纳入可选的 QUIC 出站
+cargo test --locked --doc
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-cargo check --no-default-features                 # no_std 协议核心
-cargo check --no-default-features --features std  # 引擎层，不含可选协议
-cargo test --no-default-features --features std   # …以及该配置下的测试代码
-cargo run --example minimal                       # 真跑一个引擎，只用环回端口
+cargo check --locked --no-default-features                # no_std 协议核心
+cargo check --locked --no-default-features --features std  # 引擎层，不含可选协议
+cargo test --locked --no-default-features --features std   # …以及该配置下的测试代码
+cargo run --locked --example minimal                     # 真跑一个引擎，只用环回端口
 ```
 
 逐个调用分发表每个方法的检查，必须放在「本进程没有其它活跃连接」的地方：`stop_corduit`
 与 `close_all_connections_dto` 会取消进程内所有已跟踪连接。Cargo 会给 `tests/` 下每个文件
 独立进程，因此该检查放在 `tests/rpc_dispatch.rs`，而不是挨着它所验证的分发表。
 
-CI 在 Linux、macOS、Windows 上运行完整的检查与测试矩阵，另有 all-features 作业（覆盖被门控的 QUIC / TUIC / Hysteria 代码的构建与测试）、`no_std` 核心检查、既有检查也有测试的 `std`-only 配置、Android（aarch64 与 x86_64）与 iOS 交叉检查，以及**构建并测试** 1.78 的 MSRV 作业。桌面平台的作业还会跑只用环回端口的示例，以应用的方式驱动整个 crate，并用 `--all-features` 构建文档。`RUSTFLAGS` 与 `RUSTDOCFLAGS` 都是 `-D warnings`：出现警告或文档内链接失效，都会让构建失败。
+CI 在 Linux、macOS、Windows 上运行完整的检查与测试矩阵，另有 all-features 作业（覆盖被门控的 QUIC / TUIC / Hysteria 代码的构建与测试）、`no_std` 核心检查、既有检查也有测试的 `std`-only 配置、Android（aarch64 与 x86_64）与 iOS 交叉检查，以及**构建并测试** 1.88 的 MSRV 作业。桌面平台的作业还会跑只用环回端口的示例，以应用的方式驱动整个 crate，并用 `--all-features` 构建文档。`RUSTFLAGS` 与 `RUSTDOCFLAGS` 都是 `-D warnings`：出现警告或文档内链接失效，都会让构建失败。
 
-MSRV：**Rust 1.78**。不使用任何 HTTP/TLS/QUIC 第三方库，也没有 async runtime：网络层是 courierust 加上表中列出的仓库内编解码，并发是 courierust 的 work-stealing 池加上 `std::thread`。
+MSRV：**Rust 1.88**。不使用任何 HTTP/TLS/QUIC 第三方库，也没有 async runtime：网络层是 courierust 加上表中列出的仓库内编解码，并发是 courierust 的 work-stealing 池加上 `std::thread`。
 
 ## 安全边界
 

@@ -3,6 +3,7 @@ use crate::netstack::error::{NetStackError, Result};
 use bytes::BytesMut;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+
 #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -344,9 +345,10 @@ impl TunDevice {
     #[cfg(windows)]
     fn start_windows(&mut self) -> Result<()> {
         use crate::netstack::wintun_embed;
-        use wintun_bindings::{Adapter, MAX_RING_CAPACITY};
+        use wintun_bindings::Adapter;
+        // 4 MiB per ring absorbs bursts without reserving the 64 MiB maximum.
+        const RING_CAPACITY: u32 = 4 * 1024 * 1024;
 
-        // Ensure wintun.dll is available and load it
         let dll_path = match wintun_embed::ensure_wintun_available() {
             Ok(path) => path,
             Err(_) => wintun_embed::download_wintun_dll()?,
@@ -359,7 +361,6 @@ impl TunDevice {
                 .map_err(|e| NetStackError::TunError(format!("Failed to load wintun.dll: {}", e)))?
         };
 
-        // Try to open existing adapter or create new one
         let adapter = match Adapter::open(&wintun, &self.config.name) {
             Ok(adapter) => {
                 info!("Opened existing adapter: {}", self.config.name);
@@ -373,23 +374,20 @@ impl TunDevice {
             }
         };
 
-        // Configure IP address
         let prefix_len = self.config.prefix_len();
         self.configure_windows_adapter(prefix_len)?;
 
-        // Start session - returns Arc<Session>
         let session = adapter
-            .start_session(MAX_RING_CAPACITY)
+            .start_session(RING_CAPACITY)
             .map_err(|e| NetStackError::TunError(format!("Failed to start session: {}", e)))?;
 
         info!(
             "Wintun session started with ring capacity: {} bytes",
-            MAX_RING_CAPACITY
+            RING_CAPACITY
         );
 
-        // Create channels
         let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
-        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>();
+        let (tx_to_stack, rx_from_tun) = mpsc::sync_channel::<BytesMut>(1024);
         let shutdown = CancellationToken::new();
 
         self.tx = Some(tx_to_tun);
@@ -401,7 +399,6 @@ impl TunDevice {
         let session_read = session.clone();
         let session_write = session.clone();
 
-        // Read task: dedicated thread doing blocking wintun reads.
         let running_read = running.clone();
         let shutdown_read = shutdown.clone();
         std::thread::Builder::new()
@@ -417,7 +414,10 @@ impl TunDevice {
                     match session_read.receive_blocking() {
                         Ok(packet) => {
                             let data = BytesMut::from(packet.bytes());
-                            if tx_to_stack.send(data).is_err() {
+                            if matches!(
+                                tx_to_stack.try_send(data),
+                                Err(mpsc::TrySendError::Disconnected(_))
+                            ) {
                                 debug!("Stack receiver dropped");
                                 break;
                             }
@@ -438,7 +438,6 @@ impl TunDevice {
             })
             .map_err(NetStackError::Io)?;
 
-        // Write task: dedicated thread pulling packets from the stack.
         let running_write = running.clone();
         let shutdown_write = shutdown.clone();
         let rx_from_stack = rx_from_stack;
@@ -492,7 +491,6 @@ impl TunDevice {
             ip_str, prefix_len, name
         );
 
-        // Set IP address using netsh
         match Command::new("netsh")
             .args([
                 "interface",
@@ -508,11 +506,14 @@ impl TunDevice {
             .output()
         {
             Ok(output) if output.status.success() => {}
-            Ok(output) => warn!(
-                "netsh could not set the adapter address: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Err(error) => warn!("netsh could not run: {error}"),
+            Ok(output) => {
+                return Err(NetStackError::InterfaceError(format!(
+                    "netsh could not set the adapter address: {} {}",
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Err(error) => return Err(NetStackError::Io(error)),
         }
 
         // Set MTU
@@ -528,10 +529,6 @@ impl TunDevice {
             ])
             .output();
 
-        // Configure DNS. The first entry goes in with `validate=no`:
-        // `netsh`'s probe cannot validate a virtual resolver, and without the
-        // flag the command turns interactive on a stdin that is not there,
-        // which is how the address silently fails to be written.
         for (i, dns) in self.config.dns.iter().enumerate() {
             let mut args = vec![
                 "interface".to_string(),
@@ -550,15 +547,17 @@ impl TunDevice {
             }
             match Command::new("netsh").args(&args).output() {
                 Ok(output) if output.status.success() => {}
-                Ok(output) => warn!(
-                    "netsh could not set DNS {dns}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                Err(error) => warn!("netsh could not run for DNS {dns}: {error}"),
+                Ok(output) => {
+                    return Err(NetStackError::InterfaceError(format!(
+                        "netsh could not set DNS {dns}: {} {}",
+                        String::from_utf8_lossy(&output.stdout).trim(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
+                Err(error) => return Err(NetStackError::Io(error)),
             }
         }
 
-        // Set interface metric to 1 (highest priority) to ensure DNS queries use this interface
         let _ = Command::new("powershell")
             .args([
                 "-Command",
@@ -611,7 +610,7 @@ impl TunDevice {
         );
 
         let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
-        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>();
+        let (tx_to_stack, rx_from_tun) = mpsc::sync_channel::<BytesMut>(1024);
         let shutdown = CancellationToken::new();
 
         self.tx = Some(tx_to_tun);
@@ -622,7 +621,6 @@ impl TunDevice {
         let running = self.running.clone();
         let fd = self.unix_device.as_ref().unwrap().as_raw_fd();
 
-        // Read task: poll fd, then read packets into the stack channel.
         let running_read = running.clone();
         let shutdown_read = shutdown.clone();
         let read_fd = fd;
@@ -651,7 +649,6 @@ impl TunDevice {
                         break;
                     }
                     if ret == 0 {
-                        // Timeout: poll again.
                         continue;
                     }
                     if pfd.revents & libc::POLLIN != 0 {
@@ -673,7 +670,10 @@ impl TunDevice {
                             break;
                         }
                         let packet = BytesMut::from(&read_buf[..n as usize]);
-                        if tx_to_stack.send(packet).is_err() {
+                        if matches!(
+                            tx_to_stack.try_send(packet),
+                            Err(mpsc::TrySendError::Disconnected(_))
+                        ) {
                             debug!("Stack receiver dropped");
                             break;
                         }
@@ -685,7 +685,6 @@ impl TunDevice {
             })
             .map_err(NetStackError::Io)?;
 
-        // Write task: pull packets from the stack and write them to the fd.
         let running_write = running.clone();
         let shutdown_write = shutdown.clone();
         let write_fd = fd;
@@ -770,7 +769,7 @@ impl TunDevice {
         self.vpn_file = Some(file);
 
         let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
-        let (tx_to_stack, rx_from_tun) = mpsc::channel::<BytesMut>();
+        let (tx_to_stack, rx_from_tun) = mpsc::sync_channel::<BytesMut>(1024);
         let shutdown = CancellationToken::new();
 
         self.tx = Some(tx_to_tun);
@@ -830,7 +829,10 @@ impl TunDevice {
                             break;
                         }
                         let packet = BytesMut::from(&read_buf[..n as usize]);
-                        if tx_to_stack.send(packet).is_err() {
+                        if matches!(
+                            tx_to_stack.try_send(packet),
+                            Err(mpsc::TrySendError::Disconnected(_))
+                        ) {
                             debug!("Stack receiver dropped");
                             break;
                         }

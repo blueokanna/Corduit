@@ -51,22 +51,19 @@ impl QuicClient {
             }
         }
 
-        let local = self
-            .config
-            .local_addr
-            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-        let udp = std::net::UdpSocket::bind(local)
-            .map_err(|e| QuicError::Io(format!("bind UDP: {e}")))?;
-        #[cfg(target_os = "android")]
-        {
-            use std::os::fd::AsRawFd;
-            crate::common::socket::protect_outbound_fd(udp.as_raw_fd());
-        }
-        // A TUN whose route table captures everything captures this socket's
-        // datagrams too, unless the socket is pinned to the physical
-        // interface — and a QUIC handshake that re-enters the tunnel never
-        // completes. The pin is a no-op on every platform but Windows.
-        crate::common::socket::pin_outbound_udp_socket(&udp, self.config.server_addr.ip());
+        let local = self.config.local_addr.unwrap_or_else(|| {
+            if self.config.server_addr.is_ipv4() {
+                SocketAddr::from(([0, 0, 0, 0], 0))
+            } else {
+                SocketAddr::from(([0u16; 8], 0))
+            }
+        });
+        let udp = crate::common::socket::udp_bind_for(
+            local,
+            CONN_POLL,
+            Some(self.config.server_addr.ip()),
+        )
+        .map_err(|e| QuicError::Io(format!("bind outbound UDP: {e}")))?;
         udp.connect(self.config.server_addr)
             .map_err(|e| QuicError::Io(format!("connect UDP: {e}")))?;
 

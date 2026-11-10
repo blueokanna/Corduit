@@ -50,6 +50,7 @@ pub mod bogon;
 pub mod engine_resolver;
 pub mod pattern;
 pub mod server;
+pub mod transport;
 pub mod trusted;
 pub mod upstream;
 

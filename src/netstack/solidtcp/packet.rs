@@ -182,8 +182,8 @@ fn parse_ipv4(data: &[u8]) -> Result<ParsedPacket> {
 
     Ok(ParsedPacket {
         version: IpVersion::Ipv4,
-        src_addr: IpAddr::V4(src.into()),
-        dst_addr: IpAddr::V4(dst.into()),
+        src_addr: IpAddr::V4(src),
+        dst_addr: IpAddr::V4(dst),
         protocol,
         payload_offset: ihl,
         payload_len: payload.len(),
@@ -205,8 +205,8 @@ fn parse_ipv6(data: &[u8]) -> Result<ParsedPacket> {
 
     Ok(ParsedPacket {
         version: IpVersion::Ipv6,
-        src_addr: IpAddr::V6(src.into()),
-        dst_addr: IpAddr::V6(dst.into()),
+        src_addr: IpAddr::V6(src),
+        dst_addr: IpAddr::V6(dst),
         protocol,
         payload_offset: 40,
         payload_len: payload.len(),
@@ -685,7 +685,7 @@ impl PacketBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address, UdpPacket};
+    use smoltcp::wire::{IpAddress, Ipv4Address, UdpPacket};
 
     fn v6(addr: &str) -> Ipv6Addr {
         addr.parse().expect("a literal v6 address")
@@ -746,8 +746,8 @@ mod tests {
         let tcp = TcpPacket::new_checked(&packet[40..]).expect("the TCP header is well formed");
         assert!(
             tcp.verify_checksum(
-                &IpAddress::Ipv6(Ipv6Address::from_bytes(&v6("2001:db8::1").octets())),
-                &IpAddress::Ipv6(Ipv6Address::from_bytes(&v6("fd7a:115c:a1e0::1").octets())),
+                &IpAddress::Ipv6(v6("2001:db8::1")),
+                &IpAddress::Ipv6(v6("fd7a:115c:a1e0::1")),
             ),
             "the TCP checksum must verify against the v6 pseudo-header"
         );
@@ -774,8 +774,8 @@ mod tests {
         let udp = UdpPacket::new_checked(&packet[40..]).expect("the UDP header is well formed");
         assert!(
             udp.verify_checksum(
-                &IpAddress::Ipv6(Ipv6Address::from_bytes(&v6("2001:db8::1").octets())),
-                &IpAddress::Ipv6(Ipv6Address::from_bytes(&v6("fd7a:115c:a1e0::2").octets())),
+                &IpAddress::Ipv6(v6("2001:db8::1")),
+                &IpAddress::Ipv6(v6("fd7a:115c:a1e0::2")),
             ),
             "the UDP checksum must verify against the v6 pseudo-header"
         );

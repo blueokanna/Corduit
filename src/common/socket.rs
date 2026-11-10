@@ -86,7 +86,10 @@ static OUTBOUND_INTERFACE_INDEX: std::sync::atomic::AtomicU32 =
 /// the tunnel does. A no-op elsewhere.
 #[cfg(windows)]
 pub fn set_outbound_interface_index(index: Option<u32>) {
-    OUTBOUND_INTERFACE_INDEX.store(index.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+    let index = index.unwrap_or(0);
+    if OUTBOUND_INTERFACE_INDEX.swap(index, std::sync::atomic::Ordering::SeqCst) != index {
+        courierust::courierust_net::outbound::network_changed();
+    }
 }
 
 /// See [`set_outbound_interface_index`]; no-op on non-Windows platforms.
@@ -102,7 +105,7 @@ fn outbound_interface_index() -> Option<u32> {
 /// Apply `IP_UNICAST_IF` / `IPV6_UNICAST_IF` to a freshly created socket.
 ///
 /// The option only affects unicast route selection for the address family it
-/// is set on, and it must carry the index in network byte order (per the
+/// is set on, IPv4 carries the index in network byte order; IPv6 uses host byte order (per the
 /// WinSock documentation). A loopback destination never needs the pin and is
 /// left alone, so loopback traffic keeps taking the loopback route.
 ///
@@ -118,21 +121,21 @@ fn outbound_interface_index() -> Option<u32> {
 fn apply_outbound_interface_raw(
     raw: std::os::windows::io::RawSocket,
     destination: std::net::IpAddr,
-) {
+) -> io::Result<()> {
     /// `IP_UNICAST_IF` / `IPV6_UNICAST_IF` share this option number.
     const UNICAST_IF: libc::c_int = 31;
     const IPPROTO_IP: libc::c_int = 0;
     const IPPROTO_IPV6: libc::c_int = 41;
 
     let Some(index) = outbound_interface_index() else {
-        return;
+        return Ok(());
     };
     if destination.is_loopback() {
-        return;
+        return Ok(());
     }
 
     let ipv6 = destination.is_ipv6();
-    let value = index.to_be();
+    let value = if ipv6 { index } else { index.to_be() };
     let level = if ipv6 { IPPROTO_IPV6 } else { IPPROTO_IP };
     let result = unsafe {
         libc::setsockopt(
@@ -144,26 +147,29 @@ fn apply_outbound_interface_raw(
         )
     };
     if result != 0 {
-        // A missing option is not fatal: without it the socket simply takes
-        // the route table as it is, which is the pre-TUN behaviour.
-        tracing::debug!(
-            "IP{}_UNICAST_IF to index {index} was refused: {}",
-            if ipv6 { "V6" } else { "" },
-            std::io::Error::last_os_error()
-        );
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }
 
 /// See [`apply_outbound_interface_raw`]; the `socket2` spelling.
 #[cfg(windows)]
-fn apply_outbound_interface(sock: &socket2::Socket, destination: std::net::IpAddr) {
+fn apply_outbound_interface(
+    sock: &socket2::Socket,
+    destination: std::net::IpAddr,
+) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket;
-    apply_outbound_interface_raw(sock.as_raw_socket(), destination);
+    apply_outbound_interface_raw(sock.as_raw_socket(), destination)
 }
 
 /// See [`apply_outbound_interface_raw`]; no-op on non-Windows platforms.
 #[cfg(not(windows))]
-fn apply_outbound_interface(_sock: &socket2::Socket, _destination: std::net::IpAddr) {}
+fn apply_outbound_interface(
+    _sock: &socket2::Socket,
+    _destination: std::net::IpAddr,
+) -> io::Result<()> {
+    Ok(())
+}
 
 /// Pin a `std` UDP socket to the engine's physical interface (Windows).
 ///
@@ -174,7 +180,9 @@ fn apply_outbound_interface(_sock: &socket2::Socket, _destination: std::net::IpA
 #[cfg(windows)]
 pub fn pin_outbound_udp_socket(udp: &std::net::UdpSocket, destination: std::net::IpAddr) {
     use std::os::windows::io::AsRawSocket;
-    apply_outbound_interface_raw(udp.as_raw_socket(), destination);
+    if let Err(error) = apply_outbound_interface_raw(udp.as_raw_socket(), destination) {
+        tracing::warn!("Cannot pin outbound UDP socket: {error}");
+    }
 }
 
 /// See [`pin_outbound_udp_socket`]; a no-op off Windows.
@@ -182,14 +190,22 @@ pub fn pin_outbound_udp_socket(udp: &std::net::UdpSocket, destination: std::net:
 pub fn pin_outbound_udp_socket(_udp: &std::net::UdpSocket, _destination: std::net::IpAddr) {}
 
 /// Exempt a `socket2` socket from the engine's own tunnel.
-fn protect_socket2(sock: &socket2::Socket) {
+fn protect_socket2(sock: &socket2::Socket) -> io::Result<()> {
     #[cfg(any(target_os = "android", target_env = "ohos"))]
     {
         use std::os::fd::AsRawFd;
-        protect_outbound_fd(sock.as_raw_fd());
+        if crate::netstack::has_protect_callback()
+            && !crate::netstack::protect_socket(sock.as_raw_fd())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "VPN refused outbound socket protection",
+            ));
+        }
     }
     #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     let _ = sock;
+    Ok(())
 }
 
 /// Establish a TCP connection to `addr` within `timeout`.
@@ -206,8 +222,8 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
     let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
     // Both must precede `connect`: the tunnel exemption for the OS to honour
     // it, and the interface pin for the route table the tunnel installs.
-    protect_socket2(&sock);
-    apply_outbound_interface(&sock, addr.ip());
+    protect_socket2(&sock)?;
+    apply_outbound_interface(&sock, addr.ip())?;
     // `connect_timeout` switches to non-blocking mode internally and restores
     // blocking mode on success, as required by the synchronous engine's I/O
     // timeouts (SO_RCVTIMEO / SO_SNDTIMEO).
@@ -583,9 +599,9 @@ pub fn udp_bind_for(
         socket2::Domain::IPV6
     };
     let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    protect_socket2(&sock);
+    protect_socket2(&sock)?;
     if let Some(addr) = destination {
-        apply_outbound_interface(&sock, addr);
+        apply_outbound_interface(&sock, addr)?;
     }
     sock.set_reuse_address(true)?;
     sock.bind(&bind.into())?;

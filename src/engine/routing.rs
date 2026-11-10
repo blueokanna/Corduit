@@ -94,7 +94,7 @@ fn rule_provider_config_changed(a: &RuleProviderConfig, b: &RuleProviderConfig) 
 
 pub struct Router {
     config: Arc<RwLock<Config>>,
-    rules: RwLock<Vec<CompiledRule>>,
+    rules: RwLock<RuleTable>,
     /// Pre-resolved default outbound tags — no per-request scan of `outbounds`.
     defaults: RwLock<DefaultOutbounds>,
     geoip_manager: Arc<dyn CountryMatcher>,
@@ -225,6 +225,76 @@ struct CompiledRule {
     children: Vec<CompiledRule>,
     /// Connections this rule has decided since it was compiled.
     hits: AtomicU64,
+}
+
+/// Rules and their index swap together under one lock on profile reload.
+/// Keep original positions: a suffix rule must never leapfrog an earlier
+/// regex, IP or process rule just because it can be indexed.
+struct RuleTable {
+    rules: Vec<CompiledRule>,
+    exact: HashMap<String, Vec<usize>>,
+    suffix: HashMap<String, Vec<usize>>,
+    residual: Vec<usize>,
+}
+
+impl From<Vec<CompiledRule>> for RuleTable {
+    fn from(rules: Vec<CompiledRule>) -> Self {
+        let mut table = Self {
+            rules,
+            exact: HashMap::new(),
+            suffix: HashMap::new(),
+            residual: Vec::new(),
+        };
+        for (position, rule) in table.rules.iter().enumerate() {
+            match rule.rule_type {
+                RuleType::Domain => table
+                    .exact
+                    .entry(rule.pattern.clone())
+                    .or_default()
+                    .push(position),
+                RuleType::DomainSuffix => table
+                    .suffix
+                    .entry(rule.pattern.trim_start_matches('.').to_string())
+                    .or_default()
+                    .push(position),
+                _ => {
+                    table.residual.push(position);
+                }
+            }
+        }
+        table
+    }
+}
+
+impl std::ops::Deref for RuleTable {
+    type Target = Vec<CompiledRule>;
+    fn deref(&self) -> &Self::Target {
+        &self.rules
+    }
+}
+
+impl RuleTable {
+    fn candidates(&self, domain: Option<&str>) -> Vec<usize> {
+        let mut positions = self.residual.clone();
+        if let Some(domain) = domain {
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            if let Some(exact) = self.exact.get(normalized.as_str()) {
+                positions.extend_from_slice(exact);
+            }
+            let mut tail = normalized.as_str();
+            loop {
+                if let Some(suffix) = self.suffix.get(tail) {
+                    positions.extend_from_slice(suffix);
+                }
+                let Some((_, rest)) = tail.split_once('.') else {
+                    break;
+                };
+                tail = rest;
+            }
+        }
+        positions.sort_unstable();
+        positions
+    }
 }
 
 impl CompiledRule {
@@ -382,7 +452,7 @@ impl Router {
 
         Ok(Self {
             config,
-            rules: RwLock::new(rules),
+            rules: RwLock::new(rules.into()),
             defaults: RwLock::new(defaults),
             geoip_manager,
             rule_provider_manager,
@@ -527,7 +597,8 @@ impl Router {
             }
         }
 
-        for (index, rule) in rules.iter().enumerate() {
+        for index in rules.candidates(request.domain) {
+            let rule = &rules[index];
             if !resolution_attempted && request.dst_ip.is_none() && self.wants_dst_ip(rule) {
                 resolved = Self::resolve_destination_ips(request.domain, None);
                 resolution_attempted = true;
@@ -548,7 +619,7 @@ impl Router {
 
             if self.matches_rule_with(rule, &context) {
                 rule.hits.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
+                tracing::debug!(
                     "Rule matched: #{} {:?} '{}' -> '{}'",
                     index,
                     rule.rule_type,
@@ -649,7 +720,7 @@ impl Router {
         };
         {
             let mut rules = self.rules.write();
-            *rules = new_rules;
+            *rules = new_rules.into();
         }
         {
             let mut defaults_guard = self.defaults.write();
@@ -1222,7 +1293,7 @@ mod tests {
 
         Router {
             config: Arc::new(RwLock::new(config)),
-            rules: RwLock::new(rules),
+            rules: RwLock::new(rules.into()),
             defaults: RwLock::new(DefaultOutbounds {
                 direct: "bypass".to_string(),
                 global: Some("proxy".to_string()),
@@ -1237,7 +1308,7 @@ mod tests {
     /// list, so the no-rule auto-direct fallback can be exercised.
     fn mainland_routing_test_router_no_rules() -> Router {
         let mut router = mainland_routing_test_router();
-        router.rules = RwLock::new(Vec::new());
+        router.rules = RwLock::new(Vec::new().into());
         router
     }
 
@@ -1375,7 +1446,7 @@ mod tests {
 
         Router {
             config: Arc::new(RwLock::new(config)),
-            rules: RwLock::new(rules),
+            rules: RwLock::new(rules.into()),
             defaults: RwLock::new(DefaultOutbounds {
                 direct: "DIRECT".to_string(),
                 global: Some("PROXY".to_string()),
@@ -1669,7 +1740,7 @@ mod tests {
         let rules = Router::compile_rules(&config.rules).expect("the table compiles");
         Router {
             config: Arc::new(RwLock::new(config)),
-            rules: RwLock::new(rules),
+            rules: RwLock::new(rules.into()),
             defaults: RwLock::new(DefaultOutbounds {
                 direct: "DIRECT".to_string(),
                 global: None,
@@ -1830,7 +1901,7 @@ mod property_tests {
 
             let router = Router {
                 config: std::sync::Arc::new(RwLock::new(Config::default())),
-                rules: RwLock::new(vec![rule]),
+                rules: RwLock::new(vec![rule].into()),
                 defaults: RwLock::new(DefaultOutbounds {
                     direct: "proxy".to_string(),
                     global: None,
@@ -1878,7 +1949,7 @@ mod property_tests {
 
             let router = Router {
                 config: std::sync::Arc::new(RwLock::new(Config::default())),
-                rules: RwLock::new(vec![rule]),
+                rules: RwLock::new(vec![rule].into()),
                 defaults: RwLock::new(DefaultOutbounds {
                     direct: "proxy".to_string(),
                     global: None,
@@ -1919,7 +1990,7 @@ mod property_tests {
 
             let router = Router {
                 config: std::sync::Arc::new(RwLock::new(Config::default())),
-                rules: RwLock::new(vec![rule]),
+                rules: RwLock::new(vec![rule].into()),
                 defaults: RwLock::new(DefaultOutbounds {
                     direct: "proxy".to_string(),
                     global: None,
@@ -2021,7 +2092,7 @@ mod property_tests {
 
             let router = Router {
                 config: std::sync::Arc::new(RwLock::new(Config::default())),
-                rules: RwLock::new(vec![rule]),
+                rules: RwLock::new(vec![rule].into()),
                 defaults: RwLock::new(DefaultOutbounds {
                     direct: "proxy".to_string(),
                     global: None,
@@ -2097,5 +2168,51 @@ mod property_tests {
 
             prop_assert_eq!(result, "first", "First matching rule should be used");
         }
+    }
+}
+
+#[cfg(test)]
+mod domain_index_tests {
+    use super::*;
+    #[test]
+    fn indexed_candidates_preserve_order_case_and_label_boundaries() {
+        let mut rules = Vec::new();
+        for (kind, pattern) in [
+            (RuleType::DomainSuffix, "example.com"),
+            (RuleType::DomainKeyword, "example"),
+            (RuleType::Domain, "a.example.com"),
+            (RuleType::Match, ""),
+        ] {
+            let mut rule = CompiledRule::blank();
+            rule.rule_type = kind;
+            rule.pattern = pattern.into();
+            rules.push(rule);
+        }
+        let table = RuleTable::from(rules);
+        assert_eq!(table.candidates(Some("A.Example.COM.")), vec![0, 1, 2, 3]);
+        assert_eq!(table.candidates(Some("notexample.com")), vec![1, 3]);
+        assert_eq!(table.candidates(None), vec![1, 3]);
+    }
+    #[test]
+    fn hundred_thousand_domains_produce_only_matching_candidates() {
+        let mut rules = Vec::with_capacity(100_001);
+        for index in 0..100_000 {
+            let mut rule = CompiledRule::blank();
+            rule.rule_type = RuleType::DomainSuffix;
+            rule.pattern = format!("site{index}.example");
+            rules.push(rule);
+        }
+        rules.push(CompiledRule::blank());
+        let table = RuleTable::from(rules);
+        assert_eq!(
+            table.candidates(Some("www.site99999.example")),
+            vec![99_999, 100_000]
+        );
+        assert_eq!(table.candidates(Some("unmatched.test")), vec![100_000]);
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            std::hint::black_box(table.candidates(Some("www.site99999.example")));
+        }
+        eprintln!("100k domain rules, 10k lookups: {:?}", start.elapsed());
     }
 }

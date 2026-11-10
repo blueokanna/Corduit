@@ -1,10 +1,10 @@
 [package]
 name = "corduit"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.88"
 license-file = "LICENSE"
-authors = ["blueokanna"]
+authors = ["blueokanna", "HyphenTeam"]
 description = "A synchronous, no_std-ready unified network proxy engine core by rust"
 homepage = "https://github.com/blueokanna/Corduit"
 repository = "https://github.com/blueokanna/Corduit"
@@ -32,6 +32,21 @@ std = [
     "dep:tracing-subscriber",
     "bytes/std",
     "courierust/std",
+    "dep:recurse-x",
+    "recurse-x/std",
+    "recurse-x/dot",
+    "recurse-x/doh",
+    "recurse-x/doh3",
+    "recurse-x/doq",
+    "recurse-x/persist",
+    "dep:libc",
+    "dep:tun-rs",
+    "dep:wintun-bindings",
+    "dep:tempfile",
+    "dep:zip",
+    "dep:windows",
+    "dep:jni",
+    "dep:tracing-android",
     "thiserror/std",
 ]
 tls = []
@@ -70,28 +85,21 @@ tracing-subscriber = { version = "0.3", features = [
 ], optional = true }
 
 # --- HTTP / TLS / QUIC / multithreading --
-courierust = { version = "1.1.1", default-features = false }
+courierust = { version = "1.1.2", default-features = false }
 
 # --- DNS ---------------------------------------------------------------------
-recurse-x = { version = "0.2.4", default-features = false, features = [
-    "std",
-    "dot",
-    "doh",
-    "doh3",
-    "doq",
-    "persist",
-] }
+recurse-x = { version = "0.2.5", default-features = false, optional = true }
 ipnet = { version = "2.12.2", optional = true }
 
 
 # --- crypto ------------------------------------------------------------------
-getrandom = { version = "0.3.2", features = ["std"], optional = true }
+getrandom = { version = "0.4.3", features = ["std"], optional = true }
 
 # --- networking / system (std only) -----------------------------------------
 bitflags = "2.13.2"
 bytes = { version = "1", default-features = false }
 regex = { version = "1", optional = true }
-smoltcp = { version = "0.11.0", default-features = false, features = [
+smoltcp = { version = "0.12.0", default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",
@@ -109,19 +117,19 @@ sysinfo = { version = "0.38", default-features = false, features = [
 mach2 = { version = "0.7", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", default-features = false, optional = true }
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
-tun-rs = { version = "=2.5.7" }
+tun-rs = { version = "2.8.18", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-wintun-bindings = { version = "0.7" }
-tempfile = "3.27"
-zip = { version = "9.5.0", default-features = false, features = [
+wintun-bindings = { version = "0.7", optional = true }
+tempfile = { version = "3.27", optional = true }
+zip = { version = "9.5.0", optional = true, default-features = false, features = [
     "deflate-flate2-zlib-rs",
 ] }
-libc = "0.2"
-windows = { version = "0.62.2", features = [
+libc = { version = "0.2", default-features = false, optional = true }
+windows = { version = "0.62.2", optional = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Cryptography",
@@ -130,8 +138,8 @@ windows = { version = "0.62.2", features = [
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
-tracing-android = "0.2"
+jni = { version = "0.22.4", optional = true }
+tracing-android = { version = "0.2", optional = true }
 
 [dev-dependencies]
 proptest = "1.8.0"
