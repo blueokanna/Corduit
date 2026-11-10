@@ -78,7 +78,7 @@ jobs:
         run: cargo +1.88.0 check --locked --no-default-features
 
       - name: Check Android (MSRV)
-        run: cargo +1.88.0 check --locked --all-features --target aarch64-linux-android
+        run: cargo +1.88.0 check --locked --all-targets --all-features --target aarch64-linux-android
 
   # ---- Android: cross-check via `cross` (handles the NDK in Docker) --------
   android:
@@ -100,14 +100,14 @@ jobs:
         with:
           command: check
           target: aarch64-linux-android
-          args: --locked --workspace
+          args: --locked --workspace --all-targets --all-features
 
       - name: Cross check x86_64 (Android)
         uses: houseabsolute/actions-rust-cross@v1
         with:
           command: check
           target: x86_64-linux-android
-          args: --locked --workspace
+          args: --locked --workspace --all-targets --all-features
 
   # ---- iOS: cross-check on macOS (needs the Xcode toolchain) ---------------
   ios:

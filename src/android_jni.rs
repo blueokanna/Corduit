@@ -1,24 +1,24 @@
 //! The Android JNI bridge.
 //!
-//! Kotlin/Java calls [`nativeInitRustBridge`] once on `CorduitVpnService`
+//! Kotlin/Java calls
+//! [`nativeInitRustBridge`](Java_com_blueokanna_corduit_CorduitVpnService_nativeInitRustBridge)
+//! once on `CorduitVpnService`
 //! creation; from then on any Rust thread may ask the service to
 //! `protect(fd)` a socket (the engine's netstack callback). The `JavaVM` and
 //! the service reference are kept for the process lifetime and replaced on a
 //! VPN restart.
 //!
-//! Built on `jni` 0.21, which is the last release line that compiles on the
-//! workspace's MSRV (Rust 1.78): `jni` 0.22 is edition 2024 and requires
-//! Rust 1.85. Only the JNI surface the bridge actually uses is pulled in —
-//! 0.21 keeps the JVM *invocation* feature (and with it `libloading` and
-//! `java-locator`) off by default, and Android always hands us a live VM.
+//! Built on `jni` 0.22 with the workspace's Rust 1.88 MSRV. Native entry
+//! points receive an FFI-safe `EnvUnowned` and acquire an `Env` before using
+//! JNI. Android supplies the VM; the JVM invocation feature stays disabled.
 //!
 //! Both exported functions catch panics: unwinding across an `extern
 //! "system"` boundary aborts the process, and a panic in the bridge must not
 //! take the Android app down.
 
-use jni::objects::{GlobalRef, JObject, JValue};
+use jni::objects::{Global, JObject, JValue};
 use jni::sys::jint;
-use jni::{JNIEnv, JavaVM};
+use jni::{Env, EnvUnowned, JavaVM, Outcome, jni_sig, jni_str};
 use parking_lot::RwLock;
 use std::ffi::CString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -36,7 +36,7 @@ unsafe extern "C" {
 /// `JavaVM` and the `VpnService` reference are process-wide and swapped on
 /// restart, so they live behind `RwLock` rather than `OnceLock`.
 static JAVA_VM: RwLock<Option<JavaVM>> = RwLock::new(None);
-static VPN_SERVICE: RwLock<Option<GlobalRef>> = RwLock::new(None);
+static VPN_SERVICE: RwLock<Option<Global<JObject<'static>>>> = RwLock::new(None);
 static JNI_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Store the VM and the service, replacing whatever a previous VPN session
@@ -45,27 +45,34 @@ static JNI_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeInitRustBridge<
     'local,
 >(
-    env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     vpn_service: JObject<'local>,
 ) {
     android_log(
         "INFO",
         "=== Initializing Rust JNI bridge for VpnService ===",
     );
-    let outcome = catch_unwind(AssertUnwindSafe(|| init_bridge(&env, vpn_service)));
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        env.with_env(|env| {
+            let result = init_bridge(env, vpn_service);
+            if let Err(error) = &result {
+                report_java_exception(env, &format!("bridge initialization failed: {error}"));
+            }
+            result
+        })
+        .into_outcome()
+    }));
     match outcome {
-        Ok(Ok(())) => {
+        Ok(Outcome::Ok(())) => {
             info!("JNI bridge initialized");
             android_log("INFO", "=== JNI bridge initialization complete ===");
         }
-        Ok(Err(e)) => {
+        Ok(Outcome::Err(e)) => {
             let message = format!("JNI bridge initialization failed: {e}");
             error!("{message}");
             android_log("ERROR", &message);
         }
-        Err(_) => {
-            // Recover the lock state a panicking initializer may have left
-            // behind: a poisoned bridge would otherwise never initialize.
+        Ok(Outcome::Panic(_)) | Err(_) => {
             clear_state();
             error!("JNI bridge initialization panicked");
             android_log("ERROR", "JNI bridge initialization panicked");
@@ -78,19 +85,25 @@ pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeInitR
 pub extern "system" fn Java_com_blueokanna_corduit_CorduitVpnService_nativeClearRustBridge<
     'local,
 >(
-    _env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _vpn_service: JObject<'local>,
 ) {
     android_log("INFO", "Clearing Rust JNI bridge");
-    let outcome = catch_unwind(AssertUnwindSafe(clear_bridge));
-    if outcome.is_err() {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        env.with_env(|_| {
+            clear_bridge();
+            Ok::<(), jni::errors::Error>(())
+        })
+        .into_outcome()
+    }));
+    if !matches!(outcome, Ok(Outcome::Ok(()))) {
         error!("JNI bridge teardown panicked");
         android_log("ERROR", "JNI bridge teardown panicked");
     }
 }
 
 /// Perform the store half of initialization.
-fn init_bridge(env: &JNIEnv, vpn_service: JObject) -> jni::errors::Result<()> {
+fn init_bridge(env: &Env, vpn_service: JObject) -> jni::errors::Result<()> {
     // Clear first: a restarted VPN service must not keep the old instance.
     clear_state();
 
@@ -128,16 +141,14 @@ fn clear_state() {
 /// Ask `VpnService.protect(fd)` to exempt a socket from the tunnel.
 ///
 /// Returns `false` (with a log line) whenever the bridge is not ready or the
-/// Java call fails; an exception thrown by `protect` is described, cleared
-/// and reported rather than left pending for the next JNI call to trip over.
+/// Java call fails. The attachment scope captures exceptions thrown by
+/// `protect` and restores any exception that was pending before this call.
 pub fn protect_socket_via_jni(fd: i32) -> bool {
     if !JNI_INITIALIZED.load(Ordering::SeqCst) {
         warn!("JNI not initialized, cannot protect socket fd={fd}");
         return false;
     }
 
-    // Hold the read guards for the duration of the call: they keep the VM
-    // and the service reference alive.
     let vm_guard = JAVA_VM.read();
     let service_guard = VPN_SERVICE.read();
     let (Some(vm), Some(service)) = (vm_guard.as_ref(), service_guard.as_ref()) else {
@@ -145,55 +156,42 @@ pub fn protect_socket_via_jni(fd: i32) -> bool {
         return false;
     };
 
-    // `attach_current_thread_permanently` attaches a worker thread on first
-    // use and keeps it attached: the callback fires once per socket, and a
-    // detach/attach pair per call is pure JVM bookkeeping overhead.
-    let mut env = match vm.attach_current_thread_permanently() {
-        Ok(env) => env,
+    let result: jni::errors::Result<bool> = vm.attach_current_thread(|env| {
+        env.call_method(
+            service.as_obj(),
+            jni_str!("protect"),
+            jni_sig!("(I)Z"),
+            &[JValue::Int(fd as jint)],
+        )?
+        .z()
+    });
+    match result {
+        Ok(true) => {
+            debug!("Socket fd={fd} protected");
+            true
+        }
+        Ok(false) => {
+            let message = format!("VpnService.protect() returned false for fd={fd}");
+            warn!("{message}");
+            android_log("WARN", &message);
+            false
+        }
         Err(e) => {
-            let message = format!("Failed to attach thread to the JVM: {e}");
+            let message = format!("VpnService.protect() failed for fd={fd}: {e}");
             error!("{message}");
             android_log("ERROR", &message);
-            return false;
-        }
-    };
-
-    match env.call_method(
-        service.as_obj(),
-        "protect",
-        "(I)Z",
-        &[JValue::Int(fd as jint)],
-    ) {
-        Ok(value) => match value.z() {
-            Ok(true) => {
-                debug!("Socket fd={fd} protected");
-                true
-            }
-            Ok(false) => {
-                let message = format!("VpnService.protect() returned false for fd={fd}");
-                warn!("{message}");
-                android_log("WARN", &message);
-                false
-            }
-            Err(e) => {
-                report_java_exception(&mut env, &format!("protect() returned no boolean: {e}"));
-                false
-            }
-        },
-        Err(e) => {
-            report_java_exception(&mut env, &format!("VpnService.protect() failed: {e}"));
             false
         }
     }
 }
 
 /// Describe and clear a pending Java exception, then log the failure.
-fn report_java_exception(env: &mut JNIEnv, context: &str) {
-    if env.exception_check().unwrap_or(false) {
-        let _ = env.exception_describe();
-        let _ = env.exception_clear();
+fn report_java_exception(env: &mut Env, context: &str) {
+    if env.exception_check() {
+        env.exception_describe();
+        env.exception_clear();
     }
-    let message = format!("Failed to call VpnService.protect(): {context}");
+    let message = format!("JNI call failed: {context}");
     error!("{message}");
     android_log("ERROR", &message);
 }

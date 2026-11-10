@@ -16,7 +16,7 @@ const TUN_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// A `std::sync::mpsc::Receiver` that can cross thread boundaries.
 ///
-/// `std::sync::mpsc::Receiver` is deliberately `!Send`/`!Sync`. Here the
+/// `std::sync::mpsc::Receiver<T>` is `Send` when `T: Send`, but never `Sync`. Here the
 /// receiver is created on the thread that starts the TUN device, stored in
 /// `TunDevice`, and moved out exactly once (via `take_receiver` / `recv`)
 /// before being used on a single consumer thread. It is never shared — this
@@ -24,17 +24,30 @@ const TUN_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 /// on the underlying channel.
 ///
 /// # Safety
-/// - `Send`: the inner receiver is transferred between threads by ownership
-///   only; no other thread retains a reference to it.
+/// - `Send` is derived from the inner receiver and requires `T: Send`.
 /// - `Sync`: a shared reference cannot reach the inner receiver (all
-///   accessors require `&mut self`), so concurrent access is impossible.
+///   accessors require `&mut self`), so concurrent access is impossible. The
+///   payload must still be safe to transfer between threads.
+///
+/// Non-`Send` payloads must not become transferable through this wrapper:
+///
+/// ```compile_fail
+/// use corduit::netstack::tun::SendReceiver;
+/// fn require_send<T: Send>() {}
+/// require_send::<SendReceiver<std::rc::Rc<()>>>();
+/// ```
+///
+/// ```compile_fail
+/// use corduit::netstack::tun::SendReceiver;
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<SendReceiver<std::rc::Rc<()>>>();
+/// ```
 #[repr(transparent)]
 pub struct SendReceiver<T> {
     inner: mpsc::Receiver<T>,
 }
 
-unsafe impl<T> Send for SendReceiver<T> {}
-unsafe impl<T> Sync for SendReceiver<T> {}
+unsafe impl<T: Send> Sync for SendReceiver<T> {}
 
 impl<T> SendReceiver<T> {
     fn new(rx: mpsc::Receiver<T>) -> Self {
