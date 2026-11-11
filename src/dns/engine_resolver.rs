@@ -51,7 +51,7 @@ use recurse_x::hosts::HostsTable;
 use recurse_x::pattern::DomainPattern;
 use recurse_x::resolver::{DnsPolicy, EngineConfig, ResolverConfig, UpstreamGroups};
 use recurse_x::routing::{FallbackFilter, GroupId, NameserverPolicy};
-use recurse_x::{ErrorKind, Name, Resolver, RrType};
+use recurse_x::{ErrorKind, Name, Rcode, Resolver, RrType};
 use tracing::{debug, info, warn};
 
 use crate::dns::bogon;
@@ -449,8 +449,6 @@ impl EngineResolver {
 
         let name = parse_name(host)?;
         let rr_type = if want_v6 { RrType::AAAA } else { RrType::A };
-        // Explicit hosts and nameserver policies may intentionally resolve to
-        // private addresses. Generic fallback filters must not override them.
         let mut ips = if let Some(addresses) = self.plan.hosts.lookup(&name) {
             addresses
                 .iter()
@@ -484,6 +482,7 @@ impl EngineResolver {
                         self.query_fallback(fallback.as_deref(), &name, rr_type, host)?
                     }
                     Ok(ips) => ips,
+                    Err(error) if negative_dns_answer(&error).is_some() => return Err(error),
                     Err(_) if fallback.is_some() => {
                         self.query_fallback(fallback.as_deref(), &name, rr_type, host)?
                     }
@@ -493,10 +492,7 @@ impl EngineResolver {
         };
 
         if ips.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("engine DNS found no address for '{host}'"),
-            ));
+            return Err(NegativeDnsAnswer::NoData.into_error());
         }
         // Dialing order matters for flaky IPv6 paths.
         ips.sort_by_key(|ip| matches!(ip, IpAddr::V6(_)) as u8);
@@ -517,8 +513,13 @@ impl EngineResolver {
             )
         };
         let resolver = resolver.ok_or_else(|| rejected("resolver unavailable"))?;
-        let ips =
-            query(resolver, name, rr_type, host).map_err(|error| rejected(&error.to_string()))?;
+        let ips = query(resolver, name, rr_type, host).map_err(|error| {
+            if negative_dns_answer(&error).is_some() {
+                error
+            } else {
+                rejected(&error.to_string())
+            }
+        })?;
         // Country and domain conditions select the fallback; applying them
         // again here would reject the very answer they were meant to obtain.
         if ips.is_empty()
@@ -645,9 +646,6 @@ impl Plan {
         if groups.default.is_empty() && groups.extra.is_empty() {
             return None;
         }
-        // An empty fallback group disables RecurseX's fallback selection. Do
-        // not start a listener that would send forced-fallback names to default
-        // DNS merely because the configured fallback could not bootstrap.
         if !self.fallback.is_empty() && groups.fallback.is_empty() {
             warn!("DNS listener cannot start: no configured fallback server could be resolved");
             return None;
@@ -1065,21 +1063,59 @@ fn addresses_of(resolution: &recurse_x::Resolution) -> Vec<IpAddr> {
         .collect()
 }
 
-/// Resolve `name`, flattening the two negative answers the engine treats as
-/// "no address" rather than as failures.
-///
-/// NODATA is a *successful* answer that carries no records, and NXDOMAIN is a
-/// successful answer that says the name does not exist; neither says anything
-/// about the primary servers being broken, so neither is reported as an error
-/// against them.
+/// Negative DNS replies are not transport failures. Preserve their meaning
+/// through the dial API's io::Error without relying on error-message matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegativeDnsAnswer {
+    NoData,
+    NxDomain,
+}
+
+impl std::fmt::Display for NegativeDnsAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoData => "DNS name has no record of the requested address family",
+            Self::NxDomain => "DNS name does not exist",
+        })
+    }
+}
+impl std::error::Error for NegativeDnsAnswer {}
+impl NegativeDnsAnswer {
+    fn into_error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::NotFound, self)
+    }
+}
+pub fn negative_dns_answer(error: &io::Error) -> Option<NegativeDnsAnswer> {
+    error
+        .get_ref()?
+        .downcast_ref::<NegativeDnsAnswer>()
+        .copied()
+}
+
+/// Keep NODATA and NXDOMAIN distinct. A configured negative answer must not
+/// trigger an unrelated resolver or become SERVFAIL in the VPN responder.
 fn query(resolver: &Resolver, name: &Name, rr_type: RrType, host: &str) -> io::Result<Vec<IpAddr>> {
     match resolver.resolve(name, rr_type) {
-        Ok(resolution) => Ok(addresses_of(&resolution)),
-        Err(error) => match error.kind() {
-            ErrorKind::NoData | ErrorKind::NxDomain => {
-                debug!("engine DNS: '{host}' has no {} record", rr_type.as_str());
-                Ok(Vec::new())
+        Ok(resolution) => {
+            if resolution.rcode == Rcode::NXDOMAIN {
+                return Err(NegativeDnsAnswer::NxDomain.into_error());
             }
+            if resolution.rcode != Rcode::NOERROR {
+                return Err(io::Error::other(format!(
+                    "DNS reply for '{host}': {}",
+                    resolution.rcode
+                )));
+            }
+            let addresses = addresses_of(&resolution);
+            if addresses.is_empty() {
+                Err(NegativeDnsAnswer::NoData.into_error())
+            } else {
+                Ok(addresses)
+            }
+        }
+        Err(error) => match error.kind() {
+            ErrorKind::NoData => Err(NegativeDnsAnswer::NoData.into_error()),
+            ErrorKind::NxDomain => Err(NegativeDnsAnswer::NxDomain.into_error()),
             _ => Err(io::Error::other(error.to_string())),
         },
     }
@@ -1256,6 +1292,47 @@ mod tests {
 
     fn v4(address: &str) -> IpAddr {
         address.parse().expect("ipv4 literal")
+    }
+
+    #[test]
+    fn negative_replies_preserve_nodata_and_nxdomain_without_fallback() {
+        use recurse_x::Message;
+        use std::net::UdpSocket;
+        for code in [0u8, 3] {
+            let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let address = server.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut bytes = [0u8; 2048];
+                let (size, peer) = server.recv_from(&mut bytes).unwrap();
+                let request = Message::parse(&bytes[..size]).unwrap();
+                let mut response = Message::new(request.id);
+                response.flags.qr = true;
+                response.flags.ra = true;
+                response.questions = request.questions;
+                let mut packet = response.to_bytes().unwrap();
+                packet[3] = (packet[3] & 0xf0) | code;
+                server.send_to(&packet, peer).unwrap();
+            });
+            let resolver = EngineResolver::from_settings(EngineDnsSettings {
+                nameservers: vec![address.to_string()],
+                fallback: vec!["127.0.0.1:9".into()],
+                ..EngineDnsSettings::default()
+            })
+            .unwrap();
+            let error = resolver.resolve_ips("no-v6.example", true).unwrap_err();
+            assert_eq!(
+                negative_dns_answer(&error),
+                Some(if code == 0 {
+                    NegativeDnsAnswer::NoData
+                } else {
+                    NegativeDnsAnswer::NxDomain
+                })
+            );
+            worker.join().unwrap();
+        }
     }
 
     // -- the anti-poisoning gate -------------------------------------------

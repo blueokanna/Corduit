@@ -1,7 +1,7 @@
 //! DNS handling with Fake-IP support
 
 use crate::common::lru::LruCache;
-use crate::dns::engine_resolver::resolve_ips;
+use crate::dns::engine_resolver::{NegativeDnsAnswer, negative_dns_answer, resolve_ips};
 use crate::dns::pattern::{any_suffix_matches, normalize_suffix};
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use dashmap::DashMap;
@@ -12,6 +12,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+enum ClientDnsAnswer {
+    Addresses(Vec<IpAddr>),
+    NoData,
+    NxDomain,
+}
 
 /// TTL of a fake-IP answer, in seconds.
 ///
@@ -514,10 +520,6 @@ impl DnsHandler {
     }
 
     fn parse_name(&self, data: &[u8], start: usize) -> Result<(String, usize)> {
-        // Compression pointers may only point backwards, but without a hop
-        // budget a self-referencing pointer (`C0 0C` at offset 12) spins the
-        // parser forever on a 14-byte datagram. RFC 1035 caps a name at 255
-        // bytes, which also bounds the number of labels we can see.
         const MAX_NAME_BYTES: usize = 255;
         const MAX_POINTERS: usize = 128;
         let mut labels = Vec::new();
@@ -697,8 +699,16 @@ impl DnsHandler {
 
     /// Resolve for real and build the answer.
     fn real_answer(&self, query: &DnsQuery, want_v6: bool) -> Vec<u8> {
-        match self.resolve_real(&query.domain, want_v6) {
-            Ok(addresses) if !addresses.is_empty() => {
+        self.build_real_answer(query, self.resolve_real(&query.domain, want_v6))
+    }
+
+    fn build_real_answer(
+        &self,
+        query: &DnsQuery,
+        answer: std::result::Result<ClientDnsAnswer, String>,
+    ) -> Vec<u8> {
+        match answer {
+            Ok(ClientDnsAnswer::Addresses(addresses)) if !addresses.is_empty() => {
                 info!(
                     "DNS {} query: {} -> {} resolved addresses",
                     query.qtype.to_u16(),
@@ -709,7 +719,10 @@ impl DnsHandler {
                 self.build_address_response(query, addresses.as_slice(), REAL_ANSWER_TTL_SECS)
             }
 
-            Ok(_) => self.build_nxdomain(query),
+            Ok(ClientDnsAnswer::NxDomain) => self.build_nxdomain(query),
+            Ok(ClientDnsAnswer::NoData | ClientDnsAnswer::Addresses(_)) => {
+                self.build_empty_response(query)
+            }
             Err(error) => {
                 warn!(
                     "DNS: could not resolve {} for a client query: {error}",
@@ -726,19 +739,29 @@ impl DnsHandler {
         &self,
         domain: &str,
         want_v6: bool,
-    ) -> std::result::Result<Vec<IpAddr>, String> {
+    ) -> std::result::Result<ClientDnsAnswer, String> {
         let engine = resolve_ips(domain, want_v6);
+        if let Some(Err(error)) = &engine {
+            match negative_dns_answer(error) {
+                Some(NegativeDnsAnswer::NoData) => return Ok(ClientDnsAnswer::NoData),
+                Some(NegativeDnsAnswer::NxDomain) => return Ok(ClientDnsAnswer::NxDomain),
+                None => {}
+            }
+        }
+        if matches!(&engine, Some(Ok(addresses)) if addresses.is_empty()) {
+            return Ok(ClientDnsAnswer::NoData);
+        }
         if crate::dns::engine_resolver::domain_uses_policy(domain) {
             // A `nameserver-policy` entry names the only resolver that may
             // answer this name; its verdict (including "no answer") is final.
             return match engine {
-                Some(Ok(addresses)) if !addresses.is_empty() => Ok(addresses),
-                Some(Ok(_)) => Err("the engine DNS returned no addresses".to_string()),
+                Some(Ok(addresses)) => Ok(ClientDnsAnswer::Addresses(addresses)),
                 Some(Err(error)) => Err(error.to_string()),
                 None => Err("no engine DNS resolver is configured".to_string()),
             };
         }
         with_system_fallback(domain, engine, || system_lookup(domain, want_v6))
+            .map(ClientDnsAnswer::Addresses)
     }
 
     /// Build a response carrying every address of the matching family.
@@ -850,10 +873,6 @@ fn with_system_fallback(
 /// One system-resolver lookup, restricted to the requested family.
 fn system_lookup(domain: &str, want_v6: bool) -> std::result::Result<Vec<IpAddr>, String> {
     if crate::dns::trusted::is_active() {
-        // While a TUN is up the OS resolver is pointed at the tunnel's own
-        // DNS address — this responder. Asking it from in here would hand
-        // the query straight back to this function; the physical servers
-        // captured before the tunnel was raised answer instead.
         return crate::dns::trusted::resolve(domain, want_v6).map_err(|error| error.to_string());
     }
     let resolved = (domain, 0u16)
@@ -1198,6 +1217,25 @@ mod tests {
     }
 
     #[test]
+    fn client_negative_answers_keep_their_wire_semantics() {
+        let (handler, _pool) = handler(fake_ip_mode());
+        let query = handler
+            .parse_query(&query_bytes(9, "no-v6.example", 28))
+            .unwrap();
+        for (answer, rcode) in [
+            (Ok(ClientDnsAnswer::NoData), 0),
+            (Ok(ClientDnsAnswer::NxDomain), 3),
+            (Err("upstream timeout".to_string()), 2),
+        ] {
+            let bytes = handler.build_real_answer(&query, answer);
+            assert_eq!(bytes[3] & 0x0f, rcode);
+            assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 0);
+            assert_eq!(&bytes[..2], &9u16.to_be_bytes());
+            assert_eq!(bytes[bytes.len() - 4..bytes.len() - 2], 28u16.to_be_bytes());
+        }
+    }
+
+    #[test]
     fn servfail_says_the_lookup_failed_not_that_the_name_is_missing() {
         let (handler, _pool) = handler(fake_ip_mode());
         let query = handler
@@ -1360,8 +1398,6 @@ mod tests {
             ClientDnsMode::from_profile("redir-host"),
             ClientDnsMode::Normal
         );
-        // Unknown input resolves for real, which cannot silently lose the domain
-        // a connection was made to.
         assert_eq!(ClientDnsMode::from_profile(""), ClientDnsMode::Normal);
         assert_eq!(ClientDnsMode::from_profile("typo"), ClientDnsMode::Normal);
     }
