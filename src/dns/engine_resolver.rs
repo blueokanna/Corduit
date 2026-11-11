@@ -55,7 +55,6 @@ use recurse_x::{ErrorKind, Name, Resolver, RrType};
 use tracing::{debug, info, warn};
 
 use crate::dns::bogon;
-use crate::dns::pattern::{normalize_suffix, suffix_matches};
 use crate::dns::upstream::Upstream;
 
 /// Timeout for one exchange with one server.
@@ -64,7 +63,8 @@ use crate::dns::upstream::Upstream;
 /// this module documents rather than something a caller may tune.
 const ATTEMPT_TIMEOUT_MS: u64 = 1_500;
 
-/// Wall-clock budget for one engine lookup, covering every attempt it spawns.
+/// Wall-clock budget for one RecurseX resolution, including nested attempts.
+/// Corduit-level primary/fallback resolutions and bootstrap are separate calls.
 ///
 /// RecurseX defaults to 20 s, which is the right number for a resolver serving
 /// clients and the wrong one for a dial that is already holding a connection
@@ -92,22 +92,21 @@ pub type CountryLookup = Arc<dyn Fn(&str, IpAddr) -> bool + Send + Sync>;
 
 /// What makes a primary answer not worth using.
 ///
-/// An answer can be wrong in ways the client has no way to notice, so the only
-/// defence is to recognise the shape of a bad answer and ask someone else. All
+/// These configured heuristics identify addresses to retry elsewhere; they
+/// do not authenticate answers or reliably detect poisoning. All
 /// four signals are cheap; none of them requires the other.
 #[derive(Debug, Default, Clone)]
 struct SuspectPolicy {
     /// Any private, loopback, link-local, CGNAT or otherwise bogus address
     /// makes the whole answer suspect.
     ///
-    /// This is the signal that catches poisoning with no configuration at all:
-    /// a poisoned answer is almost never a routable public address, because
-    /// routing it would reach the real server and defeat the point.
+    /// Private answers can be legitimate, and forged answers can be public.
+    /// Apply this heuristic only when the profile explicitly arms fallback.
     bogus: bool,
     /// Explicit networks that make an answer suspect.
     networks: Vec<IpCidr>,
-    /// Suffixes that always go to the fallback set, normalized.
-    domains: Vec<String>,
+    /// Compiled RecurseX patterns shared by dial and listener routing.
+    domains: Vec<DomainPattern>,
     /// Countries whose addresses may be accepted from the primary servers.
     countries: Vec<String>,
 }
@@ -122,10 +121,8 @@ impl SuspectPolicy {
 
     /// Does this answer need re-resolving through the fallback set?
     fn suspect(&self, host: &str, ips: &[IpAddr], country: Option<&CountryLookup>) -> bool {
-        if self
-            .domains
-            .iter()
-            .any(|suffix| suffix_matches(host, suffix))
+        if parse_name(host)
+            .is_ok_and(|name| self.domains.iter().any(|pattern| pattern.matches(&name)))
         {
             return true;
         }
@@ -307,11 +304,12 @@ impl EngineResolver {
         for (suffix, servers) in &settings.policy {
             let parsed = parse_upstreams(servers, "nameserver-policy");
             if parsed.is_empty() {
-                warn!("DNS policy for '{suffix}' has no usable servers; entry ignored");
-                continue;
+                warn!("DNS policy for '{suffix}' has no usable servers; keeping a closed route");
             }
             policy.push((suffix.clone(), parsed));
         }
+        // HashMap iteration order must not decide equal-specificity routes.
+        policy.sort_by(|left, right| left.0.cmp(&right.0));
 
         if default.is_empty() && policy.is_empty() {
             return None;
@@ -341,7 +339,13 @@ impl EngineResolver {
             domains: settings
                 .fallback_domain
                 .iter()
-                .map(|suffix| normalize_suffix(suffix))
+                .filter_map(|pattern| match DomainPattern::parse(pattern) {
+                    Ok(pattern) => Some(pattern),
+                    Err(error) => {
+                        warn!("invalid dns.fallback-filter.domain '{pattern}': {error}");
+                        None
+                    }
+                })
                 .collect(),
             countries,
         };
@@ -457,22 +461,25 @@ impl EngineResolver {
             let (primary, fallback) = self.live().ok_or_else(|| self.no_resolver(host))?;
             if self.uses_policy(host) {
                 query(&primary, &name, rr_type, host)?
-            } else if self
-                .plan
-                .suspect
-                .domains
-                .iter()
-                .any(|suffix| suffix_matches(host, suffix))
+            } else if !self.plan.fallback.is_empty()
+                && self
+                    .plan
+                    .suspect
+                    .domains
+                    .iter()
+                    .any(|pattern| pattern.matches(&name))
             {
                 // A forced fallback domain must not first leak to the default resolver.
                 self.query_fallback(fallback.as_deref(), &name, rr_type, host)?
             } else {
                 match query(&primary, &name, rr_type, host) {
                     Ok(ips)
-                        if self
-                            .plan
-                            .suspect
-                            .suspect(host, &ips, self.plan.country.as_ref()) =>
+                        if !self.plan.fallback.is_empty()
+                            && self.plan.suspect.suspect(
+                                host,
+                                &ips,
+                                self.plan.country.as_ref(),
+                            ) =>
                     {
                         self.query_fallback(fallback.as_deref(), &name, rr_type, host)?
                     }
@@ -601,18 +608,17 @@ impl Plan {
     /// `None` when nothing usable came out — every upstream was either
     /// unreachable in name or unusable as a string.
     fn build_engine(&self, bootstrap: Option<&Bootstrap>) -> Option<Built> {
-        let groups = self.render_groups(bootstrap)?;
+        let mut groups = self.render_groups(bootstrap)?;
         let policy_count = groups.extra.len();
         let default_count = groups.default.len();
         if default_count == 0 && policy_count == 0 {
             return None;
         }
 
+        let fallback_forwarders = std::mem::take(&mut groups.fallback);
         let config = self.resolver_config(Role::Engine, groups)?;
         let primary = Arc::new(Resolver::new(config));
 
-        let fallback_forwarders =
-            parse_forwarders(&render_set(&self.fallback, bootstrap, "fallback"));
         let fallback_count = fallback_forwarders.len();
         let fallback = self.build_fallback(fallback_forwarders);
         let _ = primary.spawn_maintenance();
@@ -639,6 +645,13 @@ impl Plan {
         if groups.default.is_empty() && groups.extra.is_empty() {
             return None;
         }
+        // An empty fallback group disables RecurseX's fallback selection. Do
+        // not start a listener that would send forced-fallback names to default
+        // DNS merely because the configured fallback could not bootstrap.
+        if !self.fallback.is_empty() && groups.fallback.is_empty() {
+            warn!("DNS listener cannot start: no configured fallback server could be resolved");
+            return None;
+        }
 
         let config = self.resolver_config(Role::Client, groups)?;
         let resolver = Arc::new(Resolver::new(config));
@@ -656,8 +669,9 @@ impl Plan {
         for (suffix, upstreams) in &self.policy {
             let rendered = render_set(upstreams, bootstrap, "nameserver-policy");
             if rendered.is_empty() {
-                warn!("dns.nameserver-policy for '{suffix}' left no usable server; entry ignored");
-                continue;
+                warn!(
+                    "dns.nameserver-policy for '{suffix}' has no usable server; keeping a closed route"
+                );
             }
             surviving.push(suffix.clone());
             extra.push(parse_forwarders(&rendered));
@@ -728,12 +742,18 @@ impl Plan {
             ipcidr.extend(bogon::all_ranges().map(str::to_string));
         }
 
-        match FallbackFilter::new(&self.suspect.domains, Some(&ipcidr), false) {
+        let domains: Vec<String> = self
+            .suspect
+            .domains
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        match FallbackFilter::new(&domains, Some(&ipcidr), false) {
             Ok(filter) => Some(filter),
             Err(error) => {
                 warn!(
                     "dns.fallback-filter could not be given to the DNS listener ({error}); the \
-                     listener answers without it"
+                     listener cannot start"
                 );
                 None
             }
@@ -813,7 +833,7 @@ struct Groups {
     rules: Vec<(String, GroupId)>,
 }
 
-/// Assign RecurseX group ids to the policy groups that survived rendering.
+/// Assign RecurseX group ids to every policy, including unavailable routes.
 ///
 /// Ids `0` and `1` are reserved by RecurseX for the default and fallback
 /// groups, so policy groups start at `2`, and the rule that names a group must
@@ -1240,9 +1260,144 @@ mod tests {
 
     // -- the anti-poisoning gate -------------------------------------------
 
-    /// A poisoned answer is almost never a routable address, because routing it
-    /// would reach the real server and defeat the point. That is why the bogus
-    /// signal needs no configuration once a fallback list exists.
+    #[test]
+    fn unresolved_policy_keeps_its_closed_route() {
+        let settings = EngineDnsSettings {
+            nameservers: vec!["127.0.0.1:5353".into()],
+            policy: HashMap::from([(
+                "+.private.test".into(),
+                vec!["tls://unavailable.test:853".into()],
+            )]),
+            ..EngineDnsSettings::default()
+        };
+        let engine = EngineResolver::from_settings(settings).expect("valid plan");
+        let groups = engine.plan.render_groups(None).expect("render groups");
+        assert_eq!(groups.rules.len(), 1);
+        assert_eq!(groups.extra.len(), 1);
+        assert!(groups.extra[0].is_empty());
+        let config = engine.plan.resolver_config(Role::Client, groups).unwrap();
+        let resolver = Resolver::new(config);
+        // An absent explicit route must fail before contacting default port 5353.
+        let result = resolver.resolve(&Name::from_ascii("node.private.test").unwrap(), RrType::A);
+        assert!(result.is_err());
+        assert_eq!(resolver.stats_snapshot().upstream_queries, 0);
+    }
+
+    #[test]
+    fn unusable_policy_servers_never_fall_through_to_default() {
+        for servers in [Vec::new(), vec!["unsupported://127.0.0.1".into()]] {
+            let engine = EngineResolver::from_settings(EngineDnsSettings {
+                nameservers: vec!["127.0.0.1:9".into()],
+                policy: HashMap::from([("+.private.test".into(), servers)]),
+                ..EngineDnsSettings::default()
+            })
+            .unwrap();
+            assert!(engine.uses_policy("node.private.test"));
+            assert!(engine.resolve_ips("node.private.test", false).is_err());
+            let (primary, _) = engine.live().unwrap();
+            assert_eq!(primary.stats_snapshot().upstream_queries, 0);
+            let client = engine.client_resolver().unwrap();
+            assert!(
+                client
+                    .resolve(&Name::from_ascii("node.private.test").unwrap(), RrType::A)
+                    .is_err()
+            );
+            assert_eq!(client.stats_snapshot().upstream_queries, 0);
+            client.shutdown();
+        }
+    }
+
+    #[test]
+    fn unavailable_fallback_does_not_disable_listener_policy() {
+        let engine = EngineResolver::from_settings(EngineDnsSettings {
+            nameservers: vec!["127.0.0.1:9".into()],
+            fallback: vec!["tls://unavailable.test".into()],
+            fallback_domain: vec!["+.private.test".into()],
+            ..EngineDnsSettings::default()
+        })
+        .unwrap();
+        assert!(engine.plan.build_client(None).is_none());
+        // Engine dials retain their separate fallback gate even when only the
+        // default group was built. No bootstrap or external lookup is needed.
+        let built = engine.plan.build_engine(None).unwrap();
+        {
+            let mut live = engine.live.write();
+            live.primary = Some(built.primary);
+            live.fallback = built.fallback;
+        }
+        assert_eq!(
+            engine
+                .resolve_ips("node.private.test", false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let (primary, _) = engine.live().unwrap();
+        assert_eq!(primary.stats_snapshot().upstream_queries, 0);
+    }
+
+    #[test]
+    fn fallback_patterns_select_the_same_upstream_for_dials_and_clients() {
+        let (primary_port, _primary) = spawn_udp_server(|_| Some(Ipv4Addr::new(8, 8, 8, 8)));
+        let (fallback_port, _fallback) = spawn_udp_server(|_| Some(Ipv4Addr::new(1, 1, 1, 1)));
+        for (pattern, host, forced) in [
+            ("exact.test", "exact.test", true),
+            ("exact.test", "child.exact.test", false),
+            ("+.tree.test", "child.tree.test", true),
+            ("+.tree.test", "nottree.test", false),
+            ("time.*.test", "time.node.test", true),
+            ("time.*.test", "child.time.node.test", false),
+            ("*.stun.*.*", "child.stun.node.test", true),
+            ("*", "any.test", true),
+        ] {
+            let engine = EngineResolver::from_settings(EngineDnsSettings {
+                nameservers: vec![format!("127.0.0.1:{primary_port}")],
+                fallback: vec![format!("127.0.0.1:{fallback_port}")],
+                fallback_domain: vec![pattern.into()],
+                ..EngineDnsSettings::default()
+            })
+            .unwrap();
+            let expected = vec![v4(if forced { "1.1.1.1" } else { "8.8.8.8" })];
+            assert_eq!(
+                engine.resolve_ips(host, false).unwrap(),
+                expected,
+                "dial: {pattern}, {host}"
+            );
+            let client = engine.client_resolver().unwrap();
+            let answer = client
+                .resolve(&Name::from_ascii(host).unwrap(), RrType::A)
+                .unwrap();
+            assert_eq!(
+                addresses_of(&answer),
+                expected,
+                "listener: {pattern}, {host}"
+            );
+            client.shutdown();
+        }
+    }
+
+    #[test]
+    fn fallback_filters_are_inactive_without_fallback_servers() {
+        let (port, _server) = spawn_udp_server(|_| Some(Ipv4Addr::new(10, 1, 2, 3)));
+        let engine = EngineResolver::from_settings(EngineDnsSettings {
+            nameservers: vec![format!("127.0.0.1:{port}")],
+            fallback_domain: vec!["*".into()],
+            fallback_ipcidr: vec!["10.0.0.0/8".into()],
+            ..EngineDnsSettings::default()
+        })
+        .unwrap();
+        assert_eq!(
+            engine.resolve_ips("private.test", false).unwrap(),
+            vec![v4("10.1.2.3")]
+        );
+        let client = engine.client_resolver().unwrap();
+        let answer = client
+            .resolve(&Name::from_ascii("private.test").unwrap(), RrType::A)
+            .unwrap();
+        assert_eq!(addresses_of(&answer), vec![v4("10.1.2.3")]);
+        client.shutdown();
+    }
+
     #[test]
     fn bogus_addresses_are_suspect_and_public_ones_are_not() {
         let policy = SuspectPolicy {
@@ -1277,7 +1432,7 @@ mod tests {
     fn ipcidr_and_domain_signals_match_on_boundaries() {
         let policy = SuspectPolicy {
             networks: vec![IpCidr::parse("203.0.113.0/24").expect("cidr")],
-            domains: vec!["blocked.example".to_string()],
+            domains: vec![DomainPattern::parse("+.blocked.example").unwrap()],
             ..SuspectPolicy::default()
         };
         let public = v4("1.1.1.1");
@@ -1557,10 +1712,13 @@ mod tests {
             .resolve("entry.example", 443)
             .expect_err("nothing can reach dns.invalid");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        let started = Instant::now();
+        let next_attempt = resolver.live.read().next_attempt;
+        assert!(next_attempt > Instant::now());
         assert!(resolver.resolve("entry.example", 443).is_err());
-        assert!(started.elapsed() < Duration::from_millis(50));
-        assert!(resolver.live.read().next_attempt > Instant::now());
+        // A failed rebuild assigns a fresh deadline. Keeping the same value
+        // proves both address-family lookups respected the existing backoff,
+        // without relying on scheduler latency under parallel CI load.
+        assert_eq!(resolver.live.read().next_attempt, next_attempt);
     }
     #[test]
     fn suspect_answer_is_not_used_when_fallback_has_no_answer() {

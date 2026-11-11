@@ -410,9 +410,11 @@ behind the `std` feature.
 
 ### Dependency versions
 
-Corduit uses the published `courierust 1.1.2` and `recurse-x 0.2.5` packages
-from crates.io. `Cargo.lock` records their versions and checksums; local builds
-and CI use `--locked`. No sibling checkouts or vendored sources are required.
+Corduit uses the published RecurseX 0.2.6 and Courierust 1.1.2 packages.
+`Cargo.lock` pins their registry versions and checksums. Local builds and CI use
+the same dependencies with `--locked`; no sibling checkout or repository
+variable is required.
+
 RecurseX and Corduit resolve to the same Courierust package, so HTTP and all
 DNS transports share the outbound socket factory. The `dns_socket_factory`
 integration test checks that these transports use the installed callbacks.
@@ -519,3 +521,30 @@ More: [Security](https://github.com/blueokanna/Corduit/wiki/Security).
   must stay inside the law that applies to you.
 
 Required Notice: Copyright 2026 blueokanna (https://github.com/blueokanna/Corduit)
+
+### DNS integration with RecurseX 0.2.6
+
+Unavailable hostname-based nameserver policies retain a closed route instead of
+falling through to default DNS. A default listener admits only loopback clients;
+the explicit `allow-lan` setting adds RFC1918, IPv4 link-local, IPv6 ULA and link-local
+clients. Public source addresses remain denied. A wildcard bind is not permission.
+UDP and TCP use the same bound port and the same resolver policy.
+
+DNS upstream syntax and policy patterns are checked before startup. Dial and
+listener fallback rules use RecurseX's matcher: bare names match exactly, `+.`
+matches a subtree, and embedded `*` labels are supported. Filters are inactive
+when no fallback servers are configured.
+If all configured fallback endpoints fail to bootstrap, the DNS listener refuses
+to start rather than forwarding forced-fallback names to the default servers.
+
+TUN TCP and SOCKS5 UDP relay sockets use the common socket layer. Protection
+failure stops socket creation; an active Android VPN with no callback also fails
+closed. Replacing or clearing a callback invalidates cached DNS transports.
+`common::socket::protect_outbound_fd` now returns `io::Result<()>`; callers must
+handle the result. The Android regression test is `tests/vpn_socket_protection.rs`
+and needs an Android test runner to execute.
+
+RecurseX supplies transport recovery, bounded query observations and conservative
+cache admission. Local signature verification does not establish a root-anchored
+DNSSEC chain. Pure recursion still requires authoritative UDP/TCP reachability;
+configured alternatives recover transport failures without changing explicit routes.

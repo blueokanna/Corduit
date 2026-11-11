@@ -1,6 +1,6 @@
 [package]
 name = "corduit"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.88"
 license-file = "LICENSE"
@@ -88,7 +88,7 @@ tracing-subscriber = { version = "0.3", features = [
 courierust = { version = "1.1.2", default-features = false }
 
 # --- DNS ---------------------------------------------------------------------
-recurse-x = { version = "0.2.5", default-features = false, optional = true }
+recurse-x = { version = "0.2.6", default-features = false, optional = true }
 ipnet = { version = "2.12.2", optional = true }
 
 
@@ -120,8 +120,6 @@ mach2 = { version = "0.7", optional = true }
 libc = { version = "0.2", default-features = false, optional = true }
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
-# DeviceBuilder configures the initial IPv4 address without address-management.
-# Corduit owns routing; address enumeration would pull in unused netlink crates.
 tun-rs = { version = "2.8.18", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]

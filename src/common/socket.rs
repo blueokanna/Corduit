@@ -53,18 +53,34 @@ pub fn tcp_concurrent() -> bool {
 /// `vpnConnection.protect` callback behind `set_protect_callback` (OHOS) must be
 /// invoked before `connect`/`bind` for the routing decision to stick. A no-op on
 /// every other platform.
+///
+/// Returns `PermissionDenied` when protection fails, including a missing callback
+/// while a VPN descriptor is installed. Callers must propagate this error before
+/// connecting or sending data. OHOS may instead protect the entire process.
 #[cfg(any(target_os = "android", target_env = "ohos"))]
-pub fn protect_outbound_fd(fd: i32) {
-    if crate::netstack::has_protect_callback() && !crate::netstack::protect_socket(fd) {
-        tracing::warn!(
-            "failed to protect outbound socket fd={fd}; it may be routed into the tunnel"
-        );
+pub fn protect_outbound_fd(fd: i32) -> io::Result<()> {
+    #[cfg(target_os = "android")]
+    let vpn_active = crate::netstack::get_android_vpn_fd() >= 0;
+    #[cfg(target_env = "ohos")]
+    let vpn_active =
+        crate::netstack::get_ohos_vpn_fd() >= 0 && !crate::netstack::is_ohos_process_protected();
+
+    if (vpn_active || crate::netstack::has_protect_callback())
+        && !crate::netstack::protect_socket(fd)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VPN refused outbound socket protection",
+        ));
     }
+    Ok(())
 }
 
 /// See [`protect_outbound_fd`]; this variant is a no-op.
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
-pub fn protect_outbound_fd(_fd: i32) {}
+pub fn protect_outbound_fd(_fd: i32) -> io::Result<()> {
+    Ok(())
+}
 
 /// Interface the engine's own sockets are pinned to while a TUN route table
 /// is in place.
@@ -194,14 +210,7 @@ fn protect_socket2(sock: &socket2::Socket) -> io::Result<()> {
     #[cfg(any(target_os = "android", target_env = "ohos"))]
     {
         use std::os::fd::AsRawFd;
-        if crate::netstack::has_protect_callback()
-            && !crate::netstack::protect_socket(sock.as_raw_fd())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "VPN refused outbound socket protection",
-            ));
-        }
+        protect_outbound_fd(sock.as_raw_fd())?;
     }
     #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     let _ = sock;

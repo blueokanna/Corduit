@@ -282,7 +282,7 @@ src/
 
 ### 依赖版本
 
-Corduit 使用 crates.io 发布的 `courierust 1.1.2` 和 `recurse-x 0.2.5`，由 `Cargo.lock` 记录版本与校验和，本地构建和 CI 均使用 `--locked`。构建不需要相邻源码仓库，也不保留 vendor 副本。Corduit 与 RecurseX 解析到同一个 Courierust 包，让 HTTP 和各 DNS 传输共享 socket 工厂；`dns_socket_factory` 集成测试会验证这些传输确实经过已安装的回调。
+Corduit 使用 crates.io 正式发布的 RecurseX 0.2.6 与 Courierust 1.1.2，`Cargo.lock` 锁定版本和校验和。本地构建与 CI 均使用 `--locked`，无需相邻仓库或额外仓库变量。两个项目共用同一个 Courierust socket 工厂，`dns_socket_factory` 验证实际传输经过安装的回调。
 
 平台适配留在 Corduit；Courierust 只提供 socket 回调和网络代次通知。回调应在客户端启动前安装，在连接前完成接口绑定或 VPN 保护，失败时返回错误。网络代次变化后，RecurseX 会淘汰缓存中的旧转发传输；正在执行的交换允许结束。
 
@@ -335,3 +335,20 @@ MSRV：**Rust 1.88**。不使用任何 HTTP/TLS/QUIC 第三方库，也没有 as
 - **以合法使用为前提**：不授予任何规避权利，使用必须停留在适用于你的法律之内。
 
 Required Notice: Copyright 2026 blueokanna (https://github.com/blueokanna/Corduit)
+
+### RecurseX 0.2.6 的 DNS 集成
+
+域名形式的策略上游无法解析时，保留关闭的专用路由，不将问题泄露到默认 DNS。
+监听默认只允许回环客户端；显式开启 `allow-lan` 后增加 RFC1918、IPv4 链路本地、IPv6 ULA
+及链路本地范围，公共来源仍被拒绝。绑定通配地址不等于开放访问。UDP/TCP 共用绑定端口和解析策略。
+
+启动前校验 DNS 上游语法与策略模式。拨号和监听器的 fallback 规则共用 RecurseX 匹配器：裸域名精确匹配，
+`+.` 匹配域名及其子域，支持标签中的 `*` 通配符。未配置 fallback 服务器时，过滤条件不生效。
+若已配置的 fallback 上游全部无法完成 bootstrap，DNS 监听器拒绝启动，避免将指定域名发送到默认服务器。
+
+TUN TCP 与 SOCKS5 UDP 中继统一通过公共 socket 层创建连接。保护失败立即返回错误；Android VPN 已启用但
+回调缺失时同样拒绝联网。更换或清除回调会使缓存的 DNS 传输失效。`common::socket::protect_outbound_fd`
+现返回 `io::Result<()>`，调用方需要处理错误。`tests/vpn_socket_protection.rs` 需在 Android 测试环境执行。
+
+传输恢复、有界查询观测和缓存准入由 RecurseX 提供。局部验签不表示完整 DNSSEC 信任链。
+纯递归依赖权威 UDP/TCP 的实际可达性；已配置的备用服务器可处理传输失败，但不改变显式域名路由。

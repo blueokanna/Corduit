@@ -114,9 +114,12 @@ impl ConfigValidator {
             ("default-nameserver", &dns.default_nameserver),
         ] {
             for server in servers.iter() {
-                if server.trim().is_empty() {
+                let upstream = crate::dns::upstream::Upstream::parse(server).map_err(|error| {
+                    Error::config(format!("dns.{label} entry '{server}': {error}"))
+                })?;
+                if label == "default-nameserver" && upstream.needs_bootstrap() {
                     return Err(Error::config(format!(
-                        "dns.{label} contains an empty entry"
+                        "dns.default-nameserver '{server}' must use an IP literal"
                     )));
                 }
             }
@@ -133,6 +136,19 @@ impl ConfigValidator {
                     "dns.nameserver-policy['{suffix}'] has no servers"
                 )));
             }
+            recurse_x::routing::NameserverPolicy::new(&[(suffix.clone(), 2)])
+                .map_err(|error| Error::config(format!("dns.nameserver-policy: {error}")))?;
+            for server in servers {
+                crate::dns::upstream::Upstream::parse(server).map_err(|error| {
+                    Error::config(format!("dns.nameserver-policy['{suffix}']: {error}"))
+                })?;
+            }
+        }
+
+        for pattern in &dns.fallback_filter.domain {
+            recurse_x::pattern::DomainPattern::parse(pattern).map_err(|error| {
+                Error::config(format!("dns.fallback-filter.domain '{pattern}': {error}"))
+            })?;
         }
 
         // The fake-IP pool is an IPv4 pool: the stack hands out an `Ipv4Addr`,
@@ -526,6 +542,63 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_dns_upstreams_are_rejected_before_startup() {
+        for server in ["", "garbage server", "udp://127.0.0.1:0", "ftp://dns.test"] {
+            for field in [
+                "nameservers",
+                "fallback",
+                "default-nameserver",
+                "nameserver-policy",
+            ] {
+                let mut dns = DnsConfig::default();
+                match field {
+                    "nameservers" => dns.nameservers = vec![server.into()],
+                    "fallback" => dns.fallback = vec![server.into()],
+                    "default-nameserver" => dns.default_nameserver = vec![server.into()],
+                    _ => {
+                        dns.nameserver_policy
+                            .insert("+.private.test".into(), vec![server.into()]);
+                    }
+                }
+                let error = ConfigValidator::validate_dns(&dns).unwrap_err().to_string();
+                assert!(error.contains(field), "{field}, {server}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn dns_policy_and_bootstrap_syntax_are_validated() {
+        for pattern in ["*", "bad..test", "+."] {
+            let mut dns = DnsConfig::default();
+            dns.nameserver_policy
+                .insert(pattern.into(), vec!["127.0.0.1".into()]);
+            assert!(ConfigValidator::validate_dns(&dns).is_err(), "{pattern}");
+        }
+        let dns = DnsConfig {
+            default_nameserver: vec!["https://dns.test/dns-query".into()],
+            ..DnsConfig::default()
+        };
+        assert!(
+            ConfigValidator::validate_dns(&dns)
+                .unwrap_err()
+                .to_string()
+                .contains("IP literal")
+        );
+
+        let mut dns = DnsConfig::default();
+        dns.fallback_filter.domain = vec!["bad..test".into()];
+        assert!(
+            ConfigValidator::validate_dns(&dns)
+                .unwrap_err()
+                .to_string()
+                .contains("fallback-filter.domain")
+        );
+        dns.fallback_filter.domain =
+            vec!["*".into(), "time.*.test".into(), "+.private.test".into()];
+        ConfigValidator::validate_dns(&dns).unwrap();
+    }
 
     #[test]
     fn test_valid_config() {

@@ -173,7 +173,12 @@ impl Corduit {
 
         let started = crate::dns::engine_resolver::client_resolver(dns.resolver_settings())
             .and_then(|resolver| {
-                crate::dns::DnsServer::start(resolver, listen).map_err(|error| error.to_string())
+                crate::dns::DnsServer::start_with_lan_access(
+                    resolver,
+                    listen,
+                    self.config.general.allow_lan,
+                )
+                .map_err(|error| error.to_string())
             });
         match started {
             Ok(server) => *self.dns_listener.lock() = Some(server),

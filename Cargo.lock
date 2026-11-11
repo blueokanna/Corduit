@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "corduit"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -812,9 +812,9 @@ dependencies = [
 
 [[package]]
 name = "recurse-x"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1e8601795341ea18816a638b06020ff876216c1af6d354a80066b2e45b3f"
+checksum = "8a93c009b81c85fcf73c55c869958e72f6aa237bcffcde596819023cdc2a122d"
 dependencies = [
  "courierust",
  "nextjson",

@@ -261,9 +261,6 @@ fn is_peer_gone(error: &io::Error) -> bool {
 }
 
 #[cfg(any(target_os = "android", target_env = "ohos"))]
-use std::os::unix::io::AsRawFd;
-
-#[cfg(any(target_os = "android", target_env = "ohos"))]
 type ProtectCallback = Box<dyn Fn(i32) -> bool + Send + Sync>;
 
 #[cfg(any(target_os = "android", target_env = "ohos"))]
@@ -277,6 +274,8 @@ where
 {
     let mut guard = PROTECT_CALLBACK.write();
     *guard = Some(Box::new(callback));
+    drop(guard);
+    courierust::courierust_net::outbound::network_changed();
     info!("SolidStack: Socket protect callback registered");
 }
 
@@ -284,6 +283,8 @@ where
 pub fn clear_protect_callback() {
     let mut guard = PROTECT_CALLBACK.write();
     *guard = None;
+    drop(guard);
+    courierust::courierust_net::outbound::network_changed();
     info!("SolidStack: Socket protect callback cleared");
 }
 
@@ -1302,16 +1303,6 @@ impl StackProxy {
                 SolidTcpError::ProxyError(format!("UDP associate connect failed: {}", e))
             })?;
 
-        #[cfg(any(target_os = "android", target_env = "ohos"))]
-        {
-            let fd = tcp_stream.as_raw_fd();
-            if !protect_socket(fd) {
-                warn!("Failed to protect UDP associate TCP socket fd={}", fd);
-            } else {
-                debug!("Protected UDP associate TCP socket fd={}", fd);
-            }
-        }
-
         let mut tcp_stream = tcp_stream;
         let _ = tcp_stream.set_read_timeout(Some(PROXY_HANDSHAKE_TIMEOUT));
         let _ = tcp_stream.set_write_timeout(Some(PROXY_HANDSHAKE_TIMEOUT));
@@ -1380,22 +1371,16 @@ impl StackProxy {
         // The relay socket has to be bound in the relay's family, or a v6
         // relay address has nowhere to be sent from.
         let bind_addr = if relay_addr.is_ipv6() {
-            "[::]:0"
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         } else {
-            "0.0.0.0:0"
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
         };
-        let udp_socket = StdUdpSocket::bind(bind_addr)
-            .map_err(|e| SolidTcpError::ProxyError(format!("UDP socket bind failed: {}", e)))?;
-
-        #[cfg(any(target_os = "android", target_env = "ohos"))]
-        {
-            let fd = udp_socket.as_raw_fd();
-            if !protect_socket(fd) {
-                warn!("Failed to protect UDP relay socket fd={}", fd);
-            } else {
-                debug!("Protected UDP relay socket fd={}", fd);
-            }
-        }
+        let udp_socket = crate::common::socket::udp_bind_for(
+            bind_addr,
+            UDP_ASSOCIATION_IDLE,
+            Some(relay_addr.ip()),
+        )
+        .map_err(|e| SolidTcpError::ProxyError(format!("UDP socket bind failed: {}", e)))?;
 
         // The association outlives this call: the control connection is held
         // open (and dropped with the association) so the server keeps the
@@ -1459,14 +1444,6 @@ impl StackProxy {
 
         let mut stream = crate::common::socket::connect(&self.proxy_addr, PROXY_HANDSHAKE_TIMEOUT)
             .map_err(|e| SolidTcpError::ProxyError(format!("Connect failed: {}", e)))?;
-
-        #[cfg(any(target_os = "android", target_env = "ohos"))]
-        {
-            let fd = stream.as_raw_fd();
-            if !protect_socket(fd) {
-                warn!("Failed to protect proxy TCP socket fd={}", fd);
-            }
-        }
 
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(PROXY_HANDSHAKE_TIMEOUT));

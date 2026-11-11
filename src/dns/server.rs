@@ -24,10 +24,12 @@
 //!   client an address nothing can reverse would be strictly worse than one that
 //!   answers with the real address. `enhanced-mode: fake-ip` therefore belongs
 //!   to `netstack`, and the engine says so when a profile sets both.
-//! - **DNSSEC.** RecurseX validates RSASHA256 end to end but ships no root trust
-//!   anchor, so the honest verdict for an unanchored chain is `Indeterminate`.
-//!   Asking for validation without an anchor would cost CPU and change no
-//!   answer, which is why the `dnssec` feature is not compiled in.
+//! - **DNSSEC.** RecurseX 0.2.6 has local RSA/SHA-256 verification, not a
+//!   root-anchored validation chain. Neither local success nor an upstream
+//!   AD bit is represented as complete DNSSEC authentication here.
+//! - **Public recursion.** Loopback clients are allowed by default. The engine's
+//!   explicit allow-lan setting adds private and link-local client ranges;
+//!   binding a wildcard address alone never opens recursion.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,7 +65,18 @@ impl DnsServer {
     /// to retry over TCP (RFC 7766 §5), and a listener that speaks only UDP
     /// hands out truncation with nowhere to go — so there is no knob for it.
     pub fn start(resolver: Arc<Resolver>, listen: SocketAddr) -> std::io::Result<Self> {
+        Self::start_with_lan_access(resolver, listen, false)
+    }
+
+    /// Start with the profile's explicit LAN permission. Public client ranges
+    /// remain denied; a wildcard listen address is not an access policy.
+    pub fn start_with_lan_access(
+        resolver: Arc<Resolver>,
+        listen: SocketAddr,
+        allow_lan: bool,
+    ) -> std::io::Result<Self> {
         let config = ServerConfig {
+            allowed_clients: allowed_client_networks(allow_lan),
             max_tcp_connections: MAX_TCP_CONNECTIONS,
             ..ServerConfig::default()
         };
@@ -286,5 +299,38 @@ mod tests {
             RData::A("198.18.0.9".parse().expect("ip"))
         );
         server.stop();
+    }
+}
+
+fn allowed_client_networks(allow_lan: bool) -> Vec<recurse_x::cidr::IpCidr> {
+    if !allow_lan {
+        return Vec::new();
+    }
+    [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    .into_iter()
+    .filter_map(recurse_x::cidr::IpCidr::parse)
+    .collect()
+}
+
+#[cfg(test)]
+mod access_regressions {
+    use super::*;
+    #[test]
+    fn lan_permission_never_enables_public_recursion() {
+        assert!(allowed_client_networks(false).is_empty());
+        let allowed = allowed_client_networks(true);
+        for ip in ["192.168.1.2", "10.1.2.3", "fd00::2", "fe80::2"] {
+            assert!(allowed.iter().any(|net| net.contains(ip.parse().unwrap())));
+        }
+        for ip in ["1.1.1.1", "2001:4860:4860::8888"] {
+            assert!(!allowed.iter().any(|net| net.contains(ip.parse().unwrap())));
+        }
     }
 }
