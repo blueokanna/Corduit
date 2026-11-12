@@ -17,6 +17,9 @@
 //!
 //! # Availability
 //!
+//! x86 targets must enable SSE2 at compile time. Soft-float targets such as
+//! `x86_64-unknown-none` use software rounds and do not compile SIMD intrinsics.
+//!
 //! * `target_feature = "aes"` (the crate was compiled for a CPU that has
 //!   it, e.g. `-C target-cpu=native`): always used;
 //! * x86/x86_64: one CPUID leaf-1 probe — `ECX.AESNI` (bit 25) plus
@@ -59,7 +62,10 @@
 // x86 / x86_64 — AES-NI
 // ---------------------------------------------------------------------------
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "sse2"
+))]
 mod x86 {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{
@@ -259,14 +265,23 @@ mod arm {
 
 #[cfg(target_arch = "aarch64")]
 use arm as back_end;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "sse2"
+))]
 use x86 as back_end;
 
 /// Whether the platform's AES round instructions are usable on this CPU.
 ///
 /// Architectures without a back end always answer `false`, which is what
 /// sends [`Aes`](super::aes::Aes) down the software path.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ),
+    target_arch = "aarch64"
+))]
 pub fn available() -> bool {
     back_end::available()
 }
@@ -274,7 +289,13 @@ pub fn available() -> bool {
 /// Architectures without a hardware AES back end: the software rounds in
 /// [`Aes`](super::aes::Aes) are the only implementation, so nothing is
 /// available here.
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ),
+    target_arch = "aarch64"
+)))]
 pub fn available() -> bool {
     false
 }
@@ -285,7 +306,13 @@ pub fn available() -> bool {
 /// This is the only encryption entry point callers such as
 /// [`Aes`](super::aes::Aes) reach; the runtime check keeps the `unsafe`
 /// call out of their code.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ),
+    target_arch = "aarch64"
+))]
 pub fn encrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) -> bool {
     if !matches!(rounds, 10 | 12 | 14) || keys.len() <= rounds || !available() {
         return false;
@@ -296,7 +323,13 @@ pub fn encrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) -> 
 
 /// Decrypt one block with the hardware rounds; contract as
 /// [`encrypt_block`].
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ),
+    target_arch = "aarch64"
+))]
 pub fn decrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) -> bool {
     if !matches!(rounds, 10 | 12 | 14) || keys.len() <= rounds || !available() {
         return false;
@@ -308,7 +341,13 @@ pub fn decrypt_block(rounds: usize, keys: &[[u8; 16]], block: &mut [u8; 16]) -> 
 
 #[cfg(all(
     test,
-    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse2"
+        ),
+        target_arch = "aarch64"
+    )
 ))]
 mod tests {
     #[test]

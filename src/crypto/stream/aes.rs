@@ -67,7 +67,13 @@ pub struct Aes {
     /// architectures without a back end the field is always `false` and the
     /// reader below is compiled out.
     #[cfg_attr(
-        not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")),
+        not(any(
+            all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                target_feature = "sse2"
+            ),
+            target_arch = "aarch64"
+        )),
         allow(dead_code)
     )]
     hw: bool,
@@ -142,7 +148,13 @@ impl Aes {
     /// Encrypt one 16-byte block in place, on the hardware rounds when the
     /// CPU has them.
     pub fn encrypt_block(&self, block: &mut [u8; 16]) {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(any(
+            all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                target_feature = "sse2"
+            ),
+            target_arch = "aarch64"
+        ))]
         if self.hw && aes_hw::encrypt_block(self.rounds, &self.round_keys, block) {
             return;
         }
@@ -187,7 +199,13 @@ impl Aes {
     /// Decrypt one 16-byte block in place, on the hardware rounds when the
     /// CPU has them.
     pub fn decrypt_block(&self, block: &mut [u8; 16]) {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(any(
+            all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                target_feature = "sse2"
+            ),
+            target_arch = "aarch64"
+        ))]
         if self.hw && aes_hw::decrypt_block(self.rounds, &self.round_keys, block) {
             return;
         }

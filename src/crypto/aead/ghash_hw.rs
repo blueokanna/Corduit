@@ -55,11 +55,17 @@
 
 #![allow(unsafe_code)]
 
+// Only compile the x86 SIMD backend when the target enables SSE2. A CPUID
+// probe cannot make SSE usable on a soft-float target such as x86_64-unknown-none.
+
 // ---------------------------------------------------------------------------
 // x86 / x86_64 — PCLMULQDQ
 // ---------------------------------------------------------------------------
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "sse2"
+))]
 mod x86 {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{
@@ -188,21 +194,36 @@ mod arm {
 
 #[cfg(target_arch = "aarch64")]
 use arm as back_end;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "sse2"
+))]
 use x86 as back_end;
 
 /// Whether the platform's carry-less multiply is usable on this CPU.
 ///
 /// Architectures without a back end always answer `false`, which is what
 /// keeps [`prepare`] returning `None` there.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ),
+    target_arch = "aarch64"
+))]
 pub fn available() -> bool {
     back_end::available()
 }
 
 /// Architectures without a carry-less multiply back end: the caller's
 /// software multiply is the only implementation, so nothing is available.
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ),
+    target_arch = "aarch64"
+)))]
 pub fn available() -> bool {
     false
 }
@@ -211,7 +232,13 @@ pub fn available() -> bool {
 ///
 /// # Safety
 /// [`available`] must have returned `true` on this CPU.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ),
+    target_arch = "aarch64"
+))]
 #[inline]
 unsafe fn clmul64(a: u64, b: u64) -> u128 {
     unsafe { back_end::clmul64(a, b) }
@@ -220,7 +247,13 @@ unsafe fn clmul64(a: u64, b: u64) -> u128 {
 /// Unreachable stand-in for architectures without a back end: [`prepare`]
 /// refuses to build a [`PreparedKey`] there, so [`dot`] — its only caller —
 /// cannot run.
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    ),
+    target_arch = "aarch64"
+)))]
 unsafe fn clmul64(_a: u64, _b: u64) -> u128 {
     unreachable!("no carry-less multiply back end on this architecture")
 }

@@ -307,9 +307,6 @@ impl QuicConn {
         peer: SocketAddr,
         config: ClientConfig,
     ) -> Result<Arc<QuicConn>> {
-        // The driver blocks on recv; a short read timeout turns a quiet
-        // socket into a periodic wakeup so timers and queued writes get
-        // serviced promptly.
         udp.set_read_timeout(Some(DRIVER_POLL))
             .map_err(|e| QuicError::Io(e.to_string()))?;
         let udp = Arc::new(udp);
@@ -349,9 +346,7 @@ impl QuicConn {
         )
         .map_err(|e| QuicError::Tls(e.to_string()))?;
 
-        // Obfuscation must be captured before `config` is moved into state.
         let config_obfs = config.obfs.clone();
-
         let mut state = ConnState {
             config,
             tls,
@@ -525,9 +520,6 @@ impl QuicConn {
             && let Some(_ka) = st.config.keep_alive_interval
             && Instant::now() >= st.keep_alive_next
         {
-            // Send an ack-eliciting PING so the peer replies and the
-            // connection stays alive. An ACK frame alone is not
-            // ack-eliciting and would not solicit a response.
             st.ping_pending = true;
             st.keep_alive_next = Instant::now() + _ka;
         }
@@ -547,10 +539,6 @@ impl QuicConn {
             return Ok(());
         }
         let first = data[0];
-
-        // Long-header packet: verify the version and that it is addressed to
-        // our connection ID (RFC 9000 §5.2). Anything unrecognised is
-        // discarded, not fatal — stray UDP can hit the socket at any time.
         if first & 0x80 != 0 {
             if data.len() < 5 {
                 return Ok(());
@@ -584,16 +572,12 @@ impl QuicConn {
                 0x01 => return Ok(()), // 0-RTT: not offered
                 _ => PnSpace::Handshake,
             };
-            // The long header is not authenticated yet: a packet we cannot
-            // even locate the number in is stray (or injected) traffic, and
-            // RFC 9000 §5.2 says to discard it, not to close the connection.
             let Some(pn_offset) = long_pn_offset(data) else {
                 return Ok(());
             };
             return self.process_packet(st, data, space, pn_offset, true);
         }
 
-        // Short-header packet: destination connection ID must match ours.
         let pn_offset = 1 + st.scid.len();
         if data.len() <= pn_offset || &data[1..pn_offset] != st.scid.as_slice() {
             return Ok(());
@@ -602,9 +586,7 @@ impl QuicConn {
     }
 
     fn process_retry(&self, st: &mut ConnState, data: &[u8]) -> Result<()> {
-        // A Retry is unauthenticated until its integrity tag checks out
-        // (RFC 9001 §5.8); a truncated one is discarded like any stray UDP.
-        let mut pos = 5usize; // first byte + version
+        let mut pos = 5usize;
         if data.len() < pos + 2 {
             return Ok(());
         }
@@ -635,7 +617,6 @@ impl QuicConn {
         pos += token_len;
         let tag = &data[pos..pos + 16];
 
-        // Integrity tag over the pseudo-packet (RFC 9001 §5.8).
         let mut pseudo = Vec::with_capacity(1 + dcid_len + 6 + scid_len + token_len);
         pseudo.push(dcid_len as u8);
         pseudo.extend_from_slice(retry_dcid);
@@ -647,9 +628,6 @@ impl QuicConn {
         tok.extend_from_slice(token);
         pseudo.extend_from_slice(&tok);
 
-        // RFC 9000 §5.8: a client MUST discard a Retry whose DCID does not
-        // match the one it sent or that fails the integrity check — it is a
-        // stray/spoofed packet, not a reason to tear the connection down.
         if retry_dcid != st.dcid.as_slice()
             || courierust::courierust_tls::crypto::gcm::open(&RETRY_KEY, &RETRY_NONCE, &pseudo, tag)
                 .is_none()
@@ -657,7 +635,6 @@ impl QuicConn {
             return Ok(());
         }
 
-        // Restart the Initial space with the new DCID + token.
         st.dcid = retry_scid.to_vec();
         st.retry_token = token.to_vec();
         st.spaces[0] = Space::new();
@@ -682,7 +659,6 @@ impl QuicConn {
         pn_offset: usize,
         long: bool,
     ) -> Result<()> {
-        // The sample for header protection must be within the datagram.
         if data.len() < pn_offset + 4 + 16 + 1 {
             return Ok(());
         }
@@ -693,10 +669,6 @@ impl QuicConn {
 
         let mut packet = data.to_vec();
         if key.unprotect_header(&mut packet, pn_offset, long).is_err() {
-            // Header protection is not authentication: a scribbled packet
-            // from an on-path sender must be dropped, never tear the
-            // connection down (RFC 9000 §5.2). Real corruption on the path
-            // is retransmitted by the peer.
             return Ok(());
         }
 
@@ -717,7 +689,6 @@ impl QuicConn {
             return Ok(());
         }
 
-        // Duplicate or already-acked packet numbers are dropped.
         let largest = st.spaces[space.index()].largest_recv_pn;
         if pn <= largest && st.spaces[space.index()].ack_queue.contains(&pn) {
             return Ok(());
@@ -726,8 +697,6 @@ impl QuicConn {
             return Ok(()); // very old
         }
 
-        // The server's source connection ID becomes our destination ID for
-        // all subsequent packets (RFC 9000 §7.2).
         if let ParsedPacket::Long(h) = &parsed
             && !h.scid.is_empty()
         {
@@ -736,7 +705,7 @@ impl QuicConn {
 
         let plain = match key.open(pn, &packet[..header_end], &packet[header_end..]) {
             Ok(p) => p,
-            Err(_) => return Ok(()), // auth failure: drop
+            Err(_) => return Ok(()),
         };
 
         let mut pos = 0usize;
@@ -753,8 +722,6 @@ impl QuicConn {
             }
             st.spaces[space.index()].ack_queue.insert(pn);
             st.spaces[space.index()].ack_pending = true;
-            // Bound the ACK queue so a long-lived connection doesn't retain
-            // every received packet number forever (RFC 9000 §19.3.1).
             let q = &mut st.spaces[space.index()].ack_queue;
             while q.len() > MAX_ACK_QUEUE {
                 let oldest = *q.iter().next().expect("non-empty queue");
@@ -878,8 +845,6 @@ impl QuicConn {
         data: Vec<u8>,
     ) -> Result<()> {
         let sp = &mut st.spaces[space.index()];
-        // Contiguous crypto handling (servers send CRYPTO in order; overlap
-        // only occurs on retransmission).
         let expected = sp.crypto_recv.len() as u64;
         match offset.cmp(&expected) {
             std::cmp::Ordering::Equal => sp.crypto_recv.extend_from_slice(&data),
@@ -942,7 +907,6 @@ impl QuicConn {
             .get_mut(&stream_id)
             .ok_or_else(|| QuicError::Protocol("stream vanished".into()))?;
 
-        // Flow-control enforcement (RFC 9000 §4.1).
         let data_len = data.len() as u64;
         let end = offset + data_len;
         if end > s.peer_send_limit {
@@ -964,7 +928,6 @@ impl QuicConn {
             }
             promote_gaps(s);
         } else {
-            // Out-of-order: merge into gaps, then promote if contiguous.
             insert_gap(s, offset, data);
             let pend = s.recv_contig + s.recv_prefix.len() as u64;
             if let Some(seg) = s.recv_gaps.remove(&pend) {
@@ -987,13 +950,7 @@ impl QuicConn {
         ack_delay: u64,
         ranges: Vec<(u64, u64)>,
     ) -> Result<()> {
-        // RFC 9000 §13.1: only packets this endpoint actually sent may be
-        // acknowledged. The ranges are expanded into a bounded interval list
-        // and matched against the sent-packet table, so a peer that claims a
-        // huge `largest_acked` cannot drive attacker-sized loops.
         let intervals = ack_intervals(largest_acked, &ranges);
-
-        // Drain sent packets, classifying into acked / lost / retained.
         let mut acked_count: u64 = 0;
         let mut acked_frames: Vec<Frame> = Vec::new();
         let mut lost_frames: Vec<Frame> = Vec::new();
@@ -1050,7 +1007,6 @@ impl QuicConn {
                 st.smoothed_rtt = latest;
                 st.rttvar = latest / 2;
             } else {
-                // abs_diff (stable 1.81) — hand-rolled for MSRV 1.78.
                 let diff = st.smoothed_rtt.abs_diff(adj);
                 st.rttvar = (st.rttvar * 3 + diff) / 4;
                 st.smoothed_rtt = (st.smoothed_rtt * 7 + adj) / 8;
@@ -1090,11 +1046,7 @@ impl QuicConn {
                 }
             }
             Frame::Crypto { offset, data } => {
-                let sp = &mut st.spaces[0];
-                let _ = sp;
-                // ACK for crypto: advance the acked prefix.
-                for space_idx in 0..2 {
-                    let sp = &mut st.spaces[space_idx];
+                for sp in &mut st.spaces[..2] {
                     let end = offset + data.len() as u64;
                     if end > sp.crypto_acked && end <= sp.crypto_written {
                         let drain = (end - sp.crypto_acked) as usize;
@@ -1641,8 +1593,6 @@ impl QuicConn {
         if let Some(e) = &st.closed {
             return Err(e.clone());
         }
-        // The same bound the driver applies when building packets, so an
-        // accepted datagram is never silently dropped at flush time.
         let max_datagram = st.peer_max_udp_payload().min(MAX_UDP_PAYLOAD);
         if data.len() as u64 > max_datagram.saturating_sub(DATAGRAM_OVERHEAD) {
             return Err(QuicError::DatagramTooLarge);
@@ -1806,7 +1756,6 @@ fn insert_gap(s: &mut StreamState, offset: u64, data: Vec<u8>) {
     let mut merged_offset = offset;
     let mut merged = data;
     loop {
-        // Find any existing segment overlapping [merged_offset, merged_end).
         let merged_end = merged_offset + merged.len() as u64;
         let overlapping: Vec<(u64, Vec<u8>)> = s
             .recv_gaps

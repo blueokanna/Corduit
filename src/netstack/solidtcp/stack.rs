@@ -1937,11 +1937,20 @@ mod tests {
 
     #[test]
     fn download_survives_packet_loss_zero_window_and_client_half_close() {
+        assert_download_recovers(256 * 1024, 16, false);
+    }
+
+    #[test]
+    fn download_survives_tun_queue_overflow() {
+        assert_download_recovers(16 * 1024, 2, true);
+    }
+
+    fn assert_download_recovers(payload_size: usize, queue_capacity: usize, force_overflow: bool) {
         use std::collections::BTreeMap;
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy_addr = listener.local_addr().unwrap();
-        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let payload: Vec<u8> = (0..payload_size).map(|i| (i % 251) as u8).collect();
         let expected = payload.clone();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -1969,7 +1978,8 @@ mod tests {
             proxy_addr,
             ..StackConfig::default()
         });
-        let (tx, rx) = crate::netstack::packet_queue::channel(2);
+        let (tx, rx) = crate::netstack::packet_queue::channel(queue_capacity);
+        let queue_stats = tx.clone();
         stack.set_tun_tx(tx);
         stack.start();
         let client = Ipv4Addr::new(198, 18, 0, 1);
@@ -1999,6 +2009,13 @@ mod tests {
         send(1001, base, TcpFlags::ack_only(), 4096, &[]);
         send(1001, base, TcpFlags::psh_ack(), 4096, b"request");
         send(1008, base, TcpFlags::fin_ack(), 4096, &[]);
+        if force_overflow {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while queue_stats.dropped_packets() == 0 {
+                assert!(Instant::now() < deadline, "TUN queue did not overflow");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         let mut received = Vec::new();
         let mut reordered = BTreeMap::new();
         let mut dropped = false;
