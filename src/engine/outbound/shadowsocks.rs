@@ -118,126 +118,11 @@ impl OutboundProxy for ShadowsocksOutbound {
         test_url: &str,
         timeout: std::time::Duration,
     ) -> Result<std::time::Duration> {
-        use std::time::Instant;
-
-        // Parse the test URL to get host and port
-        let url = crate::common::url::Url::parse(test_url)
-            .map_err(|e| Error::config(format!("Invalid test URL: {}", e)))?;
-
-        let host = url
-            .host_str()
-            .ok_or_else(|| Error::config("Test URL has no host"))?
-            .to_string();
-        let url_port = url
-            .port()
-            .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
-        let path = if url.path().is_empty() {
-            "/"
-        } else {
-            url.path()
-        };
-
-        let start = Instant::now();
-
-        let cipher_spec = CipherSpec::new(&self.cipher)?;
-
-        let server_addr = format!("{}:{}", self.server, self.port);
-        tracing::debug!("SS latency test: resolving {}", server_addr);
-
-        let mut stream: BoxStream = self.plugin.wrap(&self.server, self.port, timeout)?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
-
-        tracing::debug!(
-            "SS latency test: connected, setting up cipher {}",
-            self.cipher
-        );
-
-        let mut client_salt = vec![0u8; cipher_spec.salt_len];
-        getrandom::fill(&mut client_salt)
-            .map_err(|e| Error::network(format!("Failed to generate salt: {}", e)))?;
-
-        let enc_subkey = derive_subkey_for_cipher(&self.password, &client_salt, &cipher_spec)?;
-        let mut enc = AeadCipher::new(cipher_spec, enc_subkey);
-
-        let target = crate::engine::outbound::TargetAddr::Domain(host.clone(), url_port);
-        let addr_header = self.build_address_header(&target)?;
-
-        let http_request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: Corduit/1.0\r\n\r\n",
-            path, host
-        );
-
-        let mut first_payload = addr_header;
-        first_payload.extend_from_slice(http_request.as_bytes());
-
-        let len = first_payload.len();
-        let len_bytes = (len as u16).to_be_bytes();
-        let enc_len = enc.encrypt(&len_bytes)?;
-        let enc_data = enc.encrypt(&first_payload)?;
-
-        let mut send_buf = Vec::with_capacity(client_salt.len() + enc_len.len() + enc_data.len());
-        send_buf.extend_from_slice(&client_salt);
-        send_buf.extend_from_slice(&enc_len);
-        send_buf.extend_from_slice(&enc_data);
-
-        tracing::debug!("SS latency test: sending {} bytes", send_buf.len());
-
-        stream
-            .write_all(&send_buf)
-            .map_err(|e| Error::network(format!("Failed to send request: {}", e)))?;
-        stream
-            .flush()
-            .map_err(|e| Error::network(format!("Flush failed: {}", e)))?;
-
-        tracing::debug!("SS latency test: waiting for response");
-
-        let mut server_salt = vec![0u8; cipher_spec.salt_len];
-        let salt_result = stream.read_exact(&mut server_salt);
-        match salt_result {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(Error::network(
-                    "Server closed connection (check password/cipher)",
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(Error::network("Response timeout"));
-            }
-            Err(e) => {
-                return Err(Error::network(format!("Failed to read server salt: {}", e)));
-            }
-        }
-
-        tracing::debug!("SS latency test: received server salt");
-
-        let dec_subkey = derive_subkey_for_cipher(&self.password, &server_salt, &cipher_spec)?;
-        let mut dec = AeadCipher::new(cipher_spec, dec_subkey);
-
-        match recv_decrypted_chunk(&mut stream, &mut dec)? {
-            Some(chunk) => {
-                let response = String::from_utf8_lossy(&chunk);
-                tracing::debug!(
-                    "SS latency test: got response: {}",
-                    crate::common::text::truncate_utf8(&response, 100)
-                );
-                if response.starts_with("HTTP/") {
-                    let elapsed = start.elapsed();
-                    tracing::info!("SS latency test success: {}ms", elapsed.as_millis());
-                    Ok(elapsed)
-                } else {
-                    Err(Error::network(format!(
-                        "Invalid HTTP response: {}",
-                        crate::common::text::truncate_utf8(&response, 50)
-                    )))
-                }
-            }
-            None => Err(Error::network("No response received")),
-        }
+        let probe = crate::common::http_probe::HttpProbe::new(test_url, timeout)?;
+        let target = TargetAddr::Domain(probe.url.host.clone(), probe.url.port);
+        let transport = self.connect_transport(probe.remaining()?)?;
+        let stream = self.handshake_stream(probe.bound_stream(transport), &target)?;
+        probe.finish_stream(Box::new(stream))
     }
 
     fn relay_tcp(&self, inbound: BoxStream, target: TargetAddr) -> Result<()> {
@@ -250,48 +135,44 @@ impl OutboundProxy for ShadowsocksOutbound {
         target: TargetAddr,
         connection: Option<std::sync::Arc<crate::engine::connection_tracker::TrackedConnection>>,
     ) -> Result<()> {
-        let cipher_spec = CipherSpec::new(&self.cipher)?;
-
-        // The plugin dials: ShadowTLS owns the socket from its first byte, so
-        // the wrapper takes the whole dial rather than a connected stream.
-        let mut outbound: BoxStream =
-            self.plugin
-                .wrap(&self.server, self.port, Duration::from_secs(30))?;
-        outbound
-            .set_read_timeout(Some(Duration::from_secs(60)))
-            .map_err(|e| Error::network(format!("set read timeout: {}", e)))?;
-        outbound
-            .set_write_timeout(Some(Duration::from_secs(60)))
-            .map_err(|e| Error::network(format!("set write timeout: {}", e)))?;
-
-        tracing::debug!(
-            "Shadowsocks: connected to {}:{} for target {}",
-            self.server,
-            self.port,
-            target
-        );
-
-        let mut client_salt = vec![0u8; cipher_spec.salt_len];
-        getrandom::fill(&mut client_salt)
-            .map_err(|e| Error::network(format!("Failed to generate salt: {}", e)))?;
-
-        let enc_subkey = derive_subkey_for_cipher(&self.password, &client_salt, &cipher_spec)?;
-        let mut enc = AeadCipher::new(cipher_spec, enc_subkey);
-
-        outbound
-            .write_all(&client_salt)
-            .map_err(|e| Error::network(format!("Failed to send SS salt: {}", e)))?;
-
-        let addr_header = self.build_address_header(&target)?;
-        send_encrypted_chunk(&mut outbound, &mut enc, &addr_header)?;
-
-        let ss_stream = ShadowsocksStream::new(outbound, enc, cipher_spec, self.password.clone());
+        let transport = self.connect_transport(Duration::from_secs(30))?;
+        let ss_stream = self.handshake_stream(transport, &target)?;
 
         relay_streams!(inbound, ss_stream, connection)
     }
 }
 
 impl ShadowsocksOutbound {
+    fn connect_transport(&self, timeout: Duration) -> Result<BoxStream> {
+        let transport = self.plugin.wrap(&self.server, self.port, timeout)?;
+        transport.set_read_timeout(Some(timeout))?;
+        transport.set_write_timeout(Some(timeout))?;
+        Ok(transport)
+    }
+
+    fn handshake_stream(
+        &self,
+        mut transport: BoxStream,
+        target: &TargetAddr,
+    ) -> Result<ShadowsocksStream> {
+        let spec = CipherSpec::new(&self.cipher)?;
+        let mut salt = vec![0; spec.salt_len];
+        getrandom::fill(&mut salt)
+            .map_err(|e| Error::network(format!("Failed to generate SS salt: {e}")))?;
+        let key = derive_subkey_for_cipher(&self.password, &salt, &spec)?;
+        let mut enc = AeadCipher::new(spec, key);
+        let mut hello = salt;
+        send_encrypted_chunk(&mut hello, &mut enc, &self.build_address_header(target)?)?;
+        transport.write_all(&hello)?;
+        transport.flush()?;
+        Ok(ShadowsocksStream::new(
+            transport,
+            enc,
+            spec,
+            self.password.clone(),
+        ))
+    }
+
     pub fn new(config: OutboundConfig) -> Result<Self> {
         let server = config
             .server
@@ -760,10 +641,23 @@ impl ShadowsocksStream {
                             return Ok(None);
                         }
                         Ok(0) => {
-                            return Err(std::io::Error::new(
-                                ErrorKind::UnexpectedEof,
-                                "truncated Shadowsocks record",
-                            ));
+                            let message = if self.stage == SsReadStage::Salt && self.filled == 0 {
+                                "Shadowsocks peer closed before sending a response (no salt received); \
+                                 check server reachability, cipher/password and SIP003 plugin settings"
+                                    .to_string()
+                            } else {
+                                let stage = match self.stage {
+                                    SsReadStage::Salt => "salt",
+                                    SsReadStage::Length => "encrypted length",
+                                    SsReadStage::Payload => "encrypted payload",
+                                };
+                                format!(
+                                    "truncated Shadowsocks record: {stage}, received {} of {} bytes",
+                                    self.filled,
+                                    self.wire.len()
+                                )
+                            };
+                            return Err(std::io::Error::new(ErrorKind::UnexpectedEof, message));
                         }
                         Ok(n) => self.filled += n,
                         Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -1009,7 +903,6 @@ enum AeadCipherInner {
 struct AeadCipher {
     inner: AeadCipherInner,
     counter: u64,
-    tag_len: usize,
 }
 
 impl AeadCipher {
@@ -1025,11 +918,7 @@ impl AeadCipher {
                 ChaCha20Poly1305::new_from_slice(&key).expect("validated key length"),
             ),
         };
-        Self {
-            inner,
-            counter: 0,
-            tag_len: spec.tag_len,
-        }
+        Self { inner, counter: 0 }
     }
 
     fn next_nonce(&mut self) -> [u8; 12] {
@@ -1085,55 +974,13 @@ fn send_encrypted_chunk<W: Write>(writer: &mut W, enc: &mut AeadCipher, data: &[
         .write_all(&enc_len)
         .map_err(|e| Error::network(format!("Failed to send SS length: {}", e)))?;
 
-    if len > 0 {
-        let enc_data = enc.encrypt(data)?;
-        writer
-            .write_all(&enc_data)
-            .map_err(|e| Error::network(format!("Failed to send SS data: {}", e)))?;
-    }
+    // An empty payload still has an authentication tag and consumes a nonce.
+    let enc_data = enc.encrypt(data)?;
+    writer
+        .write_all(&enc_data)
+        .map_err(|e| Error::network(format!("Failed to send SS data: {}", e)))?;
 
     Ok(())
-}
-
-/// Receives and decrypts a data block; returns `None` to indicate EOF.
-///
-/// Returns an `io::Result`, preserving the error kind from the underlying socket
-/// (e.g., `WouldBlock` or `TimedOut` signify an idle state, prompting the relay loop to retry).
-fn recv_decrypted_chunk<R: Read>(
-    reader: &mut R,
-    dec: &mut AeadCipher,
-) -> std::io::Result<Option<Vec<u8>>> {
-    let tag = dec.tag_len;
-
-    let mut enc_len_buf = vec![0u8; 2 + tag];
-    match reader.read_exact(&mut enc_len_buf) {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-
-    let len_plain = dec
-        .decrypt(&enc_len_buf)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    if len_plain.len() != 2 {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "Invalid SS length field",
-        ));
-    }
-    let data_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
-
-    if data_len == 0 {
-        return Ok(None);
-    }
-
-    let mut enc_data = vec![0u8; data_len + tag];
-    reader.read_exact(&mut enc_data)?;
-
-    let data = dec
-        .decrypt(&enc_data)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    Ok(Some(data))
 }
 
 /// Encrypt UDP payload (single-shot, not chunked like TCP)
@@ -1249,6 +1096,151 @@ fn parse_address_header(data: &[u8]) -> Result<(TargetAddr, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loopback_outbound(cipher: &str) -> (ShadowsocksOutbound, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let outbound = ShadowsocksOutbound::new(OutboundConfig {
+            tag: "loopback-ss".into(),
+            outbound_type: crate::engine::config::OutboundType::Shadowsocks,
+            server: Some("127.0.0.1".into()),
+            port: Some(listener.local_addr().unwrap().port()),
+            options: HashMap::from([
+                ("password".into(), "test".into()),
+                ("cipher".into(), cipher.into()),
+            ]),
+        })
+        .unwrap();
+        (outbound, listener)
+    }
+
+    fn accept_peer(listener: std::net::TcpListener, cipher: &str) -> ShadowsocksStream {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let spec = CipherSpec::new(cipher).unwrap();
+        let salt = vec![9; spec.salt_len];
+        let key = derive_subkey_for_cipher("test", &salt, &spec).unwrap();
+        socket.write_all(&salt).unwrap();
+        let mut peer = ShadowsocksStream::new(
+            Box::new(socket),
+            AeadCipher::new(spec, key),
+            spec,
+            "test".into(),
+        );
+        let mut address = [0; 259];
+        let size = peer.read(&mut address).unwrap();
+        assert_eq!(parse_address_header(&address[..size]).unwrap().1, size);
+        peer
+    }
+
+    #[test]
+    fn http_probe_preserves_query_and_reads_status_across_ss_records() {
+        for cipher in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
+            let (outbound, listener) = loopback_outbound(cipher);
+            let worker = std::thread::spawn(move || {
+                let mut peer = accept_peer(listener, cipher);
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    peer.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 4096);
+                }
+                assert!(request.starts_with(b"GET /probe?x=1 HTTP/1.1\r\n"));
+                assert!(String::from_utf8_lossy(&request).contains("Host: example.com:8080\r\n"));
+                peer.write_all(b"HT").unwrap();
+                peer.write_all(b"TP/1.1 204 No Content\r\n\r\n").unwrap();
+            });
+            assert!(
+                outbound
+                    .test_http_latency("http://example.com:8080/probe?x=1", Duration::from_secs(3))
+                    .is_ok()
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn https_probe_sends_tls_inside_shadowsocks_and_rejects_plaintext_peer() {
+        let (outbound, listener) = loopback_outbound("aes-128-gcm");
+        let worker = std::thread::spawn(move || {
+            let mut peer = accept_peer(listener, "aes-128-gcm");
+            let mut prefix = [0; 3];
+            peer.read_exact(&mut prefix).unwrap();
+            assert_eq!(prefix[..2], [0x16, 0x03], "expected TLS ClientHello");
+            peer.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+        });
+        assert!(
+            outbound
+                .test_http_latency("https://example.com/probe", Duration::from_secs(3))
+                .is_err()
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn http_probe_rejects_failed_status_and_unsafe_url() {
+        let (outbound, listener) = loopback_outbound("aes-128-gcm");
+        let worker = std::thread::spawn(move || {
+            let mut peer = accept_peer(listener, "aes-128-gcm");
+            let mut request = [0; 2048];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            peer.write_all(b"HTTP/1.1 503 Unavailable\r\n\r\n").unwrap();
+        });
+        let error = outbound
+            .test_http_latency("http://example.com/", Duration::from_secs(3))
+            .unwrap_err();
+        assert!(error.to_string().contains("503"), "{error}");
+        worker.join().unwrap();
+        assert!(
+            outbound
+                .test_http_latency("http://example.com/\r\nInjected:x", Duration::from_secs(3))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn eof_diagnostics_distinguish_missing_response_from_partial_records() {
+        for cipher in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
+            let spec = CipherSpec::new(cipher).unwrap();
+            for (cut, expected) in [
+                (0, "no salt received"),
+                (1, "salt, received 1"),
+                (spec.salt_len + 1, "encrypted length, received 1"),
+                (
+                    spec.salt_len + 2 + spec.tag_len + 1,
+                    "encrypted payload, received 1",
+                ),
+            ] {
+                let (mut reader, _) = framed_reader(cipher, Some(cut), false);
+                let error = reader.read(&mut [0; 32]).unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+                assert!(error.to_string().contains(expected), "{cipher}: {error}");
+                assert!(reader.read(&mut [0; 32]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_record_authenticates_payload_and_advances_both_nonces() {
+        for cipher in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
+            let spec = CipherSpec::new(cipher).unwrap();
+            let key = vec![7; spec.key_len];
+            let mut enc = AeadCipher::new(spec, key.clone());
+            let mut dec = AeadCipher::new(spec, key);
+            let mut wire = Vec::new();
+            send_encrypted_chunk(&mut wire, &mut enc, b"").unwrap();
+            assert_eq!(wire.len(), 2 + 2 * spec.tag_len, "{cipher}");
+            assert_eq!(dec.decrypt(&wire[..2 + spec.tag_len]).unwrap(), [0, 0]);
+            assert!(dec.decrypt(&wire[2 + spec.tag_len..]).unwrap().is_empty());
+            let next = enc.encrypt(b"next").unwrap();
+            assert_eq!(dec.decrypt(&next).unwrap(), b"next");
+        }
+    }
 
     struct Fragmented {
         bytes: std::io::Cursor<Vec<u8>>,

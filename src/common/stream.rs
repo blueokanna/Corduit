@@ -492,6 +492,11 @@ impl Side {
             Side::Shared(shared) => {
                 let _ = shared.shutdown(how);
             }
+            // EOF must deliver FIN even when the opposite reader owns the
+            // lock. Only abort/cancellation may skip a busy serialized side.
+            Side::Serialized(stream) if how == Shutdown::Write => {
+                let _ = shutdown_lenient(&**lock_stream(stream), how);
+            }
             Side::Serialized(stream) => match stream.try_lock() {
                 Ok(guard) => {
                     let _ = shutdown_lenient(&**guard, how);
@@ -869,6 +874,27 @@ pub fn relay(a: BoxStream, b: BoxStream, token: CancellationToken) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_half_close_is_delivered_after_a_concurrent_read() {
+        let (socket, mut peer) = socket_pair();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let stream = Arc::new(Mutex::new(Box::new(socket) as BoxStream));
+        // Hold the same lock a serialized read owns when the other direction
+        // sees EOF. A FIN must be delivered once that bounded read returns.
+        let guard = stream.lock().unwrap();
+        let side = Side::Serialized(stream.clone());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            side.shutdown(Shutdown::Write);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0, "missing TCP FIN");
+    }
     use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
 

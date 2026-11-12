@@ -1,10 +1,12 @@
 //! Bounded HTTP latency measurement over a connected TCP tunnel.
 //! Transport setup, TLS and the response share one wall-clock budget.
+use crate::common::stream::{BoxStream, SyncStream};
 use crate::engine::error::{Error, Result};
 use courierust::courierust_error::Error as IoError;
 use courierust::courierust_h1 as h1;
 use courierust::courierust_http::uri::Url;
 use courierust::courierust_io::{BufReader, Read as CRead, Write as CWrite};
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -51,6 +53,25 @@ impl HttpProbe {
     }
 
     pub fn finish(&self, tcp: &TcpStream) -> Result<Duration> {
+        self.finish_with(self.transport(tcp))
+    }
+
+    /// Encrypted tunnels use the same HTTP/TLS validation as plain TCP.
+    pub fn finish_stream(&self, stream: BoxStream) -> Result<Duration> {
+        let stream = RefCell::new(stream);
+        self.finish_with(ProbeStream(&stream))
+    }
+
+    /// Install below the record codec so each framing read shares the probe's
+    /// deadline, including partial salts and payloads.
+    pub fn bound_stream(&self, inner: BoxStream) -> BoxStream {
+        Box::new(DeadlineStream {
+            inner,
+            deadline: self.deadline,
+        })
+    }
+
+    fn finish_with<S: CRead + CWrite + Clone>(&self, mut transport: S) -> Result<Duration> {
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
             self.url.path_and_query.as_str(),
@@ -58,11 +79,11 @@ impl HttpProbe {
         );
         if self.url.scheme == "https" {
             let mut tls = super::http::shared_tls_connector()
-                .connect(&self.url.host, self.transport(tcp), self.transport(tcp))
+                .connect(&self.url.host, transport.clone(), transport)
                 .map_err(|e| Error::network(format!("Probe TLS handshake failed: {e}")))?;
             exchange(&mut tls, request.as_bytes())?;
         } else {
-            exchange(&mut self.transport(tcp), request.as_bytes())?;
+            exchange(&mut transport, request.as_bytes())?;
         }
         self.remaining()?;
         Ok(self.start.elapsed())
@@ -127,9 +148,66 @@ fn remaining(deadline: Instant) -> std::io::Result<Duration> {
 
 /// Re-arm each blocking operation with the remaining budget. An upstream
 /// trickling one byte per timeout cannot extend a probe indefinitely.
+#[derive(Clone)]
 pub(crate) struct DeadlineSocket<'a> {
     tcp: &'a TcpStream,
     deadline: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ProbeStream<'a>(&'a RefCell<BoxStream>);
+
+impl CRead for ProbeStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::result::Result<usize, IoError> {
+        self.0.borrow_mut().read(buf).map_err(IoError::from)
+    }
+}
+
+impl CWrite for ProbeStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, IoError> {
+        self.0.borrow_mut().write(buf).map_err(IoError::from)
+    }
+    fn flush(&mut self) -> std::result::Result<(), IoError> {
+        self.0.borrow_mut().flush().map_err(IoError::from)
+    }
+}
+
+struct DeadlineStream {
+    inner: BoxStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner
+            .set_read_timeout(Some(remaining(self.deadline)?))?;
+        self.inner.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner
+            .set_write_timeout(Some(remaining(self.deadline)?))?;
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner
+            .set_write_timeout(Some(remaining(self.deadline)?))?;
+        self.inner.flush()
+    }
+}
+
+impl SyncStream for DeadlineStream {
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        self.inner.shutdown(how)
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.inner.set_read_timeout(timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.inner.set_write_timeout(timeout)
+    }
 }
 
 impl Read for DeadlineSocket<'_> {

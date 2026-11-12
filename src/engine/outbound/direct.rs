@@ -381,16 +381,51 @@ fn relay_classified(
             if token.is_cancelled() {
                 return Err(Error::network("relay cancelled"));
             }
-            let message = error.to_string().to_lowercase();
-            let teardown = message.contains("reset")
-                || message.contains("broken pipe")
-                || message.contains("connection")
-                || message.contains("not connected");
-            if teardown {
+            if is_relay_teardown(&error) {
                 Ok(())
             } else {
                 Err(Error::network(format!("Relay error: {error}")))
             }
+        }
+    }
+}
+
+// OS error messages are localized, and protocol failures may mention a
+// "connection" too. Only an actual socket teardown can be treated as normal.
+fn is_relay_teardown(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+#[cfg(test)]
+mod relay_error_tests {
+    use super::is_relay_teardown;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn protocol_errors_are_not_hidden_by_connection_keywords() {
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::Other,
+        ] {
+            assert!(!is_relay_teardown(&Error::new(
+                kind,
+                "invalid connection record after reset"
+            )));
+        }
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(is_relay_teardown(&Error::new(kind, "本地化的系统错误")));
         }
     }
 }

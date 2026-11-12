@@ -38,6 +38,14 @@ Corduit 是网络工程工具，涵盖代理协议、规则路由、DNS 与用�
 - **`no_std` 核心**：`default-features = false` 时以 `no_std + alloc` 编译；加密原语、URL 解析器与纯线路编解码（`protocol::address`、`protocol::error`）不依赖 OS。
 - **热重载**（`Corduit::reload`）与**流量统计**（逐连接上下行、速率、活跃列表）。
 
+## Shadowsocks 连接诊断
+
+接收端区分两类关闭：`no salt received` 表示上游在返回任何 Shadowsocks 响应之前关闭；`truncated Shadowsocks record` 表示 salt、加密长度或加密载荷尚未收完整。后者会记录所在阶段及已收／预期字节数。前者仅说明没有响应，不能单凭它认定密码错误；需要同时核对节点可达性、密码套件、SIP003 插件和服务端日志。
+
+完整记录之间的 EOF 正常结束读取；半条记录和认证失败返回错误，未通过认证的明文不会交给应用。读超时保留分帧状态和 nonce，下一次读取继续原记录。客户端关闭上传方向后，中继仍等待并转发下载数据，写方向的 FIN 不会因读锁竞争而丢失。
+
+Shadowsocks 的 HTTP 测速与实际转发共用握手和记录编解码。HTTPS 目标在隧道内执行 TLS 握手并验证证书；HTTP 请求保留查询参数和端口，只有 2xx／3xx 最终状态算成功。加密记录格式依据 [Shadowsocks AEAD 规范](https://shadowsocks.org/doc/aead.html)。回环测试覆盖分片、超时、空记录、半关闭和错误响应；这些测试不能替代目标设备与实际节点的互操作验证。
+
 ## 架构
 
 ```mermaid
