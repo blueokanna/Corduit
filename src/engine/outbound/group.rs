@@ -57,7 +57,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Health-check URL: a `204`-answering endpoint, so the measurement is one
 /// round trip and nothing else — and the same URL almost every provider's
@@ -269,13 +269,35 @@ impl GroupOutbound {
         let mut health = self.health.write();
         let state = health.entry(tag.to_string()).or_default();
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        if !state.is_available() {
+        if state.consecutive_failures == FAILURES_BEFORE_DEAD && self.strategy.needs_probing() {
             tracing::warn!(
                 "Proxy group '{}': member '{}' retired after {} consecutive failures",
                 self.config.tag,
                 tag,
                 state.consecutive_failures
             );
+        }
+    }
+
+    fn record_relay_outcome(
+        &self,
+        tag: &str,
+        outcome: &Result<()>,
+        connection: Option<&crate::engine::connection_tracker::TrackedConnection>,
+    ) {
+        if connection.is_some_and(|c| c.cancellation_token().is_cancelled()) {
+            return;
+        }
+        if connection.is_some_and(|c| c.get_download() > 0) || outcome.is_ok() {
+            self.record_success(tag, None);
+        } else if !matches!(
+            outcome,
+            Err(Error::Dns { .. }
+                | Error::Config { .. }
+                | Error::Routing { .. }
+                | Error::ResourceExhausted { .. })
+        ) {
+            self.record_failure(tag);
         }
     }
 
@@ -340,8 +362,6 @@ impl GroupOutbound {
                 if available.is_empty() {
                     return Err(self.empty_group_error());
                 }
-                // Rotation over the *available* list, so a member that is out
-                // does not consume a turn.
                 let turn = self.cursor.fetch_add(1, Ordering::Relaxed);
                 Ok(available[turn % available.len()].clone())
             }
@@ -558,21 +578,9 @@ impl OutboundProxy for GroupOutbound {
             ))
         })?;
 
-        let started = Instant::now();
-        let outcome = proxy.relay_tcp_with_connection(inbound, target, connection);
-        match outcome {
-            Ok(()) => {
-                self.record_success(&tag, Some(started.elapsed()));
-                Ok(())
-            }
-            Err(error) => {
-                // The inbound stream is consumed by the call, so this failure
-                // cannot be retried here; retiring the member is what makes the
-                // *next* connection avoid it.
-                self.record_failure(&tag);
-                Err(error)
-            }
-        }
+        let outcome = proxy.relay_tcp_with_connection(inbound, target, connection.clone());
+        self.record_relay_outcome(&tag, &outcome, connection.as_deref());
+        outcome
     }
 
     fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
@@ -657,6 +665,44 @@ fn option_u64(config: &OutboundConfig, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_cancellation_and_delivered_payload_do_not_retire_members() {
+        use crate::engine::connection_tracker::TrackedConnection;
+        let group = group(OutboundType::Fallback, &["A", "B"]);
+        group.record_success("A", Some(Duration::from_millis(20)));
+        let make_connection = || {
+            TrackedConnection::new(
+                "in".into(),
+                "A".into(),
+                "target.test".into(),
+                443,
+                "tcp".into(),
+                "tcp".into(),
+                "MATCH".into(),
+                String::new(),
+            )
+        };
+        let cancelled = make_connection();
+        cancelled.cancellation_token().cancel();
+        for _ in 0..3 {
+            group.record_relay_outcome("A", &Err(Error::network("cancelled")), Some(&cancelled));
+        }
+        assert_eq!(group.health.read()["A"].consecutive_failures, 0);
+        let delivered = make_connection();
+        delivered.add_download(1);
+        group.record_failure("A");
+        group.record_relay_outcome("A", &Err(Error::network("reset")), Some(&delivered));
+        assert_eq!(group.health.read()["A"].consecutive_failures, 0);
+        assert_eq!(
+            group.health.read()["A"].latency,
+            Some(Duration::from_millis(20))
+        );
+        for _ in 0..2 {
+            group.record_relay_outcome("A", &Err(Error::network("handshake failed")), None);
+        }
+        assert_eq!(group.effective_member().as_deref(), Some("B"));
+    }
     use crate::engine::config::OutboundConfig;
     use nextjson::Value as Json;
 

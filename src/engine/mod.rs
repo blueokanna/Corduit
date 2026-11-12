@@ -163,6 +163,13 @@ impl Corduit {
             }
         };
 
+        if cfg!(target_os = "android") && listen.port() < 1024 && listen.port() != 0 {
+            tracing::info!(
+                "Android VPN handles DNS in the netstack; skipping privileged listener {listen}"
+            );
+            return;
+        }
+
         if dns.enhanced_mode == DnsMode::FakeIp {
             tracing::info!(
                 "dns.enhanced-mode is fake-ip, but the DNS listener answers with real addresses: \
@@ -223,10 +230,6 @@ impl Corduit {
     /// Stop the proxy server
     pub fn stop(&self) -> Result<()> {
         let _perf = logging::time_operation("Corduit shutdown");
-
-        // The listener goes first: it is answering clients that are about to be
-        // told the engine is gone, and leaving it up while the proxy tears down
-        // would hand out answers the engine can no longer honour.
         self.stop_dns_listener();
 
         match self.proxy_manager.stop() {
@@ -273,10 +276,6 @@ impl Corduit {
         crate::common::socket::set_tcp_concurrent(config.general.tcp_concurrent);
         self.proxy_manager.reload(config.clone())?;
         self.config = config;
-
-        // Rebinding is the only way a changed `dns.listen`, `dns.enable` or
-        // upstream set takes effect: a listener holds its resolver for its whole
-        // life, and the resolver holds the forwarders it was built with.
         self.stop_dns_listener();
         if self.running.load(std::sync::atomic::Ordering::Relaxed) {
             self.start_dns_listener();

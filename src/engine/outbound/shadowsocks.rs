@@ -711,6 +711,17 @@ struct ShadowsocksStream {
     read_buffer: Vec<u8>,
     read_pos: usize,
     eof: bool,
+    stage: SsReadStage,
+    wire: Vec<u8>,
+    filled: usize,
+    failed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SsReadStage {
+    Salt,
+    Length,
+    Payload,
 }
 
 impl ShadowsocksStream {
@@ -724,12 +735,104 @@ impl ShadowsocksStream {
             read_buffer: Vec::new(),
             read_pos: 0,
             eof: false,
+            stage: SsReadStage::Salt,
+            wire: vec![0; cipher_spec.salt_len],
+            filled: 0,
+            failed: false,
+        }
+    }
+
+    fn next_stage(&mut self, stage: SsReadStage, size: usize) {
+        self.stage = stage;
+        self.wire.resize(size, 0);
+        self.filled = 0;
+    }
+
+    // Persist every framing byte and nonce across the relay's short read polls.
+    // EOF is clean only between records, never inside a salt, length or tag.
+    fn read_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            {
+                let mut inner = self.inner.lock();
+                while self.filled < self.wire.len() {
+                    match inner.read(&mut self.wire[self.filled..]) {
+                        Ok(0) if self.stage == SsReadStage::Length && self.filled == 0 => {
+                            return Ok(None);
+                        }
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                ErrorKind::UnexpectedEof,
+                                "truncated Shadowsocks record",
+                            ));
+                        }
+                        Ok(n) => self.filled += n,
+                        Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            match self.stage {
+                SsReadStage::Salt => {
+                    let key =
+                        derive_subkey_for_cipher(&self.password, &self.wire, &self.cipher_spec)
+                            .map_err(|error| {
+                                std::io::Error::new(ErrorKind::InvalidData, error.to_string())
+                            })?;
+                    self.dec = Some(AeadCipher::new(self.cipher_spec, key));
+                    self.next_stage(SsReadStage::Length, 2 + self.cipher_spec.tag_len);
+                }
+                SsReadStage::Length => {
+                    let length = self
+                        .dec
+                        .as_mut()
+                        .expect("salt initialized cipher")
+                        .decrypt(&self.wire)
+                        .map_err(|error| {
+                            std::io::Error::new(ErrorKind::InvalidData, error.to_string())
+                        })?;
+                    if length.len() != 2 {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "invalid Shadowsocks length",
+                        ));
+                    }
+                    let size = u16::from_be_bytes([length[0], length[1]]) as usize;
+                    if size > 0x3fff {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "Shadowsocks record exceeds 16 KiB",
+                        ));
+                    }
+                    self.next_stage(SsReadStage::Payload, size + self.cipher_spec.tag_len);
+                }
+                SsReadStage::Payload => {
+                    let data = self
+                        .dec
+                        .as_mut()
+                        .expect("salt initialized cipher")
+                        .decrypt(&self.wire)
+                        .map_err(|error| {
+                            std::io::Error::new(ErrorKind::InvalidData, error.to_string())
+                        })?;
+                    self.next_stage(SsReadStage::Length, 2 + self.cipher_spec.tag_len);
+                    return Ok(Some(data));
+                }
+            }
         }
     }
 }
 
 impl std::io::Read for ShadowsocksStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.failed {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "Shadowsocks reader already failed",
+            ));
+        }
         loop {
             if self.read_pos < self.read_buffer.len() {
                 let n = (self.read_buffer.len() - self.read_pos).min(buf.len());
@@ -744,17 +847,13 @@ impl std::io::Read for ShadowsocksStream {
             if self.eof {
                 return Ok(0);
             }
-            let chunk = {
-                let mut inner = self.inner.lock();
-                if self.dec.is_none() {
-                    let mut server_salt = vec![0u8; self.cipher_spec.salt_len];
-                    inner.read_exact(&mut server_salt)?;
-                    let dec_subkey =
-                        derive_subkey_for_cipher(&self.password, &server_salt, &self.cipher_spec)
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    self.dec = Some(AeadCipher::new(self.cipher_spec, dec_subkey));
+            let chunk = match self.read_chunk() {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    self.failed =
+                        !matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
+                    return Err(error);
                 }
-                recv_decrypted_chunk(&mut *inner, self.dec.as_mut().unwrap())?
             };
             match chunk {
                 Some(c) => {
@@ -844,12 +943,6 @@ impl CipherSpec {
                 tag_len: 16,
                 cipher_type: CipherType::Chacha20Poly1305,
             }),
-            // The 2022 suite is a different wire protocol (SIP022): fixed and
-            // variable headers per datagram, timestamps, session ids and a
-            // replay window. The AEAD primitives alone are not it, and a
-            // build that accepted these names would fail in the field while
-            // pretending to speak the protocol — so it is refused here,
-            // loudly, instead.
             "2022-blake3-aes-128-gcm"
             | "2022-blake3-aes-256-gcm"
             | "2022-blake3-chacha20-poly1305"
@@ -1002,17 +1095,16 @@ fn send_encrypted_chunk<W: Write>(writer: &mut W, enc: &mut AeadCipher, data: &[
     Ok(())
 }
 
-/// 接收并解密一个数据块；返回 `None` 表示 EOF。
+/// Receives and decrypts a data block; returns `None` to indicate EOF.
 ///
-/// 以 `io::Result` 返回，保留底层 socket 的错误 kind（`WouldBlock`/
-/// `TimedOut` 表示空闲，relay 循环据此重试）。
+/// Returns an `io::Result`, preserving the error kind from the underlying socket
+/// (e.g., `WouldBlock` or `TimedOut` signify an idle state, prompting the relay loop to retry).
 fn recv_decrypted_chunk<R: Read>(
     reader: &mut R,
     dec: &mut AeadCipher,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let tag = dec.tag_len;
 
-    // 读取并解密长度
     let mut enc_len_buf = vec![0u8; 2 + tag];
     match reader.read_exact(&mut enc_len_buf) {
         Ok(_) => {}
@@ -1035,7 +1127,6 @@ fn recv_decrypted_chunk<R: Read>(
         return Ok(None);
     }
 
-    // 读取并解密数据块
     let mut enc_data = vec![0u8; data_len + tag];
     reader.read_exact(&mut enc_data)?;
 
@@ -1123,7 +1214,6 @@ fn parse_address_header(data: &[u8]) -> Result<(TargetAddr, usize)> {
             ))
         }
         0x03 => {
-            // Domain: 1 + 1 + domain_len + 2
             if data.len() < 2 {
                 return Err(Error::protocol("Domain address too short"));
             }
@@ -1138,7 +1228,6 @@ fn parse_address_header(data: &[u8]) -> Result<(TargetAddr, usize)> {
             Ok((TargetAddr::Domain(domain, port), total_len))
         }
         0x04 => {
-            // IPv6: 1 + 16 + 2 = 19 bytes
             if data.len() < 19 {
                 return Err(Error::protocol("IPv6 address too short"));
             }
@@ -1160,6 +1249,113 @@ fn parse_address_header(data: &[u8]) -> Result<(TargetAddr, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Fragmented {
+        bytes: std::io::Cursor<Vec<u8>>,
+        pause: bool,
+        fragmented: bool,
+    }
+
+    impl Read for Fragmented {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fragmented {
+                self.pause = !self.pause;
+                if self.pause {
+                    return Err(ErrorKind::TimedOut.into());
+                }
+                let n = buf.len().min(1);
+                self.bytes.read(&mut buf[..n])
+            } else {
+                self.bytes.read(buf)
+            }
+        }
+    }
+    impl Write for Fragmented {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl crate::common::stream::SyncStream for Fragmented {
+        fn shutdown(&self, _: std::net::Shutdown) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn framed_reader(
+        cipher: &str,
+        truncate: Option<usize>,
+        fragmented: bool,
+    ) -> (ShadowsocksStream, usize) {
+        let spec = CipherSpec::new(cipher).unwrap();
+        let salt = vec![7; spec.salt_len];
+        let key = derive_subkey_for_cipher("test", &salt, &spec).unwrap();
+        let mut enc = AeadCipher::new(spec, key.clone());
+        let mut wire = salt;
+        send_encrypted_chunk(&mut wire, &mut enc, b"first").unwrap();
+        let boundary = wire.len();
+        send_encrypted_chunk(&mut wire, &mut enc, b"second").unwrap();
+        if let Some(size) = truncate {
+            wire.truncate(size);
+        }
+        let inner = Fragmented {
+            bytes: std::io::Cursor::new(wire),
+            pause: false,
+            fragmented,
+        };
+        (
+            ShadowsocksStream::new(
+                Box::new(inner),
+                AeadCipher::new(spec, key),
+                spec,
+                "test".into(),
+            ),
+            boundary,
+        )
+    }
+
+    #[test]
+    fn every_framing_byte_survives_read_timeouts() {
+        for cipher in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
+            let (mut reader, _) = framed_reader(cipher, None, true);
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            let mut received = Vec::new();
+            let mut buf = [0; 3];
+            for _ in 0..512 {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::TimedOut => continue,
+                    Err(e) => panic!("{cipher}: {e}"),
+                }
+            }
+            assert_eq!(received, b"firstsecond", "{cipher}");
+            assert!(reader.eof);
+        }
+    }
+
+    #[test]
+    fn partial_records_are_errors_but_record_boundary_eof_is_clean() {
+        let (_, boundary) = framed_reader("aes-128-gcm", None, false);
+        for size in 0..boundary {
+            if size == 16 {
+                continue;
+            }
+            let (mut reader, _) = framed_reader("aes-128-gcm", Some(size), false);
+            assert_eq!(
+                reader.read(&mut [0; 32]).unwrap_err().kind(),
+                ErrorKind::UnexpectedEof,
+                "cut at {size}"
+            );
+            assert!(reader.read(&mut [0; 32]).is_err());
+        }
+        let (mut reader, _) = framed_reader("aes-128-gcm", Some(boundary), false);
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"first");
+    }
 
     #[test]
     fn test_cipher_spec_aes_256_gcm() {

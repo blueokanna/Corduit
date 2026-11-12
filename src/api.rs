@@ -969,18 +969,6 @@ fn running_status_of(corduit: &crate::engine::Corduit) -> Result<ProxyStatus> {
 pub fn get_traffic_stats() -> Result<TrafficStats> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     tracker.update_speed();
-    #[cfg(target_os = "android")]
-    {
-        if let Some(processor) = crate::get_android_vpn_processor() {
-            let vpn_stats = processor.get_traffic_stats();
-            return Ok(TrafficStats {
-                upload: vpn_stats.bytes_received,
-                download: vpn_stats.bytes_sent,
-                upload_speed: tracker.upload_speed(),
-                download_speed: tracker.download_speed(),
-            });
-        }
-    }
 
     Ok(TrafficStats {
         upload: tracker.total_upload(),
@@ -2439,8 +2427,7 @@ pub fn get_active_connections() -> Result<Vec<ActiveConnection>> {
     let tracker = crate::engine::connection_tracker::global_tracker();
     let connections = tracker.get_all();
 
-    #[allow(unused_mut)]
-    let mut result: Vec<ActiveConnection> = connections
+    let result: Vec<ActiveConnection> = connections
         .iter()
         .map(|conn| ActiveConnection {
             id: conn.id.clone(),
@@ -2460,58 +2447,8 @@ pub fn get_active_connections() -> Result<Vec<ActiveConnection>> {
         })
         .collect();
 
-    #[cfg(target_os = "android")]
-    {
-        if let Some(processor) = crate::get_android_vpn_processor() {
-            let vpn_stats = processor.get_traffic_stats();
-
-            if vpn_stats.tcp_connections > 0 || vpn_stats.udp_sessions > 0 {
-                let start_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-
-                if vpn_stats.tcp_connections > 0 {
-                    result.push(ActiveConnection {
-                        id: format!("vpn-tcp-{}", vpn_stats.tcp_connections),
-                        inbound_tag: "tun".to_string(),
-                        outbound_tag: "proxy".to_string(),
-                        host: format!("{} TCP connections", vpn_stats.tcp_connections),
-                        destination_ip: None,
-                        destination_port: 0,
-                        protocol: "TCP".to_string(),
-                        network: "tcp".to_string(),
-                        upload_bytes: vpn_stats.bytes_received,
-                        download_bytes: vpn_stats.bytes_sent,
-                        start_time,
-                        rule: "VPN".to_string(),
-                        rule_payload: "TUN".to_string(),
-                        process_name: None,
-                    });
-                }
-
-                if vpn_stats.udp_sessions > 0 {
-                    result.push(ActiveConnection {
-                        id: format!("vpn-udp-{}", vpn_stats.udp_sessions),
-                        inbound_tag: "tun".to_string(),
-                        outbound_tag: "proxy".to_string(),
-                        host: format!("{} UDP sessions", vpn_stats.udp_sessions),
-                        destination_ip: None,
-                        destination_port: 0,
-                        protocol: "UDP".to_string(),
-                        network: "udp".to_string(),
-                        upload_bytes: 0,
-                        download_bytes: 0,
-                        start_time,
-                        rule: "VPN".to_string(),
-                        rule_payload: "TUN".to_string(),
-                        process_name: None,
-                    });
-                }
-            }
-        }
-    }
-
+    // TUN traffic traverses the same SOCKS inbounds and is already tracked.
+    // Packet-layer aggregates are neither connections nor proxy-only traffic.
     Ok(result)
 }
 
@@ -2529,29 +2466,12 @@ pub fn close_all_connections() -> Result<()> {
 pub fn get_connection_stats() -> Result<(u64, u64, u64, u64)> {
     let tracker = crate::engine::connection_tracker::global_tracker();
 
-    #[allow(unused_mut)]
-    let mut total_count = tracker.total_count();
-    #[allow(unused_mut)]
-    let mut total_upload = tracker.total_upload();
-    #[allow(unused_mut)]
-    let mut total_download = tracker.total_download();
-    #[allow(unused_mut)]
-    let mut active_count = tracker.active_count() as u64;
-
-    #[cfg(target_os = "android")]
-    {
-        if let Some(processor) = crate::get_android_vpn_processor() {
-            let vpn_stats = processor.get_traffic_stats();
-            total_upload = vpn_stats.bytes_received;
-            total_download = vpn_stats.bytes_sent;
-
-            let vpn_connections = (vpn_stats.tcp_connections + vpn_stats.udp_sessions) as u64;
-            active_count = vpn_connections;
-            total_count = total_count.max(vpn_connections);
-        }
-    }
-
-    Ok((total_count, total_upload, total_download, active_count))
+    Ok((
+        tracker.total_count(),
+        tracker.total_upload(),
+        tracker.total_download(),
+        tracker.active_count() as u64,
+    ))
 }
 
 // ============== TUN Mode ==============

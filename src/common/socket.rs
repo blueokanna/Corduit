@@ -138,7 +138,6 @@ fn apply_outbound_interface_raw(
     raw: std::os::windows::io::RawSocket,
     destination: std::net::IpAddr,
 ) -> io::Result<()> {
-    /// `IP_UNICAST_IF` / `IPV6_UNICAST_IF` share this option number.
     const UNICAST_IF: libc::c_int = 31;
     const IPPROTO_IP: libc::c_int = 0;
     const IPPROTO_IPV6: libc::c_int = 41;
@@ -229,13 +228,8 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         socket2::Domain::IPV6
     };
     let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    // Both must precede `connect`: the tunnel exemption for the OS to honour
-    // it, and the interface pin for the route table the tunnel installs.
     protect_socket2(&sock)?;
     apply_outbound_interface(&sock, addr.ip())?;
-    // `connect_timeout` switches to non-blocking mode internally and restores
-    // blocking mode on success, as required by the synchronous engine's I/O
-    // timeouts (SO_RCVTIMEO / SO_SNDTIMEO).
     sock.connect_timeout(&(*addr).into(), timeout)?;
     let stream: TcpStream = sock.into();
     stream.set_nodelay(true)?;
@@ -250,7 +244,17 @@ pub fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
 /// private `nameserver-policy` resolver, and the system resolver would
 /// answer NXDOMAIN — or worse, a decoy address — for them.
 pub fn connect_host(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
-    let addrs = resolve_host(host, port, timeout)?;
+    connect_host_with(host, port, timeout, resolve_host)
+}
+
+fn connect_host_with(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    resolve: impl FnOnce(&str, u16, Duration) -> io::Result<Vec<SocketAddr>>,
+) -> io::Result<TcpStream> {
+    let started = Instant::now();
+    let addrs = resolve(host, port, timeout)?;
     if addrs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -258,18 +262,31 @@ pub fn connect_host(host: &str, port: u16, timeout: Duration) -> io::Result<TcpS
         ));
     }
 
-    // Racing changes the shape of the budget: the attempts no longer take turns,
-    // so each one may use the whole timeout rather than a divided share.
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "DNS exhausted the connection deadline",
+        ));
+    }
     if tcp_concurrent() && addrs.len() > 1 {
-        return connect_first(&addrs, timeout);
+        return connect_first(&addrs, remaining);
     }
 
-    // Give each candidate a fair share of the budget so a dead first
-    // address (e.g. a stale AAAA record) cannot consume it all.
-    let per = (timeout / addrs.len().max(1) as u32).max(Duration::from_millis(250));
     let mut last = None;
-    for addr in addrs {
-        match connect(&addr, per) {
+    for (index, addr) in addrs.iter().enumerate() {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection deadline exhausted",
+            ));
+        }
+        let per = remaining / (addrs.len() - index) as u32;
+        if per.is_zero() {
+            break;
+        }
+        match connect(addr, per) {
             Ok(s) => return Ok(s),
             Err(e) => last = Some(e),
         }
@@ -311,11 +328,9 @@ fn connect_first(addrs: &[SocketAddr], timeout: Duration) -> io::Result<TcpStrea
                 } else {
                     connect(&addr, remaining)
                 };
-                // If another candidate won, sending drops this stream instead.
                 let _ = result_tx.send(result);
             });
         if let Err(error) = spawned {
-            // Thread exhaustion is a failed attempt, not a process panic.
             let _ = tx.send(Err(error));
         }
     }
@@ -674,6 +689,26 @@ pub fn recv_udp_timeout(sock: &UdpSocket, buf: &mut [u8], timeout: Duration) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_time_is_charged_to_the_connection_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let result = super::connect_host_with(
+            "test.invalid",
+            address.port(),
+            std::time::Duration::from_millis(1),
+            |_, _, _| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                Ok(vec![address])
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -706,7 +741,6 @@ mod tests {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    // Accepted sockets may inherit the listener's mode.
                     stream.set_nonblocking(false).expect("blocking peer");
                     configure(&stream, Some(DIAL_TEST_TIMEOUT), Some(DIAL_TEST_TIMEOUT))
                         .expect("peer timeouts");
