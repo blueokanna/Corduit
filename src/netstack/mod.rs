@@ -51,6 +51,7 @@
 #[cfg(target_os = "android")]
 pub mod android_vpn;
 pub mod error;
+pub mod packet_queue;
 pub mod route;
 pub mod solidtcp;
 pub mod tun;

@@ -1,8 +1,10 @@
 //! Platform-neutral TUN packet processing runtime.
 
 use crate::netstack::error::{NetStackError, Result};
+use crate::netstack::packet_queue::PacketSender;
 use crate::netstack::solidtcp::packet::{TransportInfo, parse_packet};
 use crate::netstack::solidtcp::{ClientDnsSettings, SolidStack, StackBuilder, StackStats};
+#[cfg(test)]
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -98,7 +100,7 @@ pub struct TunPacketProcessor {
 }
 
 impl TunPacketProcessor {
-    pub fn new(proxy_port: u16, mtu: u16, tun_tx: mpsc::Sender<BytesMut>) -> Self {
+    pub fn new(proxy_port: u16, mtu: u16, tun_tx: impl Into<PacketSender>) -> Self {
         Self::new_with_proxy_addr(
             SocketAddr::from((Ipv4Addr::LOCALHOST, proxy_port)),
             mtu,
@@ -109,7 +111,7 @@ impl TunPacketProcessor {
     pub fn new_with_proxy_addr(
         proxy_addr: SocketAddr,
         mtu: u16,
-        tun_tx: mpsc::Sender<BytesMut>,
+        tun_tx: impl Into<PacketSender>,
     ) -> Self {
         Self::new_with_dns(proxy_addr, mtu, tun_tx, ClientDnsSettings::default())
     }
@@ -123,7 +125,7 @@ impl TunPacketProcessor {
     pub fn new_with_dns(
         proxy_addr: SocketAddr,
         mtu: u16,
-        tun_tx: mpsc::Sender<BytesMut>,
+        tun_tx: impl Into<PacketSender>,
         dns: ClientDnsSettings,
     ) -> Self {
         Self::new_with_dns_and_auth(proxy_addr, mtu, tun_tx, dns, None)
@@ -134,7 +136,7 @@ impl TunPacketProcessor {
     pub fn new_with_dns_and_auth(
         proxy_addr: SocketAddr,
         mtu: u16,
-        tun_tx: mpsc::Sender<BytesMut>,
+        tun_tx: impl Into<PacketSender>,
         dns: ClientDnsSettings,
         credentials: Option<(String, String)>,
     ) -> Self {
@@ -159,7 +161,6 @@ impl TunPacketProcessor {
         })
         .expect("failed to spawn TUN DNS workers");
         let cleanup_stack = Arc::clone(&stack);
-        // Long-lived cleanup loop runs on a dedicated thread.
         std::thread::Builder::new()
             .name("tun-cleanup".into())
             .spawn(move || {

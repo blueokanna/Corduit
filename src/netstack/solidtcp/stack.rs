@@ -1,6 +1,7 @@
 //! Main TCP/IP stack coordinator
 
 use crate::common::LogThrottle;
+use crate::netstack::packet_queue::PacketSender;
 use crate::netstack::solidtcp::device::DeviceConfig;
 use crate::netstack::solidtcp::dns::{ClientDnsSettings, DnsHandler, DnsVerdict, FakeIpPool};
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
@@ -38,9 +39,6 @@ fn update_proxy_read_timeout(
     if *current != desired {
         match stream.set_read_timeout(desired) {
             Ok(()) => *current = desired,
-            // Darwin rejects setsockopt with EINVAL once both FINs have arrived,
-            // even while received bytes remain buffered. Keep the old timeout
-            // and let read drain those bytes and report EOF (or a real error).
             #[cfg(target_vendor = "apple")]
             Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
             Err(error) => return Err(error),
@@ -188,7 +186,7 @@ fn pump_udp_replies(
     control: TcpStream,
     client: SocketAddr,
     remote: SocketAddr,
-    tun_tx: Option<mpsc::Sender<BytesMut>>,
+    tun_tx: Option<PacketSender>,
     stats: Arc<StackStats>,
     alive: Arc<AtomicBool>,
 ) {
@@ -444,15 +442,9 @@ pub struct SolidStack {
     dns_handler: Arc<DnsHandler>,
     stats: Arc<StackStats>,
     running: Arc<AtomicBool>,
-    tun_tx: Option<mpsc::Sender<BytesMut>>,
+    tun_tx: Option<PacketSender>,
     fake_ip_miss_log: Arc<LogThrottle>,
-    /// One reusable SOCKS5 UDP association per flow, keyed by the client and
-    /// destination addresses.
     udp_associations: Mutex<HashMap<(SocketAddr, SocketAddr), Arc<UdpAssociation>>>,
-    /// Associations opened, used only to pace sweeping the tombstones of dead
-    /// ones out of the table. The server side of a dead association is already
-    /// gone — the reply pump closes its control connection as it ends — so a
-    /// tombstone costs nothing but its table entry.
     udp_associations_opened: AtomicU64,
 }
 
@@ -484,10 +476,10 @@ impl SolidStack {
         StackBuilder::new()
     }
 
-    pub fn set_tun_tx(&mut self, tx: mpsc::Sender<BytesMut>) {
-        self.tun_tx = Some(tx);
+    pub fn set_tun_tx(&mut self, tx: impl Into<PacketSender>) {
+        self.tun_tx = Some(tx.into());
     }
-    pub fn tun_tx(&self) -> Option<&mpsc::Sender<BytesMut>> {
+    pub fn tun_tx(&self) -> Option<&PacketSender> {
         self.tun_tx.as_ref()
     }
 
@@ -1215,7 +1207,7 @@ impl SolidStack {
 struct StackProxy {
     proxy_addr: SocketAddr,
     proxy_credentials: Option<(String, String)>,
-    tun_tx: Option<mpsc::Sender<BytesMut>>,
+    tun_tx: Option<PacketSender>,
     tcp_manager: Arc<TcpManager>,
     stats: Arc<StackStats>,
     running: Arc<AtomicBool>,
@@ -1977,7 +1969,7 @@ mod tests {
             proxy_addr,
             ..StackConfig::default()
         });
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = crate::netstack::packet_queue::channel(2);
         stack.set_tun_tx(tx);
         stack.start();
         let client = Ipv4Addr::new(198, 18, 0, 1);

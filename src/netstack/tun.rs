@@ -1,5 +1,6 @@
 use crate::common::cancel::CancellationToken;
 use crate::netstack::error::{NetStackError, Result};
+use crate::netstack::packet_queue::{self, PacketSender};
 use bytes::BytesMut;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -226,7 +227,7 @@ impl TunConfig {
 /// TUN device wrapper
 pub struct TunDevice {
     config: TunConfig,
-    tx: Option<mpsc::Sender<BytesMut>>,
+    tx: Option<PacketSender>,
     rx: Option<SendReceiver<BytesMut>>,
     running: Arc<AtomicBool>,
     shutdown: Option<CancellationToken>,
@@ -399,7 +400,7 @@ impl TunDevice {
             RING_CAPACITY
         );
 
-        let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
+        let (tx_to_tun, rx_from_stack) = packet_queue::channel(packet_queue::MAX_QUEUED_PACKETS);
         let (tx_to_stack, rx_from_tun) = mpsc::sync_channel::<BytesMut>(1024);
         let shutdown = CancellationToken::new();
 
@@ -622,7 +623,7 @@ impl TunDevice {
             self.config.name, self.config.address, prefix_len
         );
 
-        let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
+        let (tx_to_tun, rx_from_stack) = packet_queue::channel(packet_queue::MAX_QUEUED_PACKETS);
         let (tx_to_stack, rx_from_tun) = mpsc::sync_channel::<BytesMut>(1024);
         let shutdown = CancellationToken::new();
 
@@ -781,7 +782,7 @@ impl TunDevice {
         let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
         self.vpn_file = Some(file);
 
-        let (tx_to_tun, rx_from_stack) = mpsc::channel::<BytesMut>();
+        let (tx_to_tun, rx_from_stack) = packet_queue::channel(packet_queue::MAX_QUEUED_PACKETS);
         let (tx_to_stack, rx_from_tun) = mpsc::sync_channel::<BytesMut>(1024);
         let shutdown = CancellationToken::new();
 
@@ -991,7 +992,7 @@ impl TunDevice {
         }
     }
 
-    pub fn get_sender(&self) -> Option<mpsc::Sender<BytesMut>> {
+    pub fn get_sender(&self) -> Option<PacketSender> {
         self.tx.clone()
     }
     pub fn take_receiver(&mut self) -> Option<SendReceiver<BytesMut>> {

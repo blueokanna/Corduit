@@ -2,10 +2,11 @@
 //!
 //! Provides a unified interface for reading/writing packets to TUN devices.
 
+use crate::netstack::packet_queue::{self, PacketReceiver, PacketSender};
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use bytes::BytesMut;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
 
 /// Device configuration
 #[derive(Debug, Clone)]
@@ -112,15 +113,15 @@ pub struct VirtualDevice {
     /// Running flag
     running: Arc<AtomicBool>,
     /// Write channel sender
-    write_tx: mpsc::Sender<BytesMut>,
+    write_tx: PacketSender,
     /// Write channel receiver (for internal use)
-    write_rx: Option<mpsc::Receiver<BytesMut>>,
+    write_rx: Option<PacketReceiver>,
 }
 
 impl VirtualDevice {
     /// Create a new virtual device
     pub fn new(config: DeviceConfig) -> Self {
-        let (write_tx, write_rx) = mpsc::channel();
+        let (write_tx, write_rx) = packet_queue::channel(config.write_queue_size);
 
         Self {
             config,
@@ -132,12 +133,12 @@ impl VirtualDevice {
     }
 
     /// Get write channel sender (for sending packets to TUN)
-    pub fn write_sender(&self) -> mpsc::Sender<BytesMut> {
+    pub fn write_sender(&self) -> PacketSender {
         self.write_tx.clone()
     }
 
     /// Take write channel receiver (for the write loop)
-    pub fn take_write_receiver(&mut self) -> Option<mpsc::Receiver<BytesMut>> {
+    pub fn take_write_receiver(&mut self) -> Option<PacketReceiver> {
         self.write_rx.take()
     }
 
