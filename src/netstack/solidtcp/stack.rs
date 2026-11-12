@@ -29,6 +29,26 @@ use tracing::{debug, info, warn};
 const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Adjust polling without discarding a response when both socket halves close.
+fn update_proxy_read_timeout(
+    stream: &TcpStream,
+    current: &mut Option<Duration>,
+    desired: Option<Duration>,
+) -> io::Result<()> {
+    if *current != desired {
+        match stream.set_read_timeout(desired) {
+            Ok(()) => *current = desired,
+            // Darwin rejects setsockopt with EINVAL once both FINs have arrived,
+            // even while received bytes remain buffered. Keep the old timeout
+            // and let read drain those bytes and report EOF (or a real error).
+            #[cfg(target_vendor = "apple")]
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Ceiling on tunnel connections the stack will dial and hold at once.
 ///
 /// One thread pair per proxied flow is the design, so a SYN flood — or an app
@@ -1450,6 +1470,10 @@ impl StackProxy {
 
         debug!("SOCKS5 handshake complete: {} -> {}", src_addr, dst_addr);
 
+        stream
+            .set_read_timeout(Some(PROXY_POLL_TIMEOUT))
+            .map_err(|e| SolidTcpError::ProxyError(format!("Configure proxy read timeout: {e}")))?;
+
         if !conn.write().set_proxy_socket(
             stream
                 .try_clone()
@@ -1577,7 +1601,6 @@ impl StackProxy {
                 let mut buf = vec![0u8; 16 * 1024];
                 conn_clone.write().register_reader();
                 let mut read_timeout = Some(PROXY_POLL_TIMEOUT);
-                let _ = read_stream.set_read_timeout(read_timeout);
 
                 'relay: loop {
                     if !running.load(Ordering::Relaxed) || conn_clone.read().reader_finished() {
@@ -1649,12 +1672,11 @@ impl StackProxy {
                         continue;
                     }
                     let desired_timeout = outstanding.then_some(PROXY_POLL_TIMEOUT);
-                    if desired_timeout != read_timeout {
-                        if let Err(error) = read_stream.set_read_timeout(desired_timeout) {
-                            warn!("Could not configure proxy read timeout: {error}");
-                            break;
-                        }
-                        read_timeout = desired_timeout;
+                    if let Err(error) =
+                        update_proxy_read_timeout(&read_stream, &mut read_timeout, desired_timeout)
+                    {
+                        warn!("Could not configure proxy read timeout: {error}");
+                        break;
                     }
                     let count = capacity.min(buf.len());
                     match (&*read_stream).read(&mut buf[..count]) {
@@ -1894,6 +1916,31 @@ mod tests {
             writer_thread.join().expect("writer thread").is_ok(),
             "a stalled peer must delay the write, not fail it"
         );
+    }
+
+    #[test]
+    fn proxy_read_timeout_changes_preserve_data_and_eof_after_both_fins() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut writer, _) = listener.accept().unwrap();
+        let mut read_timeout = Some(Duration::from_secs(5));
+        reader.set_read_timeout(read_timeout).unwrap();
+        writer.set_read_timeout(read_timeout).unwrap();
+        writer.set_write_timeout(read_timeout).unwrap();
+
+        reader.shutdown(Shutdown::Write).unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(writer.read(&mut byte).unwrap(), 0);
+        writer.write_all(b"response after client FIN").unwrap();
+        writer.shutdown(Shutdown::Write).unwrap();
+
+        update_proxy_read_timeout(&reader, &mut read_timeout, None).unwrap();
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"response after client FIN");
+
+        update_proxy_read_timeout(&reader, &mut read_timeout, Some(PROXY_POLL_TIMEOUT)).unwrap();
+        assert_eq!(reader.read(&mut byte).unwrap(), 0);
     }
 
     #[test]
