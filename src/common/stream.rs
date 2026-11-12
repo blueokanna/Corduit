@@ -242,8 +242,6 @@ impl Read for PrefixedStream {
             let n = (self.prefix.len() - self.offset).min(buf.len());
             buf[..n].copy_from_slice(&self.prefix[self.offset..self.offset + n]);
             self.offset += n;
-            // The prefix is bounded by the preamble cap and is drained in at
-            // most one read, so nothing accumulates here.
             if self.offset == self.prefix.len() {
                 self.prefix = Vec::new();
                 self.offset = 0;
@@ -411,7 +409,6 @@ fn copy_one_way(
         }
         match src.read(&mut buf) {
             Ok(0) => {
-                // Peer closed cleanly: propagate EOF to the other side.
                 dst_shutdown();
                 return Ok(());
             }
@@ -486,14 +483,9 @@ impl Side {
 
     fn shutdown(&self, how: Shutdown) {
         match self {
-            // A socket shutdown is a non-blocking syscall, so it is always
-            // attempted: a read parked with no timeout of its own has nothing
-            // else that would ever wake it.
             Side::Shared(shared) => {
                 let _ = shared.shutdown(how);
             }
-            // EOF must deliver FIN even when the opposite reader owns the
-            // lock. Only abort/cancellation may skip a busy serialized side.
             Side::Serialized(stream) if how == Shutdown::Write => {
                 let _ = shutdown_lenient(&**lock_stream(stream), how);
             }
@@ -504,10 +496,7 @@ impl Side {
                 Err(std::sync::TryLockError::Poisoned(error)) => {
                     let _ = shutdown_lenient(&**error.into_inner(), how);
                 }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    // The other direction is inside a write. It will return,
-                    // see the finished flag, and leave.
-                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
             },
         }
     }
@@ -539,26 +528,37 @@ impl Side {
         }
     }
 
-    fn write_all(&self, data: &[u8]) -> io::Result<()> {
-        match self {
-            Side::Shared(shared) => {
-                let mut written = 0;
-                while written < data.len() {
-                    match shared.write(&data[written..]) {
-                        Ok(0) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "relay write made no progress",
-                            ));
-                        }
-                        Ok(n) => written += n,
-                        Err(e) => return Err(e),
-                    }
-                }
-                Ok(())
+    fn write_all(
+        &self,
+        data: &[u8],
+        token: &CancellationToken,
+        finished: &AtomicBool,
+    ) -> io::Result<()> {
+        let mut written = 0;
+        while written < data.len() {
+            if token.is_cancelled() || finished.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "relay cancelled",
+                ));
             }
-            Side::Serialized(stream) => lock_stream(stream).write_all(data),
+            let result = match self {
+                Side::Shared(shared) => shared.write(&data[written..]),
+                Side::Serialized(stream) => lock_stream(stream).write(&data[written..]),
+            };
+            match result {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "relay write made no progress",
+                    ));
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => std::thread::yield_now(),
+                Err(e) => return Err(e),
+            }
         }
+        Ok(())
     }
 }
 
@@ -630,9 +630,6 @@ fn copy_direction(
             dst.release();
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
-
-        // The other direction has ended and will not resume, so there is
-        // nothing left that could arrive to copy.
         if finished.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -644,22 +641,16 @@ fn copy_direction(
                     dst.release();
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
                 }
-                // A clean half-close, not an ending: the other direction may
-                // still have everything left to carry, so `finished` stays
-                // clear and only this half is closed.
                 dst.shutdown(Shutdown::Write);
                 return Ok(());
             }
             Ok(Some(n)) => n,
-            // Nothing to move yet. `Side::read` has already handed back any
-            // serialized lock it took, and this sleep is the loop's own
-            // guarantee that it never re-enters a read without having yielded
-            // the CPU first — even for a transport that reports "no progress"
-            // without ever having blocked. Without it, a handle that returns
-            // `WouldBlock` immediately turns this into a userspace spin: no
-            // syscalls, no I/O, one saturated core per relay direction.
             Ok(None) => {
                 std::thread::sleep(RELAY_POLL_YIELD);
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                std::thread::yield_now();
                 continue;
             }
             Err(e) => {
@@ -670,7 +661,7 @@ fn copy_direction(
             }
         };
 
-        if let Err(e) = dst.write_all(&buf[..n]) {
+        if let Err(e) = dst.write_all(&buf[..n], &token, &finished) {
             finished.store(true, Ordering::Release);
             src.release();
             dst.release();
@@ -771,17 +762,7 @@ pub fn relay_with(
     }
 
     let stats = Arc::new(Mutex::new(RelayStats::default()));
-
-    // Set by a direction that ends for any reason other than a half-close, and
-    // read by the other one at the top of every iteration. It is what makes the
-    // relay terminate without depending on a shutdown that a write may be
-    // holding the lock against.
     let finished = Arc::new(AtomicBool::new(false));
-
-    // The upstream direction runs on a thread of its own; if it panics it must
-    // release both sides before unwinding, because the partner may be parked in
-    // a read that only a release can wake. `resume_unwind` keeps the failure
-    // visible to `join` exactly as it was.
     let upstream = {
         let src = Arc::clone(&a);
         let dst = Arc::clone(&b);
@@ -811,8 +792,6 @@ pub fn relay_with(
             })
     };
 
-    // A failed spawn must release the sides it was handed and return; nothing
-    // else owns them yet.
     let upstream = match upstream {
         Ok(handle) => handle,
         Err(error) => {
@@ -823,10 +802,6 @@ pub fn relay_with(
         }
     };
 
-    // The downstream direction runs here, on the caller's thread. It is the
-    // same `copy_direction` with the same token, flag and stats; only the
-    // thread differs. A panic in it releases both sides for the same reason
-    // the spawned direction does, then propagates after the join below.
     let downstream = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         copy_direction(
             Arc::clone(&b),
@@ -880,8 +855,6 @@ mod tests {
         let (socket, mut peer) = socket_pair();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let stream = Arc::new(Mutex::new(Box::new(socket) as BoxStream));
-        // Hold the same lock a serialized read owns when the other direction
-        // sees EOF. A FIN must be delivered once that bounded read returns.
         let guard = stream.lock().unwrap();
         let side = Side::Serialized(stream.clone());
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -897,6 +870,132 @@ mod tests {
     }
     use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct SignalIo {
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        output: Mutex<Vec<u8>>,
+        half_closed: AtomicBool,
+        cancel_on_read: Option<CancellationToken>,
+        cancel_on_write: Option<CancellationToken>,
+    }
+
+    impl StreamHandle for Arc<SignalIo> {
+        fn read_shared(&self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(token) = &self.cancel_on_read {
+                token.cancel();
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            match self.reads.fetch_add(1, Ordering::Relaxed) {
+                0 | 2 => Err(io::ErrorKind::Interrupted.into()),
+                1 | 3 => {
+                    buf[..4].copy_from_slice(b"data");
+                    Ok(4)
+                }
+                _ => Ok(0),
+            }
+        }
+        fn write_shared(&self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(token) = &self.cancel_on_write {
+                token.cancel();
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self
+                .writes
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(2)
+            {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(3);
+            self.output.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn shutdown_shared(&self, how: Shutdown) -> io::Result<()> {
+            if how == Shutdown::Write {
+                self.half_closed.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    struct SignalStream(Arc<SignalIo>);
+    impl Read for SignalStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read_shared(buf)
+        }
+    }
+    impl Write for SignalStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write_shared(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl SyncStream for SignalStream {
+        fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+            self.0.shutdown_shared(how)
+        }
+    }
+    fn signal_side(io: &Arc<SignalIo>, shared: bool) -> Arc<Side> {
+        Arc::new(Side::new(
+            Box::new(SignalStream(io.clone())),
+            shared.then(|| SharedStream::new(io.clone())),
+        ))
+    }
+
+    #[test]
+    fn relay_retries_signals_without_losing_or_duplicating_bytes() {
+        for shared in [false, true] {
+            let src = Arc::new(SignalIo::default());
+            let dst = Arc::new(SignalIo::default());
+            let stats = Arc::new(Mutex::new(RelayStats::default()));
+            copy_direction(
+                signal_side(&src, shared),
+                signal_side(&dst, shared),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+                stats.clone(),
+                RelayAccounting::default(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(*dst.output.lock().unwrap(), b"datadata");
+            assert_eq!(stats.lock().unwrap().up, 8);
+            assert!(dst.half_closed.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn signal_retries_still_observe_cancellation() {
+        for shared in [false, true] {
+            for during_write in [false, true] {
+                let token = CancellationToken::new();
+                let src = Arc::new(SignalIo {
+                    cancel_on_read: (!during_write).then(|| token.clone()),
+                    ..Default::default()
+                });
+                let dst = Arc::new(SignalIo {
+                    cancel_on_write: during_write.then(|| token.clone()),
+                    ..Default::default()
+                });
+                let error = copy_direction(
+                    signal_side(&src, shared),
+                    signal_side(&dst, shared),
+                    token,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(Mutex::new(RelayStats::default())),
+                    RelayAccounting::default(),
+                    true,
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                assert!(dst.output.lock().unwrap().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn copy_one_way_half_closes_on_eof() {
@@ -1267,10 +1366,6 @@ mod tests {
             gate.wait_until_entered(Duration::from_secs(5)),
             "the relay never reached the write"
         );
-
-        // Opened well after the assertion window, so a passing measurement
-        // cannot be explained by having waited for the write — and so the test
-        // reports a failure instead of hanging when cancellation does block.
         let opener = {
             let gate = Arc::clone(&gate);
             std::thread::spawn(move || {

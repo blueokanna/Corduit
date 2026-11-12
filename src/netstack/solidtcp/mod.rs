@@ -50,6 +50,7 @@ pub mod dns;
 pub mod error;
 pub mod nat;
 pub mod packet;
+mod send;
 pub mod stack;
 pub mod stats;
 pub mod tcp;

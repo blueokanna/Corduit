@@ -6,8 +6,7 @@ use crate::netstack::solidtcp::dns::{ClientDnsSettings, DnsHandler, DnsVerdict, 
 use crate::netstack::solidtcp::error::{Result, SolidTcpError};
 use crate::netstack::solidtcp::nat::{NatConfig, NatTable};
 use crate::netstack::solidtcp::packet::{
-    DEFAULT_MSS_V4, DEFAULT_MSS_V6, ParsedPacket, TcpFlags, TcpInfo, TransportInfo, build_tcp,
-    build_udp, parse_packet,
+    ParsedPacket, TcpFlags, TcpInfo, TransportInfo, build_tcp, build_udp, parse_packet,
 };
 use crate::netstack::solidtcp::stats::StackStats;
 use crate::netstack::solidtcp::tcp::{
@@ -1001,7 +1000,11 @@ impl SolidStack {
             payload.len()
         );
 
-        match self.dns_handler.handle_query(payload) {
+        let answer = self.dns_handler.handle_query(payload);
+        if !self.is_running() {
+            return Ok(());
+        }
+        match answer {
             Ok(DnsVerdict::Answer {
                 bytes,
                 faked_domain,
@@ -1368,8 +1371,6 @@ impl StackProxy {
 
         debug!("UDP relay address: {}", relay_addr);
 
-        // The relay socket has to be bound in the relay's family, or a v6
-        // relay address has nowhere to be sent from.
         let bind_addr = if relay_addr.is_ipv6() {
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         } else {
@@ -1381,10 +1382,6 @@ impl StackProxy {
             Some(relay_addr.ip()),
         )
         .map_err(|e| SolidTcpError::ProxyError(format!("UDP socket bind failed: {}", e)))?;
-
-        // The association outlives this call: the control connection is held
-        // open (and dropped with the association) so the server keeps the
-        // relay in place, and the pump is the only reader of the socket.
         let _ = udp_socket.set_read_timeout(Some(UDP_ASSOCIATION_IDLE));
         let _ = udp_socket.set_write_timeout(Some(UDP_SEND_TIMEOUT));
 
@@ -1458,29 +1455,15 @@ impl StackProxy {
                 .try_clone()
                 .map_err(|e| SolidTcpError::ProxyError(format!("Clone shutdown handle: {e}")))?,
         ) {
-            return Err(SolidTcpError::ProxyError(
-                "Flow closed during proxy handshake".into(),
-            ));
+            debug!("Client closed flow during SOCKS5 handshake: {src_addr} -> {dst_addr}");
+            return Ok(());
         }
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        // The writer owns this handle: it releases each chunk back to the
-        // connection's receive window as it drains, and clears the liveness
-        // flag when it leaves — see `ProxyWriter`.
         let proxy_writer = conn.write().set_proxy_tx(tx);
-
         let stream = Arc::new(stream);
-
-        // Writer thread: drain the app->proxy channel and write to the proxy.
         let running = self.running.clone();
         let src_clone = src_addr;
         let dst_clone = dst_addr;
-        // Weak, not a clone. The connection owns the channel's sender, so a
-        // strong reference here would keep that sender alive for as long as
-        // this thread runs — and this thread only ends when the sender is
-        // dropped. Teardown (the reader removing the connection from the
-        // manager) is what has to end it, so the writer must not be part of
-        // what keeps it alive: with a clone here every finished flow left a
-        // writer parked in `recv_timeout` for the life of the engine.
         let conn_for_ws = Arc::downgrade(&conn);
         let write_stream = stream.clone();
         let rx = rx;
@@ -1490,9 +1473,6 @@ impl StackProxy {
             .spawn(move || {
                 let mut first_data = true;
                 let mut write_buffer = Vec::new();
-                // Releases bytes back to the receive window as they reach the
-                // proxy, and gives back anything still held if this thread
-                // leaves early.
                 let mut flow = proxy_writer;
 
                 loop {
@@ -1577,10 +1557,10 @@ impl StackProxy {
                 if !write_buffer.is_empty() {
                     let _ = Self::write_all_sync(&write_stream, &write_buffer);
                 }
+                let _ = write_stream.shutdown(std::net::Shutdown::Write);
             })
             .map_err(|e| SolidTcpError::ProxyError(format!("Failed to spawn writer: {}", e)))?;
 
-        // Reader thread: read proxy->app data and emit TCP segments to TUN.
         let tun_tx = self.tun_tx.clone();
         let stats = self.stats.clone();
         let tcp_manager = self.tcp_manager.clone();
@@ -1595,145 +1575,120 @@ impl StackProxy {
                 // when this flow's reader ends, however it ends.
                 let _slot = slot;
                 let mut buf = vec![0u8; 16 * 1024];
+                conn_clone.write().register_reader();
+                let mut read_timeout = Some(PROXY_POLL_TIMEOUT);
+                let _ = read_stream.set_read_timeout(read_timeout);
 
-                loop {
-                    if !running.load(Ordering::Relaxed) {
+                'relay: loop {
+                    if !running.load(Ordering::Relaxed) || conn_clone.read().reader_finished() {
                         break;
                     }
-
-                    match (&*read_stream).read(&mut buf) {
-                        Ok(0) => {
-                            debug!("Proxy->App: EOF for {} -> {}", src_addr, dst_addr);
+                    loop {
+                        let next = {
+                            let mut connection = conn_clone.write();
+                            connection
+                                .next_response_segment(Instant::now())
+                                .map(|segment| {
+                                    (
+                                        segment,
+                                        connection.rcv_nxt(),
+                                        connection.recv_window() as u16,
+                                    )
+                                })
+                        };
+                        let Some((segment, ack, window)) = next else {
                             break;
-                        }
-                        Ok(n) => {
-                            let send_info = {
-                                let mut conn_guard = conn_clone.write();
-                                if conn_guard.is_closed() {
-                                    break;
-                                }
-                                let base_seq = conn_guard.snd_nxt();
-                                let ack = conn_guard.rcv_nxt();
-                                let mss = conn_guard.mss() as usize;
-                                let src_ip = dst_addr.ip();
-                                let dst_ip = src_addr.ip();
-
-                                conn_guard.advance_snd_nxt(n as u32);
-                                let window = conn_guard.recv_window() as u16;
-                                (base_seq, ack, mss, window, src_ip, dst_ip)
-                            };
-
-                            let (base_seq, ack, mss, window, src_ip, dst_ip) = send_info;
-
-                            let family_mss = match src_ip {
-                                IpAddr::V4(_) => DEFAULT_MSS_V4,
-                                IpAddr::V6(_) => DEFAULT_MSS_V6,
-                            };
-                            let effective_mss = mss.min(family_mss as usize);
-                            let data = &buf[..n];
-                            let mut offset = 0;
-                            let mut seq = base_seq;
-                            let mut packets_to_send = Vec::new();
-
-                            while offset < data.len() {
-                                let chunk_end = (offset + effective_mss).min(data.len());
-                                let chunk = &data[offset..chunk_end];
-                                let is_last = chunk_end == data.len();
-
-                                let flags = if is_last || data.len() <= effective_mss {
-                                    TcpFlags::psh_ack()
-                                } else {
-                                    TcpFlags::ack_only()
-                                };
-
-                                let packet = match build_tcp(
-                                    src_ip,
-                                    dst_ip,
-                                    dst_addr.port(),
-                                    src_addr.port(),
-                                    seq,
-                                    ack,
-                                    flags,
-                                    window,
-                                    chunk,
-                                    None,
-                                ) {
-                                    Ok(packet) => packet,
-                                    Err(e) => {
-                                        warn!(
-                                            "Segment dropped: {} -> {}: {}",
-                                            dst_addr, src_addr, e
-                                        );
-                                        break;
-                                    }
-                                };
-
-                                packets_to_send.push(packet);
-
-                                seq = seq.wrapping_add(chunk.len() as u32);
-                                offset = chunk_end;
-                            }
-
-                            if let Some(ref tx) = tun_tx {
-                                for packet in packets_to_send {
-                                    stats.record_sent(packet.len());
-                                    if tx.send(BytesMut::from(&packet[..])).is_err() {
-                                        warn!("Failed to send to TUN");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) if is_transient(&e) => {
-                            continue;
-                        }
-                        Err(e) if is_peer_gone(&e) => {
-                            debug!(
-                                "Proxy->App: peer closed ({}) for {} -> {}",
-                                e, src_addr, dst_addr
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("Proxy read error: {} for {} -> {}", e, src_addr, dst_addr);
-                            break;
-                        }
-                    }
-                }
-
-                let fin_info = {
-                    let conn_guard = conn_clone.read();
-                    // shutdown() also ends a blocked read. A reset/expired
-                    // flow must not emit a fresh FIN for a possibly reused tuple.
-                    (!conn_guard.is_closed()).then(|| {
-                        (
-                            conn_guard.snd_nxt(),
-                            conn_guard.rcv_nxt(),
-                            conn_guard.recv_window() as u16,
+                        };
+                        let flags = if segment.fin {
+                            TcpFlags::fin_ack()
+                        } else if segment.data.is_empty() {
+                            TcpFlags::ack_only()
+                        } else {
+                            TcpFlags::psh_ack()
+                        };
+                        let packet = match build_tcp(
                             dst_addr.ip(),
                             src_addr.ip(),
-                        )
-                    })
-                };
-
-                if let (Some((seq, ack, window, src_ip, dst_ip)), Some(tx)) = (fin_info, &tun_tx) {
-                    match build_tcp(
-                        src_ip,
-                        dst_ip,
-                        dst_addr.port(),
-                        src_addr.port(),
-                        seq,
-                        ack,
-                        TcpFlags::fin_ack(),
-                        window,
-                        &[],
-                        None,
-                    ) {
-                        Ok(packet) => {
-                            let _ = tx.send(BytesMut::from(&packet[..]));
+                            dst_addr.port(),
+                            src_addr.port(),
+                            segment.seq,
+                            ack,
+                            flags,
+                            window,
+                            &segment.data,
+                            None,
+                        ) {
+                            Ok(packet) => packet,
+                            Err(error) => {
+                                warn!("TUN TCP packet build failed: {error}");
+                                break 'relay;
+                            }
+                        };
+                        if let Some(tx) = &tun_tx {
+                            stats.record_sent(packet.len());
+                            if tx.send(BytesMut::from(&packet[..])).is_err() {
+                                break 'relay;
+                            }
+                        } else {
+                            break 'relay;
                         }
-                        Err(e) => {
-                            warn!("FIN dropped: {} -> {}: {}", dst_addr, src_addr, e);
+                    }
+
+                    let (can_read, capacity, outstanding) = {
+                        let connection = conn_clone.read();
+                        (
+                            connection.can_read_proxy(),
+                            connection.send_capacity(),
+                            connection.has_unacknowledged_data(),
+                        )
+                    };
+                    if !can_read {
+                        // ACK processing unparks this thread. The timeout also
+                        // drives retransmission and zero-window probes.
+                        std::thread::park_timeout(PROXY_POLL_TIMEOUT);
+                        continue;
+                    }
+                    let desired_timeout = outstanding.then_some(PROXY_POLL_TIMEOUT);
+                    if desired_timeout != read_timeout {
+                        if let Err(error) = read_stream.set_read_timeout(desired_timeout) {
+                            warn!("Could not configure proxy read timeout: {error}");
+                            break;
+                        }
+                        read_timeout = desired_timeout;
+                    }
+                    let count = capacity.min(buf.len());
+                    match (&*read_stream).read(&mut buf[..count]) {
+                        Ok(0) => conn_clone.write().finish_response(),
+                        Ok(n) => {
+                            if !conn_clone.write().enqueue_response(&buf[..n]) {
+                                warn!("TUN response queue rejected a reserved read");
+                                break;
+                            }
+                        }
+                        Err(error) if is_transient(&error) => continue,
+                        Err(error) => {
+                            debug!("Proxy read ended: {src_addr} -> {dst_addr}: {error}");
+                            // Transport errors do not turn a truncated response
+                            // into a successful EOF. Reset the application flow.
+                            let connection = conn_clone.read();
+                            if let (Some(tx), Ok(packet)) = (
+                                &tun_tx,
+                                build_tcp(
+                                    dst_addr.ip(),
+                                    src_addr.ip(),
+                                    dst_addr.port(),
+                                    src_addr.port(),
+                                    connection.snd_nxt(),
+                                    connection.rcv_nxt(),
+                                    TcpFlags::rst_only(),
+                                    0,
+                                    &[],
+                                    None,
+                                ),
+                            ) {
+                                let _ = tx.send(BytesMut::from(&packet[..]));
+                            }
+                            break;
                         }
                     }
                 }
@@ -1783,11 +1738,20 @@ impl StackProxy {
             .write_all(&request)
             .map_err(|e| SolidTcpError::ProxyError(format!("Connect request failed: {}", e)))?;
 
-        let mut connect_response = [0u8; 10];
+        Self::read_connect_reply(stream)
+    }
+
+    fn read_connect_reply(stream: &mut impl Read) -> Result<()> {
+        let mut connect_response = [0u8; 4];
         stream
             .read_exact(&mut connect_response)
             .map_err(|e| SolidTcpError::ProxyError(format!("Connect response failed: {}", e)))?;
 
+        if connect_response[0] != 5 || connect_response[2] != 0 {
+            return Err(SolidTcpError::ProxyError(
+                "Invalid SOCKS5 reply header".into(),
+            ));
+        }
         if connect_response[1] != 0x00 {
             let error_msg = match connect_response[1] {
                 0x01 => "General SOCKS server failure",
@@ -1806,23 +1770,33 @@ impl StackProxy {
             )));
         }
 
-        match connect_response[3] {
-            0x01 => {
-                // IPv4 - already read enough
-            }
+        let address_len = match connect_response[3] {
+            0x01 => 4,
             0x03 => {
-                let domain_len = connect_response[4] as usize;
-                let mut skip = vec![0u8; domain_len + 2 - 6];
-                if !skip.is_empty() {
-                    let _ = stream.read_exact(&mut skip);
+                let mut length = [0u8; 1];
+                stream
+                    .read_exact(&mut length)
+                    .map_err(|e| SolidTcpError::ProxyError(format!("SOCKS5 domain length: {e}")))?;
+                if length[0] == 0 {
+                    return Err(SolidTcpError::ProxyError(
+                        "Empty SOCKS5 bound domain".into(),
+                    ));
                 }
+                usize::from(length[0])
             }
-            0x04 => {
-                let mut skip = [0u8; 12];
-                let _ = stream.read_exact(&mut skip);
+            0x04 => 16,
+            _ => {
+                return Err(SolidTcpError::ProxyError(
+                    "Invalid SOCKS5 address type".into(),
+                ));
             }
-            _ => {}
-        }
+        };
+        let mut bound = [0u8; 257];
+        stream
+            .read_exact(&mut bound[..address_len + 2])
+            .map_err(|e| {
+                SolidTcpError::ProxyError(format!("Truncated SOCKS5 bound address: {e}"))
+            })?;
 
         Ok(())
     }
@@ -1833,6 +1807,31 @@ mod tests {
     use super::*;
     use crate::netstack::solidtcp::packet::{build_ipv4_tcp, build_ipv4_udp};
     use std::net::TcpListener;
+
+    #[test]
+    fn socks_reply_reads_exact_bound_address_without_eating_payload() {
+        for (kind, address) in [
+            (1, vec![0; 4]),
+            (4, vec![0; 16]),
+            (3, vec![1, b'x']),
+            (3, vec![4, b'h', b'o', b's', b't']),
+        ] {
+            let mut packet = vec![5, 0, 0, kind];
+            packet.extend(address);
+            packet.extend([0x01, 0xbb]);
+            let reply_len = packet.len();
+            packet.extend(b"server-first payload");
+            let mut stream = std::io::Cursor::new(packet.clone());
+            StackProxy::read_connect_reply(&mut stream).unwrap();
+            assert_eq!(stream.position() as usize, reply_len);
+            for length in 0..reply_len {
+                assert!(StackProxy::read_connect_reply(&mut &packet[..length]).is_err());
+            }
+        }
+        for reply in [[4, 0, 0, 1], [5, 0, 1, 1], [5, 0, 0, 8], [5, 5, 0, 1]] {
+            assert!(StackProxy::read_connect_reply(&mut &reply[..]).is_err());
+        }
+    }
 
     #[test]
     fn transient_socket_errors_are_recognized() {
@@ -1895,6 +1894,145 @@ mod tests {
             writer_thread.join().expect("writer thread").is_ok(),
             "a stalled peer must delay the write, not fail it"
         );
+    }
+
+    #[test]
+    fn download_survives_packet_loss_zero_window_and_client_half_close() {
+        use std::collections::BTreeMap;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+            let mut connect = [0; 10];
+            stream.read_exact(&mut connect).unwrap();
+            assert_eq!(&connect[..4], &[5, 1, 0, 1]);
+            stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"request");
+            stream.write_all(&payload).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+        let mut stack = SolidStack::new(StackConfig {
+            proxy_addr,
+            ..StackConfig::default()
+        });
+        let (tx, rx) = mpsc::channel();
+        stack.set_tun_tx(tx);
+        stack.start();
+        let client = Ipv4Addr::new(198, 18, 0, 1);
+        let remote = Ipv4Addr::new(203, 0, 113, 10);
+        let send = |seq, ack, flags, window, data: &[u8]| {
+            stack
+                .process_packet(&build_ipv4_tcp(
+                    client,
+                    remote,
+                    40123,
+                    443,
+                    seq,
+                    ack,
+                    flags,
+                    window,
+                    data,
+                    Some(1000),
+                ))
+                .unwrap();
+        };
+        send(1000, 0, TcpFlags::syn_only(), 4096, &[]);
+        let syn_ack = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let TransportInfo::Tcp(tcp) = parse_packet(&syn_ack).unwrap().transport else {
+            panic!("TCP expected")
+        };
+        let base = tcp.seq.wrapping_add(1);
+        send(1001, base, TcpFlags::ack_only(), 4096, &[]);
+        send(1001, base, TcpFlags::psh_ack(), 4096, b"request");
+        send(1008, base, TcpFlags::fin_ack(), 4096, &[]);
+        let mut received = Vec::new();
+        let mut reordered = BTreeMap::new();
+        let mut dropped = false;
+        let mut closed_at = None;
+        let mut reopened = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "download did not recover: received={} reordered={:?}",
+                received.len(),
+                reordered.keys().collect::<Vec<_>>()
+            );
+            let packet = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let parsed = parse_packet(&packet).unwrap();
+            let TransportInfo::Tcp(tcp) = parsed.transport else {
+                continue;
+            };
+            assert!(!tcp.flags.rst, "flow reset before response completed");
+            let offset = tcp.seq.wrapping_sub(base) as usize;
+            let header_len = ((packet[parsed.payload_offset + 12] >> 4) as usize) * 4;
+            let data = &packet
+                [parsed.payload_offset + header_len..parsed.payload_offset + parsed.payload_len];
+            if tcp.flags.fin {
+                assert_eq!(received, expected, "FIN must follow the complete response");
+                assert_eq!(offset, received.len());
+                send(
+                    1009,
+                    tcp.seq.wrapping_add(1),
+                    TcpFlags::ack_only(),
+                    4096,
+                    &[],
+                );
+                break;
+            }
+            if data.is_empty() {
+                continue;
+            }
+            if closed_at.is_some_and(|time: Instant| time.elapsed() >= Duration::from_millis(250)) {
+                reopened = true;
+            }
+            if closed_at.is_none() || reopened {
+                if offset == received.len() && received.len() >= 1000 && !dropped {
+                    dropped = true; // Lose one segment, retain subsequent out-of-order bytes.
+                } else if offset >= received.len() && offset + data.len() <= received.len() + 4096 {
+                    reordered.entry(offset).or_insert_with(|| data.to_vec());
+                    while let Some((&start, _)) = reordered.first_key_value() {
+                        if start > received.len() {
+                            break;
+                        }
+                        let bytes = reordered.remove(&start).unwrap();
+                        let skip = received.len() - start;
+                        if skip < bytes.len() {
+                            received.extend_from_slice(&bytes[skip..]);
+                        }
+                    }
+                }
+                if closed_at.is_none() && !received.is_empty() {
+                    closed_at = Some(Instant::now());
+                }
+            }
+            let window = if reopened { 4096 } else { 0 };
+            send(
+                1009,
+                base.wrapping_add(received.len() as u32),
+                TcpFlags::ack_only(),
+                window,
+                &[],
+            );
+        }
+        assert!(dropped && reopened);
+        stack.stop();
+        server.join().unwrap();
     }
 
     fn start_stack_with_tun() -> (SolidStack, mpsc::Receiver<BytesMut>) {

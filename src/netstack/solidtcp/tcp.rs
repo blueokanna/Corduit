@@ -1,5 +1,6 @@
 //! TCP connection management
 
+use super::send::{Segment, SendQueue};
 use crate::netstack::solidtcp::error::Result;
 use crate::netstack::solidtcp::nat::NatKey;
 use crate::netstack::solidtcp::packet::{DEFAULT_MSS_V4, DEFAULT_MSS_V6, TcpInfo};
@@ -153,7 +154,8 @@ pub struct TcpConnection {
     mss: u16,
     config: TcpConfig,
     recv_buf: VecDeque<u8>,
-    send_buf: VecDeque<u8>,
+    sender: SendQueue,
+    reader_thread: Option<std::thread::Thread>,
     last_active: Instant,
     bytes_tx: u64,
     bytes_rx: u64,
@@ -211,7 +213,11 @@ impl TcpConnection {
             IpAddr::V4(_) => DEFAULT_MSS_V4,
             IpAddr::V6(_) => DEFAULT_MSS_V6,
         };
-        let mss = their_mss.unwrap_or(fallback_mss).min(config.mss);
+        let mss = their_mss
+            .unwrap_or(fallback_mss)
+            .min(config.mss)
+            .min(fallback_mss)
+            .max(1);
         let is_websocket = false;
 
         Self {
@@ -221,9 +227,10 @@ impl TcpConnection {
             snd_una: iss,
             rcv_nxt: their_seq.wrapping_add(1),
             mss,
+            sender: SendQueue::new(iss.wrapping_add(1), config.max_send_buffer),
+            reader_thread: None,
             config,
             recv_buf: VecDeque::new(),
-            send_buf: VecDeque::new(),
             last_active: Instant::now(),
             bytes_tx: 0,
             bytes_rx: 0,
@@ -264,7 +271,8 @@ impl TcpConnection {
         self.proxy_tx.take();
         self.proxy_alive.store(false, Ordering::Release);
         self.recv_buf = VecDeque::new();
-        self.send_buf = VecDeque::new();
+        self.sender.clear();
+        self.wake_reader();
         self.pending_data = VecDeque::new();
         self.ooo_segments.clear();
         self.ooo_size = 0;
@@ -358,7 +366,7 @@ impl TcpConnection {
     /// it drains, and clears the liveness flag when it exits, so the receive
     /// window reflects what is still queued rather than what is acknowledged.
     pub fn set_proxy_tx(&mut self, tx: mpsc::Sender<Vec<u8>>) -> ProxyWriter {
-        self.proxy_tx = Some(tx.clone());
+        self.proxy_tx = (!self.fin_recv).then(|| tx.clone());
         if !self.pending_data.is_empty() {
             let data: Vec<u8> = self.pending_data.drain(..).collect();
             let len = data.len();
@@ -399,24 +407,33 @@ impl TcpConnection {
             self.state = TcpState::Closed;
             return Ok(TcpAction::Close);
         }
-        match self.state {
-            TcpState::SynReceived => self.on_syn_recv(seg),
+        let action = match self.state {
+            TcpState::SynReceived => self.on_syn_recv(seg, payload),
             TcpState::Established => self.on_established(seg, payload),
-            TcpState::FinWait1 => self.on_fin_wait1(seg),
-            TcpState::FinWait2 => self.on_fin_wait2(seg),
+            TcpState::FinWait1 => self.on_fin_wait1(seg, payload),
+            TcpState::FinWait2 => self.on_fin_wait2(seg, payload),
             TcpState::CloseWait => self.on_close_wait(seg),
             TcpState::Closing => self.on_closing(seg),
             TcpState::LastAck => self.on_last_ack(seg),
             TcpState::TimeWait => self.on_time_wait(seg),
             _ => Ok(TcpAction::None),
+        };
+        if seg.flags.ack {
+            self.sender
+                .acknowledge(seg.seq, seg.ack, seg.window, Instant::now());
+            self.wake_reader();
         }
+        action
     }
 
-    fn on_syn_recv(&mut self, seg: &TcpInfo) -> Result<TcpAction> {
+    fn on_syn_recv(&mut self, seg: &TcpInfo, payload: &[u8]) -> Result<TcpAction> {
         if seg.flags.ack && self.valid_ack(seg.ack) {
             self.snd_una = seg.ack;
             self.state = TcpState::Established;
             info!("TCP ESTABLISHED: {:?}", self.key);
+            if !payload.is_empty() || seg.flags.fin {
+                return self.on_established(seg, payload);
+            }
             return Ok(TcpAction::Established);
         }
         Ok(TcpAction::None)
@@ -431,11 +448,15 @@ impl TcpConnection {
             action = self.process_data(seg.seq, payload)?;
         }
         if seg.flags.fin {
-            self.fin_recv = true;
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-            self.state = TcpState::CloseWait;
-            debug!("TCP FIN recv -> CLOSE_WAIT: {:?}", self.key);
-            return Ok(TcpAction::SendFinAck);
+            if seg.seq.wrapping_add(payload.len() as u32) == self.rcv_nxt {
+                self.fin_recv = true;
+                self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+                self.proxy_tx.take();
+                self.state = TcpState::CloseWait;
+                self.wake_reader();
+                debug!("TCP FIN recv -> CLOSE_WAIT: {:?}", self.key);
+            }
+            return Ok(TcpAction::SendAck);
         }
         if action == TcpAction::None && self.window_update_due() {
             action = TcpAction::SendAck;
@@ -443,38 +464,62 @@ impl TcpConnection {
         Ok(action)
     }
 
-    fn on_fin_wait1(&mut self, seg: &TcpInfo) -> Result<TcpAction> {
-        if seg.flags.ack && self.valid_ack(seg.ack) {
+    fn on_fin_wait1(&mut self, seg: &TcpInfo, payload: &[u8]) -> Result<TcpAction> {
+        let mut action = if payload.is_empty() {
+            TcpAction::None
+        } else {
+            self.process_data(seg.seq, payload)?
+        };
+        let fin_acked = seg.flags.ack && seg.ack == self.snd_nxt && self.sender.fin_sent();
+        if fin_acked {
             self.snd_una = seg.ack;
-            if seg.flags.fin {
-                self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                self.state = TcpState::TimeWait;
-                return Ok(TcpAction::SendAck);
-            }
             self.state = TcpState::FinWait2;
         }
         if seg.flags.fin {
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-            self.state = TcpState::Closing;
-            return Ok(TcpAction::SendAck);
+            if seg.seq.wrapping_add(payload.len() as u32) == self.rcv_nxt {
+                self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+                self.fin_recv = true;
+                self.proxy_tx.take();
+                self.state = if fin_acked {
+                    TcpState::TimeWait
+                } else {
+                    TcpState::Closing
+                };
+                self.wake_reader();
+            }
+            action = TcpAction::SendAck;
         }
-        Ok(TcpAction::None)
+        Ok(action)
     }
 
-    fn on_fin_wait2(&mut self, seg: &TcpInfo) -> Result<TcpAction> {
+    fn on_fin_wait2(&mut self, seg: &TcpInfo, payload: &[u8]) -> Result<TcpAction> {
+        let mut action = if payload.is_empty() {
+            TcpAction::None
+        } else {
+            self.process_data(seg.seq, payload)?
+        };
         if seg.flags.fin {
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-            self.state = TcpState::TimeWait;
-            return Ok(TcpAction::SendAck);
+            if seg.seq.wrapping_add(payload.len() as u32) == self.rcv_nxt {
+                self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+                self.fin_recv = true;
+                self.proxy_tx.take();
+                self.state = TcpState::TimeWait;
+                self.wake_reader();
+            }
+            action = TcpAction::SendAck;
         }
-        Ok(TcpAction::None)
+        Ok(action)
     }
 
     fn on_close_wait(&mut self, seg: &TcpInfo) -> Result<TcpAction> {
         if seg.flags.ack {
             self.process_ack(seg.ack);
         }
-        Ok(TcpAction::None)
+        Ok(if seg.flags.fin {
+            TcpAction::SendAck
+        } else {
+            TcpAction::None
+        })
     }
 
     fn on_closing(&mut self, seg: &TcpInfo) -> Result<TcpAction> {
@@ -705,19 +750,51 @@ impl TcpConnection {
         seq1 == seq2 || self.seq_before(seq1, seq2)
     }
 
-    pub fn send(&mut self, data: &[u8]) {
-        self.send_buf.extend(data);
+    pub(super) fn reader_finished(&self) -> bool {
+        self.state == TcpState::Closed
+            || (self.state == TcpState::TimeWait && !self.proxy_alive.load(Ordering::Acquire))
     }
 
-    pub fn get_send_data(&mut self) -> Option<Vec<u8>> {
-        if self.send_buf.is_empty() {
-            return None;
+    pub(super) fn register_reader(&mut self) {
+        self.reader_thread = Some(std::thread::current());
+    }
+
+    fn wake_reader(&self) {
+        if let Some(reader) = &self.reader_thread {
+            reader.unpark();
         }
-        let len = self.send_buf.len().min(self.mss as usize);
-        let data: Vec<u8> = self.send_buf.drain(..len).collect();
-        self.snd_nxt = self.snd_nxt.wrapping_add(data.len() as u32);
-        self.bytes_tx += data.len() as u64;
-        Some(data)
+    }
+
+    pub(super) fn send_capacity(&self) -> usize {
+        self.sender.remaining()
+    }
+    pub(super) fn can_read_proxy(&self) -> bool {
+        matches!(self.state, TcpState::Established | TcpState::CloseWait) && self.sender.can_read()
+    }
+    pub(super) fn has_unacknowledged_data(&self) -> bool {
+        self.sender.outstanding()
+    }
+    pub(super) fn enqueue_response(&mut self, data: &[u8]) -> bool {
+        self.sender.enqueue(data)
+    }
+    pub(super) fn finish_response(&mut self) {
+        self.sender.finish();
+    }
+
+    pub(super) fn next_response_segment(&mut self, now: Instant) -> Option<Segment> {
+        let packet = self.sender.next_segment(now, self.mss.max(1) as usize)?;
+        let previous = self.snd_nxt;
+        self.snd_nxt = self.sender.next_sequence();
+        if !packet.fin {
+            self.bytes_tx += self.snd_nxt.wrapping_sub(previous) as u64;
+        } else if previous != self.snd_nxt {
+            self.state = if self.fin_recv {
+                TcpState::LastAck
+            } else {
+                TcpState::FinWait1
+            };
+        }
+        Some(packet)
     }
 
     pub fn close(&mut self) -> TcpAction {
@@ -736,7 +813,7 @@ impl TcpConnection {
 
     pub fn is_timed_out(&self) -> bool {
         let timeout = match self.state {
-            TcpState::Established => {
+            TcpState::Established | TcpState::CloseWait => {
                 if self.is_websocket {
                     self.config.websocket_timeout
                 } else {
@@ -836,7 +913,7 @@ impl TcpManager {
             .iter()
             .filter(|entry| {
                 let conn = entry.read();
-                conn.is_closed() || conn.is_timed_out()
+                conn.reader_finished() || conn.is_timed_out()
             })
             .map(|entry| *entry.key())
             .collect();
@@ -844,7 +921,7 @@ impl TcpManager {
         for key in to_remove {
             if let Some((_, connection)) = self.connections.remove_if(&key, |_, connection| {
                 let connection = connection.read();
-                connection.is_closed() || connection.is_timed_out()
+                connection.reader_finished() || connection.is_timed_out()
             }) {
                 connection.write().abort();
             }
@@ -970,6 +1047,49 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let writer = conn.set_proxy_tx(tx);
         (conn, rx, writer)
+    }
+
+    #[test]
+    fn handshake_payload_and_upload_after_remote_fin_are_preserved() {
+        use crate::netstack::solidtcp::packet::TcpFlags;
+        let (mut conn, rx, mut writer) = stalled_proxy(4096);
+        let mut segment = TcpInfo {
+            src_port: 1234,
+            dst_port: 443,
+            seq: conn.rcv_nxt(),
+            ack: conn.snd_nxt(),
+            flags: TcpFlags::psh_ack(),
+            window: 4096,
+            mss: None,
+            payload_len: 5,
+        };
+        conn.process(&segment, b"first").unwrap();
+        assert_eq!(rx.recv().unwrap(), b"first");
+        writer.take(5);
+        writer.written();
+        conn.finish_response();
+        let fin = conn.next_response_segment(Instant::now()).unwrap();
+        assert!(fin.fin);
+        segment.seq = conn.rcv_nxt();
+        segment.ack = fin.seq.wrapping_add(1);
+        conn.process(&segment, b"later").unwrap();
+        assert_eq!(conn.state, TcpState::FinWait2);
+        assert_eq!(rx.recv().unwrap(), b"later");
+        writer.take(5);
+        writer.written();
+        segment.seq = conn.rcv_nxt();
+        segment.flags = TcpFlags::fin_ack();
+        conn.process(&segment, b"final").unwrap();
+        assert_eq!(rx.recv().unwrap(), b"final");
+        assert_eq!(conn.state, TcpState::TimeWait);
+        assert!(
+            !conn.reader_finished(),
+            "the writer still owns acknowledged upload bytes"
+        );
+        writer.take(5);
+        writer.written();
+        drop(writer);
+        assert!(conn.reader_finished());
     }
 
     /// Stand in for the writer thread draining the channel and writing it out.

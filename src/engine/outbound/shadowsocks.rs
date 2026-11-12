@@ -922,8 +922,6 @@ impl AeadCipher {
     }
 
     fn next_nonce(&mut self) -> [u8; 12] {
-        // Shadowsocks AEAD uses little-endian nonce counter
-        // The nonce is simply the counter value in little-endian format
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&self.counter.to_le_bytes());
         self.counter = self.counter.wrapping_add(1);
@@ -961,7 +959,6 @@ impl AeadCipher {
     }
 }
 
-/// 发送一个加密块：加密(2-byte length) + 加密(payload)
 fn send_encrypted_chunk<W: Write>(writer: &mut W, enc: &mut AeadCipher, data: &[u8]) -> Result<()> {
     let len = data.len();
     if len > 0x3fff {
@@ -1643,6 +1640,59 @@ mod property_tests {
             let decrypted = decrypt_udp_payload(&key, &encrypted, &spec).unwrap();
 
             prop_assert_eq!(plaintext, decrypted);
+        }
+    }
+}
+
+#[cfg(test)]
+mod openssl_interop_vectors {
+    use super::*;
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+    // Generated independently with Node/OpenSSL createHash, hkdfSync and
+    // createCipheriv, not Corduit crypto. Fixed salts are TEST DATA ONLY.
+    #[test]
+    fn aead_wire_matches_openssl_for_all_supported_ciphers() {
+        let vectors = [
+            (
+                "aes-128-gcm",
+                "5a528d3bcd81e0ad2e21bd9097ee9980",
+                "25ba62fd9354f731a8f8a8f15f859491",
+                "e4a57f045f2451484ab83272f7d1901c41ea4f6297a67935dcd4347c87c42fb8ead4ee3c6c1a3c1a4aa2e95233199ba89858d25c635c79c4f546520e28108684ba2ceec0467a21d75702f9da8be4acc6e035ed0d0cff43",
+            ),
+            (
+                "aes-256-gcm",
+                "5a528d3bcd81e0ad2e21bd9097ee9980363b23a367ca7a38f9d15ba88254c5b5",
+                "c12861428702fd4b8ebca894a3f2869573697d48ba14046a10666f341388793f",
+                "0bb0a2515a9949182c3161012be5027ea9e4a3ae490e6044204694d1ecc30653b0fbadc8400cdc44ed743c1be9510bdee26a7154ac3af426c3e8060ba92563b5ddac874573cd15fc44514cf671c9f7c080eeb476047d22",
+            ),
+            (
+                "chacha20-ietf-poly1305",
+                "5a528d3bcd81e0ad2e21bd9097ee9980363b23a367ca7a38f9d15ba88254c5b5",
+                "c12861428702fd4b8ebca894a3f2869573697d48ba14046a10666f341388793f",
+                "9cd6448d816ce283af9bebfa1341c7e704b7c10848605643c8bd520c4de45027d2acda110889a8886f9614536fec6aaf2afba0c457f9c803895b0df18ea9802890799d6624ed2c2b7646134e0ab8af59923478bbff8845",
+            ),
+        ];
+        for (method, master, key, wire) in vectors {
+            let spec = CipherSpec::new(method).unwrap();
+            let salt: Vec<u8> = (0..spec.salt_len as u8).collect();
+            assert_eq!(
+                hex(&evp_bytes_to_key("interop-password", spec.key_len)),
+                master,
+                "{method} master key"
+            );
+            let subkey = derive_subkey_for_cipher("interop-password", &salt, &spec).unwrap();
+            assert_eq!(hex(&subkey), key, "{method} subkey");
+            let mut cipher = AeadCipher::new(spec, subkey);
+            let mut output = Vec::new();
+            send_encrypted_chunk(&mut output, &mut cipher, b"\x03\x0bexample.com\x01\xbb").unwrap();
+            send_encrypted_chunk(&mut output, &mut cipher, b"test").unwrap();
+            assert_eq!(
+                hex(&output),
+                wire,
+                "{method} framing and authentication tags"
+            );
         }
     }
 }

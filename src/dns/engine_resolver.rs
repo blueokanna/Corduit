@@ -59,10 +59,6 @@ use crate::dns::upstream::Upstream;
 
 /// Timeout for one exchange with one server.
 ///
-/// RecurseX's own default, restated here because it is part of the contract
-/// this module documents rather than something a caller may tune.
-const ATTEMPT_TIMEOUT_MS: u64 = 1_500;
-
 /// Wall-clock budget for one RecurseX resolution, including nested attempts.
 /// Corduit-level primary/fallback resolutions and bootstrap are separate calls.
 ///
@@ -802,7 +798,11 @@ impl Plan {
 /// RecurseX intentionally leaves its default store empty and fails closed.
 fn forwarding_engine_config(query_budget_ms: u64) -> EngineConfig {
     EngineConfig {
-        timeout_ms: ATTEMPT_TIMEOUT_MS,
+        // RecurseX applies timeout_ms to the entire forwarding group, then
+        // reserves a fraction for each upstream. Its iterative per-exchange
+        // default (1.5 s) is too short for a group of cold TLS connections.
+        // Share the existing end-to-end budget; do not extend the deadline.
+        timeout_ms: query_budget_ms,
         query_budget_ms,
         forwarder_roots: crate::common::roots::system_root_store().clone(),
         ..EngineConfig::default()
@@ -1721,6 +1721,33 @@ mod tests {
             .resolve("NODE.example.", 443)
             .expect("hosts entry should answer");
         assert_eq!(addresses, vec!["203.0.113.9:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn forwarding_allows_a_response_within_the_query_budget() {
+        let (port, _server) = spawn_udp_server(|_| {
+            std::thread::sleep(Duration::from_millis(1_800));
+            Some(Ipv4Addr::new(10, 9, 8, 7))
+        });
+        let config = forwarding_engine_config(QUERY_BUDGET_MS);
+        let mut forwarders = recurse_x::forward::ForwarderSet::new(config.forwarder_roots, true, 0);
+        forwarders
+            .add(recurse_x::config::parse_upstream(&format!("udp://127.0.0.1:{port}")).unwrap());
+        let query = recurse_x::Message::query(
+            123,
+            recurse_x::Name::from_ascii("delayed.example").unwrap(),
+            recurse_x::RrType::A,
+            true,
+        );
+        // Exercise the actual forwarding deadline without the separate
+        // loopback-recursion multiplier applied by Resolver::resolve.
+        let answer = forwarders
+            .exchange(&query, &query.to_bytes().unwrap(), config.timeout_ms)
+            .expect("answer within five seconds");
+        assert!(
+            matches!(answer.answers[0].rdata, recurse_x::RData::A(address)
+            if address == Ipv4Addr::new(10, 9, 8, 7))
+        );
     }
 
     #[test]
