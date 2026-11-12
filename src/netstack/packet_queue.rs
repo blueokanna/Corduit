@@ -22,6 +22,28 @@ struct Budget {
     closed: AtomicBool,
 }
 
+impl Budget {
+    fn try_reserve(&self, length: usize) -> bool {
+        // Use CAS to support the MSRV without the deprecated fetch_update API.
+        let mut used = self.bytes.load(Ordering::Acquire);
+        loop {
+            let Some(total) = used
+                .checked_add(length)
+                .filter(|&total| total <= MAX_QUEUED_BYTES)
+            else {
+                return false;
+            };
+            match self
+                .bytes
+                .compare_exchange_weak(used, total, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(current) => used = current,
+            }
+        }
+    }
+}
+
 /// A queued packet owns exactly its payload, never a larger shared read buffer.
 /// Its reservation lasts until the writer finishes with it, including I/O.
 pub struct QueuedPacket {
@@ -71,14 +93,7 @@ impl PacketSender {
             budget.dropped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        if budget
-            .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(length)
-                    .filter(|&total| total <= MAX_QUEUED_BYTES)
-            })
-            .is_err()
-        {
+        if !budget.try_reserve(length) {
             budget.dropped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
