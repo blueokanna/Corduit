@@ -628,7 +628,11 @@ mod tests {
     #[test]
     fn an_unreadable_payload_is_refused() {
         let mut database = GeoIpDatabase::new();
-        assert!(database.install_bytes(b"DOMAIN,example.com".to_vec()).is_err());
+        assert!(
+            database
+                .install_bytes(b"DOMAIN,example.com".to_vec())
+                .is_err()
+        );
         assert!(!database.is_loaded());
     }
 

@@ -801,9 +801,8 @@ mod tests {
     #[test]
     fn the_mode_guard_accepts_both_spellings() {
         for spelling in ["proxy-mode", "proxy_mode"] {
-            let document = format!(
-                r#"{{"type":"{spelling}","payload":"global","outbound":"PROXY"}}"#
-            );
+            let document =
+                format!(r#"{{"type":"{spelling}","payload":"global","outbound":"PROXY"}}"#);
             let rule: RuleConfig = nextjson::from_str(&document).expect("the rule decodes");
             assert_eq!(rule.rule_type, RuleType::ProxyMode, "{spelling}");
             assert_eq!(rule.payload, "global");
@@ -813,10 +812,12 @@ mod tests {
         assert_eq!(RuleType::ProxyMode.as_str(), "proxy-mode");
         assert_eq!(RuleType::parse("proxy-mode"), Some(RuleType::ProxyMode));
         assert_eq!(RuleType::parse("proxy_mode"), Some(RuleType::ProxyMode));
-        assert!(nextjson::from_str::<RuleConfig>(
-            r#"{"type":"unknown-mode","payload":"global","outbound":"X"}"#
-        )
-        .is_err());
+        assert!(
+            nextjson::from_str::<RuleConfig>(
+                r#"{"type":"unknown-mode","payload":"global","outbound":"X"}"#
+            )
+            .is_err()
+        );
     }
 
     /// A field the caller never mentions keeps the engine default instead of

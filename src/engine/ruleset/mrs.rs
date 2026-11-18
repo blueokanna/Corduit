@@ -154,7 +154,9 @@ fn read_i64(reader: &mut Reader<'_>, field: &str) -> Result<usize> {
         )));
     }
     usize::try_from(raw).map_err(|_| {
-        Error::config(format!("Binary rule set {field} count does not fit this platform"))
+        Error::config(format!(
+            "Binary rule set {field} count does not fit this platform"
+        ))
     })
 }
 
@@ -184,7 +186,9 @@ fn read_ip_ranges(reader: &mut Reader<'_>) -> Result<IpRangeSet> {
         let from = read_address(reader)?;
         let to = read_address(reader)?;
         set.insert_range(from, to).map_err(|error| {
-            Error::config(format!("Binary rule set address range is unusable: {error}"))
+            Error::config(format!(
+                "Binary rule set address range is unusable: {error}"
+            ))
         })?;
     }
     set.finish();
@@ -221,7 +225,7 @@ pub(crate) fn encode_for_test(behavior: u8, body: &[u8], count: usize, extra: &[
 
 #[cfg(test)]
 mod tests {
-    use super::super::{RuleSetInput, RuleSet};
+    use super::super::{RuleSet, RuleSetInput};
     use super::*;
 
     /// An address set body holding the given inclusive ranges.
@@ -268,7 +272,10 @@ mod tests {
 
     #[test]
     fn decodes_an_address_set_with_ipv4_stored_as_mapped() {
-        let body = address_body(&[("10.0.0.0", "10.255.255.255"), ("2001:db8::", "2001:db8::ff")]);
+        let body = address_body(&[
+            ("10.0.0.0", "10.255.255.255"),
+            ("2001:db8::", "2001:db8::ff"),
+        ]);
         let payload = encode_for_test(BEHAVIOR_IP_CIDR, &body, 2, &[]);
         let rules = decode(&payload).expect("decodes");
         let set = RuleSet::new(rules);

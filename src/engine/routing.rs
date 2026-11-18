@@ -471,7 +471,6 @@ impl Router {
         self.geoip_manager.load_geosite_database(path)
     }
 
-
     pub fn rule_provider_manager(&self) -> &RuleProviderManager {
         &self.rule_provider_manager
     }
@@ -1082,10 +1081,7 @@ impl Router {
             // and direct mode the rule table is not consulted at all, so in
             // practice this decides between "the mode the rules were written for" and
             // nothing, which is what such a profile means by it.
-            RuleType::ProxyMode => context
-                .mode
-                .as_str()
-                .eq_ignore_ascii_case(&rule.pattern),
+            RuleType::ProxyMode => context.mode.as_str().eq_ignore_ascii_case(&rule.pattern),
             RuleType::And => rule
                 .children
                 .iter()

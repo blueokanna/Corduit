@@ -219,9 +219,7 @@ mod tests {
     /// ask for terabytes before the first element could be read.
     #[test]
     fn impossible_counts_are_refused_before_allocating() {
-        let mut reader = Reader::new(&[
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
-        ]);
+        let mut reader = Reader::new(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
         assert!(reader.u64_slice().is_err());
     }
 

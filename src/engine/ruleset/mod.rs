@@ -277,9 +277,11 @@ impl HeadlessRule {
             return false;
         }
         if !self.domain_regexes.is_empty()
-            && !input
-                .domain
-                .is_some_and(|domain| self.domain_regexes.iter().any(|regex| regex.is_match(domain)))
+            && !input.domain.is_some_and(|domain| {
+                self.domain_regexes
+                    .iter()
+                    .any(|regex| regex.is_match(domain))
+            })
         {
             return false;
         }
@@ -431,7 +433,9 @@ pub fn compile_regex(pattern: &str) -> Result<Regex> {
         .case_insensitive(true)
         .build()
         .map_err(|error| {
-            Error::config(format!("Rule set pattern '{pattern}' is not a valid regex: {error}"))
+            Error::config(format!(
+                "Rule set pattern '{pattern}' is not a valid regex: {error}"
+            ))
         })
 }
 
@@ -583,8 +587,7 @@ mod tests {
     #[test]
     fn a_zstd_payload_that_is_not_a_rule_set_is_refused() {
         use std::io::Write;
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         let _ = encoder.write_all(b"hello");
         let zlib = encoder.finish().expect("compresses");
         assert_eq!(detect(&zlib), Format::Text, "zlib is not the mrs container");
@@ -592,8 +595,8 @@ mod tests {
 
     #[test]
     fn a_declared_format_must_match_the_content() {
-        let error = decode(b"DOMAIN,example.com\n", Some(Format::Srs))
-            .expect_err("text is not srs");
+        let error =
+            decode(b"DOMAIN,example.com\n", Some(Format::Srs)).expect_err("text is not srs");
         assert!(error.to_string().contains("declared"));
     }
 

@@ -126,9 +126,7 @@ impl SuccinctSet {
         let label_count = reader.count(1)?;
         let labels = reader.take(label_count)?.to_vec();
         Self::assemble(leaves, label_bitmap, labels).ok_or_else(|| {
-            Error::config(
-                "Rule set domain matcher is malformed: node and label counts disagree",
-            )
+            Error::config("Rule set domain matcher is malformed: node and label counts disagree")
         })
     }
 
@@ -151,9 +149,7 @@ impl SuccinctSet {
         let label_count = read_positive_i64(reader, "label count")?;
         let labels = reader.take(label_count)?.to_vec();
         Self::assemble(leaves, label_bitmap, labels).ok_or_else(|| {
-            Error::config(
-                "Rule set domain matcher is malformed: node and label counts disagree",
-            )
+            Error::config("Rule set domain matcher is malformed: node and label counts disagree")
         })
     }
 
@@ -333,7 +329,10 @@ impl SuccinctSet {
 
     /// Number of keys stored, which is the number of terminal nodes.
     pub fn len(&self) -> usize {
-        self.leaves.iter().map(|word| word.count_ones() as usize).sum()
+        self.leaves
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
     }
 
     /// Bit `index` of `label_bitmap`.
@@ -358,11 +357,7 @@ impl SuccinctSet {
             return base;
         };
         let offset = index & 63;
-        let mask = if offset == 0 {
-            0
-        } else {
-            (1u64 << offset) - 1
-        };
+        let mask = if offset == 0 { 0 } else { (1u64 << offset) - 1 };
         base + (bits & mask).count_ones()
     }
 

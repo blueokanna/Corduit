@@ -391,7 +391,10 @@ mod tests {
                     cidr(&[1, 0, 1, 0], 24),
                     cidr(&[36, 0, 0, 0], 8),
                     // IPv6 in the same country.
-                    cidr(&[0x24, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 20),
+                    cidr(
+                        &[0x24, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        20,
+                    ),
                 ],
                 false,
             ),
@@ -448,7 +451,11 @@ mod tests {
     fn unusable_cidrs_are_reported_without_losing_the_rest() {
         let index = GeoIpIndex::open(database(&[country(
             "MIXED",
-            &[cidr(&[1, 2, 3, 4], 24), cidr(&[1, 2, 3], 24), cidr(&[1, 2, 3, 4], 40)],
+            &[
+                cidr(&[1, 2, 3, 4], 24),
+                cidr(&[1, 2, 3], 24),
+                cidr(&[1, 2, 3, 4], 40),
+            ],
             false,
         )]))
         .expect("database");

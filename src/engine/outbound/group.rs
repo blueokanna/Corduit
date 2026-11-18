@@ -494,7 +494,9 @@ impl GroupOutbound {
         if let Some(incumbent) = self.sticky.read().clone()
             && available.contains(&incumbent)
         {
-            let current = health.get(incumbent.as_str()).and_then(|state| state.latency);
+            let current = health
+                .get(incumbent.as_str())
+                .and_then(|state| state.latency);
             let keeps = match (best_latency, current) {
                 (Some(best), Some(current)) => current <= best + self.tolerance,
                 (None, _) => true,
@@ -904,7 +906,12 @@ mod tests {
     }
 
     /// A group carrying extra options, for the policies configured through them.
-    fn group_with(tag: &str, kind: OutboundType, members: &[&str], options: &[(&str, &str)]) -> GroupOutbound {
+    fn group_with(
+        tag: &str,
+        kind: OutboundType,
+        members: &[&str],
+        options: &[(&str, &str)],
+    ) -> GroupOutbound {
         let mut map = HashMap::new();
         map.insert(
             "outbounds".to_string(),
@@ -992,7 +999,10 @@ mod tests {
         // that it does not consume the rotation counter.
         let other = TargetAddr::new_domain("downloads.example.net".to_string(), 443);
         let other_first = group.primary_for(Some(&other)).expect("a member");
-        assert_eq!(group.primary_for(Some(&other)).expect("a member"), other_first);
+        assert_eq!(
+            group.primary_for(Some(&other)).expect("a member"),
+            other_first
+        );
     }
 
     #[test]

@@ -1289,10 +1289,8 @@ mod tests {
         use flate2::write::ZlibEncoder;
         use std::io::Write;
 
-        let matcher = DomainMatcher::build(
-            std::iter::empty::<String>(),
-            ["example.com".to_string()],
-        );
+        let matcher =
+            DomainMatcher::build(std::iter::empty::<String>(), ["example.com".to_string()]);
         let mut set_bytes = Vec::new();
         matcher.write_for_test(&mut set_bytes);
 
