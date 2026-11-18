@@ -79,6 +79,54 @@ const MAX_PROBE_CONCURRENCY: usize = 8;
 /// Consecutive failures before a member is taken out of rotation.
 const FAILURES_BEFORE_DEAD: u32 = 2;
 
+/// How much better a rival must be before `url-test` abandons its current pick.
+///
+/// Two nodes a millisecond apart would otherwise trade places on every probe
+/// round, and every switch costs the client a fresh handshake. Profiles that want
+/// none of this hysteresis can say `tolerance: 0`.
+const DEFAULT_TOLERANCE: Duration = Duration::from_millis(50);
+
+/// How a `load-balance` group spreads connections over its members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BalanceKey {
+    /// One connection per member, in turn.
+    #[default]
+    RoundRobin,
+    /// The same destination always lands on the same member, so a site that
+    /// needs several connections keeps one session's worth of state on one node.
+    ConsistentHashing,
+    /// Like consistent hashing, keyed on destination *and* port, which pins a
+    /// service's flows together instead of only its hostname.
+    StickySessions,
+}
+
+impl BalanceKey {
+    /// Parse the `strategy:` option, `None` for a value this build does not
+    /// implement so the caller can warn instead of silently rotating.
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "round-robin" | "round_robin" | "roundrobin" | "rr" => Some(Self::RoundRobin),
+            "consistent-hashing" | "consistent_hashing" | "ch" => Some(Self::ConsistentHashing),
+            "sticky-sessions" | "sticky_sessions" | "sticky" => Some(Self::StickySessions),
+            _ => None,
+        }
+    }
+}
+
+/// 64-bit FNV-1a.
+///
+/// A few instructions and no table: enough to spread short hostnames so two sites
+/// sharing a TLD do not share a node, and stable across processes, which is what
+/// makes the mapping reproducible for the operator reading the logs.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
 /// How a group chooses among its members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupStrategy {
@@ -146,6 +194,11 @@ pub struct GroupOutbound {
     health: RwLock<HashMap<String, MemberHealth>>,
     /// Rotation cursor for `load-balance`.
     cursor: AtomicUsize,
+    /// Hysteresis for `url-test`, and the choice it is currently sticking to.
+    tolerance: Duration,
+    sticky: RwLock<Option<String>>,
+    /// How `load-balance` picks a member.
+    balance: BalanceKey,
     test_url: String,
     test_timeout: Duration,
     probe_interval: Duration,
@@ -202,6 +255,21 @@ impl GroupOutbound {
         let probe_interval = option_u64(&config, "interval")
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_PROBE_INTERVAL);
+        let tolerance = option_u64(&config, "tolerance")
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_TOLERANCE);
+        let balance = match option_string(&config, "strategy") {
+            Some(value) => BalanceKey::parse(&value).unwrap_or_else(|| {
+                tracing::warn!(
+                    "Proxy group '{}' asks for load-balance strategy '{value}', which this build \
+                     does not implement; rotating round-robin instead. Supported: round-robin, \
+                     consistent-hashing, sticky-sessions",
+                    config.tag
+                );
+                BalanceKey::default()
+            }),
+            None => BalanceKey::default(),
+        };
 
         tracing::info!(
             "Proxy group '{}' ({:?}) with {} members: {:?}",
@@ -218,6 +286,9 @@ impl GroupOutbound {
             registry,
             health: RwLock::new(HashMap::new()),
             cursor: AtomicUsize::new(0),
+            tolerance,
+            sticky: RwLock::new(None),
+            balance,
             test_url,
             test_timeout,
             probe_interval: probe_interval.max(Duration::from_secs(1)),
@@ -337,6 +408,14 @@ impl GroupOutbound {
     }
 
     fn primary(&self) -> Result<String> {
+        self.primary_for(None)
+    }
+
+    /// The member that would serve `target`.
+    ///
+    /// Only `load-balance` needs the destination — it hashes it — so every other
+    /// policy takes the `None` path and answers exactly what it answered before.
+    fn primary_for(&self, target: Option<&TargetAddr>) -> Result<String> {
         match self.strategy {
             GroupStrategy::Select => self
                 .manual_selection()
@@ -357,15 +436,31 @@ impl GroupOutbound {
             GroupStrategy::UrlTest => self
                 .fastest_member()
                 .ok_or_else(|| self.empty_group_error()),
-            GroupStrategy::LoadBalance => {
-                let available = self.available_members();
-                if available.is_empty() {
-                    return Err(self.empty_group_error());
-                }
-                let turn = self.cursor.fetch_add(1, Ordering::Relaxed);
-                Ok(available[turn % available.len()].clone())
-            }
+            GroupStrategy::LoadBalance => self.balanced_member(target),
         }
+    }
+
+    /// The member a load-balancing group picks for `target`.
+    ///
+    /// Rotation is the default because it needs nothing from the connection; the
+    /// hashing strategies exist because rotation breaks anything that wants its
+    /// connections on one node — a login that must hit the same egress twice, or a
+    /// streaming session whose chunks would otherwise leave from three countries.
+    fn balanced_member(&self, target: Option<&TargetAddr>) -> Result<String> {
+        let available = self.available_members();
+        if available.is_empty() {
+            return Err(self.empty_group_error());
+        }
+        let Some(target) = target.filter(|_| self.balance != BalanceKey::RoundRobin) else {
+            let turn = self.cursor.fetch_add(1, Ordering::Relaxed);
+            return Ok(available[turn % available.len()].clone());
+        };
+        let key = match self.balance {
+            BalanceKey::StickySessions => format!("{}:{}", target.host(), target.port()),
+            _ => target.host(),
+        };
+        let index = (fnv1a(key.as_bytes()) % available.len() as u64) as usize;
+        Ok(available[index].clone())
     }
 
     /// The available member with the lowest measured latency.
@@ -394,7 +489,25 @@ impl GroupOutbound {
                 None => best = Some((latency, tag)),
             }
         }
-        best.map(|(_, tag)| tag.clone())
+        let (best_latency, best_tag) = best?;
+
+        if let Some(incumbent) = self.sticky.read().clone()
+            && available.contains(&incumbent)
+        {
+            let current = health.get(incumbent.as_str()).and_then(|state| state.latency);
+            let keeps = match (best_latency, current) {
+                (Some(best), Some(current)) => current <= best + self.tolerance,
+                (None, _) => true,
+                (Some(_), None) => false,
+            };
+            if keeps {
+                return Some(incumbent);
+            }
+        }
+
+        let elected = best_tag.clone();
+        *self.sticky.write() = Some(elected.clone());
+        Some(elected)
     }
 
     fn empty_group_error(&self) -> Error {
@@ -409,7 +522,12 @@ impl GroupOutbound {
     }
 
     fn resolved(&self) -> Result<Arc<dyn OutboundProxy>> {
-        let tag = self.primary()?;
+        self.resolved_for(None)
+    }
+
+    /// The proxy that would serve `target`, for policies that hash it.
+    fn resolved_for(&self, target: Option<&TargetAddr>) -> Result<Arc<dyn OutboundProxy>> {
+        let tag = self.primary_for(target)?;
         self.find(&tag).ok_or_else(|| {
             Error::config(format!(
                 "Proxy group '{}' selected '{tag}', which is not in the registry",
@@ -570,7 +688,7 @@ impl OutboundProxy for GroupOutbound {
         target: TargetAddr,
         connection: Option<Arc<crate::engine::connection_tracker::TrackedConnection>>,
     ) -> Result<()> {
-        let tag = self.primary()?;
+        let tag = self.primary_for(Some(&target))?;
         let proxy = self.find(&tag).ok_or_else(|| {
             Error::config(format!(
                 "Proxy group '{}' selected '{tag}', which is not in the registry",
@@ -584,7 +702,7 @@ impl OutboundProxy for GroupOutbound {
     }
 
     fn relay_udp_packet(&self, target: &TargetAddr, data: &[u8]) -> Result<Vec<u8>> {
-        let proxy = self.resolved()?;
+        let proxy = self.resolved_for(Some(target))?;
         proxy.relay_udp_packet(target, data)
     }
 
@@ -592,7 +710,7 @@ impl OutboundProxy for GroupOutbound {
     /// is what the rules selected; the default implementation here would fall
     /// back to the member's blocking one-shot relay instead.
     fn udp_submit(&self, target: &TargetAddr, data: &[u8], sink: &Arc<UdpReplySink>) -> Result<()> {
-        let proxy = self.resolved()?;
+        let proxy = self.resolved_for(Some(target))?;
         proxy.udp_submit(target, data, sink)
     }
 
@@ -783,6 +901,154 @@ mod tests {
             let group = group(kind, &["A", "B"]);
             assert_eq!(group.strategy(), expected, "{kind:?}");
         }
+    }
+
+    /// A group carrying extra options, for the policies configured through them.
+    fn group_with(tag: &str, kind: OutboundType, members: &[&str], options: &[(&str, &str)]) -> GroupOutbound {
+        let mut map = HashMap::new();
+        map.insert(
+            "outbounds".to_string(),
+            Json::from(
+                members
+                    .iter()
+                    .map(|member| Json::from((*member).to_string()))
+                    .collect::<Vec<Json>>(),
+            ),
+        );
+        for (key, value) in options {
+            map.insert((*key).to_string(), Json::from((*value).to_string()));
+        }
+        GroupOutbound::new(
+            OutboundConfig {
+                outbound_type: kind,
+                tag: tag.to_string(),
+                server: None,
+                port: None,
+                options: map,
+            },
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .expect("group builds")
+    }
+
+    #[test]
+    fn url_test_keeps_its_choice_inside_the_tolerance() {
+        let group = group_with(
+            "TOLERANT",
+            OutboundType::Urltest,
+            &["A", "B"],
+            &[("tolerance", "100")],
+        );
+        group.record_success("A", Some(Duration::from_millis(100)));
+        group.record_success("B", Some(Duration::from_millis(150)));
+
+        assert_eq!(group.effective_member().as_deref(), Some("A"));
+
+        group.record_success("B", Some(Duration::from_millis(80)));
+        assert_eq!(group.effective_member().as_deref(), Some("A"));
+
+        group.record_success("A", Some(Duration::from_millis(300)));
+        group.record_success("B", Some(Duration::from_millis(10)));
+        assert_eq!(group.effective_member().as_deref(), Some("B"));
+        assert_eq!(group.effective_member().as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn url_test_without_tolerance_follows_the_leader() {
+        let group = group_with(
+            "EAGER",
+            OutboundType::Urltest,
+            &["A", "B"],
+            &[("tolerance", "0")],
+        );
+        group.record_success("A", Some(Duration::from_millis(100)));
+        group.record_success("B", Some(Duration::from_millis(150)));
+        assert_eq!(group.effective_member().as_deref(), Some("A"));
+
+        group.record_success("B", Some(Duration::from_millis(99)));
+        assert_eq!(group.effective_member().as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn consistent_hashing_pins_a_destination_to_one_member() {
+        let group = group_with(
+            "HASHED",
+            OutboundType::Loadbalance,
+            &["A", "B", "C"],
+            &[("strategy", "consistent-hashing")],
+        );
+        let target = TargetAddr::new_domain("cdn.example.com".to_string(), 443);
+        let first = group.primary_for(Some(&target)).expect("a member");
+        for _ in 0..8 {
+            assert_eq!(
+                group.primary_for(Some(&target)).expect("a member"),
+                first,
+                "the same destination must land on the same member"
+            );
+        }
+
+        // A different destination is allowed to land elsewhere, and must itself be
+        // stable; the point is that the mapping is a function of the target, and
+        // that it does not consume the rotation counter.
+        let other = TargetAddr::new_domain("downloads.example.net".to_string(), 443);
+        let other_first = group.primary_for(Some(&other)).expect("a member");
+        assert_eq!(group.primary_for(Some(&other)).expect("a member"), other_first);
+    }
+
+    #[test]
+    fn round_robin_ignores_the_destination() {
+        let group = group_with(
+            "ROTATING",
+            OutboundType::Loadbalance,
+            &["A", "B"],
+            &[("strategy", "round-robin")],
+        );
+        let target = TargetAddr::new_domain("cdn.example.com".to_string(), 443);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(group.primary_for(Some(&target)).expect("a member"));
+        }
+        assert_eq!(seen, ["A", "B", "A", "B"]);
+    }
+
+    /// A destination-less decision (a probe, an API query) must not pin itself to
+    /// member zero; it rotates, so traffic keeps moving while the race is on.
+    #[test]
+    fn a_hashed_group_still_rotates_without_a_destination() {
+        let group = group_with(
+            "HASHLESS",
+            OutboundType::Loadbalance,
+            &["A", "B"],
+            &[("strategy", "consistent-hashing")],
+        );
+        let first = group.primary_for(None).expect("a member");
+        let second = group.primary_for(None).expect("a member");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn an_unknown_balance_strategy_falls_back_to_rotation() {
+        let group = group_with(
+            "UNKNOWN",
+            OutboundType::Loadbalance,
+            &["A", "B"],
+            &[("strategy", "magic")],
+        );
+        assert_eq!(group.balance, BalanceKey::RoundRobin);
+        assert_eq!(
+            group.primary_for(None).expect("a member"),
+            "A",
+            "rotation starts at the first member"
+        );
+    }
+
+    #[test]
+    fn the_hash_spreads_short_hostnames() {
+        // Not a distribution claim: a check that two names differing in one
+        // character do not collide into the same bucket on a two-member ring.
+        let a = fnv1a(b"example.com") % 8;
+        let b = fnv1a(b"exampld.com") % 8;
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -1822,6 +1822,7 @@ fn parse_rule_type(value: &str) -> Result<crate::engine::RuleType> {
         "network" => Ok(RuleType::Network),
         "rule-set" => Ok(RuleType::RuleSet),
         "geosite" => Ok(RuleType::Geosite),
+        "proxy-mode" | "proxy_mode" => Ok(RuleType::ProxyMode),
         "and" => Ok(RuleType::And),
         "or" => Ok(RuleType::Or),
         "not" => Ok(RuleType::Not),

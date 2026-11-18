@@ -118,27 +118,10 @@ const MAX_RULE_DEPTH: usize = 8;
 /// Transport a connection uses.
 ///
 /// Spelled `tcp` / `udp` in a `network` rule payload, matching the vocabulary
-/// the profiles this engine consumes are written in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Network {
-    /// Stream transport.
-    #[default]
-    Tcp,
-    /// Datagram transport.
-    Udp,
-}
-
-impl Network {
-    fn parse(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "tcp" => Ok(Self::Tcp),
-            "udp" => Ok(Self::Udp),
-            other => Err(Error::config(format!(
-                "Invalid network '{other}': expected 'tcp' or 'udp'"
-            ))),
-        }
-    }
-}
+/// the profiles this engine consumes are written in. It is the same type a
+/// binary rule set constrains, so a `NETWORK,tcp` rule and a `.srs` `network`
+/// condition can never drift apart.
+pub use crate::engine::ruleset::Transport as Network;
 
 /// Which inbound a connection arrived on.
 ///
@@ -346,6 +329,8 @@ impl CompiledRule {
 
 /// The inputs a compiled rule is evaluated against.
 struct MatchContext<'a> {
+    /// The routing mode this request is being decided under.
+    mode: Mode,
     domain: Option<&'a str>,
     dst_ip: Option<IpAddr>,
     resolved: &'a [IpAddr],
@@ -373,6 +358,10 @@ impl MatchContext<'_> {
             no_resolve,
             src_ip: self.src_ip,
             process_name: self.process_name,
+            process_path: self.process_path,
+            network: self.network,
+            dst_port: self.dst_port,
+            src_port: self.src_port,
         }
     }
 
@@ -399,7 +388,8 @@ impl Router {
             return false;
         }
         match rule.rule_type {
-            RuleType::RuleSet | RuleType::Geosite => self
+            RuleType::Geosite => false,
+            RuleType::RuleSet => self
                 .rule_provider_manager
                 .carries_dst_ip_entries(&rule.pattern),
             RuleType::And | RuleType::Or | RuleType::Not => {
@@ -459,13 +449,28 @@ impl Router {
         })
     }
 
+    /// Install a Geo database file, deciding its kind from its content.
+    ///
+    /// `Country.mmdb`, `geoip.dat` and `geosite.dat` are all accepted through
+    /// this one call; see [`crate::engine::geo`].
     pub fn load_geoip_database(&self, path: &str) -> Result<()> {
         self.geoip_manager.load_database(path)
     }
 
+    /// Install a Geo database payload, deciding its kind from its content.
     pub fn load_geoip_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
         self.geoip_manager.load_database_from_bytes(data)
     }
+
+    /// Install a `geosite.dat`, failing when the file is not one.
+    ///
+    /// Separate from [`Router::load_geoip_database`] so that a mislabelled file
+    /// fails at the call site that asked for categories rather than quietly
+    /// replacing the address database.
+    pub fn load_geosite_database(&self, path: &str) -> Result<()> {
+        self.geoip_manager.load_geosite_database(path)
+    }
+
 
     pub fn rule_provider_manager(&self) -> &RuleProviderManager {
         &self.rule_provider_manager
@@ -605,6 +610,7 @@ impl Router {
             }
 
             let context = MatchContext {
+                mode: effective_mode,
                 domain: request.domain,
                 dst_ip: request.dst_ip,
                 resolved: &resolved,
@@ -895,6 +901,14 @@ impl Router {
             )));
         }
 
+        if rule_type == RuleType::ProxyMode && Mode::parse(rule.payload.trim()).is_none() {
+            return Err(Error::config(format!(
+                "proxy-mode rule for '{outbound}' names '{}'; expected 'rule', 'global' or \
+                 'direct'",
+                rule.payload
+            )));
+        }
+
         let regex = if rule_type == RuleType::DomainRegex {
             // Case-insensitive, because a DNS name is (RFC 1035 §2.3.3) and
             // every sibling rule type here already is: their patterns are
@@ -904,7 +918,7 @@ impl Router {
             // `Host: AD.example.com`, and the rule would look like it worked.
             //
             // A pattern that genuinely needs case sensitivity can still ask for
-            // it with an inline `(?-i)`.
+            // it with an inline `(?i)`-off group, `(?-i)`.
             Some(
                 RegexBuilder::new(&rule.payload)
                     .case_insensitive(true)
@@ -934,7 +948,12 @@ impl Router {
             Vec::new()
         };
         let network = if rule_type == RuleType::Network {
-            Some(Network::parse(&rule.payload)?)
+            Some(Network::parse(&rule.payload).ok_or_else(|| {
+                Error::config(format!(
+                    "Invalid network '{}': expected 'tcp' or 'udp'",
+                    rule.payload
+                ))
+            })?)
         } else {
             None
         };
@@ -1053,9 +1072,20 @@ impl Router {
                 .process_path
                 .is_some_and(|path| Self::matches_process_path(&rule.pattern, path)),
             RuleType::Network => rule.network == Some(context.network),
-            RuleType::RuleSet | RuleType::Geosite => self
+            RuleType::RuleSet => self
                 .rule_provider_manager
                 .matches(&rule.pattern, &context.rule_input(rule.no_resolve)),
+            RuleType::Geosite => context
+                .domain
+                .is_some_and(|domain| self.geoip_manager.matches_geosite(&rule.pattern, domain)),
+            // A `proxy-mode` rule names the routing mode it applies to. In global
+            // and direct mode the rule table is not consulted at all, so in
+            // practice this decides between "the mode the rules were written for" and
+            // nothing, which is what such a profile means by it.
+            RuleType::ProxyMode => context
+                .mode
+                .as_str()
+                .eq_ignore_ascii_case(&rule.pattern),
             RuleType::And => rule
                 .children
                 .iter()
@@ -1097,6 +1127,7 @@ impl Router {
                 src_ip: None,
                 src_port: None,
                 network: Network::Tcp,
+                mode: Mode::Rule,
                 process_name,
                 process_path: None,
                 inbound: InboundContext::default(),
@@ -1253,11 +1284,32 @@ mod tests {
             is_cn && country_code.eq_ignore_ascii_case("cn")
         }
 
+        /// Two categories, so a `GEOSITE` rule can be shown to route and a
+        /// mistyped category can be shown not to.
+        fn matches_geosite(&self, tag: &str, domain: &str) -> bool {
+            let in_suffix = |pattern: &str| {
+                let domain = domain.trim_end_matches('.');
+                domain.eq_ignore_ascii_case(pattern)
+                    || (domain.len() > pattern.len()
+                        && domain.as_bytes()[domain.len() - pattern.len() - 1] == b'.'
+                        && domain[domain.len() - pattern.len()..].eq_ignore_ascii_case(pattern))
+            };
+            match tag.to_ascii_lowercase().as_str() {
+                "netflix" => in_suffix("netflix.com"),
+                "category-ads-all" => in_suffix("doubleclick.net"),
+                _ => false,
+            }
+        }
+
         fn load_database(&self, _path: &str) -> Result<()> {
             Ok(())
         }
 
         fn load_database_from_bytes(&self, _data: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+
+        fn load_geosite_database(&self, _path: &str) -> Result<()> {
             Ok(())
         }
     }
@@ -1751,6 +1803,54 @@ mod tests {
         }
     }
 
+    /// `proxy-mode` names the routing mode a rule belongs to.
+    ///
+    /// A profile written for an engine without a native direct mode expresses it
+    /// as a rule instead: `{"proxy_mode": "direct", "outbound": "DIRECT"}`. This
+    /// engine does have one, so in direct mode the rule table is never consulted.
+    /// Both routes end up doing the same thing, and recognising the condition is
+    /// what lets such a profile load.
+    #[test]
+    fn proxy_mode_rules_follow_the_effective_mode() {
+        let _mode_guard = MODE_LOCK.lock();
+        set_runtime_proxy_mode(proxy_mode::CONFIG);
+
+        let router = rule_table_router(vec![
+            rule(RuleType::ProxyMode, "global", "GLOBAL-ONLY"),
+            rule(RuleType::ProxyMode, "rule", "RULE-ONLY"),
+            rule(RuleType::Match, "", "FALLBACK"),
+        ]);
+
+        // The configured mode is `rule`, so the `rule` branch decides and the
+        // `global` branch cannot.
+        assert_eq!(
+            router.match_outbound(Some("example.com"), None, Some(443), None),
+            "RULE-ONLY"
+        );
+
+        // Forcing global mode short-circuits the table entirely: there is no
+        // group configured, so the mode fails closed rather than leaking to
+        // DIRECT.
+        set_runtime_proxy_mode(proxy_mode::GLOBAL);
+        assert_eq!(
+            router.match_outbound(Some("example.com"), None, Some(443), None),
+            "REJECT"
+        );
+        set_runtime_proxy_mode(proxy_mode::CONFIG);
+    }
+
+    /// A `proxy-mode` payload outside the mode vocabulary is a config error, not a
+    /// rule that silently never fires.
+    #[test]
+    fn a_proxy_mode_rule_with_an_unknown_mode_is_refused() {
+        let config = Config {
+            rules: vec![rule(RuleType::ProxyMode, "tunnel", "PROXY")],
+            ..Config::default()
+        };
+        let error = Router::compile_rules(&config.rules).expect_err("must refuse");
+        assert!(error.to_string().contains("proxy-mode"), "{error}");
+    }
+
     /// The inbound rules read where a connection arrived: the protocol it
     /// spoke, the inbound it landed on, the port that inbound listens on, and
     /// the user it authenticated as.
@@ -1839,7 +1939,7 @@ mod tests {
 
         // A range is accepted for `in-port`: the parser is the port parser the
         // source/destination rules already use, and a superset of the single
-        // port form the Clash profiles write.
+        // port form the community profiles write.
         let ranges = Router::compile_port_ranges("1000-2000,53").expect("parses");
         assert_eq!(ranges, vec![(1000, 2000), (53, 53)]);
     }

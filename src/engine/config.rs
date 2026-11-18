@@ -667,6 +667,13 @@ pub enum RuleType {
     Network,
     RuleSet,
     Geosite,
+    /// A mode guard: matches the routing mode the engine is in.
+    ///
+    /// Some profile dialects express "direct" and "global" as *rules* guarded by
+    /// this condition, because they have no native mode short-circuit; this engine
+    /// has one, so the two arrive at the same behaviour from opposite directions.
+    /// Recognising the condition is what lets such a profile load at all.
+    ProxyMode,
     And,
     Or,
     Not,
@@ -692,6 +699,7 @@ impl_config_enum!(RuleType {
     Network => "network",
     RuleSet => "rule-set" | "rule_set",
     Geosite => "geosite",
+    ProxyMode => "proxy-mode" | "proxy_mode",
     And => "and",
     Or => "or",
     Not => "not",
@@ -781,10 +789,34 @@ mod tests {
         assert_eq!(DnsMode::parse("redir-hosted"), None);
 
         // The spellings reach the config document too, not just the parser.
-        let clash: DnsConfig =
+        let redir_host: DnsConfig =
             nextjson::from_str(r#"{"enable":true,"enhanced-mode":"redir-host"}"#)
-                .expect("the Clash spelling");
-        assert_eq!(clash.enhanced_mode, DnsMode::Normal);
+                .expect("the redir-host spelling");
+        assert_eq!(redir_host.enhanced_mode, DnsMode::Normal);
+    }
+
+    /// The mode guard reads from a profile, so the vocabulary is a compatibility
+    /// surface: both spellings have to land on the same variant, and an unknown
+    /// rule type must stay an error rather than become a rule that never fires.
+    #[test]
+    fn the_mode_guard_accepts_both_spellings() {
+        for spelling in ["proxy-mode", "proxy_mode"] {
+            let document = format!(
+                r#"{{"type":"{spelling}","payload":"global","outbound":"PROXY"}}"#
+            );
+            let rule: RuleConfig = nextjson::from_str(&document).expect("the rule decodes");
+            assert_eq!(rule.rule_type, RuleType::ProxyMode, "{spelling}");
+            assert_eq!(rule.payload, "global");
+            assert_eq!(rule.outbound, "PROXY");
+        }
+
+        assert_eq!(RuleType::ProxyMode.as_str(), "proxy-mode");
+        assert_eq!(RuleType::parse("proxy-mode"), Some(RuleType::ProxyMode));
+        assert_eq!(RuleType::parse("proxy_mode"), Some(RuleType::ProxyMode));
+        assert!(nextjson::from_str::<RuleConfig>(
+            r#"{"type":"unknown-mode","payload":"global","outbound":"X"}"#
+        )
+        .is_err());
     }
 
     /// A field the caller never mentions keeps the engine default instead of

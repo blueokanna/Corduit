@@ -1,4 +1,5 @@
 use crate::engine::error::{Error, Result};
+use crate::engine::geo::{DatabaseKind, GeoDatabases};
 use crate::engine::mmdb::MmdbReader;
 use parking_lot::RwLock;
 use std::net::IpAddr;
@@ -6,8 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 static DEFAULT_DATABASE_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
+static DEFAULT_GEOSITE_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// Register the database used by subsequently constructed routers.
+///
+/// The file may be any of the three shapes this engine reads — a MaxMind
+/// `Country.mmdb`, a v2ray/Mihomo `geoip.dat`, or a `geosite.dat` — because the
+/// kind is decided from the content, not from the name.
 ///
 /// Embedders must use this instead of mutating process environment variables
 /// after native or Flutter worker threads have started. Existing routers keep
@@ -21,6 +27,24 @@ pub fn set_default_database_path(path: impl AsRef<Path>) -> Result<()> {
         return Err(Error::config("GeoIP database path is not a file"));
     }
     *DEFAULT_DATABASE_PATH.write() = Some(path);
+    Ok(())
+}
+
+/// Register the `geosite.dat` used by subsequently constructed routers.
+///
+/// Separate from [`set_default_database_path`] because a profile normally ships
+/// both files and wants both; passing the geosite file to the country database
+/// would otherwise replace the address half instead of installing the category
+/// half.
+pub fn set_default_geosite_path(path: impl AsRef<Path>) -> Result<()> {
+    let path = path
+        .as_ref()
+        .canonicalize()
+        .map_err(|error| Error::config(format!("Cannot resolve geosite database: {error}")))?;
+    if !path.is_file() {
+        return Err(Error::config("Geosite database path is not a file"));
+    }
+    *DEFAULT_GEOSITE_PATH.write() = Some(path);
     Ok(())
 }
 
@@ -97,64 +121,144 @@ impl core::fmt::Debug for CountryCode {
     }
 }
 
-/// Country-level IP matching abstraction.
+/// Geo data matching for the router.
 ///
-/// `Router` depends on this trait (not on `GeoIpManager` directly) so that
-/// tests and alternate data sources can inject a deterministic implementation.
+/// `Router` depends on this trait (not on `GeoIpManager` directly) so that tests
+/// and alternate data sources can inject a deterministic implementation. It spans
+/// both questions a `GEOIP` / `GEOSITE` rule can ask, because both are answered
+/// from the same family of files.
 pub trait CountryMatcher: Send + Sync {
+    /// Whether `ip` belongs to `country_code`.
     fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool;
+
+    /// Whether `domain` belongs to the geosite category `tag`.
+    fn matches_geosite(&self, tag: &str, domain: &str) -> bool;
+
+    /// Install a Geo database file, deciding its kind from its content.
     fn load_database(&self, path: &str) -> Result<()>;
+
+    /// Install a Geo database from memory.
     fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()>;
+
+    /// Install a `geosite.dat`, refusing a file that is not one.
+    fn load_geosite_database(&self, path: &str) -> Result<()>;
 }
 
+/// The Geo databases behind one router: an optional MaxMind DB for country
+/// ownership and the community `.dat` pair for categories and address ranges.
 pub struct GeoIpDatabase {
+    /// `Country.mmdb`, when the profile ships one. Preferred for country lookups
+    /// because it is the source that carries per-city and per-ASN detail.
     reader: Option<MmdbReader>,
+    /// `geoip.dat` / `geosite.dat`, when the profile ships those.
+    geo: GeoDatabases,
 }
 
 impl GeoIpDatabase {
+    /// A database with nothing loaded: every Geo rule misses.
     pub fn new() -> Self {
-        Self { reader: None }
+        Self {
+            reader: None,
+            geo: GeoDatabases::new(),
+        }
     }
 
+    /// Load a database file of any supported kind.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let data = std::fs::read(path.as_ref())
             .map_err(|e| Error::config(format!("Failed to read GeoIP database: {e}")))?;
-        let reader = MmdbReader::open(data)
-            .map_err(|e| Error::config(format!("Failed to parse GeoIP database: {e}")))?;
-        Ok(Self {
-            reader: Some(reader),
-        })
+        Self::load_from_bytes(data)
     }
 
+    /// Load a database payload of any supported kind.
     pub fn load_from_bytes(data: Vec<u8>) -> Result<Self> {
-        let reader = MmdbReader::open(data).map_err(|e| {
-            Error::config(format!("Failed to parse GeoIP database from bytes: {e}"))
-        })?;
-        Ok(Self {
-            reader: Some(reader),
-        })
+        let mut database = Self::new();
+        database.install_bytes(data)?;
+        Ok(database)
     }
 
+    /// Install a file into this database, replacing the half it belongs to.
+    ///
+    /// A MaxMind DB replaces the address reader; `geoip.dat` replaces the address
+    /// ranges; `geosite.dat` replaces the categories. Two address sources cannot
+    /// both be installed through this call because the file decides, and a profile
+    /// that ships both wants the pair, not a merge.
+    pub fn install_file<P: AsRef<Path>>(&mut self, path: P) -> Result<DatabaseKind> {
+        let path = path.as_ref();
+        let data = std::fs::read(path).map_err(|error| {
+            Error::config(format!(
+                "Failed to read Geo database '{}': {error}",
+                path.display()
+            ))
+        })?;
+        self.install_bytes(data)
+    }
+
+    /// Install a payload into this database, replacing the half it belongs to.
+    pub fn install_bytes(&mut self, data: Vec<u8>) -> Result<DatabaseKind> {
+        let kind = crate::engine::geo::identify(&data);
+        match kind {
+            DatabaseKind::Mmdb => {
+                let reader = MmdbReader::open(data)
+                    .map_err(|e| Error::config(format!("Failed to parse Country.mmdb: {e}")))?;
+                self.reader = Some(reader);
+                Ok(kind)
+            }
+            DatabaseKind::GeoSite | DatabaseKind::GeoIp => {
+                let installed = self.geo.load_bytes(data)?;
+                Ok(installed)
+            }
+            DatabaseKind::Unknown => Err(Error::config(
+                "Geo database is in a format this engine does not read: expected Country.mmdb, \
+                 geosite.dat or geoip.dat",
+            )),
+        }
+    }
+
+    /// Whether any Geo source is available.
     pub fn is_loaded(&self) -> bool {
+        self.reader.is_some() || !self.geo.is_empty()
+    }
+
+    /// Whether a MaxMind database is loaded.
+    pub fn has_mmdb(&self) -> bool {
         self.reader.is_some()
     }
 
+    /// The community databases, for callers that want to query tags directly.
+    pub fn geo(&self) -> &GeoDatabases {
+        &self.geo
+    }
+
+    /// Country ownership from the MaxMind database, when one is loaded.
     pub fn lookup_country(&self, ip: IpAddr) -> Option<CountryCode> {
         self.reader.as_ref()?.lookup_country(ip)
     }
 
+    /// Whether `ip` belongs to `country_code`.
+    ///
+    /// Order matters and is deliberate: `LAN`/`PRIVATE` are answered from the
+    /// unroutable table (no database describes them consistently), then the
+    /// MaxMind database is authoritative when it has a record, and `geoip.dat`
+    /// answers the rest. A profile that ships only `geoip.dat` — the common
+    /// community-profile case — therefore works without a MaxMind file at all.
     pub fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
         if country_code.eq_ignore_ascii_case("LAN") || country_code.eq_ignore_ascii_case("PRIVATE")
         {
             return is_non_routable(ip);
         }
-        let Some(code) = CountryCode::parse(country_code) else {
-            return false;
-        };
-        match self.lookup_country(ip) {
-            Some(found) => found.matches(&code),
-            None => false,
+        if let Some(found) = self.lookup_country(ip) {
+            return match CountryCode::parse(country_code) {
+                Some(code) => found.matches(&code),
+                None => false,
+            };
         }
+        self.geo.matches_geoip(country_code, ip)
+    }
+
+    /// Whether `domain` belongs to the geosite category `tag`.
+    pub fn matches_geosite(&self, tag: &str, domain: &str) -> bool {
+        self.geo.matches_geosite(tag, domain)
     }
 }
 
@@ -164,9 +268,9 @@ impl Default for GeoIpDatabase {
     }
 }
 
-/// Guards the "Country.mmdb not found" warning so it is emitted at most once
-/// per process (routers can be constructed repeatedly, e.g. on hot reload or
-/// in tests, and the missing DB is a normal recoverable state).
+/// Guards the "no Geo database found" warning so it is emitted at most once per
+/// process (routers can be constructed repeatedly, e.g. on hot reload or in
+/// tests, and a missing database is a normal recoverable state).
 static GEOIP_MISSING_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -181,91 +285,136 @@ impl GeoIpManager {
         }
     }
 
-    /// Creates a manager backed by an optionally-supplied country database.
-    /// A database is loaded from `Country.mmdb` next to the executable (or the
-    /// path registered through [`set_default_database_path`] or supplied via
-    /// `CORDUIT_GEOIP_DB`). If no database is available the
-    /// manager starts empty: `GEOIP` rules will simply miss and fall through,
-    /// while the rest of the router keeps working. Callers can later install a
-    /// database at runtime via [`GeoIpManager::load_database`].
+    /// Build a manager from the Geo databases beside the executable.
+    ///
+    /// Candidate files, each loaded independently so a profile may ship any
+    /// combination of them:
+    ///
+    /// * the path registered through [`set_default_database_path`], otherwise
+    ///   `CORDUIT_GEOIP_DB`, otherwise `Country.mmdb` / `geoip.dat` next to the
+    ///   executable;
+    /// * the path registered through [`set_default_geosite_path`], otherwise
+    ///   `CORDUIT_GEOSITE_DB`, otherwise `geosite.dat` next to the executable.
+    ///
+    /// A database that is absent is a normal, recoverable state: `GEOIP` and
+    /// `GEOSITE` rules simply miss and fall through to the next rule. A database
+    /// that is present but unreadable is a warning naming the file, because that
+    /// one is a mistake worth seeing.
     pub fn from_embedded_country_database() -> Self {
-        let db_path = DEFAULT_DATABASE_PATH
-            .read()
-            .clone()
-            .or_else(|| std::env::var_os("CORDUIT_GEOIP_DB").map(PathBuf::from))
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| exe.parent().map(|dir| dir.join("Country.mmdb")))
-            });
+        let mut database = GeoIpDatabase::new();
+        let mut found_any = false;
 
-        let database = match db_path {
-            Some(path) if path.is_file() => match GeoIpDatabase::load_from_file(&path) {
-                Ok(db) => {
-                    tracing::info!("GeoIP country database loaded from {}", path.display());
-                    db
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "GeoIP database at {} is unreadable: {error}; \
-                             continuing without GeoIP rules",
-                        path.display()
-                    );
-                    GeoIpDatabase::new()
-                }
-            },
-            Some(path) => {
-                // A missing database is a normal, recoverable state (GEOIP
-                // rules just miss). Warn once per process instead of on every
-                // router construction so test/restart loops don't flood logs.
-                if !GEOIP_MISSING_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    tracing::warn!(
-                        "GeoIP database {} not found; continuing without GeoIP rules \
-                         (set CORDUIT_GEOIP_DB to enable)",
-                        path.display()
-                    );
-                } else {
-                    tracing::debug!(
-                        "GeoIP database {} not found (already warned); GEOIP rules disabled",
-                        path.display()
-                    );
-                }
-                GeoIpDatabase::new()
+        for candidate in ip_candidates() {
+            if !candidate.is_file() {
+                continue;
             }
-            None => GeoIpDatabase::new(),
-        };
+            match database.install_file(&candidate) {
+                Ok(kind) => {
+                    found_any = true;
+                    tracing::info!(
+                        "Geo database {} loaded from {}",
+                        kind.as_str(),
+                        candidate.display()
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    "Geo database {} is unreadable: {error}; continuing without it",
+                    candidate.display()
+                ),
+            }
+        }
+
+        for candidate in site_candidates() {
+            if !candidate.is_file() {
+                continue;
+            }
+            match database.install_file(&candidate) {
+                Ok(kind) => {
+                    found_any = true;
+                    tracing::info!(
+                        "Geo database {} loaded from {}",
+                        kind.as_str(),
+                        candidate.display()
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    "Geo database {} is unreadable: {error}; continuing without it",
+                    candidate.display()
+                ),
+            }
+        }
+
+        if !found_any && !GEOIP_MISSING_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!(
+                "No Geo database found (looked for Country.mmdb, geoip.dat and geosite.dat next to \
+                 the executable); GEOIP and GEOSITE rules will not match. Set CORDUIT_GEOIP_DB / \
+                 CORDUIT_GEOSITE_DB or call set_default_database_path to enable them"
+            );
+        }
+
+        if found_any {
+            tracing::info!("Geo databases: {}", database.geo().describe());
+        }
 
         Self {
             database: Arc::new(RwLock::new(database)),
         }
     }
 
+    /// Install a database file, deciding its kind from its content.
     pub fn load_database<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let db = GeoIpDatabase::load_from_file(path)?;
-        let mut guard = self.database.write();
-        *guard = db;
-        tracing::info!("GeoIP database loaded successfully");
+        let kind = self.database.write().install_file(path)?;
+        tracing::info!("Geo database ({}) loaded successfully", kind.as_str());
         Ok(())
     }
 
+    /// Install a database from memory, deciding its kind from its content.
     pub fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
-        let db = GeoIpDatabase::load_from_bytes(data)?;
-        let mut guard = self.database.write();
-        *guard = db;
-        tracing::info!("GeoIP database loaded from bytes successfully");
+        let kind = self.database.write().install_bytes(data)?;
+        tracing::info!(
+            "Geo database ({}) loaded from memory successfully",
+            kind.as_str()
+        );
         Ok(())
     }
 
+    /// Install a `geosite.dat`, refusing a file that is not one.
+    ///
+    /// The geosite half is replaced on its own: reloading categories must not
+    /// disturb the address database a connection is being routed against.
+    pub fn load_geosite_database<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.database.read().geo().load_geosite_file(path.as_ref())
+    }
+
+    /// Whether any Geo source is available.
     pub fn is_loaded(&self) -> bool {
         self.database.read().is_loaded()
     }
 
+    /// Country ownership from the MaxMind database, when one is loaded.
     pub fn lookup_country(&self, ip: IpAddr) -> Option<CountryCode> {
         self.database.read().lookup_country(ip)
     }
 
+    /// Whether `ip` belongs to `country_code`.
     pub fn matches_country(&self, country_code: &str, ip: IpAddr) -> bool {
         self.database.read().matches_country(country_code, ip)
+    }
+
+    /// Whether `domain` belongs to the geosite category `tag`.
+    pub fn matches_geosite(&self, tag: &str, domain: &str) -> bool {
+        self.database.read().matches_geosite(tag, domain)
+    }
+
+    /// One line describing the loaded sources, for diagnostics.
+    pub fn describe(&self) -> String {
+        let database = self.database.read();
+        let mmdb = if database.has_mmdb() {
+            "mmdb"
+        } else {
+            "no mmdb"
+        };
+        format!("{mmdb}, {}", database.geo().describe())
     }
 }
 
@@ -274,12 +423,20 @@ impl CountryMatcher for GeoIpManager {
         self.matches_country(country_code, ip)
     }
 
+    fn matches_geosite(&self, tag: &str, domain: &str) -> bool {
+        self.matches_geosite(tag, domain)
+    }
+
     fn load_database(&self, path: &str) -> Result<()> {
         self.load_database(path)
     }
 
     fn load_database_from_bytes(&self, data: Vec<u8>) -> Result<()> {
         self.load_database_from_bytes(data)
+    }
+
+    fn load_geosite_database(&self, path: &str) -> Result<()> {
+        self.load_geosite_database(path)
     }
 }
 
@@ -295,6 +452,43 @@ impl Clone for GeoIpManager {
             database: Arc::clone(&self.database),
         }
     }
+}
+
+/// Where to look for the address half, in order.
+fn ip_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = DEFAULT_DATABASE_PATH.read().clone() {
+        candidates.push(path);
+    }
+    if let Some(path) = std::env::var_os("CORDUIT_GEOIP_DB") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(directory) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        candidates.push(directory.join("Country.mmdb"));
+        candidates.push(directory.join("geoip.dat"));
+    }
+    candidates
+}
+
+/// Where to look for the geosite half, in order.
+fn site_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = DEFAULT_GEOSITE_PATH.read().clone() {
+        candidates.push(path);
+    }
+    if let Some(path) = std::env::var_os("CORDUIT_GEOSITE_DB") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(directory) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        candidates.push(directory.join("geosite.dat"));
+    }
+    candidates
 }
 
 /// Whether an address can be reached from the public internet.
@@ -391,6 +585,7 @@ mod tests {
     fn test_geoip_database_new() {
         let db = GeoIpDatabase::new();
         assert!(!db.is_loaded());
+        assert!(!db.has_mmdb());
     }
 
     #[test]
@@ -401,20 +596,114 @@ mod tests {
         assert!(!db.matches_country("US", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 
+    /// The community pair is what makes this reachable without a MaxMind file:
+    /// `GEOIP,CN` and `GEOSITE,netflix` both have to answer from `geoip.dat` and
+    /// `geosite.dat` alone.
+    #[test]
+    fn the_community_dat_pair_answers_rules_without_an_mmdb() {
+        let mut database = GeoIpDatabase::new();
+        assert_eq!(
+            database
+                .install_bytes(geoip_fixture())
+                .expect("geoip installs"),
+            DatabaseKind::GeoIp
+        );
+        assert_eq!(
+            database
+                .install_bytes(geosite_fixture())
+                .expect("geosite installs"),
+            DatabaseKind::GeoSite
+        );
+        assert!(database.is_loaded());
+        assert!(!database.has_mmdb());
+
+        assert!(database.matches_country("CN", "36.1.2.3".parse().expect("ip")));
+        assert!(!database.matches_country("CN", "8.8.8.8".parse().expect("ip")));
+        assert!(database.matches_geosite("netflix", "www.netflix.com"));
+        assert!(!database.matches_geosite("netflix", "example.com"));
+        // LAN stays answered from the unroutable table even with a database.
+        assert!(database.matches_country("LAN", "10.1.2.3".parse().expect("ip")));
+    }
+
+    #[test]
+    fn an_unreadable_payload_is_refused() {
+        let mut database = GeoIpDatabase::new();
+        assert!(database.install_bytes(b"DOMAIN,example.com".to_vec()).is_err());
+        assert!(!database.is_loaded());
+    }
+
     #[test]
     fn test_embedded_country_database_degrades_gracefully() {
-        // Without a real Country.mmdb on disk the manager must still construct,
-        // start empty, and let GEOIP rules miss without panicking.
+        // Without a real database on disk the manager must still construct, start
+        // empty, and let GEOIP rules miss without panicking.
         let manager = GeoIpManager::from_embedded_country_database();
+        let loaded = manager.is_loaded();
+        // Either a database from the environment exists (CI may ship one) or the
+        // manager is empty; both are valid, neither may panic.
+        if !loaded {
+            assert!(
+                manager
+                    .lookup_country(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))
+                    .is_none()
+            );
+            assert!(!manager.matches_country("CN", IpAddr::V4(Ipv4Addr::new(36, 152, 0, 1))));
+            assert!(!manager.matches_geosite("netflix", "www.netflix.com"));
+        }
+        assert!(!manager.describe().is_empty());
+    }
 
-        assert!(!manager.is_loaded());
-        // Empty database: every GEOIP lookup is a miss, falling through to
-        // the next rule instead of aborting routing.
-        assert!(
-            manager
-                .lookup_country(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)))
-                .is_none()
-        );
-        assert!(!manager.matches_country("CN", IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114))));
+    // --- fixtures ------------------------------------------------------------
+
+    fn varint(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    fn field_varint(out: &mut Vec<u8>, number: u8, value: u64) {
+        varint(out, u64::from(number) << 3);
+        varint(out, value);
+    }
+
+    fn field_bytes(out: &mut Vec<u8>, number: u8, payload: &[u8]) {
+        varint(out, (u64::from(number) << 3) | 2);
+        varint(out, payload.len() as u64);
+        out.extend_from_slice(payload);
+    }
+
+    fn geoip_fixture() -> Vec<u8> {
+        let mut cidr = Vec::new();
+        field_bytes(&mut cidr, 1, &[36, 0, 0, 0]);
+        field_varint(&mut cidr, 2, 8);
+
+        let mut country = Vec::new();
+        field_bytes(&mut country, 1, b"CN");
+        field_bytes(&mut country, 2, &cidr);
+
+        let mut out = Vec::new();
+        field_bytes(&mut out, 1, &country);
+        out
+    }
+
+    fn geosite_fixture() -> Vec<u8> {
+        let mut domain = Vec::new();
+        field_varint(&mut domain, 1, 0);
+        field_bytes(&mut domain, 2, b"netflix.com");
+
+        let mut category = Vec::new();
+        field_bytes(&mut category, 1, b"netflix");
+        field_bytes(&mut category, 2, &domain);
+
+        let mut out = Vec::new();
+        field_bytes(&mut out, 1, &category);
+        out
     }
 }

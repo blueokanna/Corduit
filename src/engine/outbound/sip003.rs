@@ -1,6 +1,6 @@
 //! SIP003 plugins: the transport a Shadowsocks node's `plugin` names.
 //!
-//! `plugin` + `plugin-opts` is how Clash-family subscriptions spell
+//! `plugin` + `plugin-opts` is how the community subscriptions spell
 //! "shadowsocks behind something else". Every plugin here shapes the **TCP**
 //! stream the SS records travel inside; once the socket is wrapped the node is
 //! an ordinary Shadowsocks outbound, which is why the wiring lives in one place:

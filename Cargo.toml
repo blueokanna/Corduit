@@ -18,6 +18,7 @@ default = ["std", "tls", "wireguard"]
 std = [
     "tls",
     "dep:dashmap",
+    "dep:flate2",
     "dep:getrandom",
     "dep:ipnet",
     "dep:once_cell",
@@ -27,6 +28,7 @@ std = [
     "dep:smoltcp",
     "dep:socket2",
     "dep:sysinfo",
+    "dep:zstd",
     "dep:mach2",
     "dep:tracing",
     "dep:tracing-subscriber",
@@ -77,6 +79,17 @@ nextjson = { version = "0.1.5", default-features = false, features = [
 rustbinary = { version = "0.1.10", default-features = false, features = [
     "derive",
 ], optional = true }
+
+# --- compression (std only) --------------------------------------------------
+# Both binary rule-set formats arrive compressed: a sing-box set (".srs") is a
+# four-byte header followed by a zlib stream, and another dialect's set (".mrs")
+# is a single zstd frame whose magic lives *inside* the compressed stream. The
+# zlib-rs backend is pure Rust; zstd-sys vendors its own C sources, and every
+# target this crate builds for already has a C toolchain.
+flate2 = { version = "1", default-features = false, features = [
+    "zlib-rs",
+], optional = true }
+zstd = { version = "0.13", default-features = false, optional = true }
 
 # --- tracing / telemetry (std only) -----------------------------------------
 tracing = { version = "0.1", optional = true }

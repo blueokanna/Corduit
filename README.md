@@ -70,9 +70,17 @@ Capabilities:
   `shadow-tls` (v3) — resolved as an in-tree stream, never as an external
   binary.
 - **Routing**: `domain`, `domain-suffix`, `domain-keyword`, `domain-regex`,
-  `geoip`, `ip-cidr`, `src-ip-cidr`, `src-port`, `dst-port`, `process-name`,
-  `rule-set` and `match`, with `rule` / `global` / `direct` modes; rule
-  providers and proxy providers refresh on an interval.
+  `geosite`, `geoip`, `ip-cidr`, `src-ip-cidr`, `src-port`, `dst-port`,
+  `in-port` / `in-type` / `in-name` / `in-user`, `process-name`,
+  `process-path`, `network`, `rule-set`, `proxy-mode`, `and` / `or` / `not`
+  and `match`, with `rule` / `global` / `direct` modes; rule providers and
+  proxy providers refresh on an interval.
+- **Rule sets and Geo data**: text, YAML and JSON payloads; both binary rule-set
+  families in the wild - `.srs` (versions 1-5, zlib, including `and` / `or` /
+  `invert`) and `.mrs` (container version 1, zstd, with its `+` suffix and `*`
+  single-label operators) - plus the v2ray Geo databases (`geosite.dat` for
+  categories, `geoip.dat` or `Country.mmdb` for address ownership), all decoded
+  in-tree with categories and countries compiled on first use.
 - **DNS**: the resolver is [RecurseX](https://crates.io/crates/recurse-x), the
   same author's library, consumed as a dependency. It provides upstreams over
   UDP / TCP / DoT / DoH / DoH3 / DoQ, a stability-measured multi-tier cache,

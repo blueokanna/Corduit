@@ -101,6 +101,18 @@ pub struct RuleMatchInput<'a> {
     pub src_ip: Option<IpAddr>,
     /// Executable name owning the connection.
     pub process_name: Option<&'a str>,
+    /// Full executable path, when it is resolvable.
+    ///
+    /// A `.srs` set may pin a path rather than a name, which the text format
+    /// cannot express; the field lives here so both formats are evaluated
+    /// against the same input.
+    pub process_path: Option<&'a str>,
+    /// Transport in use.
+    pub network: crate::engine::ruleset::Transport,
+    /// Destination port.
+    pub dst_port: Option<u16>,
+    /// Source port.
+    pub src_port: Option<u16>,
 }
 
 impl RuleMatchInput<'_> {
@@ -109,6 +121,25 @@ impl RuleMatchInput<'_> {
     fn dst_candidates(&self) -> impl Iterator<Item = IpAddr> + '_ {
         let resolved: &[IpAddr] = if self.no_resolve { &[] } else { self.resolved };
         resolved.iter().copied()
+    }
+
+    /// The same connection, described for a binary rule set.
+    ///
+    /// One input type instead of two keeps the router from describing a
+    /// connection twice and then disagreeing with itself about the port.
+    fn ruleset_input(&self) -> crate::engine::ruleset::RuleSetInput<'_> {
+        crate::engine::ruleset::RuleSetInput {
+            domain: self.domain,
+            dst_ip: self.dst_ip,
+            resolved: self.resolved,
+            no_resolve: self.no_resolve,
+            src_ip: self.src_ip,
+            dst_port: self.dst_port,
+            src_port: self.src_port,
+            network: self.network,
+            process_name: self.process_name,
+            process_path: self.process_path,
+        }
     }
 }
 
@@ -365,9 +396,43 @@ impl RuleIndex {
     }
 }
 
+/// A provider's payload, compiled for matching.
+///
+/// Two representations, one owner: a text payload becomes a [`RuleIndex`], a
+/// binary payload becomes a [`crate::engine::ruleset::RuleSet`], and either way
+/// the provider answers through [`CompiledSet::matches`]. Both are kept because
+/// they are not interchangeable — the index has no notion of a transport or a
+/// port, and the binary form has no notion of a per-behavior text line — and a
+/// provider holds exactly one of them.
+#[derive(Debug, Default)]
+struct CompiledSet {
+    index: RuleIndex,
+    rules: crate::engine::ruleset::RuleSet,
+}
+
+impl CompiledSet {
+    /// Whether any entry from either representation matches.
+    fn matches(&self, input: &RuleMatchInput<'_>) -> bool {
+        if self.index.matches(input) {
+            return true;
+        }
+        !self.rules.is_empty() && self.rules.matches(&input.ruleset_input())
+    }
+
+    /// Entries that can decide a match.
+    fn matchable_count(&self) -> usize {
+        self.index.matchable_count() + self.rules.condition_count()
+    }
+
+    /// Whether an address the router resolved could decide this set.
+    fn has_dst_ip_entries(&self) -> bool {
+        self.index.has_dst_ip_entries() || self.rules.wants_dst_ip()
+    }
+}
+
 pub struct RuleProvider {
     config: RuleProviderConfig,
-    index: RwLock<RuleIndex>,
+    set: RwLock<CompiledSet>,
     last_update: RwLock<Option<Instant>>,
 }
 
@@ -375,7 +440,7 @@ impl RuleProvider {
     pub fn new(config: RuleProviderConfig) -> Self {
         Self {
             config,
-            index: RwLock::new(RuleIndex::default()),
+            set: RwLock::new(CompiledSet::default()),
             last_update: RwLock::new(None),
         }
     }
@@ -401,41 +466,21 @@ impl RuleProvider {
     /// be indexed are reported instead of dropped — a rule that silently never
     /// matches is the hardest kind of routing bug to find.
     pub fn load(&self) -> Result<()> {
-        let content = match self.config.provider_type {
+        let payload = match self.config.provider_type {
             RuleProviderType::File => self.load_from_file()?,
             RuleProviderType::Http => self.load_from_http()?,
         };
 
-        let entries = self.parse_rules(&content)?;
-        if entries.is_empty() {
+        let set = self.compile_payload(&payload)?;
+        let indexed = set.matchable_count();
+        if indexed == 0 {
             return Err(Error::config(format!(
-                "Rule provider '{}' did not contain any supported rules",
+                "Rule provider '{}' has entries but none of them can decide a match",
                 self.config.name
             )));
         }
 
-        let index = RuleIndex::compile(&entries);
-        let indexed = index.matchable_count();
-        if indexed == 0 {
-            return Err(Error::config(format!(
-                "Rule provider '{}' has {} entries but none are usable: {}",
-                self.config.name,
-                entries.len(),
-                index.rejected_summary()
-            )));
-        }
-        if !index.rejected.is_empty() {
-            tracing::warn!(
-                "Rule provider '{}' indexed {} of {} entries; {} unusable: {}",
-                self.config.name,
-                indexed,
-                entries.len(),
-                index.rejected.len(),
-                index.rejected_summary()
-            );
-        }
-
-        *self.index.write() = index;
+        *self.set.write() = set;
 
         *self.last_update.write() = Some(Instant::now());
 
@@ -448,18 +493,94 @@ impl RuleProvider {
         Ok(())
     }
 
-    fn load_from_file(&self) -> Result<String> {
+    /// Compile a payload into the representation its format calls for.
+    ///
+    /// The format is decided from the content, never from a file extension: a
+    /// subscription URL's suffix is a suggestion, and a `.mrs` provider that was
+    /// parsed as text used to yield a rule set that matched nothing at all. A
+    /// payload this build cannot decode is an error naming what it recognised.
+    fn compile_payload(&self, payload: &[u8]) -> Result<CompiledSet> {
+        use crate::engine::ruleset::Format;
+
+        match crate::engine::ruleset::detect(payload) {
+            Format::Text => {
+                let content = core::str::from_utf8(payload).map_err(|error| {
+                    Error::config(format!(
+                        "Rule provider '{}' is text but is not valid UTF-8: {error}",
+                        self.config.name
+                    ))
+                })?;
+                let entries = self.parse_rules(content)?;
+                if entries.is_empty() {
+                    return Err(Error::config(format!(
+                        "Rule provider '{}' did not contain any supported rules",
+                        self.config.name
+                    )));
+                }
+                let index = RuleIndex::compile(&entries);
+                if index.matchable_count() == 0 {
+                    return Err(Error::config(format!(
+                        "Rule provider '{}' has {} entries but none are usable: {}",
+                        self.config.name,
+                        entries.len(),
+                        index.rejected_summary()
+                    )));
+                }
+                if !index.rejected.is_empty() {
+                    tracing::warn!(
+                        "Rule provider '{}' indexed {} of {} entries; {} unusable: {}",
+                        self.config.name,
+                        index.matchable_count(),
+                        entries.len(),
+                        index.rejected.len(),
+                        index.rejected_summary()
+                    );
+                }
+                Ok(CompiledSet {
+                    index,
+                    rules: crate::engine::ruleset::RuleSet::default(),
+                })
+            }
+            format => {
+                let rules = crate::engine::ruleset::decode(payload, Some(format))?;
+                if rules.is_empty() {
+                    return Err(Error::config(format!(
+                        "Rule provider '{}' decoded no rules from a {} payload",
+                        self.config.name,
+                        format.as_str()
+                    )));
+                }
+                if self.config.behavior != RuleProviderBehavior::Classical {
+                    // A binary payload carries its own conditions; `behavior`
+                    // only ever described how to read *text* lines.
+                    tracing::debug!(
+                        "Rule provider '{}' is binary ({}), so its `behavior: {}` is not used",
+                        self.config.name,
+                        format.as_str(),
+                        self.config.behavior.as_str()
+                    );
+                }
+                Ok(CompiledSet {
+                    index: RuleIndex::default(),
+                    rules: crate::engine::ruleset::RuleSet::new(rules),
+                })
+            }
+        }
+    }
+
+    fn load_from_file(&self) -> Result<Vec<u8>> {
         let path = self
             .config
             .path
             .as_ref()
             .ok_or_else(|| Error::config("File rule provider requires 'path' field"))?;
 
-        std::fs::read_to_string(path)
+        // Bytes, not text: a `.srs` provider is binary from its first byte.
+        std::fs::read(path)
             .map_err(|e| Error::config(format!("Failed to read rule file '{}': {}", path, e)))
     }
 
-    fn load_from_http(&self) -> Result<String> {
+    fn load_from_http(&self) -> Result<Vec<u8>> {
         let url = self
             .config
             .url
@@ -488,9 +609,7 @@ impl RuleProvider {
             }
         };
 
-        let content = response
-            .text()
-            .map_err(|e| Error::network(format!("Failed to read response body: {e}")))?;
+        let content = response.bytes().to_vec();
 
         if let Some(path) = &cache_path {
             if let Some(parent) = path.parent() {
@@ -527,9 +646,9 @@ impl RuleProvider {
         &self,
         cache_path: &Option<PathBuf>,
         message: String,
-    ) -> Result<String> {
+    ) -> Result<Vec<u8>> {
         if let Some(path) = cache_path
-            && let Ok(content) = std::fs::read_to_string(path)
+            && let Ok(content) = std::fs::read(path)
         {
             tracing::warn!(
                 "Using cached rule provider '{}' after refresh failed: {}",
@@ -644,7 +763,7 @@ impl RuleProvider {
     /// Runs against the compiled index: no allocation for a lowercase hostname,
     /// no per-entry lowercasing or `format!`, and no re-parsing of CIDRs.
     pub fn matches(&self, input: &RuleMatchInput<'_>) -> bool {
-        self.index.read().matches(input)
+        self.set.read().matches(input)
     }
 
     /// Whether one specific entry matches, without going through the index.
@@ -766,7 +885,7 @@ impl RuleProvider {
     }
 
     pub fn rule_count(&self) -> usize {
-        self.index.read().matchable_count()
+        self.set.read().matchable_count()
     }
 
     pub fn last_update_time(&self) -> Option<Instant> {
@@ -779,7 +898,7 @@ impl RuleProvider {
     /// a resolution before this set is evaluated; a set of domain patterns
     /// must not pay for a lookup it cannot use.
     pub fn has_dst_ip_entries(&self) -> bool {
-        self.index.read().has_dst_ip_entries()
+        self.set.read().has_dst_ip_entries()
     }
 }
 
@@ -948,7 +1067,10 @@ mod tests {
     /// A provider whose index was built from `entries`.
     fn provider_with_entries(entries: Vec<CompiledRuleEntry>) -> RuleProvider {
         let provider = test_provider(RuleProviderBehavior::Classical);
-        *provider.index.write() = RuleIndex::compile(&entries);
+        *provider.set.write() = CompiledSet {
+            index: RuleIndex::compile(&entries),
+            rules: crate::engine::ruleset::RuleSet::default(),
+        };
         provider
     }
 
@@ -1016,9 +1138,9 @@ mod tests {
         assert!(cidr.parse_rules("payload: ['not-an-ip']").is_err());
     }
 
-    /// The domain payload contract used by Loyalsoldier/clash-rules.
+    /// The domain payload contract community `payload:` rulesets follow.
     #[test]
-    fn clash_yaml_payload_covers_video_subdomains_without_suffix_confusion() {
+    fn community_yaml_payload_covers_video_subdomains_without_suffix_confusion() {
         let provider = test_provider(RuleProviderBehavior::Domain);
         let entries = provider
             .parse_rules("payload:\n  - '+.bilibili.com'\n  - '+.bilivideo.com'\n")
@@ -1155,6 +1277,102 @@ mod tests {
             .expect("IP-CIDR should be supported");
 
         assert!(provider.matches_entry(&entry, &dst_input("10.20.30.40")));
+    }
+
+    /// The binary path end to end: a `.srs` payload is detected, decoded, and
+    /// answers matches through the provider — the same entry point a text
+    /// provider uses.
+    #[test]
+    fn a_sing_box_binary_payload_is_detected_and_matched() {
+        use crate::engine::ruleset::succinct::DomainMatcher;
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let matcher = DomainMatcher::build(
+            std::iter::empty::<String>(),
+            ["example.com".to_string()],
+        );
+        let mut set_bytes = Vec::new();
+        matcher.write_for_test(&mut set_bytes);
+
+        let mut body = Vec::new();
+        body.push(1); // one rule
+        body.push(0); // default rule
+        body.push(2); // domain item
+        body.extend_from_slice(&set_bytes);
+        body.push(0xFF); // final
+        body.push(0); // not inverted
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&body).expect("compress");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"SRS");
+        payload.push(5);
+        payload.extend_from_slice(&encoder.finish().expect("finish"));
+
+        let provider = test_provider(RuleProviderBehavior::Classical);
+        let set = provider
+            .compile_payload(&payload)
+            .expect("a binary payload compiles");
+        assert_eq!(set.matchable_count(), 1);
+        assert!(set.matches(&domain_input("www.example.com")));
+        assert!(set.matches(&domain_input("example.com")));
+        assert!(!set.matches(&domain_input("example.org")));
+        // A binary set of domains must never trigger a DNS lookup.
+        assert!(!set.has_dst_ip_entries());
+    }
+
+    /// The `.mrs` container end to end: detected by its zstd frame, decompressed,
+    /// decoded, and matched through the provider's normal entry point.
+    #[test]
+    fn a_binary_mrs_payload_is_detected_and_matched() {
+        use crate::engine::ruleset::mrs;
+        use crate::engine::ruleset::succinct::SuccinctSet;
+
+        // An exact key: `example.com` and nothing below it.
+        let set = SuccinctSet::from_keys(vec!["moc.elpmaxe".to_string()]);
+        let mut body = Vec::new();
+        set.write_wire_v1(&mut body);
+        let payload = mrs::encode_for_test(0, &body, 1, &[]);
+
+        let provider = test_provider(RuleProviderBehavior::Domain);
+        let compiled = provider
+            .compile_payload(&payload)
+            .expect("a binary payload compiles");
+        assert_eq!(compiled.matchable_count(), 1);
+        assert!(compiled.matches(&domain_input("example.com")));
+        assert!(!compiled.matches(&domain_input("www.example.com")));
+        assert!(!compiled.has_dst_ip_entries());
+    }
+
+    /// An address set, which is the other behavior the container defines.
+    #[test]
+    fn a_binary_mrs_address_set_matches_by_destination() {
+        use crate::engine::ruleset::mrs;
+
+        let mut body = Vec::new();
+        body.push(1);
+        body.extend_from_slice(&1i64.to_be_bytes());
+        for address in ["10.0.0.0", "10.255.255.255"] {
+            let ipv4: std::net::Ipv4Addr = address.parse().expect("address");
+            body.extend_from_slice(&ipv4.to_ipv6_mapped().octets());
+        }
+        let payload = mrs::encode_for_test(1, &body, 1, &[]);
+
+        let provider = test_provider(RuleProviderBehavior::IpCidr);
+        let compiled = provider
+            .compile_payload(&payload)
+            .expect("a binary payload compiles");
+        assert!(compiled.has_dst_ip_entries());
+        assert!(compiled.matches(&RuleMatchInput {
+            dst_ip: Some("10.9.8.7".parse().expect("ip")),
+            ..RuleMatchInput::default()
+        }));
+        assert!(!compiled.matches(&RuleMatchInput {
+            dst_ip: Some("11.0.0.1".parse().expect("ip")),
+            ..RuleMatchInput::default()
+        }));
     }
 
     /// The index and the single-entry path must agree on every input. They use

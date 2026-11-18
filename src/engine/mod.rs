@@ -67,6 +67,7 @@ pub mod config;
 pub mod connection_tracker;
 pub mod dns;
 pub mod error;
+pub mod geo;
 pub mod geoip;
 pub mod health_check;
 pub mod inbound;
@@ -80,6 +81,7 @@ pub mod proxy_provider;
 pub mod random;
 pub mod routing;
 pub mod rule_provider;
+pub mod ruleset;
 pub mod tls;
 pub mod traffic_stats;
 
