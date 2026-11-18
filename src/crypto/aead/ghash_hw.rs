@@ -90,18 +90,10 @@ mod x86 {
             1 => false,
             2 => true,
             _ => {
-                // Safety: CPUID is part of the x86 ISA; leaf 1 is the
-                // feature-information leaf every CPU answers without any
-                // enable bit, and the call has no memory effects. (Newer
-                // toolchains declare `__cpuid` safe, 1.78 still declares it
-                // `unsafe fn`; the allow keeps both warning-free.)
                 #[allow(unused_unsafe)]
                 let leaf = unsafe { __cpuid(1) };
-                /// CPUID.1:ECX[1] — PCLMULQDQ.
                 const PCLMULQDQ: u32 = 1 << 1;
-                /// CPUID.1:EDX[25] — SSE.
                 const SSE: u32 = 1 << 25;
-                /// CPUID.1:EDX[24] — FXSAVE/FXRSTOR (the OS saves XMM state).
                 const FXSR: u32 = 1 << 24;
                 let present = leaf.ecx & PCLMULQDQ != 0 && leaf.edx & (SSE | FXSR) == (SSE | FXSR);
                 AVAILABLE.store(if present { 2 } else { 1 }, Ordering::Relaxed);
@@ -117,15 +109,11 @@ mod x86 {
     #[target_feature(enable = "pclmulqdq")]
     pub unsafe fn clmul64(a: u64, b: u64) -> u128 {
         unsafe {
-            // `_mm_set_epi64x` rather than the x86_64-only `_mm_cvtsi64_si128`:
-            // one source compiles (and emits the same `movq`) on both x86 widths.
             let product = _mm_clmulepi64_si128(
                 _mm_set_epi64x(0, a as i64),
                 _mm_set_epi64x(0, b as i64),
                 0x00,
             );
-            // The lane pair is the full product: low half in lane 0, high half in
-            // lane 1. Reading it back as little-endian `u128` gives exactly that.
             let mut out = [0u8; 16];
             _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, product);
             u128::from_le_bytes(out)
@@ -174,17 +162,21 @@ mod arm {
         cfg!(target_feature = "pmull") || detected()
     }
 
-    /// `a ⊗ b`: the 64×64 carry-less product, as a 128-bit value.
+    /// `a * b`: the 64x64 carry-less product, as a 128-bit value.
     ///
-    /// No `target_feature` attribute: NEON is baseline on aarch64 and PMULL
-    /// use is gated by [`available`] alone (`pmull` is not even a codegen
-    /// feature name). Same shape as the reference implementations.
+    /// The attribute is not decoration: the intrinsic is `#[inline(always)]` and
+    /// gated on `neon,aes`, so a call from a function without those features is
+    /// the `inline_always_mismatching_target_features` case: the callee cannot be
+    /// inlined there and the build is refused (`-D warnings`) instead of quietly
+    /// falling back. NEON is baseline on AArch64, so the attribute is free; the
+    /// gate that matters at runtime is [`available`], whose `pmull` detection
+    /// covers the crypto extension this instruction belongs to.
     ///
     /// # Safety
     /// [`available`] must have returned `true` on this CPU.
+    #[target_feature(enable = "neon,aes")]
     pub unsafe fn clmul64(a: u64, b: u64) -> u128 {
-        // SAFETY: the caller checked PMULL support; NEON is baseline on AArch64.
-        unsafe { vmull_p64(a, b) }
+        vmull_p64(a, b)
     }
 }
 
@@ -272,9 +264,6 @@ impl PreparedKey {
     /// `x · H` over the GHASH field, for the `H` this key was prepared from.
     #[inline]
     pub fn mul(&self, x: u128) -> u128 {
-        // Safety: `PreparedKey` is only ever built by `prepare`, which
-        // returned `Some` only after `available()` said the instructions
-        // exist on this CPU; that cannot regress at runtime.
         unsafe { dot(x, self.0) }
     }
 }
