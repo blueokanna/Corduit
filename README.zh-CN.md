@@ -4,10 +4,11 @@
 
 [![Crates.io](https://img.shields.io/crates/v/corduit)](https://crates.io/crates/corduit)
 [![docs.rs](https://img.shields.io/docsrs/corduit)](https://docs.rs/corduit)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
+[![CI](https://github.com/blueokanna/Corduit/actions/workflows/ci.yml/badge.svg)](https://github.com/blueokanna/Corduit/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.95-blue)](Cargo.toml)
 
-- **English** → [README.md](README.md)
-- **完整文档** → [Wiki](https://github.com/blueokanna/Corduit/wiki)（FFI / RPC / 方法参考）
+- English documentation → [README.md](README.md)
+- 完整文档 → [Wiki](https://github.com/blueokanna/Corduit/wiki)（FFI / RPC / 方法参考）
 
 ---
 
@@ -19,345 +20,260 @@ Corduit 是网络工程工具，涵盖代理协议、规则路由、DNS 与用�
 - **不得用于违法用途。** 在某些司法辖区（包括中国大陆），提供或使用代理、VPN、隧道类服务规避国家网络管控属于违法。Corduit 不授予此类权利，维护者既不授权也不支持。
 - **TUIC、Hysteria v1 与 Hysteria2 默认关闭。** 三者均为可选 Cargo feature（`tuic`、`hysteria`、`hysteria2`），默认构建不包含，是否开启由你决定。
 - **违法用途不提供支持。** 涉及违法用途的 issue、PR、讨论一律关闭。
-- **无担保、无责任。** 软件按“现状”提供，见 [LICENSE](LICENSE)：其中的附加许可人条款把合法使用作为所有许可的前提条件。
+- **无担保、无责任。** 软件按「现状」提供，见 [LICENSE](LICENSE)：其中的附加许可人条款把合法使用作为所有许可的前提条件。
 - **本声明不是法律意见。** 若不确定用途是否合法，请先咨询你所在辖区的执业律师，再构建或运行。
 
 ---
 
-## 这是什么
+## 目录
 
-多数代理都是拼装出来的：配置加载器、规则引擎、DNS 解析器与若干协议内核各来自不同上游，有各自的缺陷追踪与发版节奏。Corduit 把这些部分放在同一个引擎里，配置、路由、DNS、用户态网络与各线路协议一起开发、一起测试、一起发布。
+- [设计动机](#设计动机)
+- [能力概览](#能力概览)
+- [协议支持](#协议支持)
+- [架构](#架构)
+- [执行模型](#执行模型)
+- [构建](#构建)
+- [驱动引擎](#驱动引擎)
+- [配置](#配置)
+- [规则引擎](#规则引擎)
+- [安全模型](#安全模型)
+- [测试与持续集成](#测试与持续集成)
+- [平台支持](#平台支持)
+- [目录结构](#目录结构)
+- [已知边界](#已知边界)
+- [许可证](#许可证)
 
-能力概览：
+## 设计动机
 
-- **入站**：`http`、`socks5`、`mixed`（HTTP + SOCKS5 自动识别）三种可配置监听器；TUN 模式基于仓库内的用户态协议栈，通过平台入口启用，而不是写进 `inbounds` 列表。`redir`、`tproxy` 以及写进 `inbounds` 的 `tun` 条目均可被解析为类型，但会在**校验阶段被直接拒绝**，错误信息明确说明缺什么：三者都没有监听器实现，接受了它们的构建只会“表面启动”却什么都不应答。
-- **出站**：`direct`、`reject`、`socks5`、`socks4` / `socks4a`、`http`（明文或 TLS 包裹）、`shadowsocks`（2017 AEAD 密码套件；2022 套件会以具名错误明确拒绝，而不是半实现）、`shadowsocksr`、`snell`（v4 / v5，`obfs: http` / `obfs: tls`）、`vmess`、`vless`、`trojan`、`wireguard`、`naive`（NaiveProxy），以及需要显式开启的 `shadowtls`（v3）、`tuic`（v5）、`hysteria`（v1）与 `hysteria2`；代理组 `selector`、`url-test`、`fallback`、`load-balance`、`relay`。Shadowsocks 节点可携带 SIP003 插件——`obfs`（simple-obfs 的 `http` / `tls`）、`v2ray-plugin`（`websocket` 模式，并默认使用其服务端期望的 mux 会话帧）或 `shadow-tls`（v3）——全部以仓库内流实现，不拉起外部插件进程。
-- **路由**：`domain`、`domain-suffix`、`domain-keyword`、`domain-regex`、`geosite`、`geoip`、`ip-cidr`、`src-ip-cidr`、`src-port`、`dst-port`、`in-port` / `in-type` / `in-name` / `in-user`、`process-name`、`process-path`、`network`、`rule-set`、`proxy-mode`、`and` / `or` / `not`、`match`，配合 `rule` / `global` / `direct` 三种模式；规则集与代理集按间隔刷新。
-- **规则集与 Geo 数据**：文本 / YAML / JSON 载荷；两种二进制规则集——`.srs`（版本 1–5，zlib，含 `and` / `or` / `invert`）与 `.mrs`（容器版本 1，zstd，含 `+` 后缀与 `*` 单标签通配）——以及 v2ray Geo 数据库（`geosite.dat` 提供分类、`geoip.dat` 或 `Country.mmdb` 提供地址归属），全部在仓库内解码，分类与国家码按首次使用惰性编译。
-- **DNS**：解析器是同一作者的 [RecurseX](https://crates.io/crates/recurse-x)，以依赖形式引入：上游支持 UDP / TCP / DoT / DoH / DoH3 / DoQ，带按稳定性度量的分层缓存、请求合并，以及按期望成本排序的服务器选择。Corduit 补上 profile 方言带来的那部分：`nameserver-policy`、`default-nameserver`、`hosts`、`cache-size` 的写法，加密上游的主机名到 IP 的 bootstrap，以及 bogon / GeoIP 应答过滤（RecurseX 不附带国家库）。启用 `dns.enable` 后，`dns.listen` 上会真正启动监听器，UDP 与 TCP 同时可用，并以同一份 profile 应答。
-- **同步执行**：没有 tokio，没有 reactor，引擎内没有 `async` / `await`。并发来自短任务的 work-stealing 池与长连接中继的专用线程。
-- **`no_std` 核心**：`default-features = false` 时以 `no_std + alloc` 编译；加密原语、URL 解析器与纯线路编解码（`protocol::address`、`protocol::error`）不依赖 OS。
-- **热重载**（`Corduit::reload`）与**流量统计**（逐连接上下行、速率、活跃列表）。
+多数代理都是拼装出来的：配置加载器、规则引擎、DNS 解析器与若干协议内核各来自不同上游，有各自的缺陷追踪与发版节奏。问题恰好出在这些部件的接缝处——同一条规则对路由器和解析器含义不同，同一个 profile 键被一个组件接受、被下一个组件静默丢弃。
 
-## Shadowsocks 连接诊断
+Corduit 走的是相反的安排：一个 crate 拥有整条数据平面，因此一个配置键、一种规则类型、一个线路细节只有一份实现和一套测试。引擎是同步的：没有 async runtime、没有 reactor、数据路径里没有 `async` / `await`，线程拓扑、取消语义与失败模式都可被直接检视。
 
-接收端区分两类关闭：`no salt received` 表示上游在返回任何 Shadowsocks 响应之前关闭；`truncated Shadowsocks record` 表示 salt、加密长度或加密载荷尚未收完整。后者会记录所在阶段及已收／预期字节数。前者仅说明没有响应，不能单凭它认定密码错误；需要同时核对节点可达性、密码套件、SIP003 插件和服务端日志。
+## 能力概览
 
-完整记录之间的 EOF 正常结束读取；半条记录和认证失败返回错误，未通过认证的明文不会交给应用。读超时保留分帧状态和 nonce，下一次读取继续原记录。客户端关闭上传方向后，中继仍等待并转发下载数据，写方向的 FIN 不会因读锁竞争而丢失。
+| 领域 | 已实现 |
+|---|---|
+| **入站** | `http`、`socks5`、`mixed`（协议自动识别）；TUN 走仓库内的用户态协议栈 |
+| **出站** | `direct`、`reject`、`socks5`、`socks4`/`socks4a`、`http`（明文或 TLS）、`shadowsocks`（2017 AEAD + SIP003 插件）、`shadowsocksr`、`snell` v4/v5、`vmess`、`vless`、`trojan`、`wireguard`、`naive`，以及需显式开启的 `shadowtls` v3、`tuic` v5、`hysteria` v1、`hysteria2` |
+| **策略组** | `selector`、`url-test`（带防抖容差）、`fallback`、`load-balance`（轮询 / 一致性哈希 / 会话保持）、`relay` |
+| **规则类型** | `domain`、`domain-suffix`、`domain-keyword`、`domain-regex`、`geosite`、`geoip`、`ip-cidr`、`src-ip-cidr`、`src-port`、`dst-port`、`in-port`/`in-type`/`in-name`/`in-user`、`process-name`、`process-path`、`network`、`rule-set`、`proxy-mode`、`and`/`or`/`not`、`match` |
+| **规则集** | 文本 / YAML / JSON 载荷；`.srs`（版本 1–5，zlib）；`.mrs`（容器版本 1，zstd） |
+| **Geo 数据** | `geosite.dat`（分类）、`geoip.dat` 与 `Country.mmdb`（地址归属） |
+| **DNS** | [RecurseX](https://crates.io/crates/recurse-x) 解析器；profile 侧策略、上游 bootstrap、应答过滤、可选的监听式解析器 |
+| **运行时** | 热重载、逐连接流量统计、JSON-RPC 控制面、C ABI、Android JNI |
 
-Shadowsocks 的 HTTP 测速与实际转发共用握手和记录编解码。HTTPS 目标在隧道内执行 TLS 握手并验证证书；HTTP 请求保留查询参数和端口，只有 2xx／3xx 最终状态算成功。加密记录格式依据 [Shadowsocks AEAD 规范](https://shadowsocks.org/doc/aead.html)。回环测试覆盖分片、超时、空记录、半关闭和错误响应；这些测试不能替代目标设备与实际节点的互操作验证。
+支持与不支持遵循同一条标准：引擎兑现不了的能力，在**配置阶段**就以点名缺失项的错误拒绝，而不是接受后静默降级。详见 [已知边界](#已知边界)。
+
+## 协议支持
+
+### 入站
+
+| 类型 | 说明 |
+|---|---|
+| `http` | CONNECT 与绝对 URI 转发，可选认证 |
+| `socks5` | CONNECT、UDP ASSOCIATE、用户名/密码认证 |
+| `mixed` | 同一监听器根据首字节识别 HTTP 或 SOCKS5，且不消费该字节 |
+| TUN | 仓库内用户态 TCP/IP（`netstack`），带 fake-IP 池与 DNS 应答器 |
+| `redir`、`tproxy`、`inbounds` 中的 `tun` | 可解析为类型，但**在校验阶段被拒绝**：三者都没有监听器实现，接受了它们的构建只会表面启动却什么都不应答 |
+
+### 出站
+
+| 类型 | 说明 |
+|---|---|
+| `direct`、`reject` | 直连；fail-closed 拒绝 |
+| `socks5`、`socks4`/`socks4a`、`http` | 明文或 TLS 包裹的 HTTP 代理 |
+| `shadowsocks` | 2017 AEAD 密码套件；SIP003 插件 `obfs`、`v2ray-plugin`、`shadow-tls` 全部以仓库内流实现 |
+| `shadowsocksr` | 完整 protocol / obfs 组合 |
+| `snell` | v4 与 v5，`obfs: http` / `obfs: tls` |
+| `vmess`、`vless`、`trojan` | 完整客户端实现，含协议定义的复用 |
+| `wireguard` | 用户态 WireGuard 客户端（feature `wireguard`） |
+| `naive` | NaiveProxy 客户端 |
+| `shadowtls` v3、`tuic` v5、`hysteria` v1、`hysteria2` | 由 feature 门控（`shadowtls`、`tuic`、`hysteria`、`hysteria2`） |
+
+Shadowsocks 2022 套件以具名错误明确拒绝，不做半实现。
 
 ## 架构
 
-```mermaid
-flowchart LR
-    subgraph IN["入站 —— 每监听器一条线程"]
-        MIX["mixed"]
-        HTTP["http"]
-        S5["socks5"]
-        TUN["TUN → netstack<br/>用户态 TCP/IP + NAT"]
-    end
-
-    MIX & HTTP & S5 & TUN --> RT["Router<br/>规则 · 规则集 · geoip"]
-    DNS["DNS — RecurseX<br/>解析器 · 缓存 · 传输"] -.-> RT
-    RT --> OM["OutboundManager<br/>代理组 · 健康检查 · 连接追踪"]
-    OM --> DIAL["拨号出站<br/>握手 + 可选链式代理"]
-    DIAL --> RELAY["中继<br/>两线程、半关闭、计量"]
-    RELAY --> NET(["socket / QUIC 连接"])
+```
+        client ──▶ inbound ──▶ router ──▶ policy group ──▶ outbound ──▶ server
+                     │           │
+                     │           └── rule table · rule providers · geo databases
+                     └── netstack (TUN) · DNS resolver · connection tracker
 ```
 
-一条连接进入一个入站监听器，由路由分类一次，交给一个出站；之后由中继接管，直到任一侧关闭，期间复制的每个字节都按连接计量。
+- **`engine/config`** —— 校验过的配置模型，以及把 profile 方言映射到该模型的编解码层。
+- **`engine/routing`** —— 规则编译与匹配。规则只编译一次（正则、CIDR、端口区间、传输层），域名与后缀走索引，使有序规则表在每条连接上都不必线性扫描。
+- **`engine/ruleset`** —— 二进制规则集解码器（`.srs`、`.mrs`）、两者共用的压缩域集，以及它们解码成的 headless 规则模型。
+- **`engine/geo`** —— Geo 数据库：严格 protobuf 解码、分类与国家码首次使用即编译、地址区间合并。
+- **`engine/outbound`** —— 每个协议一个模块，外加策略组。
+- **`engine/inbound`** —— 监听器。
+- **`dns`** —— 基于 RecurseX 的 profile → 解析器适配。
+- **`netstack`** —— 用户态栈：TCP 状态机、UDP 会话、TUN 集成、平台路由。
+- **`protocol`**、**`crypto`** —— 线路编解码与密码学原语，两者均兼容 `no_std`。
+- **`common`** —— 同步原语、socket、带缓冲的流、定时器、取消机制，以及 provider 更新所用的 HTTP 客户端。
 
-## 同步执行模型
+依赖方向是单向的：`protocol` 与 `crypto` 不认识 `engine`，`engine` 也不会伸手进 `netstack` 的内部。
 
-Corduit 没有 reactor。并发是分层的，每层只做一件事：
+## 执行模型
 
-```mermaid
-flowchart TB
-    L["accept 循环<br/>每监听器一条线程"] -->|接受到的 socket| S["连接线程<br/>courierust 单连接引擎<br/>HTTP/1.1 · h2c · CONNECT 隧道"]
-    S -->|拨号与握手| G{"连接配额<br/>准入控制"}
-    G -->|准入| R["中继<br/>一条复制线程 + 连接线程自身"]
-    R -->|EOF| HC["对另一侧做半关闭"]
-    R -->|取消令牌| SD["关闭两端传输"]
-    P["courierust work-stealing 池<br/>短任务：DNS · 控制面 · 定时器"] -->|定时器| T["时间轮<br/>健康检查 · 代理集刷新"]
+这里没有执行器，并发是显式的：
+
+- 来自 [`courierust`](https://crates.io/crates/courierust) 的 work-stealing 池运行短小、有界任务——accept、握手、provider 刷新；
+- 长连接中继各占一个线程，取消令牌触发时退出；
+- 每一次阻塞等待要么带截止时间，要么可被该令牌打断，因此停机不依赖某个网络操作的完成。
+
+这也是为什么引擎可以被 `main` 线程、Flutter worker、Android service 或 C 调用方直接驱动：没有需要「接入」的运行时。
+
+## 构建
+
+**要求**：Rust 1.95（edition 2024）与 C 工具链。C 工具链用于 `zstd`（`.mrs` 规则集的后端）；`mrs` 属于默认 feature 集，所以直接 `cargo build` 就会用到它。无 C 工具链的交叉编译同样支持——见 [已知边界](#已知边界)。
+
+```bash
+cargo build --release
+cargo build --release --no-default-features --features std,tls,wireguard   # 无 C 依赖
 ```
 
-1. **短任务**（DNS 查询、控制面、周期刷新、定时器回调）运行在 **courierust 的 work-stealing 线程池**上：每 worker 私有 LIFO、全局 FIFO、跨 worker 窃取、空闲时零 CPU。
-2. **长连接中继**运行在**专用线程**上：每连接一条复制线程，另一个方向跑在连接线程自身，带半关闭语义。数量由监听器的连接配额封顶，因此中继不会挤占池中的握手容量。
-3. **accept 循环**每个监听器一条线程。接入的 socket 由 **courierust 的单连接引擎**在专属线程上处理（TLS/ALPN、HTTP/1.1、HTTP/2、keep-alive、`CONNECT` 隧道、WebSocket 升级）；连接数达到监听器配额后 accept 循环被阻塞，空闲客户端无法无限扩张线程。
-
-阻塞由 socket 超时界定（`SO_RCVTIMEO` / `SO_SNDTIMEO`）：`WouldBlock` / `TimedOut` 表示*此刻无数据*，各循环在两次操作之间检查 `CancellationToken`。中继的两个线程通过互斥量共享同一条流，一次可能无限阻塞的读会构成锁序死锁，因此中继在启动前设置 25 ms 读轮询（`RELAY_READ_POLL`），让每次持锁时长有上界。
-
-代价是明确的：长期空闲的连接会各占连接线程 + 一条复制线程。监听器的连接配额为此封顶，线程池保证短任务路径的吞吐。对几十到几百并发连接的桌面 / 移动代理来说，这个取舍是合理的。
-
-## Cargo feature
+### Feature 开关
 
 | Feature | 默认 | 作用 |
 |---|---|---|
-| `std` | 开 | 线程化引擎层：engine、netstack、RPC、FFI。隐含 `tls`。 |
-| `tls` | 开 | `protocol::tls` 客户端 / 服务端层，以及依赖它的出站（HTTPS、Trojan、VMess/VLESS TLS、TLS 入站）。 |
-| `wireguard` | 开 | `protocol::wireguard` 与 WireGuard 出站。 |
-| `quic` | 关 | `protocol::quic`，即仓库内 QUIC v1 客户端传输（RFC 9000/9001/9002）。 |
-| `tuic` | 关 | TUIC v5 出站。隐含 `quic`。 |
-| `hysteria` | 关 | Hysteria v1 出站（控制流认证、XPlus 混淆、struct 编码的 UDP 数据报）。隐含 `quic`。 |
-| `hysteria2` | 关 | Hysteria2 出站（HTTP/3 `POST /auth`、Salamander 混淆）。隐含 `quic`。 |
-| `tls13` | 关 | 仓库内 TLS 1.3 客户端，及其可呈现的浏览器形态 `ClientHello` 指纹（`chrome`、`randomized`、`off`）。 |
-| `reality` | 关 | VLESS/Trojan/VMess 的 REALITY 客户端认证（`security: reality`）。隐含 `tls13`。 |
-| `shadowtls` | 关 | ShadowTLS v3 出站。隐含 `tls13`。 |
+| `std` | 开 | 线程化引擎层（隐含 `tls`） |
+| `tls` | 开 | 依赖 TLS 的出站所用的客户端 / 服务端层 |
+| `wireguard` | 开 | WireGuard 协议与出站 |
+| `mrs` | 开 | `.mrs` 二进制规则集；引入自带 C 源码的 `zstd` 解码器 |
+| `quic` | 关 | 仓库内 QUIC v1 传输（RFC 9000/9001/9002） |
+| `tuic`、`hysteria`、`hysteria2` | 关 | 对应出站（隐含 `quic`） |
+| `tls13` | 关 | 仓库内 TLS 1.3 客户端，可呈现浏览器形态 `ClientHello` 指纹 |
+| `reality`、`shadowtls` | 关 | REALITY 与 ShadowTLS v3（隐含 `tls13`） |
 
-未开启 `tuic`、`hysteria`、`hysteria2` 或 `shadowtls` 的构建会**直接拒绝**对应出站配置，并给出指明缺失 feature 的错误，不会退化为直连。`security: reality` 与 `fingerprint` 在缺少对应 feature 时遵循同一条 fail-closed 规则。这条规则同样覆盖“彻底没有实现”的能力：`redir` / `tproxy` / `tun` 入站条目与 Shadowsocks 2022 密码套件一律在边界处被拒绝，并给出原因——绝不放进一个无法兑现它们的运行时。
+`default-features = false` 时以 `no_std + alloc` 编译；纯线路编解码与密码学原语不依赖 OS。
 
-## 职责划分：courierust 与仓库内实现
+## 驱动引擎
 
-[courierust](https://crates.io/crates/courierust) 是零依赖、`no_std` 就绪的协议套件。Corduit 以库的形式消费它，只补齐 courierust 有意不暴露的那些层：
-
-| 关注点 | 实现位置 |
-|---|---|
-| HTTP/1.1 编解码、HTTP/2 连接、HTTP/3 分帧 | `courierust_h1` / `courierust_h2` / `courierust_h3` |
-| QPACK 字段段（HTTP/3 头） | `courierust_h3::qpack` |
-| HTTP 客户端（连接池、重定向、TLS 设置） | `courierust_client` |
-| TLS 1.2 / 1.3、X.509 校验、加密原语 | `courierust_tls` |
-| WebSocket RFC 6455（分帧、掩码、分片、关闭） | `courierust_ws`，由 `protocol::ws` 单点封装 |
-| Snell obfs 与 simple-obfs 共用的 HTTP/TLS 混淆流 | `protocol::obfs`（仓库内） |
-| QUIC 线路编解码（包、帧、varint、包保护） | `courierust_quic` |
-| work-stealing 调度器 | `courierust_pool` |
-| base64 | `courierust_crypto::base64` |
-| QUIC v1 **连接运行时**（握手驱动、ACK/丢包恢复、拥塞控制、流控、datagram） | `protocol::quic`（仓库内） |
-| 数据驱动的 TLS 1.3 客户端指纹 | `protocol::tls13`（仓库内） |
-| REALITY 客户端（`security: reality`） | `protocol::reality`（仓库内） |
-| Shadowsocks / ShadowsocksR / Snell / VMess / VLESS / Trojan / ShadowTLS / NaiveProxy / TUIC / Hysteria / Hysteria2 / WireGuard / SOCKS4 | `engine::outbound`（仓库内） |
-| DNS 解析器、语义缓存、UDP/TCP/DoT/DoH/DoH3/DoQ 传输、线格式编解码 | [RecurseX](https://crates.io/crates/recurse-x)（同作者的解析器，以依赖引入） |
-| profile → 解析器 适配、上游 bootstrap、bogon/GeoIP 应答过滤 | `dns`（仓库内） |
-| 用户态 TCP/IP 协议栈（SolidTCP）+ NAT + TUN | `netstack`（仓库内） |
-| 双栈（IPv4 + IPv6）数据通路：v6 包解析与应答构造（TCP/UDP、v6 伪首部校验和）、v6 SOCKS5 目标与 v6 UDP 中继应答 | `netstack`（仓库内） |
-
-仓库遵循一条准则：每个职责只保留一份实现。第二套 RFC 6455 状态机、第二份 QPACK 编解码、第二份 base64 或第二份 DNS 线格式编解码，都按缺陷处理。
-
-## REALITY 与 TLS 指纹
-
-可选的 `tls13` 与 `reality` feature 在 courierust 连接器之外增加第二套 TLS 引擎，它的 `ClientHello` 由数据驱动，服务端认证走可插拔钩子。
-
-- **指纹**（`fingerprint: chrome` | `randomized` | `off`）：密码套件列表、扩展集合与顺序、groups、签名算法、ALPN 与填充来自 `courierust_fingerprint` 的 Chrome profile（JA4 规范的参数集），并按浏览器习惯加入 GREASE 与 512 字节对齐填充。测试会把发出的字节反解析成 profile，用 JA3/JA4 比对。
-- **REALITY**（`security: reality` 配合 `public-key`、`short-id`、`server-name`）：session id 承载 `version || time || short-id`，以 X25519 派生认证密钥下的 AES-256-GCM 密封；服务端认证使用临时证书证明（对证书 SPKI 计算 `HMAC-SHA512`）替代 CA 链。
-- **不宣告而不是伪造**：证书压缩（RFC 8879）与 ALPS 不会宣告（本客户端无法解压或呈现）；`mldsa65` 校验直接报不支持；REALITY *回落*（收到真实证书）按硬错误处理，不做静默降级。
-- **仅客户端**：REALITY *服务端* 需要 Ed25519 签名能力完成 `CertificateVerify`，仓库内加密层不提供；session id 的验证方向已实现并测试（`protocol::reality::wire::unseal_session_id`）。
-
-## QUIC 栈
-
-courierust 提供 RFC 9000/9001 的线路编解码与 TLS 1.3 加密原语，但不提供 QUIC 连接运行时，其 `courierust_tls::quic` 握手驱动为 crate 私有。因此 Corduit 在 `protocol::quic` 中实现缺失层：每连接一条驱动线程持有 UDP socket，握手自行运行 TLS 1.3 密钥调度，流是互斥量缓冲 + 条件变量唤醒之上的同步 `Read` / `Write` 句柄。
-
-```mermaid
-sequenceDiagram
-    participant C as Corduit（客户端）
-    participant S as QUIC 服务端
-
-    C->>S: Initial - CRYPTO ClientHello
-    Note over C,S: 密钥由 DCID 推导（RFC 9001 section 5.2）<br/>Initial / Handshake 密钥来自 TLS 秘密
-
-    S->>C: Initial - CRYPTO ServerHello + ACK
-    S->>C: Handshake - CRYPTO EncryptedExtensions, Certificate, CertificateVerify, Finished
-
-    C->>C: 校验证书链（courierust_tls::x509）与 CertificateVerify 签名
-
-    C->>S: Handshake - CRYPTO Finished + ACK
-
-    Note over C,S: 1-RTT：安装应用密钥<br/>三个包号空间、PTO 丢包恢复、NewReno、流控
-
-    C->>S: 1-RTT - STREAM / DATAGRAM（RFC 9221）
-    S->>C: 1-RTT - STREAM / DATAGRAM
-```
-
-该传输之上承载 TUIC v5（`tuic`）、Hysteria v1（`hysteria`）与 Hysteria2（`hysteria2`）：三者在 QUIC 之上没有任何共同点。Hysteria2 按官方规范实现：客户端初始化的双向流上的 HTTP/3 `POST /auth`（QPACK 字段段，期望 `:status 233`）、`0x401` TCP 请求帧、自有的 UDP 会话 / 分片组帧，以及 Salamander 包混淆（以每包 8 字节盐为密钥的 BLAKE2b-256，作用于 socket 层）。Hysteria v1 是更早的设计：控制流上的 struct（无对齐填充、大端）`client hello`、每连接一条双向流、struct 编码的 UDP 数据报，以及它自己的 XPlus 混淆（以 16 字节盐为密钥的 SHA-256）。XPlus 的用途与 Salamander 相近，但两者互不兼容，因此各自实现为独立类型。
-
-以下四项有意不提供；配置请求时会给出显式警告，而不是静默替代：0-RTT（early data）、BBR / TCP-Brutal 拥塞控制（只有 NewReno）、源端口跳动，以及 courierust 连接器上的 TLS 指纹模拟。
-
-## 驱动方式
-
-无论前端是什么，最终都汇入同一张类型化分发表（`rpc::dispatch`）：
-
-| 前端 | 传输 | 参考 |
-|---|---|---|
-| Flutter / Kotlin / Swift / C++ | 手写 C ABI（`corduit_call`、`corduit_call_binary`） | [FFI-API](https://github.com/blueokanna/Corduit/wiki/FFI-API) |
-| 网页仪表盘 / 任意语言 | 本地 HTTP + WebSocket JSON-RPC | [RPC-API](https://github.com/blueokanna/Corduit/wiki/RPC-API) |
-| Rust 应用 | 类型化同步 `api::*` | [Rust-API](https://github.com/blueokanna/Corduit/wiki/Rust-API) |
-
-RPC 服务端只绑定回环地址，用常量时间比较校验 bearer token；WebSocket 只能通过 `?token=` 查询参数携带 token，因为浏览器无法为 WebSocket 设置请求头。升级请求由 VMess 传输所用的同一套 `courierust_ws` 会话以服务端角色应答。
-
-## 快速开始
-
-构造 `Config`、创建引擎、启动、停止，生命周期仅此而已，没有 runtime 需要初始化。
-
-```toml
-[dependencies]
-corduit = "0.2"
-```
-
-```rust,no_run
-use corduit::engine::{
-    Config, Corduit, GeneralConfig, InboundConfig, InboundType,
-    OutboundConfig, OutboundType,
-};
+```rust
+use corduit::engine::{Config, Corduit};
 
 fn main() -> corduit::engine::Result<()> {
-    let config = Config {
-        general: GeneralConfig { mixed_port: Some(7890), ..Default::default() },
-        inbounds: vec![InboundConfig {
-            inbound_type: InboundType::Mixed,
-            tag: "mixed-in".to_string(),
-            listen: "127.0.0.1".to_string(),
-            port: 7890,
-            options: Default::default(),
-        }],
-        outbounds: vec![OutboundConfig {
-            outbound_type: OutboundType::Direct,
-            tag: "DIRECT".to_string(),
-            server: None,
-            port: None,
-            options: Default::default(),
-        }],
-        ..Config::default()
-    };
-
+    let text = std::fs::read_to_string("config.yaml")?;
+    let config = Config::from_str(&text)?;
     let engine = Corduit::new(config)?;
     engine.start()?;
-    // ... 提供服务 ...
+    // ... 提供服务，直到停机 ...
     engine.stop()
 }
 ```
 
-也可以直接使用 JSON facade，FFI 与 RPC 层调用的就是它：
-
-```rust,no_run
-use corduit::api;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    api::start_proxy_from_yaml(r#"
-    {
-      "general": { "mode": "rule", "mixed_port": 7890, "log_level": "info" },
-      "dns": { "enable": true, "nameservers": ["https://dns.google/dns-query"] },
-      "inbounds": [{ "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "port": 7890 }],
-      "outbounds": [{ "type": "direct", "tag": "DIRECT" }],
-      "rules": []
-    }"#.to_string())?;
-
-    let status = api::get_corduit_status()?;
-    println!("running = {}", status.running);
-    api::stop_proxy()?;
-    Ok(())
-}
-```
-
-两行代码接入仪表盘：
-
-```rust,no_run
-use corduit::api;
-api::start_rpc_server(8765, Some("my-token".into()))?; // 仅绑 127.0.0.1
-```
-
-```bash
-curl -X POST http://127.0.0.1:8765/rpc \
-  -H "Authorization: Bearer my-token" \
-  -H "Content-Type: application/json" \
-  -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.2.6"}
-```
+JSON 门面（`api::start_proxy_from_yaml` 等）与 JSON-RPC 控制面（`rpc`）都建立在这同一个引擎之上；`ffi` 提供的 C ABI 与 Android JNI 桥接调用前者。可运行示例在 [`examples/`](examples)，并在 docs.rs 上有文档。
 
 ## 配置
 
-单一已校验 JSON 模型：`general` / `dns` / `inbounds` / `outbounds` / `rules`。所有枚举均为字符串，非法值在边界处即被拒绝，不会流入引擎。逐字段参考：
-[Configuration](https://github.com/blueokanna/Corduit/wiki/Configuration)。
+profile 是 YAML（或 JSON）文档，形态贴近引擎所消费的方言，只有一条规矩：**每个键只有一个含义，未实现的键是错误而不是空操作**。
 
-## 项目结构
+```yaml
+general:
+  mode: rule
+  log-level: info
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  nameserver: [https://1.1.1.1/dns-query]
+
+inbounds:
+  - { type: mixed, tag: mixed-in, listen: 127.0.0.1, port: 7890 }
+
+outbounds:
+  - { type: selector, tag: PROXY, outbounds: [ss-a, ss-b], tolerance: 50 }
+  - { type: shadowsocks, tag: ss-a, server: 203.0.113.10, port: 8388, cipher: aes-256-gcm, password: "..." }
+  - { type: direct, tag: DIRECT }
+
+rule-providers:
+  ads:
+    type: http
+    behavior: classical
+    url: https://example.org/ads.srs
+    interval: 86400
+
+rules:
+  - { type: geosite,  payload: category-ads-all, outbound: REJECT }
+  - { type: geoip,    payload: CN,               outbound: DIRECT }
+  - { type: rule-set, payload: ads,              outbound: REJECT }
+  - { type: match,    payload: "",               outbound: PROXY }
+```
+
+[`wiki/Configuration.md`](wiki/Configuration.md) 记录每个键；[`wiki/Rules.md`](wiki/Rules.md) 详细说明规则引擎、规则集格式与 Geo 数据库。
+
+## 规则引擎
+
+规则自上而下求值，第一条命中即生效。有三条性质值得明确写出，因为它们在别处很容易被做错：
+
+1. **不存在静默丢弃。** payload 编译不了的规则、格式解不出的规则集、不存在的 Geo 分类——每一条都会在加载期报出并点名具体条目。一条永远不可能命中的规则，是后期极难定位的路由缺陷。
+2. **索引不会改变规则顺序。** 域名与后缀规则会建索引以加速查找，但候选仍按配置顺序求值，因此被索引的规则不会越过前面出现的正则或进程规则。
+3. **域名解析是显式选择。** 只有规则没有声明 `no-resolve` 时，`ip-cidr` 与 `geoip` 才能看到路由器解析出的地址；若全部 IP 规则都是 `no-resolve`，引擎在域名解析上不会付出任何一次开销。
+
+规则集的格式**按内容判定，绝不看文件名**：载荷被识别为文本、`.srs`、`.mrs` 或 Geo 数据库依据的是字节本身，因为订阅 URL 的扩展名说明不了任何事。
+
+## 安全模型
+
+- **Fail closed。** 配置点名了本构建已关闭的协议，则拒绝加载，绝不退化为直连；global 模式若没有代理出站，则走拒绝而不是泄露。
+- **输入有界。** 仓库内每个解码器都有明确上限：规则集载荷（解压后 256 MiB）、Geo 数据库（512 MiB）、HTTP 响应体、DNS 报文尺寸，以及逻辑规则与 protobuf 消息的嵌套深度。
+- **不信任 profile 字符串。** 会进入线路格式的取值（主机名、路径、凭据）一律校验；控制字符直接拒绝，而不是转义后放行。
+- **自实现密码学。** AEAD、哈希、KDF 与流密码都在 `crypto` 中实现并由已知答案测试覆盖；不存在 OpenSSL 或 ring 依赖。
+- **默认不跳过证书校验。** `skip-cert-verify` 是每个出站的显式选择。
+
+细节见 [`wiki/Security.md`](wiki/Security.md)。
+
+## 测试与持续集成
+
+```bash
+cargo test --all-features      # 1097 项
+cargo test                     # 默认 feature 下 1008 项
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+```
+
+测试覆盖：纯编解码的已知答案与性质测试、规则引擎的顺序与优先级测试、二进制格式解码器的字节级夹具（含手工拼装的夹具，避免解码器只被自己的写入器验证）、以及环回环境下的引擎端到端测试。
+
+CI 在三个桌面平台运行，检查声明的 MSRV，交叉检查 Android（aarch64 与 x86_64，通过 NDK）与 iOS，用裸机目标验证 `no_std` 核心，并且出现任何编译警告或 rustdoc 链接失效都会让构建失败。
+
+## 平台支持
+
+| 平台 | 状态 |
+|---|---|
+| Linux、macOS、Windows | 支持；桌面 CI |
+| Android | 支持（`jni` 桥接，TUN 走 `VpnService`） |
+| iOS | 支持（TUN；`sysinfo` 指标改由平台 API 提供） |
+| HarmonyOS（`target_env = ohos`） | 引擎层支持 |
+| `no_std + alloc` 目标 | 协议核心可编译；线程化引擎不可用 |
+
+## 目录结构
 
 ```
 src/
-├── lib.rs          # 模块接线、全局状态、no_std 门控、平台入口
-├── api.rs          # 类型化同步 API
-├── ffi.rs          # 手写 C ABI
-├── rpc/            # 共享分发表 + 本地 HTTP/WebSocket JSON-RPC
-├── types.rs        # 共享 DTO
-├── common/         # 线程池封装、socket、中继、监听器、定时器、取消、URL、
-│                   #   courierust HTTP 客户端、根证书
-├── engine/         # 配置、路由、入站、出站、代理集、统计
-├── crypto/         # 加密原语 + 文本编解码（no_std）
-├── protocol/       # 线路协议：QUIC v1、TLS 1.3、REALITY、WebSocket、WireGuard
-├── dns/            # profile → RecurseX 适配：上游、bogon、域名模式
-└── netstack/       # 用户态 TCP/IP（SolidTCP）、TUN、NAT、VPN 驱动
+  engine/    config、routing、ruleset、geo、inbound、outbound、dns、providers
+  netstack/  用户态 TCP/IP、TUN 集成、平台路由
+  dns/       profile → RecurseX 适配、监听式解析器
+  protocol/  线路编解码：TLS 1.3、QUIC、WebSocket、WireGuard、地址类型
+  crypto/    AEAD、哈希、KDF、流密码、随机数
+  common/    同步原语、socket、流、定时器、HTTP 客户端
+  api.rs     类型化同步门面
+  rpc/       JSON-RPC 控制面
+  ffi.rs     C ABI
 ```
 
-`no_std` 核心包括 `crypto/`、`common/url`、`protocol/address` 与 `protocol/error`，都是纯逻辑、无 OS 依赖。线程化网络层（engine、DNS 服务端、netstack、RPC、各传输）由 `std` feature 门控。
+## 已知边界
 
-## 构建与测试
+以下都是有意为之，且每一条都会在**配置阶段**暴露，而不是留到运行时。
 
-### 依赖版本
+| 领域 | 现状 | 后果 |
+|---|---|---|
+| 流量嗅探（TLS ClientHello SNI / HTTP Host 回捞） | 未实现 | 域名来自 DNS 侧（fake-IP、redir-host）。客户端直接用 IP 连接时，域名规则无法命中；这类流量用 `ip-cidr` / `geoip` 兜底 |
+| 子规则段（`sub-rules`） | 未实现 | 用「具名 rule-provider + `rule-set` 规则」表达等价语义 |
+| `.srs` 中的客户端条件（`wifi_ssid`、`package_name` 等） | 识别并拒绝 | 整份规则集被拒绝并点名该条件；不含这些条件的规则集正常加载 |
+| 无 C 工具链的目标上的 `.mrs` | 可用 feature 关闭 | 以 `--no-default-features --features std,tls,wireguard` 构建；此时 `.mrs` 载荷会以点名缺失 feature 的错误被拒绝 |
+| `DOMAIN-KEYWORD` 匹配 | 与关键词数量线性相关 | 关键词集合保持精简，或用 `domain-regex` 表达 |
 
-Corduit 使用 crates.io 正式发布的 RecurseX 0.2.6 与 Courierust 1.1.2，`Cargo.lock` 锁定版本和校验和。本地构建与 CI 均使用 `--locked`，无需相邻仓库或额外仓库变量。两个项目共用同一个 Courierust socket 工厂，`dns_socket_factory` 验证实际传输经过安装的回调。
+## 许可证
 
-平台适配留在 Corduit；Courierust 只提供 socket 回调和网络代次通知。回调应在客户端启动前安装，在连接前完成接口绑定或 VPN 保护，失败时返回错误。网络代次变化后，RecurseX 会淘汰缓存中的旧转发传输；正在执行的交换允许结束。
-
-`--no-default-features` 只构建协议核心，不启用 DNS 运行时和平台 I/O 依赖；默认特性继续保留现有桌面引擎行为。Corduit 的 `bytes` 依赖仍要求指针宽度原子操作，因此 Corduit 暂不支持 `thumbv6m-none-eabi`；Courierust 和 RecurseX 的独立协议核心可以在该目标编译。使用真正的裸机目标验证 Corduit：
-
-```sh
-cargo check --locked --no-default-features --target x86_64-unknown-none
-```
-
-```bash
-cargo check --locked --all-targets
-cargo test --locked                          # 单元 + 属性测试（默认 feature）
-cargo test --locked --features tuic,hysteria2  # 纳入可选的 QUIC 出站
-cargo test --locked --doc
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo fmt --all -- --check
-cargo check --locked --no-default-features                # no_std 协议核心
-cargo check --locked --no-default-features --features std  # 引擎层，不含可选协议
-cargo test --locked --no-default-features --features std   # …以及该配置下的测试代码
-cargo run --locked --example minimal                     # 真跑一个引擎，只用环回端口
-```
-
-逐个调用分发表每个方法的检查，必须放在「本进程没有其它活跃连接」的地方：`stop_corduit`
-与 `close_all_connections_dto` 会取消进程内所有已跟踪连接。Cargo 会给 `tests/` 下每个文件
-独立进程，因此该检查放在 `tests/rpc_dispatch.rs`，而不是挨着它所验证的分发表。
-
-CI 在 Linux、macOS、Windows 上运行完整的检查与测试矩阵，另有 all-features 作业（覆盖被门控的 QUIC / TUIC / Hysteria 代码的构建与测试）、`no_std` 核心检查、既有检查也有测试的 `std`-only 配置、Android（aarch64 与 x86_64）与 iOS 交叉检查，以及**构建并测试** 1.88 的 MSRV 作业。桌面平台的作业还会跑只用环回端口的示例，以应用的方式驱动整个 crate，并用 `--all-features` 构建文档。`RUSTFLAGS` 与 `RUSTDOCFLAGS` 都是 `-D warnings`：出现警告或文档内链接失效，都会让构建失败。
-
-MSRV：**Rust 1.88**。不使用任何 HTTP/TLS/QUIC 第三方库，也没有 async runtime：网络层是 courierust 加上表中列出的仓库内编解码，并发是 courierust 的 work-stealing 池加上 `std::thread`。
-
-## 安全边界
-
-本工具在本机控制网络流量，因此边界是显式的：
-
-- **FFI**：没有任何 panic 能跨越 `extern "C"` 展开；全部参数经类型检查；二进制通道有界（`rustbinary`，64 MiB 上限），交给调用方的缓冲区占用的分配大小与长度精确一致。
-- **RPC 服务端**：仅绑回环地址，常量时间 bearer token 比较，拒绝空 token（绝不静默变成开放服务），请求体 16 MiB 上限，空闲连接回收，WebSocket 升级按 RFC 6455 校验（`Sec-WebSocket-Key` 形状与 accept 值）。
-- **入站认证**：`general.authentication` 在每条路径上强制执行——HTTP 普通请求与 `CONNECT`（407 带客户端重试所需的 challenge）、SOCKS5 的 TCP 与 UDP 关联（RFC 1929），以及 TUN 协议栈自己的 SOCKS5 客户端（它携带配置的凭据，而不是让整条隧道失败）。
-- **出站握手**：`Sec-WebSocket-Accept` 不匹配按硬失败处理，不会降级成警告；配置提供的握手头（token 名称、值中不得含 CR/LF）在写上线之前完成校验；QUIC 系出站要求服务端证书链**且**通过验证的 `CertificateVerify` 证明，缺一不安装 1-RTT 密钥。
-- **Windows TUN**：`wintun.dll` 只从可执行文件所在目录（或其下的 `wintun/` 子目录）加载；不再搜索用户级目录与工作目录，未提权进程无法为提权引擎“种”一个 DLL。
-- **数据路径**：DNS 线解析来自 RecurseX：循环前先限段数、每个长度字段都对报文做边界检查、压缩指针只允许向前且带跳数预算（由 255 字节名字上限推导）；仓库内的 DNS 应答器执行同样的指针预算，自引用名字无法把 TUN 线程转死。引擎自身的回退解析器只接受事务 ID 与问题完全匹配的应答，截断应答按失败处理、不作为答案。SOCKS5 客户端的域名若携带空白或控制字节，会收到失败应答而不是被拼进伪造的请求行；同一条规则守护一切会进入文本行的配置名（WebSocket 握手、Snell obfs、simple-obfs、SSR 的 `obfs-host`）。MMDB 读取有边界检查、HTTP 响应体有上限、`skip-cert-verify` 默认关闭。
-
-更多：[Security](https://github.com/blueokanna/Corduit/wiki/Security)。
-
-## 许可
-
-[PolyForm Strict License 1.0.0](LICENSE)，外加附加许可人条款。
-
-- **允许**：个人用途（研究、实验、测试、个人学习、业余项目）与非商业用途，包括非商业组织使用。
-- **不允许**：以任何形式分发本软件（无论免费或收费），以及基于本软件进行修改或创作衍生作品。
-- **以合法使用为前提**：不授予任何规避权利，使用必须停留在适用于你的法律之内。
-
-Required Notice: Copyright 2026 blueokanna (https://github.com/blueokanna/Corduit)
-
-### RecurseX 0.2.6 的 DNS 集成
-
-域名形式的策略上游无法解析时，保留关闭的专用路由，不将问题泄露到默认 DNS。
-监听默认只允许回环客户端；显式开启 `allow-lan` 后增加 RFC1918、IPv4 链路本地、IPv6 ULA
-及链路本地范围，公共来源仍被拒绝。绑定通配地址不等于开放访问。UDP/TCP 共用绑定端口和解析策略。
-
-启动前校验 DNS 上游语法与策略模式。拨号和监听器的 fallback 规则共用 RecurseX 匹配器：裸域名精确匹配，
-`+.` 匹配域名及其子域，支持标签中的 `*` 通配符。未配置 fallback 服务器时，过滤条件不生效。
-若已配置的 fallback 上游全部无法完成 bootstrap，DNS 监听器拒绝启动，避免将指定域名发送到默认服务器。
-
-TUN TCP 与 SOCKS5 UDP 中继统一通过公共 socket 层创建连接。保护失败立即返回错误；Android VPN 已启用但
-回调缺失时同样拒绝联网。更换或清除回调会使缓存的 DNS 传输失效。`common::socket::protect_outbound_fd`
-现返回 `io::Result<()>`，调用方需要处理错误。`tests/vpn_socket_protection.rs` 需在 Android 测试环境执行。
-
-传输恢复、有界查询观测和缓存准入由 RecurseX 提供。局部验签不表示完整 DNSSEC 信任链。
-纯递归依赖权威 UDP/TCP 的实际可达性；已配置的备用服务器可处理传输失败，但不改变显式域名路由。
+见 [LICENSE](LICENSE)。Corduit 仅面向合法用途发布：它是面向代理协议、路由、DNS 与用户态 TCP/IP 的网络工程工具。

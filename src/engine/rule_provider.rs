@@ -1,10 +1,12 @@
 use crate::engine::error::{Error, Result};
+use crate::engine::geo::ipset::IpRangeSet;
+use crate::engine::ruleset::succinct::DomainMatcher;
 use ipnet::IpNet;
 use nextjson::{NsonDeserialize, NsonSerialize};
 use parking_lot::RwLock;
 use regex::Regex;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -176,49 +178,27 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
         .any(|start| haystack[start..start + needle.len()].eq_ignore_ascii_case(needle))
 }
 
-/// Whether any configured suffix ends `domain` on a label boundary.
-///
-/// Walks the domain's own labels — at most one hash probe per label — instead of
-/// asking every suffix in the set whether it matches. On a rule set with tens of
-/// thousands of suffixes that is the difference between four lookups and fifty
-/// thousand comparisons, and it is why suffix-heavy sets are usable at all.
-fn suffix_matches(suffixes: &HashSet<Box<str>>, domain: &str) -> bool {
-    if suffixes.is_empty() {
-        return false;
-    }
-    let mut rest = domain;
-    loop {
-        if suffixes.contains(rest) {
-            return true;
-        }
-        match rest.split_once('.') {
-            Some((_, tail)) => rest = tail,
-            None => return false,
-        }
-    }
-}
-
 /// A rule set arranged for lookup rather than for storage.
 ///
 /// [`CompiledRuleEntry`] stays as authored so a set can be inspected and
-/// reported; this is what matching runs against. Every pattern is folded to
-/// ASCII lowercase exactly once, here, so the hot path never lowercases,
-/// formats or parses anything — the three things the previous linear scan did
-/// per entry, per connection.
+/// reported; this is what matching runs against. Two structures carry the bulk of
+/// a real rule set, and both are the compressed forms the rest of the engine
+/// already uses: a community set of a hundred thousand suffixes costs roughly an
+/// order of magnitude less memory as a compressed domain set than as hash sets of
+/// boxed strings, and merged address intervals beat a list of CIDR values on both
+/// size and lookup cost.
 #[derive(Debug, Default)]
 struct RuleIndex {
-    /// Fully-qualified domains: one hash probe.
-    exact: HashSet<Box<str>>,
-    /// Domain suffixes: one probe per label of the queried domain.
-    suffixes: HashSet<Box<str>>,
+    /// Exact and suffix domains, in one compressed set.
+    domains: DomainMatcher,
     /// Substrings, which have no structure a set can exploit and stay a list.
     keywords: Vec<Box<str>>,
     regexes: Vec<Regex>,
-    /// Destination networks, pre-parsed.
-    dst_nets: Vec<IpNet>,
-    /// Source networks, pre-parsed. Kept separate from `dst_nets` because they
-    /// are compared against a different address.
-    src_nets: Vec<IpNet>,
+    /// Destination addresses, merged into intervals.
+    dst: IpRangeSet,
+    /// Source addresses, merged. Kept separate from `dst` because they are
+    /// compared against a different address.
+    src: IpRangeSet,
     /// Process names, folded.
     process_names: Vec<Box<str>>,
     /// Entries that parsed but could not be indexed, with the reason.
@@ -228,23 +208,35 @@ struct RuleIndex {
 
 impl RuleIndex {
     fn compile(entries: &[CompiledRuleEntry]) -> Self {
+        // Domain patterns are collected first because the compressed set is built
+        // from one sorted key list; everything else is indexed as it is read.
+        let mut exact: Vec<String> = Vec::new();
+        let mut suffix: Vec<String> = Vec::new();
         let mut index = Self::default();
         for entry in entries {
-            index.add(entry);
+            index.add(entry, &mut exact, &mut suffix);
         }
+        index.domains = DomainMatcher::build(exact, suffix);
+        index.dst.finish();
+        index.src.finish();
         index
     }
 
-    fn add(&mut self, entry: &CompiledRuleEntry) {
+    fn add(
+        &mut self,
+        entry: &CompiledRuleEntry,
+        exact: &mut Vec<String>,
+        suffix: &mut Vec<String>,
+    ) {
         match entry {
             CompiledRuleEntry::Domain(pattern) => {
-                if !pattern.is_empty() {
-                    self.exact.insert(folded_box(pattern));
+                if !pattern.trim().is_empty() {
+                    exact.push(pattern.clone());
                 }
             }
             CompiledRuleEntry::DomainSuffix(pattern) => {
-                if !pattern.is_empty() {
-                    self.suffixes.insert(folded_box(pattern));
+                if !pattern.trim().is_empty() {
+                    suffix.push(pattern.clone());
                 }
             }
             CompiledRuleEntry::DomainKeyword(pattern) => {
@@ -253,20 +245,20 @@ impl RuleIndex {
                 }
             }
             CompiledRuleEntry::DomainRegex(regex) => self.regexes.push(regex.clone()),
-            CompiledRuleEntry::IpCidr(network) => self.dst_nets.push(*network),
+            CompiledRuleEntry::IpCidr(network) => self.dst.insert_net(*network),
             CompiledRuleEntry::Classical {
                 rule_type,
                 pattern,
                 regex,
             } => match rule_type {
                 ClassicalRuleType::Domain => {
-                    if !pattern.is_empty() {
-                        self.exact.insert(folded_box(pattern));
+                    if !pattern.trim().is_empty() {
+                        exact.push(pattern.clone());
                     }
                 }
                 ClassicalRuleType::DomainSuffix => {
-                    if !pattern.is_empty() {
-                        self.suffixes.insert(folded_box(pattern));
+                    if !pattern.trim().is_empty() {
+                        suffix.push(pattern.clone());
                     }
                 }
                 ClassicalRuleType::DomainKeyword => {
@@ -281,11 +273,11 @@ impl RuleIndex {
                         .push(format!("DOMAIN-REGEX '{pattern}' is not a valid regex")),
                 },
                 ClassicalRuleType::IpCidr => match pattern.trim().parse::<IpNet>() {
-                    Ok(network) => self.dst_nets.push(network),
+                    Ok(network) => self.dst.insert_net(network),
                     Err(error) => self.rejected.push(format!("IP-CIDR '{pattern}': {error}")),
                 },
                 ClassicalRuleType::SrcIpCidr => match pattern.trim().parse::<IpNet>() {
-                    Ok(network) => self.src_nets.push(network),
+                    Ok(network) => self.src.insert_net(network),
                     Err(error) => self
                         .rejected
                         .push(format!("SRC-IP-CIDR '{pattern}': {error}")),
@@ -301,19 +293,18 @@ impl RuleIndex {
 
     /// Entries that can actually decide a match.
     fn matchable_count(&self) -> usize {
-        self.exact.len()
-            + self.suffixes.len()
+        self.domains.len()
             + self.keywords.len()
             + self.regexes.len()
-            + self.dst_nets.len()
-            + self.src_nets.len()
+            + self.dst.range_count()
+            + self.src.range_count()
             + self.process_names.len()
     }
 
     /// Whether this set holds any address entry a resolved answer could
     /// decide. The router asks before paying for a lookup.
     fn has_dst_ip_entries(&self) -> bool {
-        !self.dst_nets.is_empty()
+        !self.dst.is_empty()
     }
 
     /// A bounded description of what could not be indexed.
@@ -334,48 +325,42 @@ impl RuleIndex {
 
     fn matches(&self, input: &RuleMatchInput<'_>) -> bool {
         if let Some(domain) = input.domain {
-            let domain = fold_ascii_lower(domain.trim_end_matches('.'));
-            let domain = domain.as_ref();
-            if self.exact.contains(domain)
-                || suffix_matches(&self.suffixes, domain)
-                || self
-                    .keywords
-                    .iter()
-                    .any(|keyword| domain.contains(keyword.as_ref()))
-                || self.regexes.iter().any(|regex| regex.is_match(domain))
+            let domain = domain.trim_end_matches('.');
+            if self.domains.matches(domain) {
+                return true;
+            }
+            // Keywords and regexes keep their own folded copy: the compressed
+            // set folds internally, and a substring test cannot ask it anything.
+            let folded = fold_ascii_lower(domain);
+            if self
+                .keywords
+                .iter()
+                .any(|keyword| folded.contains(keyword.as_ref()))
+                || self.regexes.iter().any(|regex| regex.is_match(&folded))
             {
                 return true;
             }
         }
 
         if let Some(address) = input.dst_ip
-            && self
-                .dst_nets
-                .iter()
-                .any(|network| network.contains(&address))
+            && self.dst.contains(address)
         {
             return true;
         }
 
         // Addresses the router resolved for the domain count too, unless the
         // rule opted out with `no-resolve`.
-        if !input.no_resolve {
-            for address in input.resolved {
-                if self
-                    .dst_nets
-                    .iter()
-                    .any(|network| network.contains(address))
-                {
-                    return true;
-                }
-            }
+        if !input.no_resolve
+            && input
+                .resolved
+                .iter()
+                .any(|address| self.dst.contains(*address))
+        {
+            return true;
         }
 
         if let Some(address) = input.src_ip
-            && self
-                .src_nets
-                .iter()
-                .any(|network| network.contains(&address))
+            && self.src.contains(address)
         {
             return true;
         }

@@ -8,7 +8,7 @@
 //! the service reference are kept for the process lifetime and replaced on a
 //! VPN restart.
 //!
-//! Built on `jni` 0.22 with the workspace's Rust 1.88 MSRV. Native entry
+//! Built on `jni` 0.22 with the workspace's Rust 1.95 MSRV. Native entry
 //! points receive an FFI-safe `EnvUnowned` and acquire an `Env` before using
 //! JNI. Android supplies the VM; the JVM invocation feature stays disabled.
 //!

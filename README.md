@@ -1,558 +1,345 @@
 # Corduit
 
-A synchronous network proxy engine for Rust, with a `no_std` core. The
-configuration model, rule router, DNS stack, userspace TCP/IP stack and every
-wire protocol live in one crate, built without a third-party proxy core;
-**there is no async runtime anywhere in the dependency tree**.
+A synchronous network proxy engine for Rust, with a `no_std` core. The configuration model,
+rule router, DNS stack, userspace TCP/IP stack and every wire protocol live in one crate,
+built without a third-party proxy core; **there is no async runtime anywhere in the
+dependency tree**.
 
 [![Crates.io](https://img.shields.io/crates/v/corduit)](https://crates.io/crates/corduit)
 [![docs.rs](https://img.shields.io/docsrs/corduit)](https://docs.rs/corduit)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
+[![CI](https://github.com/blueokanna/Corduit/actions/workflows/ci.yml/badge.svg)](https://github.com/blueokanna/Corduit/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.95-blue)](Cargo.toml)
 
-- **中文说明** → [README.zh-CN.md](README.zh-CN.md)
-- **完整文档** → [Wiki](https://github.com/blueokanna/Corduit/wiki)（FFI / RPC / 方法参考）
+- Chinese documentation → [README.zh-CN.md](README.zh-CN.md)
+- Full documentation → [Wiki](https://github.com/blueokanna/Corduit/wiki) (FFI, RPC, method reference)
 
 ---
 
 ## Legal notice — read before building or running anything
 
-Corduit is a network engineering toolkit: proxy protocols, a rule router, DNS
-and a userspace TCP/IP stack. It is published for **lawful use only**.
+Corduit is a network engineering toolkit: proxy protocols, a rule router, DNS and a
+userspace TCP/IP stack. It is published for **lawful use only**.
 
-- **Your local law governs.** Nothing in this repository, its license or its
-  documentation grants any permission the law applying to you does not already
-  give you. You alone are responsible for how you use it.
-- **Do not use it to break the law.** In some jurisdictions, mainland China
-  included, providing or using a proxy, VPN or tunnel service to bypass state
-  network controls is illegal. Corduit grants no right to do that, and the
-  maintainers neither authorize nor support it.
-- **TUIC, Hysteria and Hysteria2 are opt-in.** They are disabled Cargo features
-  (`tuic`, `hysteria`, `hysteria2`) and are absent from a default build;
-  enabling them is your own decision.
-- **Unlawful use gets no support.** Issues, pull requests and discussions that
-  would enable unlawful use will be closed.
-- **No warranty, no liability.** The software is provided as is. See
-  [LICENSE](LICENSE), whose additional licensor terms make lawful use a
-  condition of every license granted.
-- **This is not legal advice.** If you are unsure whether your intended use is
-  lawful, consult a qualified lawyer in your jurisdiction before building or
-  running anything.
+- **Your local law governs.** Nothing in this repository, its license or its documentation
+  grants any permission the law applying to you does not already give you. You alone are
+  responsible for how you use it.
+- **Do not use it to break the law.** In some jurisdictions, mainland China included,
+  providing or using a proxy, VPN or tunnel service to bypass state network controls is
+  illegal. Corduit grants no right to do that, and the maintainers neither authorize nor
+  support it.
+- **TUIC, Hysteria and Hysteria2 are opt-in.** They are disabled Cargo features (`tuic`,
+  `hysteria`, `hysteria2`) and are absent from a default build; enabling them is your own
+  decision.
+- **Unlawful use gets no support.** Issues, pull requests and discussions that would enable
+  unlawful use will be closed.
+- **No warranty, no liability.** The software is provided as is. See [LICENSE](LICENSE),
+  whose additional licensor terms make lawful use a condition of every license granted.
+- **This is not legal advice.** If you are unsure whether your intended use is lawful,
+  consult a qualified lawyer in your jurisdiction before building or running anything.
 
 ---
 
-## What it is
+## Contents
 
-Most proxies are assemblies: a config loader, a rule engine, a DNS resolver
-and a set of protocol kernels, each from a different upstream with its own bug
-tracker and release cadence. Corduit keeps those parts in one engine, where
-configuration, routing, DNS, userspace networking and the wire protocols are
-developed, tested and released together.
+- [Motivation](#motivation)
+- [At a glance](#at-a-glance)
+- [Protocol support](#protocol-support)
+- [Architecture](#architecture)
+- [Execution model](#execution-model)
+- [Building](#building)
+- [Running the engine](#running-the-engine)
+- [Configuration](#configuration)
+- [Rule engine](#rule-engine)
+- [Security model](#security-model)
+- [Testing and continuous integration](#testing-and-continuous-integration)
+- [Platform support](#platform-support)
+- [Project layout](#project-layout)
+- [Known limitations](#known-limitations)
+- [License](#license)
 
-Capabilities:
+## Motivation
 
-- **Inbounds**: `http`, `socks5` and `mixed` (HTTP + SOCKS5 auto-detection) as
-  configured listeners; TUN mode over the in-tree userspace stack, driven
-  through the platform entry points rather than the `inbounds` list. `redir`,
-  `tproxy` and a `tun` entry in `inbounds` parse as types and are then
-  **rejected at validation** with an error naming what is missing: none of
-  the three has a listener, and a build that accepted them would answer
-  nothing while claiming otherwise.
-- **Outbounds**: `direct`, `reject`, `socks5`, `socks4` / `socks4a`, `http`
-  (plain or TLS-wrapped), `shadowsocks` (the 2017 AEAD ciphers; the 2022
-  suite is refused with a named error rather than half-implemented),
-  `shadowsocksr`, `snell` (v4 / v5, `obfs: http` / `obfs: tls`), `vmess`,
-  `vless`, `trojan`, `wireguard`, `naive` (NaiveProxy), the opt-in
-  `shadowtls` (v3), `tuic` (v5), `hysteria` (v1) and `hysteria2`; plus the
-  group selectors `selector`, `url-test`, `fallback`, `load-balance` and
-  `relay`. A Shadowsocks node can carry a SIP003 plugin — `obfs`
-  (simple-obfs `http` / `tls`), `v2ray-plugin` (`websocket` mode, carrying
-  the mux session framing its server expects by default) or
-  `shadow-tls` (v3) — resolved as an in-tree stream, never as an external
-  binary.
-- **Routing**: `domain`, `domain-suffix`, `domain-keyword`, `domain-regex`,
-  `geosite`, `geoip`, `ip-cidr`, `src-ip-cidr`, `src-port`, `dst-port`,
-  `in-port` / `in-type` / `in-name` / `in-user`, `process-name`,
-  `process-path`, `network`, `rule-set`, `proxy-mode`, `and` / `or` / `not`
-  and `match`, with `rule` / `global` / `direct` modes; rule providers and
-  proxy providers refresh on an interval.
-- **Rule sets and Geo data**: text, YAML and JSON payloads; both binary rule-set
-  families in the wild - `.srs` (versions 1-5, zlib, including `and` / `or` /
-  `invert`) and `.mrs` (container version 1, zstd, with its `+` suffix and `*`
-  single-label operators) - plus the v2ray Geo databases (`geosite.dat` for
-  categories, `geoip.dat` or `Country.mmdb` for address ownership), all decoded
-  in-tree with categories and countries compiled on first use.
-- **DNS**: the resolver is [RecurseX](https://crates.io/crates/recurse-x), the
-  same author's library, consumed as a dependency. It provides upstreams over
-  UDP / TCP / DoT / DoH / DoH3 / DoQ, a stability-measured multi-tier cache,
-  request coalescing and server selection priced by expected cost. Corduit
-  supplies the parts that come from the profile dialect
-  (`nameserver-policy`, `default-nameserver`, `hosts`, `cache-size`), the
-  hostname-to-literal bootstrap for encrypted upstreams, and the bogon / GeoIP
-  answer filter, since RecurseX ships no country database. With `dns.enable`
-  set, a real listener answers on `dns.listen` over both UDP and TCP, from the
-  same profile.
-- **Synchronous execution**: no tokio, no reactor, no `async` / `await` in the
-  engine. Concurrency comes from a work-stealing pool for short tasks and
-  dedicated threads for long-lived relays.
-- **`no_std` core**: with `default-features = false` the crate compiles on
-  `no_std + alloc`. The crypto primitives, the URL parser and the pure wire
-  codecs (`protocol::address`, `protocol::error`) carry no OS dependency.
-- **Hot reload** (`Corduit::reload`) and **traffic accounting**
-  (per-connection up/down, speed, active list).
+Proxy deployments are usually assembled: a configuration loader, a rule engine, a DNS
+resolver and several protocol kernels, each from a different upstream with its own bug
+tracker and release cadence. The seams between those parts are where behaviour drifts — a
+rule that means one thing to the router and another to the resolver, a profile key that one
+component accepts and the next silently drops.
+
+Corduit is the opposite arrangement. One crate owns the whole data plane, so a configuration
+key, a rule type or a wire detail has exactly one implementation and one set of tests. The
+engine is synchronous: no async runtime, no reactor and no `async` / `await` in the data
+path, which keeps the thread topology, the cancellation story and the failure modes
+inspectable.
+
+## At a glance
+
+| Area | What is implemented |
+|---|---|
+| **Inbounds** | `http`, `socks5`, `mixed` (protocol auto-detection); TUN through the in-tree userspace stack |
+| **Outbounds** | `direct`, `reject`, `socks5`, `socks4`/`socks4a`, `http` (plain or TLS), `shadowsocks` (2017 AEAD + SIP003 plugins), `shadowsocksr`, `snell` v4/v5, `vmess`, `vless`, `trojan`, `wireguard`, `naive`, and the opt-in `shadowtls` v3, `tuic` v5, `hysteria` v1, `hysteria2` |
+| **Policy groups** | `selector`, `url-test` (with hysteresis), `fallback`, `load-balance` (round-robin / consistent hashing / sticky sessions), `relay` |
+| **Rule types** | `domain`, `domain-suffix`, `domain-keyword`, `domain-regex`, `geosite`, `geoip`, `ip-cidr`, `src-ip-cidr`, `src-port`, `dst-port`, `in-port`/`in-type`/`in-name`/`in-user`, `process-name`, `process-path`, `network`, `rule-set`, `proxy-mode`, `and`/`or`/`not`, `match` |
+| **Rule sets** | Text / YAML / JSON payloads; `.srs` (versions 1–5, zlib); `.mrs` (container version 1, zstd) |
+| **Geo data** | `geosite.dat` (categories), `geoip.dat` and `Country.mmdb` (address ownership) |
+| **DNS** | [RecurseX](https://crates.io/crates/recurse-x) resolver; profile-side policy, upstream bootstrap, answer filtering, optional listening resolver |
+| **Runtime** | Hot reload, per-connection accounting, JSON-RPC control plane, C ABI, Android JNI |
+
+Supported and unsupported features are held to the same standard: anything the engine
+cannot honour is refused at configuration time with an error naming the missing capability,
+rather than accepted and silently degraded. See [Known limitations](#known-limitations).
+
+## Protocol support
+
+### Inbounds
+
+| Type | Notes |
+|---|---|
+| `http` | CONNECT and absolute-URI forwarding, optional authentication |
+| `socks5` | CONNECT, UDP ASSOCIATE, username/password authentication |
+| `mixed` | One listener that detects HTTP or SOCKS5 from the first bytes without consuming them |
+| TUN | In-tree userspace TCP/IP (`netstack`), with a fake-IP pool and a DNS responder |
+| `redir`, `tproxy`, `tun` (as an `inbounds` entry) | Parsed, then **rejected at validation**: no listener exists for them, and a build that accepted them would answer nothing while claiming otherwise |
+
+### Outbounds
+
+| Type | Notes |
+|---|---|
+| `direct`, `reject` | Direct dial; fail-closed rejection |
+| `socks5`, `socks4`/`socks4a`, `http` | Plain or TLS-wrapped HTTP proxy |
+| `shadowsocks` | 2017 AEAD ciphers; SIP003 plugins `obfs`, `v2ray-plugin`, `shadow-tls` resolved in-tree |
+| `shadowsocksr` | Full protocol/obfs matrix |
+| `snell` | v4 and v5, `obfs: http` / `obfs: tls` |
+| `vmess`, `vless`, `trojan` | Full client implementations, including multiplexing where the protocol defines it |
+| `wireguard` | Userspace WireGuard client (feature `wireguard`) |
+| `naive` | NaiveProxy client |
+| `shadowtls` v3, `tuic` v5, `hysteria` v1, `hysteria2` | Feature-gated (`shadowtls`, `tuic`, `hysteria`, `hysteria2`) |
+
+Shadowsocks 2022 ciphers are refused with a named error rather than half-implemented.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph IN["Inbounds — one thread per listener"]
-        MIX["mixed"]
-        HTTP["http"]
-        S5["socks5"]
-        TUN["TUN → netstack<br/>userspace TCP/IP + NAT"]
-    end
-
-    MIX & HTTP & S5 & TUN --> RT["Router<br/>rules · rule providers · geoip"]
-    DNS["DNS — RecurseX<br/>resolver · cache · transports"] -.-> RT
-    RT --> OM["OutboundManager<br/>groups · health check · tracker"]
-    OM --> DIAL["dial outbound<br/>handshake + optional chain"]
-    DIAL --> RELAY["relay<br/>one copy thread + the connection thread, half-close, accounting"]
-    RELAY --> NET(["socket / QUIC connection"])
+```
+        client ──▶ inbound ──▶ router ──▶ policy group ──▶ outbound ──▶ server
+                     │           │
+                     │           └── rule table · rule providers · geo databases
+                     └── netstack (TUN) · DNS resolver · connection tracker
 ```
 
-A connection enters one inbound listener, is classified by the router, and is
-handed to one outbound. The relay owns it until either side closes, and every
-byte it copies is counted per connection.
+- **`engine/config`** — the validated configuration model and the encoding layer that maps
+  profile dialects onto it.
+- **`engine/routing`** — rule compilation and matching. Rules are compiled once (regexes,
+  CIDRs, port ranges, transports), and domain/suffix lookups are indexed so an ordered rule
+  table stays ordered without a linear scan per connection.
+- **`engine/ruleset`** — the binary rule-set decoders (`.srs`, `.mrs`), the compressed domain
+  set they share, and the headless rule model both formats decode into.
+- **`engine/geo`** — the Geo databases: strict protobuf decoding, per-category and
+  per-country compilation on first use, merged address interval sets.
+- **`engine/outbound`** — one module per protocol, plus the policy groups.
+- **`engine/inbound`** — the listeners.
+- **`dns`** — the profile-to-resolver adaptation on top of RecurseX.
+- **`netstack`** — the userspace stack: TCP state machine, UDP sessions, TUN integration,
+  platform routing.
+- **`protocol`**, **`crypto`** — the wire codecs and the cryptographic primitives, both
+  `no_std`-compatible.
+- **`common`** — synchronisation primitives, sockets, buffered streams, timers,
+  cancellation, and the HTTP client used by provider updates.
 
-## The synchronous execution model
+The dependency direction is one-way: `protocol` and `crypto` know nothing about `engine`,
+and `engine` never reaches into `netstack` internals.
 
-Corduit has no reactor. Concurrency is layered, and each layer does one job:
+## Execution model
 
-```mermaid
-flowchart TB
-    L["accept loop<br/>one thread per listener"] -->|accepted socket| S["connection thread<br/>courierust's per-connection engine<br/>HTTP/1.1 · h2c · CONNECT tunnels"]
-    S -->|dial + handshake| G{"connection budget<br/>admission control"}
-    G -->|admitted| R["relay<br/>one copy thread + the connection thread"]
-    R -->|EOF| HC["half-close the opposite transport"]
-    R -->|cancel token| SD["shutdown both transports"]
-    P["courierust work-stealing pool<br/>short tasks: DNS · control plane · timers"] -->|timers| T["timer wheel<br/>health checks · provider refresh"]
+There is no executor. Concurrency is explicit:
+
+- a work-stealing pool (from [`courierust`](https://crates.io/crates/courierust)) runs short,
+  bounded tasks — accepts, handshakes, provider refreshes;
+- long-lived relays own a thread each and stop when their cancellation token fires;
+- every blocking wait is either bounded by a deadline or interruptible by that token, so
+  shutdown does not depend on a network operation completing.
+
+This is why the engine can be driven from a `main` thread, a Flutter worker, an Android
+service or a C caller without an adapter layer: there is no runtime to adopt.
+
+## Building
+
+**Requirements**: Rust 1.95 (edition 2024). No C toolchain is needed: the zlib backend for
+`.srs` is `zlib-rs`, and the zstd decoder for `.mrs` is implemented in-tree
+(`engine::ruleset::zstd`).
+
+```bash
+cargo build --release
+cargo build --release --no-default-features --features std   # engine layer only
 ```
 
-1. **Short tasks** (DNS lookups, control plane, periodic refresh, timer
-   callbacks) run on **courierust's work-stealing thread pool**: per-worker
-   LIFO caches, a global FIFO, cross-worker stealing, zero CPU when idle.
-2. **Long-lived relays** run on **dedicated threads**: one copy thread per
-   connection plus the connection's own thread for the other direction, with
-   half-close semantics. The listener's connection budget bounds how many can
-   be live, so relays cannot starve the pool of handshake capacity.
-3. **Accept loops** run one thread per listener. Each accepted socket is served
-   on a thread of its own by **courierust's per-connection engine** (TLS/ALPN,
-   HTTP/1.1, HTTP/2, keep-alive, `CONNECT` tunnels, WebSocket upgrades), and
-   the listener's connection budget blocks the accept loop once the limit is
-   reached, so idle clients cannot grow threads without bound.
+### Feature flags
 
-Blocking is bounded by socket timeouts (`SO_RCVTIMEO` / `SO_SNDTIMEO`):
-`WouldBlock` and `TimedOut` mean *nothing happened yet*, and each loop
-re-checks its `CancellationToken` between operations. The two relay threads
-share a stream behind a mutex, so a read that could block indefinitely would
-be a lock-ordering deadlock. The relay therefore sets a 25 ms read poll
-(`RELAY_READ_POLL`) before it starts, which bounds every lock hold.
-
-The cost is explicit: a connection that stays open but mostly idle occupies
-its connection thread plus one relay thread. The listener's connection budget
-caps how many can be live, and the pool keeps short work fast. For a desktop
-or mobile proxy with tens to a few hundred concurrent connections, the trade
-is reasonable.
-
-## Cargo features
-
-| Feature | Default | What it adds |
+| Feature | Default | Effect |
 |---|---|---|
-| `std` | on | Threaded engine layer: engine, netstack, RPC, FFI. Implies `tls`. |
-| `tls` | on | `protocol::tls` client/server layers and the TLS-based outbounds (HTTPS, Trojan, VMess/VLESS TLS, TLS inbounds). |
-| `wireguard` | on | `protocol::wireguard` plus the WireGuard outbound. |
-| `quic` | off | `protocol::quic` — the in-tree QUIC v1 client transport (RFC 9000/9001/9002). |
-| `tuic` | off | TUIC v5 outbound. Implies `quic`. |
-| `hysteria` | off | Hysteria v1 outbound (control-stream auth, XPlus obfuscation, struct-encoded UDP datagrams). Implies `quic`. |
-| `hysteria2` | off | Hysteria2 outbound (HTTP/3 `POST /auth`, Salamander obfuscation). Implies `quic`. |
-| `tls13` | off | The in-tree TLS 1.3 client and the browser-shaped `ClientHello` fingerprints it can present (`chrome`, `randomized`, `off`). |
-| `reality` | off | REALITY client authentication for VLESS/Trojan/VMess (`security: reality`). Implies `tls13`. |
-| `shadowtls` | off | ShadowTLS v3 outbound. Implies `tls13`. |
+| `std` | yes | The threaded engine layer (implies `tls`) |
+| `tls` | yes | TLS client/server layers used by the TLS-based outbounds |
+| `wireguard` | yes | The WireGuard protocol and outbound |
+| `quic` | no | The in-tree QUIC v1 transport (RFC 9000/9001/9002) |
+| `tuic`, `hysteria`, `hysteria2` | no | The respective outbounds (imply `quic`) |
+| `tls13` | no | The in-tree TLS 1.3 client with profile-shaped `ClientHello` fingerprints |
+| `reality`, `shadowtls` | no | REALITY and ShadowTLS v3 (imply `tls13`) |
 
-A build that lacks `tuic`, `hysteria`, `hysteria2` or `shadowtls` **rejects**
-the matching outbound with a config error naming the missing feature; it never
-falls back to a direct connection. The same rule applies to `security: reality`
-and to `fingerprint` when `tls13` is off. It also covers what this engine does
-not implement at all: `redir` / `tproxy` / `tun` inbound entries and
-Shadowsocks 2022 ciphers are refused at the boundary with an error that says
-why — never accepted into a runtime that cannot honour them.
+With `default-features = false` the crate compiles for `no_std + alloc`; the pure wire codecs
+and the crypto primitives carry no OS dependency.
 
-## Division of labour: courierust vs. in-tree
+## Running the engine
 
-[courierust](https://crates.io/crates/courierust) is a zero-dependency,
-`no_std`-capable protocol suite. Corduit consumes it as a library and builds
-only the layers courierust deliberately does not expose:
-
-| Concern | Implementation |
-|---|---|
-| HTTP/1.1 codec, HTTP/2 connection, HTTP/3 framing | `courierust_h1` / `courierust_h2` / `courierust_h3` |
-| QPACK field sections (HTTP/3 headers) | `courierust_h3::qpack` |
-| HTTP client (pools, redirects, TLS settings) | `courierust_client` |
-| TLS 1.2 / 1.3, X.509 validation, crypto primitives | `courierust_tls` |
-| WebSocket RFC 6455 (framing, masking, fragmentation, close) | `courierust_ws`, wrapped once by `protocol::ws` |
-| HTTP/TLS obfuscation streams shared by Snell obfs and simple-obfs | `protocol::obfs` (in-tree) |
-| QUIC wire codecs (packets, frames, varint, packet protection) | `courierust_quic` |
-| Work-stealing scheduler | `courierust_pool` |
-| base64 | `courierust_crypto::base64` |
-| QUIC v1 **connection runtime** (handshake driver, ACK/loss recovery, congestion control, flow control, datagrams) | `protocol::quic` (in-tree) |
-| TLS 1.3 client with data-driven `ClientHello` fingerprints | `protocol::tls13` (in-tree) |
-| REALITY client (`security: reality`) | `protocol::reality` (in-tree) |
-| Shadowsocks / ShadowsocksR / Snell / VMess / VLESS / Trojan / ShadowTLS / NaiveProxy / TUIC / Hysteria / Hysteria2 / WireGuard / SOCKS4 | `engine::outbound` (in-tree) |
-| DNS resolver, semantic cache, UDP/TCP/DoT/DoH/DoH3/DoQ transports, wire codec | [RecurseX](https://crates.io/crates/recurse-x) — the same author's resolver, consumed as a library |
-| Profile → resolver adaptation, upstream bootstrap, bogon/GeoIP answer filter | `dns` (in-tree) |
-| Userspace TCP/IP stack (SolidTCP) + NAT + TUN | `netstack` (in-tree) |
-| Dual-stack (IPv4 + IPv6) netstack data path: v6 packet parsing and reply construction (TCP/UDP, v6 pseudo-header checksums), v6 SOCKS5 targets and v6 UDP relay replies | `netstack` (in-tree) |
-
-The workspace follows one rule: one implementation per responsibility. A
-second RFC 6455 state machine, a second QPACK codec, a second base64 or a
-second DNS wire codec is treated as a defect, not a feature.
-
-## REALITY and TLS fingerprints
-
-The optional `tls13` and `reality` features add a second TLS engine beside
-courierust's connector. Its `ClientHello` is data-driven, and server
-authentication runs through a hook:
-
-- **Fingerprints** (`fingerprint: chrome | randomized | off`): the cipher-suite
-  list, extension set and order, groups, signature algorithms, ALPN and padding
-  come from `courierust_fingerprint`'s Chrome profile, the parameter set of the
-  JA4 specification, with GREASE and 512-byte padding as a browser sends them.
-  Tests parse the emitted bytes back and compare JA3/JA4.
-- **REALITY** (`security: reality` with `public-key`, `short-id`,
-  `server-name`): the session id carries `version || time || short-id` sealed
-  with AES-256-GCM under the X25519-derived auth key, and the server is
-  authenticated by the ephemeral-certificate proof (`HMAC-SHA512` over the
-  certificate SPKI in place of a CA chain).
-- **Not advertised instead of faked**: certificate compression (RFC 8879) and
-  ALPS are not advertised, since the client cannot decompress or present them;
-  `mldsa65` verification is rejected as unsupported; and a REALITY *fallback*
-  (a real certificate arrives) is a hard error, not a silent downgrade.
-- **Client side only**: a REALITY *server* needs an Ed25519 signer for
-  `CertificateVerify`, which the in-tree crypto layer does not provide. The
-  session-id verification half is implemented and tested
-  (`protocol::reality::wire::unseal_session_id`).
-
-## The QUIC stack
-
-courierust ships the RFC 9000/9001 wire codecs and the TLS 1.3 crypto, but no
-QUIC connection runtime, and its `courierust_tls::quic` handshake driver is
-crate-private. Corduit therefore implements the missing layer in
-`protocol::quic`: one driver thread per connection owns the UDP socket, the
-handshake runs the TLS 1.3 key schedule itself, and streams are synchronous
-`Read` / `Write` handles over mutex-guarded buffers with condvar wakeups.
-
-```mermaid
-sequenceDiagram
-    participant C as Corduit client
-    participant S as QUIC server
-
-    C->>S: Initial - CRYPTO ClientHello
-    Note over C,S: Keys derived from DCID<br/>Initial and Handshake keys from TLS secrets
-
-    S->>C: Initial - CRYPTO ServerHello + ACK
-    S->>C: Handshake - CRYPTO EncryptedExtensions, Certificate, CertificateVerify, Finished
-
-    C->>C: Verify certificate chain and CertificateVerify signature
-    C->>S: Handshake - CRYPTO Finished + ACK
-
-    Note over C,S: 1-RTT application keys installed<br/>Three packet number spaces<br/>PTO loss recovery, NewReno, flow control
-
-    C->>S: 1-RTT - STREAM or DATAGRAM
-    S->>C: 1-RTT - STREAM or DATAGRAM
-```
-
-On top of that transport sit TUIC v5 (`tuic`), Hysteria v1 (`hysteria`) and
-Hysteria2 (`hysteria2`): three protocols that share nothing above QUIC.
-Hysteria2 is implemented against the official specification: HTTP/3 `POST /auth`
-on a client-initiated bidirectional stream (QPACK field section, `:status 233`
-expected), `0x401` TCP request frames, its own UDP session / fragment framing,
-and Salamander packet obfuscation (BLAKE2b-256 keyed by an 8-byte per-packet
-salt, applied at the socket layer). Hysteria v1 is the older design: a struct
-(no alignment padding, big-endian) `client hello` on a control stream, one
-bi-stream per TCP connection, struct-encoded UDP datagrams, and its own XPlus
-obfuscation (SHA-256 keyed by a 16-byte salt). XPlus serves the same purpose as
-Salamander but does not interoperate with it, which is why the two use separate
-types.
-
-Four things are intentionally absent, and a config that asks for one gets an
-explicit warning instead of a silent substitution: 0-RTT (early data), BBR /
-TCP-Brutal congestion control (NewReno is the only controller), source-port
-hopping, and TLS fingerprint mimicry on the courierust connector.
-
-## Driving the engine
-
-Every frontend ends up in the same typed dispatch table (`rpc::dispatch`):
-
-| Frontend | Transport | Reference |
-|---|---|---|
-| Flutter / Kotlin / Swift / C++ | hand-written C ABI (`corduit_call`, `corduit_call_binary`) | [FFI-API](https://github.com/blueokanna/Corduit/wiki/FFI-API) |
-| Browser dashboard / any language | localhost HTTP + WebSocket JSON-RPC | [RPC-API](https://github.com/blueokanna/Corduit/wiki/RPC-API) |
-| Rust application | typed synchronous `api::*` | [Rust-API](https://github.com/blueokanna/Corduit/wiki/Rust-API) |
-
-The RPC server binds loopback only and requires a bearer token compared in
-constant time; the WebSocket path takes the token as a `?token=` query
-parameter, since browsers cannot set headers on a WebSocket handshake. Upgrades
-are answered by the same `courierust_ws` session the VMess transport uses, in
-the server role.
-
-## Quick start
-
-Build a `Config`, construct the engine, start it, stop it. There is no runtime
-to initialize.
-
-```toml
-[dependencies]
-corduit = "0.2"
-```
-
-```rust,no_run
-use corduit::engine::{
-    Config, Corduit, GeneralConfig, InboundConfig, InboundType,
-    OutboundConfig, OutboundType,
-};
+```rust
+use corduit::engine::{Config, Corduit};
 
 fn main() -> corduit::engine::Result<()> {
-    let config = Config {
-        general: GeneralConfig { mixed_port: Some(7890), ..Default::default() },
-        inbounds: vec![InboundConfig {
-            inbound_type: InboundType::Mixed,
-            tag: "mixed-in".to_string(),
-            listen: "127.0.0.1".to_string(),
-            port: 7890,
-            options: Default::default(),
-        }],
-        outbounds: vec![OutboundConfig {
-            outbound_type: OutboundType::Direct,
-            tag: "DIRECT".to_string(),
-            server: None,
-            port: None,
-            options: Default::default(),
-        }],
-        ..Config::default()
-    };
-
+    let text = std::fs::read_to_string("config.yaml")?;
+    let config = Config::from_str(&text)?;
     let engine = Corduit::new(config)?;
     engine.start()?;
-    // ... serve ...
+    // ... serve until shutdown ...
     engine.stop()
 }
 ```
 
-Or use the JSON facade, which is what the FFI and RPC layers call:
-
-```rust,no_run
-use corduit::api;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    api::start_proxy_from_yaml(r#"
-    {
-      "general": { "mode": "rule", "mixed_port": 7890, "log_level": "info" },
-      "dns": { "enable": true, "nameservers": ["https://dns.google/dns-query"] },
-      "inbounds": [{ "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "port": 7890 }],
-      "outbounds": [{ "type": "direct", "tag": "DIRECT" }],
-      "rules": []
-    }"#.to_string())?;
-
-    let status = api::get_corduit_status()?;
-    println!("running = {}", status.running);
-    api::stop_proxy()?;
-    Ok(())
-}
-```
-
-Expose it to a dashboard in two lines:
-
-```rust,no_run
-use corduit::api;
-api::start_rpc_server(8765, Some("my-token".into()))?; // 127.0.0.1 only
-```
-
-```bash
-curl -X POST http://127.0.0.1:8765/rpc \
-  -H "Authorization: Bearer my-token" \
-  -H "Content-Type: application/json" \
-  -d '{"method":"get_version"}'
-# {"code":0,"data":"Corduit v0.3.0"}
-```
+A JSON facade (`api::start_proxy_from_yaml` and friends) and a JSON-RPC control plane
+(`rpc`) sit on top of the same engine; the C ABI in `ffi` and the Android JNI bridge call
+those. Runnable examples live in [`examples/`](examples) and are documented on docs.rs.
 
 ## Configuration
 
-One validated JSON model: `general` / `dns` / `inbounds` / `outbounds` /
-`rules`. Every enum is a string, and an invalid value is rejected at the
-boundary before the engine touches it. Field-by-field reference:
-[Configuration](https://github.com/blueokanna/Corduit/wiki/Configuration).
+Profiles are YAML (or JSON) documents whose shape stays close to the dialects the engine
+consumes, with one rule: every key has exactly one meaning, and an unimplemented key is an
+error rather than a no-op.
+
+```yaml
+general:
+  mode: rule
+  log-level: info
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  nameserver: [https://1.1.1.1/dns-query]
+
+inbounds:
+  - { type: mixed, tag: mixed-in, listen: 127.0.0.1, port: 7890 }
+
+outbounds:
+  - { type: selector, tag: PROXY, outbounds: [ss-a, ss-b], tolerance: 50 }
+  - { type: shadowsocks, tag: ss-a, server: 203.0.113.10, port: 8388, cipher: aes-256-gcm, password: "..." }
+  - { type: direct, tag: DIRECT }
+
+rule-providers:
+  ads:
+    type: http
+    behavior: classical
+    url: https://example.org/ads.srs
+    interval: 86400
+
+rules:
+  - { type: geosite,  payload: category-ads-all, outbound: REJECT }
+  - { type: geoip,    payload: CN,               outbound: DIRECT }
+  - { type: rule-set, payload: ads,              outbound: REJECT }
+  - { type: match,    payload: "",               outbound: PROXY }
+```
+
+[`wiki/Configuration.md`](wiki/Configuration.md) documents every key;
+[`wiki/Rules.md`](wiki/Rules.md) documents the rule engine, the rule-set formats and the Geo
+databases in detail.
+
+## Rule engine
+
+Rules are evaluated top to bottom and the first match wins. Three properties are worth
+stating explicitly, because they are easy to get wrong elsewhere:
+
+1. **Nothing is dropped silently.** A rule whose payload cannot be compiled, a rule set whose
+   format cannot be decoded, a Geo category that does not exist — each is reported at load
+   time with the entry named. A rule that can never match is a routing bug that is very hard
+   to find later.
+2. **The index never reorders the table.** Domain and suffix rules are indexed for lookup,
+   but candidates are still evaluated in configuration order, so an indexed rule cannot jump
+   ahead of an earlier regex or process rule.
+3. **Domain resolution is opt-in.** `ip-cidr` and `geoip` rules see addresses the router
+   resolved only when the rule did not ask for `no-resolve`, and a configuration whose IP
+   rules are all `no-resolve` never pays for a DNS lookup.
+
+Rule sets are identified by content, never by file name: a payload is classified as text,
+`.srs`, `.mrs` or a Geo database from its bytes, because an extension on a subscription URL
+is not evidence of anything.
+
+## Security model
+
+- **Fail closed.** A configuration naming a protocol this build disabled is rejected; it
+  never falls back to a direct connection. Global mode without a proxy outbound rejects
+  rather than leaking.
+- **Bounded input.** Every decoder in the tree has explicit limits: rule-set payloads
+  (256 MiB decoded), Geo databases (512 MiB), HTTP bodies, DNS message sizes, and nesting
+  depth in logical rules and protobuf messages.
+- **No trust in profile strings.** Values that reach a wire format (hostnames, paths,
+  credentials) are validated; control characters are rejected rather than escaped.
+- **In-tree cryptography.** The AEAD, hash, KDF and stream primitives are implemented in
+  `crypto` and covered by known-answer tests; there is no OpenSSL or ring dependency.
+- **No certificate bypass by default.** `skip-cert-verify` is an explicit opt-in per
+  outbound.
+
+Details are in [`wiki/Security.md`](wiki/Security.md).
+
+## Testing and continuous integration
+
+```bash
+cargo test --all-features      # 1097 tests
+cargo test                     # 1008 tests with default features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+```
+
+The suite covers the pure codecs with known-answer and property tests, the rule engine with
+ordering and precedence tests, the binary format decoders with byte-exact fixtures (including
+hand-assembled ones, so a decoder cannot be validated only against its own writer), and the
+engine end to end over loopback.
+
+CI runs on three desktop platforms, checks the declared MSRV, cross-checks Android (aarch64
+and x86_64 through the NDK) and iOS, verifies the `no_std` core against a bare-metal target,
+and fails on any compiler warning or broken rustdoc link.
+
+## Platform support
+
+| Platform | Status |
+|---|---|
+| Linux, macOS, Windows | Supported; desktop CI |
+| Android | Supported (`jni` bridge, TUN through `VpnService`) |
+| iOS | Supported (TUN; `sysinfo`-based metrics replaced by platform APIs) |
+| HarmonyOS (`target_env = ohos`) | Supported for the engine layer |
+| `no_std + alloc` targets | The protocol core compiles; the threaded engine does not |
 
 ## Project layout
 
 ```
 src/
-├── lib.rs          # module wiring, globals, no_std gating, platform entry points
-├── api.rs          # typed synchronous API
-├── ffi.rs          # hand-written C ABI
-├── rpc/            # shared dispatch + localhost HTTP/WebSocket JSON-RPC
-├── types.rs        # shared DTOs
-├── common/         # pool overlay, sockets, relay, listener, timers,
-│                   #   cancellation, URL, courierust HTTP client, root certificates
-├── engine/         # config, routing, inbounds, outbounds, providers, stats
-├── crypto/         # crypto primitives + text codecs (no_std)
-├── protocol/       # wire protocols: QUIC v1, TLS 1.3, REALITY, WebSocket, WireGuard
-├── dns/            # profile → RecurseX adaptation: upstreams, bogon, patterns
-└── netstack/       # userspace TCP/IP (SolidTCP), TUN, NAT, VPN drivers
+  engine/    config, routing, ruleset, geo, inbound, outbound, dns, providers
+  netstack/  userspace TCP/IP, TUN integration, platform routing
+  dns/       profile → RecurseX adaptation, listening resolver
+  protocol/  wire codecs: TLS 1.3, QUIC, WebSocket, WireGuard, address types
+  crypto/    AEAD, hashes, KDFs, stream ciphers, RNG
+  common/    sync primitives, sockets, streams, timers, HTTP client
+  api.rs     typed synchronous facade
+  rpc/       JSON-RPC control plane
+  ffi.rs     C ABI
 ```
 
-The `no_std` core is `crypto/`, `common/url`, `protocol/address` and
-`protocol/error`, which are pure logic with no OS dependency. The threaded
-networking layer (engine, DNS listener, netstack, RPC, transports) is gated
-behind the `std` feature.
+## Known limitations
 
-## Building and testing
+These are deliberate, and each is visible at configuration time rather than at runtime.
 
-### Dependency versions
-
-Corduit uses the published RecurseX 0.2.6 and Courierust 1.1.2 packages.
-`Cargo.lock` pins their registry versions and checksums. Local builds and CI use
-the same dependencies with `--locked`; no sibling checkout or repository
-variable is required.
-
-RecurseX and Corduit resolve to the same Courierust package, so HTTP and all
-DNS transports share the outbound socket factory. The `dns_socket_factory`
-integration test checks that these transports use the installed callbacks.
-The adapter belongs to Corduit; Courierust only exposes the socket callbacks and
-network-generation notification. Install callbacks before starting clients.
-Callbacks must apply protection before connecting and return an error if it fails.
-A network-generation change expires RecurseX's cached forwarding transports;
-already running exchanges are allowed to finish.
-
-`--no-default-features` builds the protocol core without DNS runtime or platform
-I/O dependencies. The existing default features retain the desktop engine.
-Corduit's `bytes` dependency requires pointer-width atomic operations, so
-Corduit does not yet support `thumbv6m-none-eabi`. Courierust and RecurseX can
-build their standalone cores on that target. Check Corduit on a freestanding target with:
-
-```sh
-cargo check --locked --no-default-features --target x86_64-unknown-none
-```
-
-```bash
-cargo check --locked --all-targets
-cargo test --locked                          # unit + property tests, default features
-cargo test --locked --features tuic,hysteria2  # include the optional QUIC-based outbounds
-cargo test --locked --doc
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo fmt --all -- --check
-cargo check --locked --no-default-features                # the no_std protocol core
-cargo check --locked --no-default-features --features std  # engine layer, no optional protocols
-cargo test --locked --no-default-features --features std   # …and its test code
-cargo run --locked --example minimal                     # a real engine, loopback only
-```
-
-A check that calls every method of the dispatch table runs where nothing else
-is connected: `stop_corduit` and `close_all_connections_dto` cancel every
-tracked connection in the process. Cargo gives each file under `tests/` a
-process of its own, so that check lives in `tests/rpc_dispatch.rs` instead of
-next to the table it verifies.
-
-CI runs the full check-and-test matrix on Linux, macOS and Windows, an
-`--all-features` job (which builds and tests the gated QUIC / TUIC / Hysteria
-code), a `no_std` core check, a `std`-only configuration that is both checked
-and tested, Android (aarch64 and x86_64) and iOS cross-checks, and an MSRV job
-that builds and tests on 1.88. The desktop jobs also run the loopback-only
-examples, which drive the crate as an application, and build the docs with
-`--all-features`. `RUSTFLAGS` and `RUSTDOCFLAGS` are both `-D warnings`, so a
-warning and a broken intra-doc link both fail the build.
-
-MSRV: **Rust 1.88**, edition **2024**. No HTTP/TLS/QUIC third-party library and no async runtime:
-the network layer is courierust plus the in-tree codecs above, and concurrency
-is courierust's work-stealing pool plus `std::thread`.
-
-## Security boundary
-
-This is a local tool that controls network traffic, so the boundary is explicit:
-
-- **FFI**: no panic ever unwinds across `extern "C"`; every argument is
-  type-checked; the binary channel is bounded (`rustbinary`, 64 MiB cap), and
-  the buffers handed to the caller own exactly the allocation their length
-  describes.
-- **RPC server**: loopback bind only, constant-time bearer-token comparison, a
-  refused empty token (never a silently open server), 16 MiB request cap, idle
-  connections reaped, WebSocket upgrades validated against RFC 6455
-  (`Sec-WebSocket-Key` shape and accept value).
-- **Inbound authentication**: `general.authentication` is enforced on every
-  path — HTTP requests and `CONNECT` (with the `407` challenge a client needs
-  to retry), SOCKS5 TCP and UDP association (RFC 1929), and the TUN stack's
-  own SOCKS5 client, which presents the configured credentials instead of
-  failing the tunnel.
-- **Outbound handshakes**: a WebSocket upgrade whose `Sec-WebSocket-Accept`
-  does not match is a hard failure, not a warning; config-supplied handshake
-  headers (token name, no CR/LF) are validated before a byte reaches the wire;
-  the QUIC-based outbounds require the server's certificate chain *and* a
-  verified `CertificateVerify` proof before 1-RTT keys are installed.
-- **Windows TUN**: `wintun.dll` is loaded from the executable's directory only
-  (or the `wintun/` directory under it); per-user and working directories are
-  never searched, so an unelevated process cannot plant a DLL for the elevated
-  engine to load.
-- **Data paths**: DNS wire parsing is RecurseX's, which caps section counts
-  before any loop, bounds every length field against the message, and follows
-  compression pointers only forwards with a hop budget derived from the 255-byte
-  name limit; the in-tree DNS responder enforces the same pointer budget, so a
-  self-referencing name cannot spin the TUN thread. The engine's own fallback
-  resolver accepts a reply only when its transaction id and question match the
-  query it sent, and treats a truncated reply as a failure rather than an
-  answer. A SOCKS5 client's destination name is refused with a failure reply
-  when it carries a space or control byte, so it can never be spliced into a
-  fabricated request line; the same rule guards every configured name that
-  reaches one (WebSocket handshake, Snell obfs, simple-obfs, SSR obfs-host).
-  MMDB reads bounds-checked, HTTP response bodies capped, `skip-cert-verify`
-  off by default.
-
-More: [Security](https://github.com/blueokanna/Corduit/wiki/Security).
+| Area | Status | Consequence |
+|---|---|---|
+| Traffic sniffing (TLS ClientHello SNI / HTTP Host recovery) | Not implemented | Hostnames come from the DNS side (fake-IP, redir-host). A client that dials a literal IP cannot match domain rules; use `ip-cidr` / `geoip` for those flows |
+| Sub-rules (`sub-rules` sections) | Not implemented | Use a named rule provider plus a `rule-set` rule |
+| `.srs` client conditions (`wifi_ssid`, `package_name`, …) | Recognised and refused | The rule set is rejected with the condition named; a set without them loads |
+| `DOMAIN-KEYWORD` matching | Linear in the keyword count | Keep keyword sets small, or express them as `domain-regex` |
 
 ## License
 
-[PolyForm Strict License 1.0.0](LICENSE), plus additional licensor terms.
-
-- **Permitted**: personal use (research, experiment, testing, personal study,
-  hobby projects) and noncommercial purposes, including use by noncommercial
-  organizations.
-- **Not permitted**: distributing the software in any form (free or paid) and
-  making changes or new works based on it.
-- **Conditioned on lawful use**: no circumvention rights are granted, and use
-  must stay inside the law that applies to you.
-
-Required Notice: Copyright 2026 blueokanna (https://github.com/blueokanna/Corduit)
-
-### DNS integration with RecurseX 0.2.6
-
-Unavailable hostname-based nameserver policies retain a closed route instead of
-falling through to default DNS. A default listener admits only loopback clients;
-the explicit `allow-lan` setting adds RFC1918, IPv4 link-local, IPv6 ULA and link-local
-clients. Public source addresses remain denied. A wildcard bind is not permission.
-UDP and TCP use the same bound port and the same resolver policy.
-
-DNS upstream syntax and policy patterns are checked before startup. Dial and
-listener fallback rules use RecurseX's matcher: bare names match exactly, `+.`
-matches a subtree, and embedded `*` labels are supported. Filters are inactive
-when no fallback servers are configured.
-If all configured fallback endpoints fail to bootstrap, the DNS listener refuses
-to start rather than forwarding forced-fallback names to the default servers.
-
-TUN TCP and SOCKS5 UDP relay sockets use the common socket layer. Protection
-failure stops socket creation; an active Android VPN with no callback also fails
-closed. Replacing or clearing a callback invalidates cached DNS transports.
-`common::socket::protect_outbound_fd` now returns `io::Result<()>`; callers must
-handle the result. The Android regression test is `tests/vpn_socket_protection.rs`
-and needs an Android test runner to execute.
-
-RecurseX supplies transport recovery, bounded query observations and conservative
-cache admission. Local signature verification does not establish a root-anchored
-DNSSEC chain. Pure recursion still requires authoritative UDP/TCP reachability;
-configured alternatives recover transport failures without changing explicit routes.
+See [LICENSE](LICENSE). Corduit is released for lawful use only: it is a network engineering
+tool for proxy protocols, routing, DNS and userspace TCP/IP.

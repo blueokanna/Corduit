@@ -95,6 +95,21 @@ impl IpRangeSet {
         true
     }
 
+    /// Add an `ipnet` network.
+    ///
+    /// A convenience for callers that already hold a parsed network — the text
+    /// rule index does — so the conversion from prefix length to interval lives
+    /// in exactly one place.
+    pub fn insert_net(&mut self, network: ipnet::IpNet) {
+        match network {
+            ipnet::IpNet::V4(net) => {
+                self.insert_v4_cidr(u32::from(net.network()), u32::from(net.prefix_len()));
+            }
+            ipnet::IpNet::V6(net) => {
+                self.insert_v6_cidr(u128::from(net.network()), u32::from(net.prefix_len()));
+            }
+        }
+    }
     /// Add an inclusive range of addresses.
     ///
     /// Both ends must be the same family; a mixed-family range is nonsense and

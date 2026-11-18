@@ -43,7 +43,6 @@ use super::succinct::SuccinctSet;
 use super::{DomainCondition, HeadlessRule, MAX_DECODED_BYTES};
 use crate::engine::error::{Error, Result};
 use crate::engine::geo::ipset::IpRangeSet;
-use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr};
 
 /// Magic inside the compressed stream: `MRS` plus the container version.
@@ -72,29 +71,12 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<HeadlessRule>> {
 }
 
 /// Decompress the frame, refusing anything that inflates past the budget.
+///
+/// The limit travels into the decoder rather than being checked afterwards: a
+/// payload that claims a huge output is stopped while it is being produced, not
+/// after the allocation it would have needed.
 fn inflate(compressed: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut decoder = zstd::stream::read::Decoder::new(compressed).map_err(|error| {
-        Error::config(format!(
-            "Binary rule set is not a valid zstd stream: {error}"
-        ))
-    })?;
-    decoder
-        .by_ref()
-        .take(MAX_DECODED_BYTES as u64 + 1)
-        .read_to_end(&mut out)
-        .map_err(|error| {
-            Error::config(format!(
-                "Binary rule set could not be decompressed: {error}"
-            ))
-        })?;
-    if out.len() > MAX_DECODED_BYTES {
-        return Err(Error::config(format!(
-            "Binary rule set expands past the {} MiB limit",
-            MAX_DECODED_BYTES / (1024 * 1024)
-        )));
-    }
-    Ok(out)
+    super::zstd::decompress(compressed, MAX_DECODED_BYTES)
 }
 
 /// Decode the decompressed container.
@@ -220,7 +202,34 @@ pub(crate) fn encode_for_test(behavior: u8, body: &[u8], count: usize, extra: &[
     plain.extend_from_slice(&(extra.len() as i64).to_be_bytes());
     plain.extend_from_slice(extra);
     plain.extend_from_slice(body);
-    zstd::stream::encode_all(plain.as_slice(), 3).expect("zstd encodes in tests")
+
+    frame_for_test(&plain)
+}
+
+/// Wrap arbitrary bytes in a frame of raw blocks.
+///
+/// Tests only. The container tests need *a* frame around their payload, and a
+/// raw block needs no compressor; the decoder's compressed path is covered
+/// separately by the reference frames under `tests/data/zstd`.
+#[cfg(test)]
+pub(crate) fn frame_for_test(plain: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&super::zstd::FRAME_MAGIC_FOR_TEST);
+    // Single segment, 4-byte content size, no checksum, no dictionary.
+    frame.push(0xA0);
+    frame.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+    let mut chunks = plain.chunks(128 * 1024).peekable();
+    if chunks.peek().is_none() {
+        // An empty payload still needs a final empty block.
+        frame.extend_from_slice(&[0x01, 0x00, 0x00]);
+    }
+    while let Some(chunk) = chunks.next() {
+        let last = chunks.peek().is_none();
+        let header = ((chunk.len() as u32) << 3) | u32::from(last);
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend_from_slice(chunk);
+    }
+    frame
 }
 
 #[cfg(test)]
@@ -337,8 +346,7 @@ mod tests {
         assert!(decode(b"not zstd at all").is_err());
 
         // A zstd frame without the inner magic is not a rule set.
-        let not_mrs = zstd::stream::encode_all(&b"hello"[..], 3).expect("zstd");
-        let error = decode(&not_mrs).expect_err("inner magic missing");
+        let error = decode(&frame_for_test(b"hello")).expect_err("inner magic missing");
         assert!(error.to_string().contains("magic"), "{error}");
     }
 

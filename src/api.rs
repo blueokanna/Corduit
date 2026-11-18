@@ -927,7 +927,11 @@ fn running_status_of(corduit: &crate::engine::Corduit) -> Result<ProxyStatus> {
     let memory_usage = crate::common::apple_metrics::resident_memory()?;
     #[cfg(not(target_os = "ios"))]
     let memory_usage = {
-        let mut sys = System::new_with_specifics(RefreshKind::nothing());
+        // sysinfo reports why it could not start a System; a status readout must
+        // not fail because one metric is unavailable, so an error reads as
+        // "unknown" (zero) and the rest of the snapshot is still returned.
+        let mut sys = System::new_with_specifics(RefreshKind::nothing())
+            .map_err(|error| CorduitError::Internal(format!("sysinfo: {error}")))?;
         let pid = Pid::from_u32(std::process::id());
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
@@ -1073,14 +1077,18 @@ pub fn get_system_info() -> Result<SystemInfo> {
 
     // Keep CPU samples between calls; never scan other processes or enumerate
     // per-thread /proc entries merely to display this application's RSS.
-    static MONITOR: once_cell::sync::Lazy<parking_lot::Mutex<System>> =
+    // The sampler is one per process, and creating it can fail; the failure is
+    // kept as the value so the endpoint can say *why* instead of inventing zeroes.
+    static MONITOR: once_cell::sync::Lazy<std::result::Result<parking_lot::Mutex<System>, String>> =
         once_cell::sync::Lazy::new(|| {
-            parking_lot::Mutex::new(System::new_with_specifics(
-                RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing().with_cpu_usage()),
-            ))
+            System::new_with_specifics(
+                RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing().with_usage()),
+            )
+            .map(parking_lot::Mutex::new)
+            .map_err(|error| error.to_string())
         });
     static PHYSICAL_CORES: once_cell::sync::Lazy<Option<usize>> =
-        once_cell::sync::Lazy::new(System::physical_core_count);
+        once_cell::sync::Lazy::new(|| System::physical_core_count().ok());
 
     let platform = if cfg!(target_os = "windows") {
         "Windows".to_string()
@@ -1100,7 +1108,10 @@ pub fn get_system_info() -> Result<SystemInfo> {
 
     let version = env!("CARGO_PKG_VERSION").to_string();
 
-    let mut sys = MONITOR.lock();
+    let monitor = MONITOR
+        .as_ref()
+        .map_err(|error| CorduitError::Internal(format!("sysinfo: {error}")))?;
+    let mut sys = monitor.lock();
     sys.refresh_cpu_usage();
     sys.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
     if let Ok(pid) = sysinfo::get_current_pid() {
@@ -1124,11 +1135,7 @@ pub fn get_system_info() -> Result<SystemInfo> {
     let cpu_usage = if sys.cpus().is_empty() {
         0.0
     } else {
-        sys.cpus()
-            .iter()
-            .map(|cpu| cpu.cpu_usage() as f64)
-            .sum::<f64>()
-            / sys.cpus().len() as f64
+        sys.cpus().iter().map(|cpu| cpu.usage() as f64).sum::<f64>() / sys.cpus().len() as f64
     };
 
     Ok(SystemInfo {

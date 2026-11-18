@@ -23,6 +23,7 @@ pub mod mrs;
 pub mod reader;
 pub mod srs;
 pub mod succinct;
+pub mod zstd;
 
 use crate::engine::error::{Error, Result};
 use regex::{Regex, RegexBuilder};
@@ -65,7 +66,11 @@ crate::impl_config_enum!(Format {
 const SRS_MAGIC: [u8; 3] = [0x53, 0x52, 0x53];
 /// Magic that starts a zstd frame, which is all an `.mrs` file shows before it is
 /// decompressed: the container's own magic is inside the compressed stream.
-const ZSTD_MAGIC: [u8; 4] = mrs::ZSTD_MAGIC;
+///
+/// Declared here rather than in the decoder so that *recognising* the format does
+/// not depend on the feature that can decode it: a build without `mrs` still
+/// names what it was handed instead of calling it text.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Trailer every MaxMind DB ends with.
 const MMDB_TRAILER: &[u8] = b"\xab\xcd\xefMaxMind.com";
 

@@ -8,6 +8,10 @@
 **Q: Windows 下 wintun 相关报错？**
 TUN 功能需要 `wintun.dll`。`ensure_wintun_dll` 会自动下载；离线环境请手动把 wintun.dll 放到可执行文件目录。非 TUN 场景不影响。
 
+**Q: 交叉编译报 `failed to find tool "aarch64-linux-android-clang"`，或 `'string.h' file not found`？**
+
+默认 feature 集包含 `mrs`，它的 zstd 解码器自带 C 源码，交叉编译就需要目标平台的 C 工具链：Android 用 NDK（`CC_aarch64_linux_android` 指向 NDK 的 clang），iOS/macOS 用 Xcode 的 clang。没有工具链时用 `--no-default-features --features std,tls,wireguard` 构建：只少 `.mrs` 这一种二进制规则集，`.srs`、文本规则集与 Geo 数据库不受影响；此时 `.mrs` 载荷仍会被识别，并以「本构建未启用 `mrs`」的明确错误拒绝，不会被当成文本解析。
+
 ## 启动
 
 **Q: `start_corduit` 返回 `Invalid config ...`？**
