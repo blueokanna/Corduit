@@ -49,15 +49,33 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Build an engine with one mixed inbound + DIRECT outbound.
-fn engine_with_mixed_inbound(port: u16) -> Corduit {
-    // Isolate from process-global runtime state staged by other (parallel)
-    // tests: `Corduit::new` merges `runtime_proxy_providers` and rule
-    // providers, so a provider left behind by an api test would make these
-    // e2e tests try to load a file that does not exist.
+/// Takes the lock that serializes every test touching the process-global routing
+/// state, and pins the state these end-to-end tests assume.
+///
+/// The runtime proxy mode is process-global rather than per-engine: `routing`
+/// and `api` tests set it, and a `GLOBAL` window routes these inbounds to a
+/// group this config does not have — so the `CONNECT` they assert comes back as
+/// a SOCKS failure (0x01) instead of an echo. Taking the writers' lock holds the
+/// pin for the whole test rather than until the next instruction.
+///
+/// `Corduit::new` also merges the runtime provider tables, so a provider staged
+/// by a parallel test would make this engine load a file that does not exist;
+/// those tables are cleared under the same lock.
+///
+/// The guard has to be held by the test itself: returning it from a helper that
+/// is not kept would drop it at the end of the statement.
+fn pin_routing_state() -> parking_lot::MutexGuard<'static, ()> {
+    let guard = crate::engine::routing::tests::MODE_LOCK.lock();
+    crate::engine::set_runtime_proxy_mode(crate::engine::proxy_mode::CONFIG);
     crate::engine::proxy_provider::set_runtime_proxy_providers(Vec::new());
     crate::engine::set_runtime_rule_providers(Vec::new());
+    guard
+}
 
+/// Build an engine with one mixed inbound + DIRECT outbound.
+///
+/// Callers pin the routing state first; see [`pin_routing_state`].
+fn engine_with_mixed_inbound(port: u16) -> Corduit {
     let config = Config {
         general: GeneralConfig {
             mixed_port: Some(port),
@@ -121,6 +139,7 @@ fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
 
 #[test]
 fn socks5_relays_to_echo_server() {
+    let _routing = pin_routing_state();
     let echo = spawn_echo_server();
     let port = free_port();
     let engine = engine_with_mixed_inbound(port);
@@ -158,6 +177,7 @@ fn socks5_relays_to_echo_server() {
 
 #[test]
 fn two_concurrent_socks5_connections() {
+    let _routing = pin_routing_state();
     let echo = spawn_echo_server();
     let port = free_port();
     let engine = engine_with_mixed_inbound(port);
@@ -166,7 +186,6 @@ fn two_concurrent_socks5_connections() {
     let proxy: SocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
     let mut handles = Vec::new();
     for i in 0..4 {
-        // `SocketAddr` is `Copy`; the `move` closure captures it by value.
         handles.push(std::thread::spawn(move || {
             let mut stream = socks5_connect(proxy, echo);
             let msg = format!("concurrent-{i}");
@@ -215,6 +234,7 @@ fn direct_udp_exchange_roundtrip() {
 /// nothing, and stop must be idempotent.
 #[test]
 fn stop_is_idempotent() {
+    let _routing = pin_routing_state();
     let port = free_port();
     let engine = engine_with_mixed_inbound(port);
     engine.start().expect("engine starts");
@@ -285,6 +305,7 @@ fn http_exchange(proxy: SocketAddr, request: &str) -> String {
 /// origin's response is re-framed back to the client.
 #[test]
 fn http_proxy_forwards_plain_requests() {
+    let _routing = pin_routing_state();
     let origin = spawn_http_origin("proxied-body");
     let port = free_port();
     let engine = engine_with_mixed_inbound(port);
@@ -316,6 +337,7 @@ fn http_proxy_forwards_plain_requests() {
 /// outbound — bytes in both directions, including the pipelined case.
 #[test]
 fn http_proxy_tunnels_connect() {
+    let _routing = pin_routing_state();
     let echo = spawn_echo_server();
     let port = free_port();
     let engine = engine_with_mixed_inbound(port);

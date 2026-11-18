@@ -47,6 +47,24 @@ use tracing::info;
 /// this bounds the burst rather than the total.
 const MAX_TCP_CONNECTIONS: usize = 64;
 
+/// How many ephemeral ports the listener tries before giving up.
+///
+/// A `:0` bind picks the two transports independently, and Windows can hand out
+/// a UDP port whose TCP twin sits inside a reserved range; that second bind then
+/// fails with `WSAEACCES`. The caller asked for "a port", not for that one, so a
+/// bounded retry is the answer — otherwise a listener that should have been
+/// ephemeral fails for a reason only a Windows user ever sees.
+const EPHEMERAL_BIND_ATTEMPTS: usize = 8;
+
+/// The listener's configuration for one attempt.
+fn server_config(allow_lan: bool) -> ServerConfig {
+    ServerConfig {
+        allowed_clients: allowed_client_networks(allow_lan),
+        max_tcp_connections: MAX_TCP_CONNECTIONS,
+        ..ServerConfig::default()
+    }
+}
+
 /// A running client-facing DNS listener.
 pub struct DnsServer {
     server: Arc<Server>,
@@ -75,34 +93,47 @@ impl DnsServer {
         listen: SocketAddr,
         allow_lan: bool,
     ) -> std::io::Result<Self> {
-        let config = ServerConfig {
-            allowed_clients: allowed_client_networks(allow_lan),
-            max_tcp_connections: MAX_TCP_CONNECTIONS,
-            ..ServerConfig::default()
+        let attempts = if listen.port() == 0 {
+            EPHEMERAL_BIND_ATTEMPTS
+        } else {
+            1
         };
-        let server = Arc::new(Server::with_config((*resolver).clone(), config));
-        let bound = match server
-            .bind_udp(listen)
-            .and_then(|udp| server.bind_tcp(udp).map(|tcp| (udp, tcp)))
-        {
-            Ok((udp, tcp)) => vec![udp, tcp],
-            Err(error) => {
-                server.shutdown();
-                server.join();
-                return Err(error);
+        let mut attempt = 1;
+        loop {
+            let server = Arc::new(Server::with_config(
+                (*resolver).clone(),
+                server_config(allow_lan),
+            ));
+            match server
+                .bind_udp(listen)
+                .and_then(|udp| server.bind_tcp(udp).map(|tcp| (udp, tcp)))
+            {
+                Ok((udp, tcp)) => {
+                    let bound = vec![udp, tcp];
+                    info!(
+                        "DNS listener serving {} over UDP and TCP",
+                        bound
+                            .iter()
+                            .map(SocketAddr::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    );
+                    return Ok(Self { server, bound });
+                }
+                Err(error) => {
+                    server.shutdown();
+                    server.join();
+                    let retryable = matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    );
+                    if !retryable || attempt == attempts {
+                        return Err(error);
+                    }
+                    attempt += 1;
+                }
             }
-        };
-
-        info!(
-            "DNS listener serving {} over UDP and TCP",
-            bound
-                .iter()
-                .map(SocketAddr::to_string)
-                .collect::<Vec<_>>()
-                .join(" / ")
-        );
-
-        Ok(Self { server, bound })
+        }
     }
 
     /// The addresses the listener is bound to.

@@ -1256,14 +1256,58 @@ fn strip_suffix_ignore_case<'a>(text: &'a str, suffix: &str) -> Option<&'a str> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::config::{OutboundConfig, OutboundType};
 
     /// The runtime proxy mode is a process-global; tests that set it must be
     /// serialized so parallel execution cannot interleave different modes.
-    pub(super) static MODE_LOCK: once_cell::sync::Lazy<parking_lot::Mutex<()>> =
+    ///
+    /// Crate-visible because the end-to-end tests in [`crate::engine::tests`]
+    /// read the same global through a real inbound: a `GLOBAL` window left open
+    /// by a routing test turns their `CONNECT` into a SOCKS failure. Locking the
+    /// readers against the writers makes that impossible rather than unlikely.
+    pub(crate) static MODE_LOCK: once_cell::sync::Lazy<parking_lot::Mutex<()>> =
         once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(()));
+
+    /// Pins the runtime proxy mode for as long as the guard lives.
+    ///
+    /// The mode is a process-global, not a property of one [`Router`], so a
+    /// test that sets it decides how every other test in the binary routes.
+    /// Leaving it set is how the end-to-end tests used to see `GLOBAL` and get
+    /// their `CONNECT` answered with a SOCKS failure (0x01) instead of an echo:
+    /// a `GLOBAL` mode with no proxy group in the profile resolves to `REJECT`.
+    ///
+    /// Resetting on `Drop` also covers a failing assertion — a test that panics
+    /// must not poison its siblings for the rest of the run.
+    pub(super) struct ModeGuard {
+        /// Held for the guard's lifetime: the mode must not change under it.
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl ModeGuard {
+        /// Take the mode lock and set `mode` under it.
+        pub(super) fn pin(mode: i32) -> Self {
+            let lock = MODE_LOCK.lock();
+            set_runtime_proxy_mode(mode);
+            Self { _lock: lock }
+        }
+
+        /// Switch to another mode mid-test, still under the lock.
+        pub(super) fn set(&self, mode: i32) {
+            set_runtime_proxy_mode(mode);
+        }
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            // `CONFIG` is the neutral value: the engine follows its own
+            // profile. Restoring the previous value instead would keep a
+            // leaked mode alive through the next test.
+            set_runtime_proxy_mode(proxy_mode::CONFIG);
+        }
+    }
+
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     /// Deterministic matcher that mimics a real GeoIP database for a small set
@@ -1364,8 +1408,7 @@ mod tests {
     fn mainland_cn_domain_follows_rule_when_configured() {
         // With rules configured, the explicit MATCH rule wins over the
         // mainland-China auto-direct shortcut: first match in order.
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::RULE);
+        let _mode = ModeGuard::pin(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
         let outbound = router.match_outbound(Some("WWW.EXAMPLE.CN."), None, Some(443), None);
@@ -1375,8 +1418,7 @@ mod tests {
 
     #[test]
     fn mainland_cn_ip_follows_rule_when_configured() {
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::RULE);
+        let _mode = ModeGuard::pin(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
         let outbound = router.match_outbound(
@@ -1392,8 +1434,7 @@ mod tests {
     #[test]
     fn mainland_cn_domain_auto_direct_without_rules() {
         // No rules configured: the auto-direct fallback still applies.
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::RULE);
+        let _mode = ModeGuard::pin(proxy_mode::RULE);
         let router = mainland_routing_test_router_no_rules();
 
         let outbound = router.match_outbound(Some("www.example.cn"), None, Some(443), None);
@@ -1403,8 +1444,7 @@ mod tests {
 
     #[test]
     fn mainland_cn_ip_auto_direct_without_rules() {
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::RULE);
+        let _mode = ModeGuard::pin(proxy_mode::RULE);
         let router = mainland_routing_test_router_no_rules();
 
         let outbound = router.match_outbound(
@@ -1419,8 +1459,7 @@ mod tests {
 
     #[test]
     fn foreign_ip_still_uses_configured_proxy_rule() {
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::RULE);
+        let _mode = ModeGuard::pin(proxy_mode::RULE);
         let router = mainland_routing_test_router();
 
         let outbound = router.match_outbound(
@@ -1507,10 +1546,7 @@ mod tests {
 
     #[test]
     fn global_mode_routes_all_traffic_through_proxy_group() {
-        // GLOBAL must send every connection (any domain/IP/port) through the
-        // proxy group, regardless of the rule table.
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::GLOBAL);
+        let _mode = ModeGuard::pin(proxy_mode::GLOBAL);
         let router = grouped_routing_test_router();
 
         for (domain, ip) in [
@@ -1531,10 +1567,7 @@ mod tests {
 
     #[test]
     fn global_mode_uses_first_proxy_when_no_group() {
-        // Without a group, GLOBAL falls back to the first non-direct/reject
-        // outbound instead of DIRECT.
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::GLOBAL);
+        let _mode = ModeGuard::pin(proxy_mode::GLOBAL);
         let router = mainland_routing_test_router();
 
         let outbound = router.match_outbound(Some("example.com"), None, Some(443), None);
@@ -1545,8 +1578,7 @@ mod tests {
     fn direct_mode_routes_all_traffic_to_direct() {
         // DIRECT must route everything (even domains matched by rules) to the
         // direct outbound.
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::DIRECT);
+        let _mode = ModeGuard::pin(proxy_mode::DIRECT);
         let router = grouped_routing_test_router();
 
         for (domain, ip) in [
@@ -1562,8 +1594,7 @@ mod tests {
     fn config_mode_follows_general_mode() {
         // Runtime mode 0 (CONFIG) falls back to `general.mode`; here it is
         // Rule, so the rule table decides.
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::CONFIG);
+        let _mode = ModeGuard::pin(proxy_mode::CONFIG);
         let router = grouped_routing_test_router();
 
         let outbound = router.match_outbound(Some("example.com"), None, Some(443), None);
@@ -1808,8 +1839,7 @@ mod tests {
     /// what lets such a profile load.
     #[test]
     fn proxy_mode_rules_follow_the_effective_mode() {
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::CONFIG);
+        let _mode = ModeGuard::pin(proxy_mode::CONFIG);
 
         let router = rule_table_router(vec![
             rule(RuleType::ProxyMode, "global", "GLOBAL-ONLY"),
@@ -1827,12 +1857,14 @@ mod tests {
         // Forcing global mode short-circuits the table entirely: there is no
         // group configured, so the mode fails closed rather than leaking to
         // DIRECT.
-        set_runtime_proxy_mode(proxy_mode::GLOBAL);
+        _mode.set(proxy_mode::GLOBAL);
         assert_eq!(
             router.match_outbound(Some("example.com"), None, Some(443), None),
             "REJECT"
         );
-        set_runtime_proxy_mode(proxy_mode::CONFIG);
+        // Back to the configured mode; the guard resets it on drop as well, so
+        // a failure above cannot leave `GLOBAL` behind.
+        _mode.set(proxy_mode::CONFIG);
     }
 
     /// A `proxy-mode` payload outside the mode vocabulary is a config error, not a
@@ -1852,8 +1884,7 @@ mod tests {
     /// the user it authenticated as.
     #[test]
     fn inbound_rules_read_the_arrival_point() {
-        let _mode_guard = MODE_LOCK.lock();
-        set_runtime_proxy_mode(proxy_mode::CONFIG);
+        let _mode = ModeGuard::pin(proxy_mode::CONFIG);
 
         let router = rule_table_router(vec![
             rule(RuleType::InType, "socks5", "socks-relay"),
@@ -2218,8 +2249,7 @@ mod property_tests {
             // (other tests may have staged a real HTTP provider), and pin the
             // runtime mode to CONFIG under the mode lock so parallel mode
             // tests cannot interleave a different mode.
-            let _mode_guard = tests::MODE_LOCK.lock();
-            set_runtime_proxy_mode(proxy_mode::CONFIG);
+            let _mode = tests::ModeGuard::pin(proxy_mode::CONFIG);
 
             let rules = vec![
                 RuleConfig {
