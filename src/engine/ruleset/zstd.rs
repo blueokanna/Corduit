@@ -743,8 +743,6 @@ fn decompress_frame(input: &mut Input<'_>, out: &mut Vec<u8>, limit: usize) -> R
     };
     let content_size_flag = descriptor >> 6;
 
-    // Window descriptor: present unless the frame is a single segment, where the
-    // content size doubles as the window.
     if !single_segment {
         let window_descriptor = input.u8()?;
         let window_log = u32::from(window_descriptor >> 3) + 10;
@@ -753,8 +751,6 @@ fn decompress_frame(input: &mut Input<'_>, out: &mut Vec<u8>, limit: usize) -> R
         }
     }
     if dict_id_size > 0 {
-        // A frame that needs a dictionary cannot be decoded against the wrong
-        // window; refusing is the only honest answer.
         input.skip(dict_id_size)?;
         return Err(corrupt("frame requires a dictionary"));
     }

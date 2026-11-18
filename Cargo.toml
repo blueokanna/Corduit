@@ -1,6 +1,6 @@
 [package]
 name = "corduit"
-version = "0.3.8"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license-file = "LICENSE"
@@ -80,11 +80,6 @@ rustbinary = { version = "0.1.10", default-features = false, features = [
 ], optional = true }
 
 # --- compression -------------------------------------------------------------
-# Both binary rule-set formats arrive compressed, and both are decoded in-tree:
-# a sing-box set (".srs") is a four-byte header then a zlib stream, and the
-# other family's set (".mrs") is a zstd frame. The zlib backend here is
-# `zlib-rs`, which is pure Rust; the zstd decoder is `ruleset::zstd`. No C
-# toolchain is involved in reading either format.
 flate2 = { version = "1", default-features = false, features = [
     "zlib-rs",
 ], optional = true }
