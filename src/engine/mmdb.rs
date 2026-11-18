@@ -61,7 +61,11 @@ const DATA_SECTION_SEPARATOR: usize = 16;
 /// The spec caps the metadata section (marker included) at 128 KiB, so the
 /// marker cannot sit further back than this. Searching the whole file would
 /// also walk a data section that may legitimately contain the same bytes.
-const METADATA_SEARCH_WINDOW: usize = 128 * 1024;
+///
+/// Public because [`crate::engine::geo::identify`] has to search the same
+/// window: a classifier that looks somewhere else accepts files this reader
+/// rejects, and rejects files it would have read.
+pub const METADATA_SEARCH_WINDOW: usize = 128 * 1024;
 /// Nesting budget for one decode: every map, array and pointer indirection
 /// costs one level. The spec recommends 512; real records stay in the tens and
 /// the bound is what keeps a hostile database from exhausting the stack.
@@ -217,7 +221,6 @@ impl MmdbReader {
         let base = (node as usize).checked_mul(self.meta.node_byte_size as usize)?;
         let value = match self.meta.record_size {
             24 => {
-                // Node = 6 bytes: [left 3][right 3].
                 let b0 = *self.data.get(base + if bit == 0 { 0 } else { 3 })?;
                 let b1 = *self.data.get(base + if bit == 0 { 1 } else { 4 })?;
                 let b2 = *self.data.get(base + if bit == 0 { 2 } else { 5 })?;
@@ -527,6 +530,11 @@ mod tests {
         file.extend_from_slice(MAGIC);
         file.extend_from_slice(&metadata(0, 24, 6));
 
+        assert_eq!(
+            crate::engine::geo::identify(&file),
+            crate::engine::geo::DatabaseKind::Mmdb
+        );
+
         let reader = MmdbReader::open(file).expect("the fixture parses");
         assert_eq!(reader.meta.ip_version, 6);
         assert_eq!(reader.meta.record_size, 24);
@@ -581,10 +589,8 @@ mod tests {
     /// wrong by reading the five size bits as a plain big-endian length.
     #[test]
     fn pointer_classes_follow_the_spec_table() {
-        // Class 0: 11-bit value in one payload byte.
         assert_eq!(read_pointer(0b00000, &[0x1C]), Some((0x1C, 1)));
         assert_eq!(read_pointer(0b00110, &[0x40]), Some(((6 << 8) | 0x40, 1)));
-        // Class 1: 19-bit value in two payload bytes, biased by 2 048.
         assert_eq!(
             read_pointer(0b01000, &[0x03, 0xB9]),
             Some((0x3B9 + 2_048, 2))
@@ -593,9 +599,7 @@ mod tests {
             read_pointer(0b01111, &[0xFF, 0xFF]),
             Some((((7 << 16) | 0xFFFF) + 2_048, 2))
         );
-        // Class 2: 27-bit value in three payload bytes, biased by 526 336.
         assert_eq!(read_pointer(0b10000, &[0, 1, 0]), Some((256 + 526_336, 3)));
-        // Class 3: raw 32-bit value; the high bits are ignored.
         assert_eq!(
             read_pointer(0b11000, &[0xDE, 0xAD, 0xBE, 0xEF]),
             Some((0xDEAD_BEEF, 4))
@@ -604,7 +608,6 @@ mod tests {
             read_pointer(0b11111, &[0, 0, 0x80, 0x00]),
             Some((0x8000, 4))
         );
-        // Truncated payloads are rejected, never read past the buffer.
         assert_eq!(read_pointer(0b01000, &[0x01]), None);
         assert_eq!(read_pointer(0b11000, &[1, 2, 3]), None);
     }

@@ -62,12 +62,32 @@ impl DatabaseKind {
     }
 }
 
-/// Trailer every MaxMind DB ends with.
+/// Trailer that introduces the metadata map at the end of a MaxMind database.
 const MMDB_TRAILER: &[u8] = b"\xab\xcd\xefMaxMind.com";
+
+/// Whether `bytes` carries the MaxMind trailer where a database puts it.
+///
+/// The trailer opens the metadata map rather than ending the file: a real
+/// database ends with that map's own keys, `node_count`, `record_size` and
+/// friends. So the test is "the marker appears in the last 128 KiB", the window
+/// the specification reserves for the metadata section and the window
+/// [`crate::engine::mmdb::MmdbReader::open`] searches.
+///
+/// The two have to agree. When this asked for the marker at end-of-file instead,
+/// it accepted only files the reader refuses for having no metadata, and
+/// refused every real database — which silently disabled every `GEOIP` rule.
+fn has_mmdb_trailer(bytes: &[u8]) -> bool {
+    let start = bytes
+        .len()
+        .saturating_sub(crate::engine::mmdb::METADATA_SEARCH_WINDOW);
+    bytes[start..]
+        .windows(MMDB_TRAILER.len())
+        .any(|window| window == MMDB_TRAILER)
+}
 
 /// Identify a payload by its bytes.
 pub fn identify(bytes: &[u8]) -> DatabaseKind {
-    if bytes.len() >= MMDB_TRAILER.len() && bytes.ends_with(MMDB_TRAILER) {
+    if has_mmdb_trailer(bytes) {
         return DatabaseKind::Mmdb;
     }
     if GeoSiteIndex::probe(bytes) {
@@ -300,6 +320,26 @@ mod tests {
         let mut mmdb = vec![0u8; 16];
         mmdb.extend_from_slice(MMDB_TRAILER);
         assert_eq!(identify(&mmdb), DatabaseKind::Mmdb);
+    }
+
+    /// A real database ends with its metadata map, not with the trailer, so the
+    /// trailer has bytes after it.
+    #[test]
+    fn a_maxmind_database_is_identified_by_its_metadata_window() {
+        let mut real_layout = vec![0u8; 64];
+        real_layout.extend_from_slice(MMDB_TRAILER);
+        real_layout.extend_from_slice(&[0xE1, 0x01, 0x96, 0xC3, 0x14, 0x01]);
+        assert_eq!(identify(&real_layout), DatabaseKind::Mmdb);
+    }
+
+    /// The same bytes outside the window the specification reserves for the
+    /// metadata section are database content, not a trailer. Searching the whole
+    /// file would misclassify a payload that happens to contain them.
+    #[test]
+    fn a_marker_outside_the_metadata_window_is_not_a_trailer() {
+        let mut buried = vec![0u8; crate::engine::mmdb::METADATA_SEARCH_WINDOW + 64];
+        buried[..MMDB_TRAILER.len()].copy_from_slice(MMDB_TRAILER);
+        assert_eq!(identify(&buried), DatabaseKind::Unknown);
     }
 
     #[test]
