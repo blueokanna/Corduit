@@ -204,10 +204,10 @@ impl Plugin {
             "shadow-tls" => {
                 #[cfg(not(feature = "shadowtls"))]
                 {
-                    return Err(Error::config(
+                    Err(Error::config(
                         "the `shadow-tls` plugin needs the `shadowtls` build feature, which \
                          this build does not carry",
-                    ));
+                    ))
                 }
                 #[cfg(feature = "shadowtls")]
                 {
