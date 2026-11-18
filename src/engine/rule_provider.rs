@@ -208,8 +208,6 @@ struct RuleIndex {
 
 impl RuleIndex {
     fn compile(entries: &[CompiledRuleEntry]) -> Self {
-        // Domain patterns are collected first because the compressed set is built
-        // from one sorted key list; everything else is indexed as it is read.
         let mut exact: Vec<String> = Vec::new();
         let mut suffix: Vec<String> = Vec::new();
         let mut index = Self::default();
@@ -502,7 +500,34 @@ impl RuleProvider {
                         self.config.name
                     )));
                 }
+                if entries.len() > crate::engine::ruleset::MAX_RULE_SET_ENTRIES {
+                    return Err(Error::config(format!(
+                        "Rule provider '{}' declares {} entries, past the {} entry cap; a rule \
+                         set that large is not a routing table but a way to exhaust memory",
+                        self.config.name,
+                        entries.len(),
+                        crate::engine::ruleset::MAX_RULE_SET_ENTRIES
+                    )));
+                }
                 let index = RuleIndex::compile(&entries);
+                if index.keywords.len() > crate::engine::ruleset::MAX_RULE_SET_KEYWORDS {
+                    return Err(Error::config(format!(
+                        "Rule provider '{}' declares {} domain keywords, past the {} cap; keyword \
+                         matching is a scan per keyword per connection",
+                        self.config.name,
+                        index.keywords.len(),
+                        crate::engine::ruleset::MAX_RULE_SET_KEYWORDS
+                    )));
+                }
+                if index.regexes.len() > crate::engine::ruleset::MAX_RULE_SET_REGEXES {
+                    return Err(Error::config(format!(
+                        "Rule provider '{}' declares {} regular expressions, past the {} cap; \
+                         expressions are the one entry whose cost is set at compile time",
+                        self.config.name,
+                        index.regexes.len(),
+                        crate::engine::ruleset::MAX_RULE_SET_REGEXES
+                    )));
+                }
                 if index.matchable_count() == 0 {
                     return Err(Error::config(format!(
                         "Rule provider '{}' has {} entries but none are usable: {}",
@@ -1304,6 +1329,47 @@ mod tests {
         assert!(!set.matches(&domain_input("example.org")));
         // A binary set of domains must never trigger a DNS lookup.
         assert!(!set.has_dst_ip_entries());
+    }
+
+    /// A rule set that declares more keywords than the ceiling is refused before
+    /// it is indexed: keyword matching costs a scan per keyword per connection.
+    #[test]
+    fn a_payload_past_the_keyword_ceiling_is_refused() {
+        let provider = test_provider(RuleProviderBehavior::Classical);
+        let mut payload = String::new();
+        for index in 0..=crate::engine::ruleset::MAX_RULE_SET_KEYWORDS {
+            payload.push_str(&format!("DOMAIN-KEYWORD,word{index}\n"));
+        }
+        let error = provider
+            .compile_payload(payload.as_bytes())
+            .expect_err("the ceiling must be enforced");
+        assert!(error.to_string().contains("keyword"), "{error}");
+    }
+
+    /// The same ceiling applies to the binary container, read from its own count.
+    #[test]
+    fn a_binary_payload_past_the_entry_ceiling_is_refused() {
+        use crate::engine::ruleset::mrs;
+
+        let body = {
+            let set = crate::engine::ruleset::succinct::SuccinctSet::from_keys(vec![
+                "moc.elpmaxe".to_string(),
+            ]);
+            let mut body = Vec::new();
+            set.write_wire_v1(&mut body);
+            body
+        };
+        let payload = mrs::encode_for_test(
+            0,
+            &body,
+            crate::engine::ruleset::MAX_RULE_SET_ENTRIES + 1,
+            &[],
+        );
+        let provider = test_provider(RuleProviderBehavior::Domain);
+        let error = provider
+            .compile_payload(&payload)
+            .expect_err("the ceiling must be enforced");
+        assert!(error.to_string().contains("ceiling"), "{error}");
     }
 
     /// The `.mrs` container end to end: detected by its zstd frame, decompressed,

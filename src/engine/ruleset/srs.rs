@@ -86,8 +86,9 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<HeadlessRule>> {
     let mut reader = Reader::new(&decoded);
     let count = reader.count(1)?;
     let mut rules = Vec::with_capacity(count.min(4096));
+    let mut budget = RuleBudget::default();
     for index in 0..count {
-        let rule = read_rule(&mut reader, 0).map_err(|error| {
+        let rule = read_rule(&mut reader, 0, &mut budget).map_err(|error| {
             Error::config(format!(
                 "Sing-box rule set (version {version}) rule {index}: {error}"
             ))
@@ -124,15 +125,54 @@ fn inflate(compressed: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decode one rule, default or logical.
-fn read_rule(reader: &mut Reader<'_>, depth: usize) -> Result<HeadlessRule> {
+/// How many expensive entries a rule set has spent so far.
+///
+/// Domains are bounded by the decoded bytes, but a regular expression costs at
+/// compile time and a keyword costs a scan per connection, so both are counted
+/// against their own ceiling while the file is read rather than after it is built.
+#[derive(Default)]
+struct RuleBudget {
+    regexes: usize,
+    keywords: usize,
+}
+
+impl RuleBudget {
+    fn spend_regexes(&mut self, count: usize) -> Result<()> {
+        self.regexes = self.regexes.saturating_add(count);
+        if self.regexes > super::MAX_RULE_SET_REGEXES {
+            return Err(Error::config(format!(
+                "Rule set declares more than {} regular expressions, the ceiling for one set",
+                super::MAX_RULE_SET_REGEXES
+            )));
+        }
+        Ok(())
+    }
+
+    fn spend_keywords(&mut self, count: usize) -> Result<()> {
+        self.keywords = self.keywords.saturating_add(count);
+        if self.keywords > super::MAX_RULE_SET_KEYWORDS {
+            return Err(Error::config(format!(
+                "Rule set declares more than {} domain keywords, the ceiling for one set",
+                super::MAX_RULE_SET_KEYWORDS
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn read_rule(
+    reader: &mut Reader<'_>,
+    depth: usize,
+    budget: &mut RuleBudget,
+) -> Result<HeadlessRule> {
     if depth > MAX_LOGICAL_DEPTH {
         return Err(Error::config(format!(
             "Logical rules nest deeper than {MAX_LOGICAL_DEPTH} levels"
         )));
     }
     match reader.u8()? {
-        RULE_DEFAULT => read_default_rule(reader),
-        RULE_LOGICAL => read_logical_rule(reader, depth),
+        RULE_DEFAULT => read_default_rule(reader, budget),
+        RULE_LOGICAL => read_logical_rule(reader, depth, budget),
         other => Err(Error::config(format!(
             "Rule kind {other} is neither a default (0) nor a logical (1) rule"
         ))),
@@ -140,7 +180,7 @@ fn read_rule(reader: &mut Reader<'_>, depth: usize) -> Result<HeadlessRule> {
 }
 
 /// Decode a default rule: `(item, payload)*`, `0xFF`, invert.
-fn read_default_rule(reader: &mut Reader<'_>) -> Result<HeadlessRule> {
+fn read_default_rule(reader: &mut Reader<'_>, budget: &mut RuleBudget) -> Result<HeadlessRule> {
     let mut rule = HeadlessRule::default();
     let mut conditions = 0usize;
     loop {
@@ -168,9 +208,12 @@ fn read_default_rule(reader: &mut Reader<'_>) -> Result<HeadlessRule> {
             }
             ITEM_DOMAIN_KEYWORD => {
                 rule.domain_keywords = read_strings(reader)?;
+                budget.spend_keywords(rule.domain_keywords.len())?;
             }
             ITEM_DOMAIN_REGEX => {
-                for pattern in read_strings(reader)? {
+                let patterns = read_strings(reader)?;
+                budget.spend_regexes(patterns.len())?;
+                for pattern in patterns {
                     rule.domain_regexes.push(compile_regex(&pattern)?);
                 }
             }
@@ -199,7 +242,9 @@ fn read_default_rule(reader: &mut Reader<'_>) -> Result<HeadlessRule> {
                 rule.process_paths = read_strings(reader)?;
             }
             ITEM_PROCESS_PATH_REGEX => {
-                for pattern in read_strings(reader)? {
+                let patterns = read_strings(reader)?;
+                budget.spend_regexes(patterns.len())?;
+                for pattern in patterns {
                     rule.process_path_regexes.push(compile_regex(&pattern)?);
                 }
             }
@@ -216,7 +261,11 @@ fn read_default_rule(reader: &mut Reader<'_>) -> Result<HeadlessRule> {
 }
 
 /// Decode a logical rule: `mode`, child count, children, invert.
-fn read_logical_rule(reader: &mut Reader<'_>, depth: usize) -> Result<HeadlessRule> {
+fn read_logical_rule(
+    reader: &mut Reader<'_>,
+    depth: usize,
+    budget: &mut RuleBudget,
+) -> Result<HeadlessRule> {
     let mode = match reader.u8()? {
         0 => LogicalMode::And,
         1 => LogicalMode::Or,
@@ -232,7 +281,7 @@ fn read_logical_rule(reader: &mut Reader<'_>, depth: usize) -> Result<HeadlessRu
     }
     let mut children = Vec::with_capacity(count.min(64));
     for _ in 0..count {
-        children.push(read_rule(reader, depth + 1)?);
+        children.push(read_rule(reader, depth + 1, budget)?);
     }
     let invert = reader.bool()?;
     Ok(HeadlessRule {

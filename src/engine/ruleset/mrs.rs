@@ -97,6 +97,12 @@ fn parse(payload: &[u8]) -> Result<Vec<HeadlessRule>> {
             "Binary rule set declares zero entries; it would match nothing",
         ));
     }
+    if count > super::MAX_RULE_SET_ENTRIES {
+        return Err(Error::config(format!(
+            "Binary rule set declares {count} entries, past the {} entry ceiling",
+            super::MAX_RULE_SET_ENTRIES
+        )));
+    }
 
     let extra = read_i64(&mut reader, "reserved")?;
     if extra > 0 {

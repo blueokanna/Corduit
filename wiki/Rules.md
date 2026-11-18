@@ -269,7 +269,7 @@ rule-provider 的载荷**按内容判格式**（`ruleset::detect`）：扩展名
 - 支持：`network`、`domain`（精确 / 后缀 / 正则混在一个压缩域集里）、`domain_keyword`、`domain_regex`、`source_ip_cidr`、`ip_cidr`、`port`、`port_range`、`source_port`、`source_port_range`、`process_name`、`process_path`、`process_path_regex`、`and` / `or` 逻辑组合、`invert` 取反。
 - 语义：同一条规则内的多个条件是 **AND**，同一规则集里的多条规则是 **OR**——与 sing-box 一致。
 - **解不了的条件拒绝整份规则集**，绝不静默丢条件：`query_type`、`package_name`、`package_name_regex`、`wifi_ssid`、`wifi_bssid`、`adguard_domain`、`network_type`、`network_is_expensive`、`network_is_constrained`、`network_interface_address`、`default_interface_address`。把「只对 Wi-Fi 生效」降级成「永远生效」，是替操作员做决定；错误的路由比加载失败难发现得多。报错会点名条件，方便你换一份导出。
-- 容错与上限：zlib 解压 256 MiB 上限（防解压炸弹）；每个 count / 长度字段先与剩余字节比对再分配；逻辑嵌套上限 100 层；截断的文件是**错误**，不是「短一点但能用」。
+- 容错与上限：zlib 解压 64 MiB 上限（防解压炸弹）；每个 count / 长度字段先与剩余字节比对再分配；逻辑嵌套上限 100 层；截断的文件是**错误**，不是「短一点但能用」。
 
 #### `.mrs`（容器版本 1）
 
@@ -290,7 +290,7 @@ payload         域集 / 地址集
 
 域集的键用的是另一套标记：`+` 表示「该域名之下任意深度」（后缀），`*` 表示「任意一个标签」（并带回溯）。因此 `.mrs` 的域集走 `SuccinctSet::has_wildcards`，单标签通配、后缀通配与精确匹配都在同一次遍历里判定，语义与写它的工具一致（包括它的回溯栈）。
 
-边界与拒绝：容器版本不是 1、behavior 不是 0/1、inner magic 缺失、count 为 0、计数与实际字节矛盾、zstd 解压超过 256 MiB —— 一律报错并点名，不会退化成「空规则集」。behavior 的 `classical` 在该格式里没有二进制编码，报错会直接说「behavior 2」。
+边界与拒绝：容器版本不是 1、behavior 不是 0/1、inner magic 缺失、count 为 0、计数与实际字节矛盾、zstd 解压超过 64 MiB —— 一律报错并点名，不会退化成「空规则集」。behavior 的 `classical` 在该格式里没有二进制编码，报错会直接说「behavior 2」。
 
 > 有两点刻意的差异：`behavior` 只描述**文本**怎么读，二进制载荷自带类型，两者不一致时以载荷为准（并记一条 debug），不会像上游那样直接拒绝整份文件；`.srs` 与 `.mrs` 的域集都按文件里的编码原样求值，不互相改写。
 

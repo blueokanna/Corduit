@@ -366,7 +366,6 @@ impl FseTable {
         let mut new_state_base = vec![0u16; size];
         let mut state_desc = [0u16; MAX_SYMBOLS];
 
-        // Symbols with probability "-1" are placed at the end and reset the state.
         let mut high_threshold = size;
         for (symbol, &frequency) in frequencies[..count].iter().enumerate() {
             if frequency == -1 {
@@ -376,7 +375,6 @@ impl FseTable {
             }
         }
 
-        // The rest are spread over the table with a step coprime to its size.
         let step = (size >> 1) + (size >> 3) + 3;
         let mask = size - 1;
         let mut position = 0usize;
@@ -681,8 +679,28 @@ struct FrameState {
     repeat_offsets: [usize; 3],
 }
 
+/// Most output one input byte may expand into.
+///
+/// Domain lists compress well — twenty times is ordinary — but a payload that
+/// claims hundreds of times its own size is a decompression bomb, and the whole
+/// point of decoding it is to hand the result to a rule engine that will index
+/// it. The bound is a ratio *and* a floor: a tiny valid frame must still decode.
+const MAX_EXPANSION_RATIO: usize = 128;
+/// Floor under the ratio, so short files are not judged by it.
+const EXPANSION_FLOOR: usize = 1 << 20;
+
+/// Largest output this many input bytes may honestly expand into.
+///
+/// The effective budget is the smaller of what the caller allows and this figure.
+fn expansion_budget(input_len: usize) -> usize {
+    input_len
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .saturating_add(EXPANSION_FLOOR)
+}
+
 /// Decompress one or more frames, refusing to produce more than `limit` bytes.
 pub fn decompress(input: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let limit = limit.min(expansion_budget(input.len()));
     let mut cursor = Input::new(input);
     let mut out: Vec<u8> = Vec::new();
     let mut decoded_any = false;
@@ -805,9 +823,6 @@ fn decompress_frame(input: &mut Input<'_>, out: &mut Vec<u8>, limit: usize) -> R
     }
 
     if checksum {
-        // The checksum guards the transport; the rule-set loader validates the
-        // decoded content, and computing xxh64 here would add a second hash
-        // implementation for no decision it changes.
         input.skip(4)?;
     }
     if let Some(size) = content_size
@@ -1198,6 +1213,20 @@ mod tests {
         )
         .expect("frame");
         assert!(decompress(&frame, 1024).is_err());
+    }
+
+    /// The amplification budget: a small file cannot claim an unbounded output,
+    /// and an ordinary one still gets room to breathe.
+    #[test]
+    fn the_expansion_budget_bounds_a_small_file() {
+        assert_eq!(expansion_budget(100), EXPANSION_FLOOR + 12_800);
+        assert!(expansion_budget(2 << 20) >= 64 * 1024 * 1024);
+        let frame = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/zstd/ruleset_l3.zst"),
+        )
+        .expect("frame");
+        assert!(decompress(&frame, 512).is_err());
+        assert!(decompress(&frame, 64 * 1024 * 1024).is_ok());
     }
 
     #[test]

@@ -274,7 +274,7 @@ is not evidence of anything.
   never falls back to a direct connection. Global mode without a proxy outbound rejects
   rather than leaking.
 - **Bounded input.** Every decoder in the tree has explicit limits: rule-set payloads
-  (256 MiB decoded), Geo databases (512 MiB), HTTP bodies, DNS message sizes, and nesting
+  (64 MiB decoded, 2 M entries, 4 K expressions), Geo databases (512 MiB), HTTP bodies, DNS message sizes, and nesting
   depth in logical rules and protobuf messages.
 - **No trust in profile strings.** Values that reach a wire format (hostnames, paths,
   credentials) are validated; control characters are rejected rather than escaped.

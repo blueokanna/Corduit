@@ -128,6 +128,15 @@ impl CompiledGeoSite {
                 rejected.push("domain entry without a value".to_string());
                 continue;
             };
+            if exact.len() + suffix.len() + patterns.len()
+                >= crate::engine::ruleset::MAX_RULE_SET_ENTRIES
+            {
+                rejected.push(format!(
+                    "category exceeds the {} entry ceiling",
+                    crate::engine::ruleset::MAX_RULE_SET_ENTRIES
+                ));
+                break;
+            }
             let value = value.trim();
             if value.is_empty() {
                 rejected.push("empty domain entry".to_string());
@@ -196,8 +205,17 @@ fn compile_patterns(
     if patterns.is_empty() {
         return (None, Vec::new());
     }
+    if patterns.len() > crate::engine::ruleset::MAX_RULE_SET_REGEXES {
+        rejected.push(format!(
+            "{} expressions, past the {} cap",
+            patterns.len(),
+            crate::engine::ruleset::MAX_RULE_SET_REGEXES
+        ));
+        return (None, Vec::new());
+    }
     match RegexSetBuilder::new(patterns.iter())
         .case_insensitive(true)
+        .size_limit(crate::engine::ruleset::REGEX_SIZE_LIMIT)
         .build()
     {
         Ok(set) => (Some(set), Vec::new()),
@@ -205,7 +223,11 @@ fn compile_patterns(
             rejected.push(format!("regex set: {set_error}"));
             let mut regexes = Vec::new();
             for pattern in patterns {
-                match RegexBuilder::new(pattern).case_insensitive(true).build() {
+                match RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .size_limit(crate::engine::ruleset::REGEX_SIZE_LIMIT)
+                    .build()
+                {
                     Ok(regex) => regexes.push(regex),
                     Err(error) => rejected.push(format!("regex '{pattern}': {error}")),
                 }
@@ -221,9 +243,6 @@ pub struct GeoSiteIndex {
     tags: Vec<TagMeta>,
     by_name: HashMap<String, u32>,
     compiled: RwLock<HashMap<u32, Arc<CompiledGeoSite>>>,
-    /// Categories a rule has asked for that the file does not have. Reported once
-    /// each: a typo in a profile must be visible, and repeating it per connection
-    /// would bury the log.
     missing: RwLock<std::collections::HashSet<String>>,
 }
 

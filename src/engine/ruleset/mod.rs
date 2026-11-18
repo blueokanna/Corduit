@@ -33,8 +33,38 @@ use succinct::{DomainMatcher, SuccinctSet};
 /// Largest payload a binary rule set may decode to, in bytes.
 ///
 /// A rule set that inflates past this is either corrupt or hostile; what it must
-/// never be is a way to make the process allocate until it dies.
-pub const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
+/// never be is a way to make the process allocate until it dies. Real sets are
+/// two orders of magnitude below this: the largest community Geo set decodes to
+/// tens of megabytes, and a single rule set to a few.
+pub const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Most entries one rule set may index.
+///
+/// The decoded-size budget bounds the bytes; this bounds the *count*, because a
+/// payload can describe a very large number of tiny entries, and every count in a
+/// decoder is a promise about how much the loader will build.
+pub const MAX_RULE_SET_ENTRIES: usize = 1 << 21;
+
+/// Most regular expressions one rule set may carry.
+///
+/// A regular expression is the only entry whose cost is not proportional to its
+/// length when it is *matched*: compilation is where a hostile set can spend
+/// memory and time, so the number of expressions is capped separately from the
+/// number of domains.
+pub const MAX_RULE_SET_REGEXES: usize = 1 << 12;
+
+/// Most domain keywords one rule set may carry.
+///
+/// Keyword matching is a substring scan per keyword per connection, so an
+/// unbounded keyw  ord list would turn every connection into a linear search over
+/// the whole list — a slow-down an attacker can ship inside a rule set.
+pub const MAX_RULE_SET_KEYWORDS: usize = 1 << 16;
+
+/// Compiled-size ceiling for one regular expression.
+///
+/// `regex` grows a program until a limit is hit; stating the limit here keeps a
+/// crafted pattern from choosing a much larger one.
+pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 /// Which family a payload belongs to.
 ///
@@ -436,6 +466,9 @@ impl RuleSet {
 pub fn compile_regex(pattern: &str) -> Result<Regex> {
     RegexBuilder::new(pattern)
         .case_insensitive(true)
+        // The ceiling is stated here rather than left to the crate's default, so a
+        // crafted pattern cannot buy a larger compiled program than this.
+        .size_limit(REGEX_SIZE_LIMIT)
         .build()
         .map_err(|error| {
             Error::config(format!(
