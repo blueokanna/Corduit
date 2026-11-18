@@ -5,3 +5,8 @@
 # working-tree copy was not.
 src/protocol/tls13/testdata/** -text
 *.der -text
+
+# Rule-set fixtures are compared byte for byte. Git must never rewrite their line
+# endings: the compressed side is binary, and the expected plaintext lives in the
+# test itself precisely so that a checkout cannot change it.
+tests/data/zstd/** -text -diff

@@ -1163,38 +1163,89 @@ fn resolve_offset(sequence: &Sequence, state: &mut FrameState) -> Result<usize> 
 mod tests {
     use super::*;
 
-    /// Every fixture pair in `tests/data/zstd` must round-trip.
+    /// The plaintexts the reference encoder compressed into `tests/data/zstd`.
+    ///
+    /// They are code rather than `.raw` files on purpose. A text fixture in a git
+    /// checkout is subject to line-ending policy, and a `.raw` file that has been
+    /// CRLF-converted is no longer the plaintext the encoder saw: the Windows job
+    /// failed once with exactly one extra byte per line. The compressed side stays
+    /// byte-exact (`.gitattributes` marks the fixture directory binary), and the
+    /// bytes it must decode to are reproduced here.
+    fn cases() -> Vec<(String, Vec<u8>)> {
+        let mut cases: Vec<(String, Vec<u8>)> = vec![
+            ("empty".to_string(), Vec::new()),
+            ("single_byte".to_string(), b"a".to_vec()),
+            (
+                "short_text".to_string(),
+                b"DOMAIN-SUFFIX,example.com\n".to_vec(),
+            ),
+            ("rle_text".to_string(), vec![b'x'; 5000]),
+            (
+                "random_4k".to_string(),
+                (0..4096u32)
+                    .map(|index| (index.wrapping_mul(16_777_619) >> 13) as u8)
+                    .collect(),
+            ),
+        ];
+
+        // A rule-set shaped document: repeated prefixes, which is what turns into
+        // Huffman literals plus FSE sequences.
+        let mut rules = String::new();
+        for index in 0..4000u32 {
+            rules.push_str(&format!(
+                "DOMAIN-SUFFIX,cdn{}.example{}.com\n",
+                index,
+                index % 37
+            ));
+        }
+        rules.push_str("DOMAIN-KEYWORD,adserver\nIP-CIDR,10.0.0.0/8,no-resolve\n");
+        for level in [1, 3, 9, 19] {
+            cases.push((format!("ruleset_l{level}"), rules.clone().into_bytes()));
+        }
+
+        // Larger than one 128 KiB block, so block-to-block state has to carry.
+        let mut big = Vec::new();
+        for index in 0..12000u32 {
+            big.extend_from_slice(
+                format!("host{:05}.service{}.internal.example\n", index, index % 97).as_bytes(),
+            );
+        }
+        for level in [3, 12] {
+            cases.push((format!("multiblock_l{level}"), big.clone()));
+        }
+        cases
+    }
+
+    /// Every fixture must decode back to the exact bytes the encoder was given.
     #[test]
     fn reference_frames_decode_to_their_plaintext() {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/zstd");
         let mut checked = 0usize;
-        let mut entries: Vec<_> = std::fs::read_dir(&directory)
-            .expect("fixture directory")
-            .map(|entry| entry.expect("entry").path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "zst"))
-            .collect();
-        entries.sort();
-        assert!(!entries.is_empty(), "no fixtures found");
-
-        for frame_path in entries {
-            let expected_path = frame_path.with_extension("raw");
-            let frame = std::fs::read(&frame_path).expect("frame");
-            let expected = std::fs::read(&expected_path).expect("plaintext");
-            let name = frame_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_string();
+        for (name, expected) in cases() {
+            let frame = std::fs::read(directory.join(format!("{name}.zst")))
+                .unwrap_or_else(|error| panic!("{name}: cannot read the fixture: {error}"));
             let decoded = decompress(&frame, 64 * 1024 * 1024)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
-            assert_eq!(decoded.len(), expected.len(), "{name}: length");
-            assert!(decoded == expected, "{name}: content");
+            assert_eq!(decoded.len(), expected.len(), "{name}: decoded length");
+            assert!(decoded == expected, "{name}: decoded content");
             checked += 1;
         }
-        assert!(
-            checked >= 10,
-            "expected the full fixture set, saw {checked}"
-        );
+        assert_eq!(checked, 11, "the fixture set is incomplete");
+    }
+
+    /// The amplification budget: a small file cannot claim an unbounded output,
+    /// and an ordinary one still gets room to breathe.
+    #[test]
+    fn the_expansion_budget_bounds_a_small_file() {
+        assert_eq!(expansion_budget(100), EXPANSION_FLOOR + 12_800);
+        assert!(expansion_budget(2 << 20) >= 64 * 1024 * 1024);
+
+        let frame = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/zstd/ruleset_l3.zst"),
+        )
+        .expect("frame");
+        assert!(decompress(&frame, 512).is_err());
+        assert!(decompress(&frame, 64 * 1024 * 1024).is_ok());
     }
 
     #[test]
@@ -1213,20 +1264,6 @@ mod tests {
         )
         .expect("frame");
         assert!(decompress(&frame, 1024).is_err());
-    }
-
-    /// The amplification budget: a small file cannot claim an unbounded output,
-    /// and an ordinary one still gets room to breathe.
-    #[test]
-    fn the_expansion_budget_bounds_a_small_file() {
-        assert_eq!(expansion_budget(100), EXPANSION_FLOOR + 12_800);
-        assert!(expansion_budget(2 << 20) >= 64 * 1024 * 1024);
-        let frame = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/zstd/ruleset_l3.zst"),
-        )
-        .expect("frame");
-        assert!(decompress(&frame, 512).is_err());
-        assert!(decompress(&frame, 64 * 1024 * 1024).is_ok());
     }
 
     #[test]
